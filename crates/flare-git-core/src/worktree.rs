@@ -45,7 +45,240 @@ pub fn is_retryable_worktree_race(err: &str) -> bool {
         || e.contains("could not lock")
         || e.contains("unable to lock")
         || e.contains("already locked")
+        || e.contains("cannot lock ref")
+        || (e.contains("unable to create") && e.contains(".lock"))
         || (e.contains("worktree add") && e.contains("already exists"))
+}
+
+/// `.worktrees/task/<sequence_id>` under `repo_root` -- the one place every
+/// per-item worktree lives.
+#[must_use]
+pub fn item_worktree_path(repo_root: &Path, sequence_id: i64) -> PathBuf {
+    repo_root
+        .join(".worktrees")
+        .join("task")
+        .join(sequence_id.to_string())
+}
+
+/// [`run_output_timeout`] against git, shaped like `shell::run_in`:
+/// `Ok(stdout)` trimmed on success, `Err(stderr)` (or the spawn/timeout
+/// message) otherwise.
+fn run_git_timeout(cwd: &Path, args: &[&str], timeout_secs: u64) -> Result<String, String> {
+    let out = run_output_timeout(crate::shell::git_binary(), args, cwd, timeout_secs)?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// Deadline for one `git worktree add`, checkout hooks included.
+const WORKTREE_ADD_TIMEOUT_SECS: u64 = 600;
+
+/// How old a leftover `index.lock` must be before it's presumed abandoned by
+/// a killed git process rather than held by a live one. Generous on purpose:
+/// no single index-mutating git operation this crate runs comes close.
+const STALE_INDEX_LOCK_AGE: Duration = Duration::from_secs(10 * 60);
+
+/// Resolves a path inside `worktree_path`'s own git dir (`index.lock`,
+/// `rebase-merge`, ...) -- per-worktree for a linked worktree.
+fn worktree_git_path(worktree_path: &Path, name: &str) -> Option<PathBuf> {
+    let raw = run_git_in(worktree_path, &["rev-parse", "--git-path", name]).ok()?;
+    let p = PathBuf::from(raw);
+    Some(if p.is_absolute() {
+        p
+    } else {
+        worktree_path.join(p)
+    })
+}
+
+/// `true` when `path` is the top level of its own git checkout. A task
+/// worktree whose `.git` pointer is missing or broken would otherwise let
+/// every git command run "in" it silently operate on the enclosing main
+/// repository instead (`.worktrees/` lives inside it).
+fn is_own_checkout(path: &Path) -> bool {
+    let Ok(top) = run_git_in(path, &["rev-parse", "--show-toplevel"]) else {
+        return false;
+    };
+    match (Path::new(&top).canonicalize(), path.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Clears the wedged state a killed or timed-out git leaves in a worktree,
+/// which otherwise blocks every later commit/rebase/re-claim with nothing to
+/// clear it automatically: an abandoned `index.lock`, and a half-finished
+/// rebase (detached `HEAD`, `rebase-merge`/`rebase-apply` left behind).
+///
+/// `lock_is_ours` skips the age check -- for a caller that just killed the
+/// git process holding the lock itself. Returns `Err` if a rebase is still
+/// in progress afterward.
+fn heal_interrupted_git_state(worktree_path: &Path, lock_is_ours: bool) -> Result<(), String> {
+    if !is_own_checkout(worktree_path) {
+        return Ok(());
+    }
+    if let Some(lock) = worktree_git_path(worktree_path, "index.lock")
+        && let Ok(meta) = std::fs::metadata(&lock)
+    {
+        let age = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .unwrap_or_default();
+        if (lock_is_ours || age >= STALE_INDEX_LOCK_AGE) && std::fs::remove_file(&lock).is_ok() {
+            eprintln!(
+                "worktree: removed abandoned {} ({}s old)",
+                lock.display(),
+                age.as_secs()
+            );
+        }
+    }
+    let rebasing = ["rebase-merge", "rebase-apply"]
+        .iter()
+        .filter_map(|n| worktree_git_path(worktree_path, n))
+        .any(|p| p.exists());
+    if !rebasing {
+        return Ok(());
+    }
+    run_git_in(worktree_path, &["rebase", "--abort"])
+        .map(|_| {
+            eprintln!(
+                "worktree: aborted interrupted rebase in {}",
+                worktree_path.display()
+            )
+        })
+        .map_err(|e| {
+            format!(
+                "worktree: {} is stuck mid-rebase and `git rebase --abort` failed: {e}",
+                worktree_path.display()
+            )
+        })
+}
+
+/// When `worktree_path` is on a detached `HEAD` whose commits no branch or
+/// remote-tracking ref contains, pins them under
+/// `refs/agentflare/rescue/...` so removing or switching the checkout can't
+/// make them unreachable (`worktree prune` drops the checkout's `HEAD`
+/// reflog, the only other thing keeping them alive). Returns the rescue ref.
+fn rescue_detached_head(worktree_path: &Path, label: &str) -> Option<String> {
+    let current = run_git_in(worktree_path, &["branch", "--show-current"]).ok()?;
+    if !current.is_empty() {
+        return None;
+    }
+    let head = run_git_in(worktree_path, &["rev-parse", "HEAD"]).ok()?;
+    let reachable = run_git_in(
+        worktree_path,
+        &[
+            "for-each-ref",
+            "--count=1",
+            "--contains",
+            &head,
+            "refs/heads",
+            "refs/remotes",
+        ],
+    )
+    .map(|out| !out.is_empty())
+    .unwrap_or(true);
+    if reachable {
+        return None;
+    }
+    let short: String = head.chars().take(12).collect();
+    let rescue = format!("refs/agentflare/rescue/{label}-{short}");
+    run_git_in(worktree_path, &["update-ref", &rescue, &head]).ok()?;
+    eprintln!(
+        "worktree: detached HEAD {short} in {} held commits no branch contains -- saved as {rescue}",
+        worktree_path.display()
+    );
+    Some(rescue)
+}
+
+/// Puts an existing, clean checkout at `worktree_path` onto `branch` in
+/// place -- the recovery for a task worktree left on a detached `HEAD` (an
+/// agent's `git checkout <sha>`, an interrupted rebase) or on some other
+/// branch. Without it, `git worktree add` refuses the occupied path forever
+/// and every redispatch of the item fails identically.
+///
+/// Never loses commits: detached work that `branch` doesn't already contain
+/// is fast-forwarded onto `branch` when possible, otherwise pinned by
+/// [`rescue_detached_head`] first.
+fn adopt_existing_checkout(worktree_path: &Path, branch: &str, label: &str) -> Result<(), String> {
+    let detached = run_git_in(worktree_path, &["branch", "--show-current"])?.is_empty();
+    let local = format!("refs/heads/{branch}");
+    let remote = format!("refs/remotes/origin/{branch}");
+    let existing = [&local, &remote]
+        .into_iter()
+        .find(|r| run_git_in_ok(worktree_path, &["rev-parse", "--verify", "--quiet", r]));
+    let is_ancestor =
+        |a: &str, b: &str| run_git_in_ok(worktree_path, &["merge-base", "--is-ancestor", a, b]);
+    let args: Vec<&str> = match existing {
+        // Nothing to preserve beyond what HEAD already has: branch from it.
+        None => vec!["switch", "-c", branch],
+        Some(r) if detached && !is_ancestor("HEAD", r) && is_ancestor(r, "HEAD") => {
+            // Detached work strictly ahead of the branch: fast-forward.
+            vec!["switch", "-C", branch]
+        }
+        Some(r) => {
+            if detached && !is_ancestor("HEAD", r) {
+                rescue_detached_head(worktree_path, label);
+            }
+            if r == &local {
+                vec!["switch", branch]
+            } else {
+                vec!["switch", "-c", branch, "--track", &remote]
+            }
+        }
+    };
+    run_git_in(worktree_path, &args).map(|_| {
+        eprintln!(
+            "worktree: switched existing checkout {} onto {branch}",
+            worktree_path.display()
+        );
+    })
+}
+
+/// `true` when `worktree_path`'s registration still carries the
+/// "initializing" lock `git worktree add` holds while it populates a new
+/// checkout, and is old enough that no add can still be in flight -- the
+/// signature of an add killed partway (crash, timeout). Such a checkout can
+/// be missing most of its files while already on the right branch; reusing
+/// it would stage every unpopulated file as a deletion.
+fn is_half_created(worktree_path: &Path) -> bool {
+    let Some(locked) = worktree_git_path(worktree_path, "locked") else {
+        return false;
+    };
+    let Ok(reason) = std::fs::read_to_string(&locked) else {
+        return false;
+    };
+    let old_enough = std::fs::metadata(&locked)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|m| m.elapsed().ok())
+        .is_some_and(|age| age >= Duration::from_secs(120));
+    reason.contains("initializing") && old_enough
+}
+
+/// Resolves a gitdir pointer as git itself does: absolute as-is, relative
+/// (`worktree.useRelativePaths`, git 2.48+) against the directory holding
+/// the file it was read from.
+fn resolve_gitdir_pointer(base_dir: &Path, raw: &str) -> PathBuf {
+    let p = Path::new(raw.trim());
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    // Lexically, not `canonicalize`: the stale-registration callers need
+    // this for paths that no longer exist.
+    let mut out = PathBuf::new();
+    for c in base_dir.join(p).components() {
+        match c {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 pub fn resolve_target_branch(conn: &rusqlite::Connection, item: &Item, repo_root: &Path) -> String {
@@ -354,10 +587,7 @@ fn resolve_worktree_branch(item: &Item, worktree_path: &Path) -> String {
 /// against the real branch but `item_done` thinks nothing diverged and
 /// returns Ok without push/PR/error (item #331 / #512).
 pub fn resolve_item_task_branch(item: &Item, repo_root: &Path) -> String {
-    let worktree_path = repo_root
-        .join(".worktrees")
-        .join("task")
-        .join(item.sequence_id.to_string());
+    let worktree_path = item_worktree_path(repo_root, item.sequence_id);
     resolve_worktree_branch(item, &worktree_path)
 }
 
@@ -375,10 +605,46 @@ pub fn create_worktree(
     target_branch: &str,
     progress: Option<&dyn Progress>,
 ) -> Result<PathBuf, String> {
-    let worktree_path = repo_root
-        .join(".worktrees")
-        .join("task")
-        .join(item.sequence_id.to_string());
+    let worktree_path = item_worktree_path(repo_root, item.sequence_id);
+    let label = format!("task-{}", item.sequence_id);
+    if worktree_path.is_dir() && !is_own_checkout(&worktree_path) {
+        // Broken or missing `.git` pointer: git run inside it would act on
+        // the main repo. Relink it if its admin entry survives; otherwise
+        // snapshot its contents and clear the directory so a fresh add can
+        // take the path.
+        let path = worktree_path.to_string_lossy().to_string();
+        let _ = run_git_in(repo_root, &["worktree", "repair", &path]);
+        if !is_own_checkout(&worktree_path) {
+            let name = item.sequence_id.to_string();
+            if gc_orphans(repo_root, std::slice::from_ref(&name)).is_empty() {
+                return Err(format!(
+                    "worktree: {} is not a valid checkout and could not be cleared for item {}",
+                    worktree_path.display(),
+                    item.id
+                ));
+            }
+        }
+    }
+    if worktree_path.is_dir() && is_own_checkout(&worktree_path) {
+        if is_half_created(&worktree_path) {
+            // Holds no work of its own yet; re-add it from scratch below.
+            eprintln!(
+                "worktree: {} was left half-created by an interrupted `worktree add`, recreating",
+                worktree_path.display()
+            );
+            let path = worktree_path.to_string_lossy().to_string();
+            let _ = run_git_in(
+                repo_root,
+                &["worktree", "remove", "--force", "--force", &path],
+            );
+            if worktree_path.exists() {
+                remove_worktree_dir(&worktree_path, &label);
+            }
+            remove_stale_registration_for_path(repo_root, &worktree_path);
+        } else {
+            heal_interrupted_git_state(&worktree_path, false)?;
+        }
+    }
     let branch = resolve_worktree_branch(item, &worktree_path);
     // Two ways a re-claim can find its own worktree already in place:
     // `already_isolated_for` catches the recursive case (the calling
@@ -419,6 +685,20 @@ pub fn create_worktree(
             );
             eprintln!("{msg}");
             return Err(msg);
+        }
+        // Clean, but on a detached HEAD or another branch: `worktree add`
+        // can never succeed over the occupied path, so switch it in place.
+        if is_own_checkout(&worktree_path) {
+            adopt_existing_checkout(&worktree_path, &branch, &label).map_err(|e| {
+                format!(
+                    "worktree: could not switch existing checkout at {} onto {branch} for item {}: {e}",
+                    worktree_path.display(),
+                    item.id
+                )
+            })?;
+            warn_if_ambient_target_dir();
+            isolate_worktree_target_dir(&worktree_path);
+            return Ok(worktree_path);
         }
     }
     ensure_worktrees_ignored(repo_root);
@@ -469,7 +749,7 @@ pub fn create_worktree(
             ],
         );
     }
-    let worktree_add_args: Vec<String> = if branch_exists {
+    let start_point: Option<String> = if branch_exists {
         // Existing branch (local or now-fetched remote-tracking): it may still
         // be tied to a broken worktree registration from an earlier attempt
         // whose directory was removed out-of-band (crash, manual cleanup) --
@@ -493,15 +773,7 @@ pub fn create_worktree(
         // branch lookup above resolved differently (item #633).
         remove_stale_registration_for(repo_root, &branch);
         remove_stale_registration_for_path(repo_root, &worktree_path);
-        // Check it out as-is, no `-b` -- git auto-creates the local tracking
-        // branch when only the remote-tracking ref exists, same as `git
-        // checkout <branch>`.
-        vec![
-            "worktree".to_string(),
-            "add".to_string(),
-            worktree_path.to_string_lossy().to_string(),
-            branch.clone(),
-        ]
+        None
     } else {
         // Brand new branch: branch off the freshly-fetched remote ref when
         // reachable, so a stale local checkout (e.g. hasn't pulled a
@@ -545,16 +817,9 @@ pub fn create_worktree(
                 target_branch.to_string()
             }
         };
-        vec![
-            "worktree".to_string(),
-            "add".to_string(),
-            worktree_path.to_string_lossy().to_string(),
-            "-b".to_string(),
-            branch.clone(),
-            start_point,
-        ]
+        Some(start_point)
     };
-    let arg_refs: Vec<&str> = worktree_add_args.iter().map(String::as_str).collect();
+    let path_arg = worktree_path.to_string_lossy().to_string();
     // `git worktree add` takes its own lock on `.git/config`/`.git/worktrees`
     // admin state; two calls against the same repo at the same instant race
     // on that lock and the loser fails outright ("could not lock config
@@ -586,9 +851,29 @@ pub fn create_worktree(
                 ADD_BACKOFF_SECS[(attempt - 1).min(ADD_BACKOFF_SECS.len() - 1)],
             ));
         }
+        // Re-derived every attempt: a failed attempt can still have created
+        // the branch (e.g. `-b` succeeded, then writing its tracking config
+        // lost a lock race), and repeating `-b` would then fail permanently
+        // with "a branch named ... already exists".
+        let exists_now = branch_exists
+            || run_git_in_ok(
+                repo_root,
+                &["rev-parse", "--verify", "--quiet", &branch_ref],
+            );
+        let arg_refs: Vec<&str> = match (&start_point, exists_now) {
+            // Existing branch: check it out as-is, no `-b` -- git auto-creates
+            // the local tracking branch when only the remote-tracking ref
+            // exists, same as `git checkout <branch>`.
+            (None, _) | (Some(_), true) => vec!["worktree", "add", &path_arg, &branch],
+            (Some(start), false) => vec!["worktree", "add", &path_arg, "-b", &branch, start],
+        };
+        // Bounded: checkout hooks or a huge tree must not hold the add lock
+        // (and so every other claim in this process) indefinitely. A killed
+        // add leaves a half-created checkout, which the next attempt at the
+        // top of this function detects and recreates.
         let git_result = {
             let _guard = WORKTREE_ADD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            run_git_in(repo_root, &arg_refs)
+            run_git_timeout(repo_root, &arg_refs, WORKTREE_ADD_TIMEOUT_SECS)
         };
         match git_result {
             Ok(_) => {
@@ -647,15 +932,17 @@ fn remove_stale_registration_for(repo_root: &Path, branch: &str) -> bool {
         }
         // Does this registration claim our branch?
         let head = std::fs::read_to_string(admin.join("HEAD")).unwrap_or_default();
-        if head.trim() != wanted_head {
+        if head.trim() != wanted_head || admin.join("locked").exists() {
             continue;
         }
         // `gitdir` holds "<checkout>/.git" -- its parent is the checkout.
         // Preserve the registration if that directory still exists (or if
         // the file is unreadable): fail closed, since removing a live
         // worktree's registration is the exact harm this function avoids.
-        let gitdir = std::fs::read_to_string(admin.join("gitdir")).unwrap_or_default();
-        let still_live = std::path::Path::new(gitdir.trim())
+        let Ok(gitdir) = std::fs::read_to_string(admin.join("gitdir")) else {
+            continue;
+        };
+        let still_live = resolve_gitdir_pointer(&admin, &gitdir)
             .parent()
             .is_none_or(std::path::Path::exists);
         if still_live {
@@ -700,7 +987,7 @@ fn remove_stale_registration_for_path(repo_root: &Path, worktree_path: &Path) ->
             continue;
         }
         let gitdir = std::fs::read_to_string(admin.join("gitdir")).unwrap_or_default();
-        let checkout = std::path::Path::new(gitdir.trim())
+        let checkout = resolve_gitdir_pointer(&admin, &gitdir)
             .parent()
             .map(std::path::Path::to_path_buf);
         let is_ours = checkout.as_deref() == Some(worktree_path);
@@ -720,7 +1007,7 @@ fn remove_stale_registration_for_path(repo_root: &Path, worktree_path: &Path) ->
         // recycled this admin dir for a replacement worktree since we first
         // read it — deleting that live registration would orphan real work.
         let gitdir_again = std::fs::read_to_string(admin.join("gitdir")).unwrap_or_default();
-        let still_ours = std::path::Path::new(gitdir_again.trim())
+        let still_ours = resolve_gitdir_pointer(&admin, &gitdir_again)
             .parent()
             .map(std::path::Path::to_path_buf)
             .as_deref()
@@ -889,17 +1176,34 @@ fn fetch_with_retry(
 /// all) apart from a run whose push/PR failed for some other reason —
 /// only the former should block marking an item done.
 pub fn branch_diverged(repo_root: &Path, branch: &str, target_branch: &str) -> bool {
-    match run_git_in(
-        repo_root,
-        &["rev-list", "--count", &format!("{target_branch}..{branch}")],
-    ) {
+    // Both the local target and `origin/<target>` count as "already there":
+    // the daemon never pulls, so the local ref alone goes stale (upstream
+    // commits misread as the branch's own), and a target that only exists
+    // remotely (a parent item's pushed branch) must not read as "nothing
+    // committed" just because the local ref is missing.
+    let bases: Vec<String> = [
+        target_branch.to_string(),
+        format!("refs/remotes/origin/{target_branch}"),
+    ]
+    .into_iter()
+    .filter(|r| run_git_in_ok(repo_root, &["rev-parse", "--verify", "--quiet", r]))
+    .collect();
+    if bases.is_empty() {
+        return false;
+    }
+    let mut rev_list = vec!["rev-list", "--count", branch, "--not"];
+    rev_list.extend(bases.iter().map(String::as_str));
+    match run_git_in(repo_root, &rev_list) {
         Ok(count) if count != "0" => {}
         _ => return false,
     }
-    !run_git_in_ok(
-        repo_root,
-        &["diff", "--quiet", &format!("{target_branch}..{branch}")],
-    )
+    // Squash-merge guard: content identical to either base means landed.
+    !bases.iter().any(|base| {
+        run_git_in_ok(
+            repo_root,
+            &["diff", "--quiet", &format!("{base}..{branch}")],
+        )
+    })
 }
 
 /// Pushes `item`'s isolated worktree branch to `target_branch`'s remote, if
@@ -933,10 +1237,7 @@ pub fn push_branch(
     target_branch: &str,
     progress: Option<&dyn Progress>,
 ) -> Option<String> {
-    let worktree_path = repo_root
-        .join(".worktrees")
-        .join("task")
-        .join(item.sequence_id.to_string());
+    let worktree_path = item_worktree_path(repo_root, item.sequence_id);
     if !worktree_path.exists() {
         return None; // nothing was ever claimed into a worktree for this item
     }
@@ -965,28 +1266,79 @@ pub fn push_branch(
     if let Some(p) = progress {
         p.send(0.0, Some(1.0), Some(format!("Pushing branch {branch}...")));
     }
-    let push_timeout = 120;
-    match run_output_timeout(
-        crate::shell::git_binary(),
-        &["push", "--force-with-lease", "-u", "origin", &branch],
-        repo_root,
-        push_timeout,
-    ) {
-        Ok(out) if !out.status.success() => {
-            eprintln!(
-                "worktree: push skipped for item {}: {}",
-                item.id,
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-            return None;
+    let first = push_with_lease(repo_root, &branch);
+    let result = match first {
+        Err(e) if is_push_rejection(&e) => {
+            // Someone else (a human fixup, GitHub's update-branch, another
+            // machine) put commits on the remote branch this worktree never
+            // integrated. Integrate them rather than overwrite them -- or
+            // stay rejected forever, since every later rebase rewrites the
+            // local branch again.
+            match integrate_remote_branch(&worktree_path, &branch) {
+                Ok(()) => push_with_lease(repo_root, &branch),
+                Err(detail) => Err(format!(
+                    "{e} (integrating origin/{branch} failed: {detail})"
+                )),
+            }
         }
+        other => other,
+    };
+    match result {
+        Ok(()) => Some(branch),
         Err(e) => {
-            eprintln!("worktree: push skipped for item {}: {e}", item.id);
-            return None;
+            eprintln!("worktree: push failed for item {}: {e}", item.id);
+            None
         }
-        _ => {}
     }
-    Some(branch)
+}
+
+/// `git push --force-with-lease --force-if-includes`: the lease alone checks
+/// against `origin/<branch>`, which ANY fetch in this repo (every worktree
+/// shares it) can advance past commits this branch never saw -- the push
+/// would then silently drop them. `--force-if-includes` additionally
+/// requires the remote tip to be in this branch's reflog. Falls back to the
+/// lease alone on a git too old to know the flag (< 2.30).
+fn push_with_lease(repo_root: &Path, branch: &str) -> Result<(), String> {
+    const PUSH_TIMEOUT_SECS: u64 = 120;
+    let with_includes = [
+        "push",
+        "--force-with-lease",
+        "--force-if-includes",
+        "-u",
+        "origin",
+        branch,
+    ];
+    match run_git_timeout(repo_root, &with_includes, PUSH_TIMEOUT_SECS) {
+        Err(e) if e.contains("force-if-includes") => run_git_timeout(
+            repo_root,
+            &["push", "--force-with-lease", "-u", "origin", branch],
+            PUSH_TIMEOUT_SECS,
+        )
+        .map(|_| ()),
+        other => other.map(|_| ()),
+    }
+}
+
+fn is_push_rejection(err: &str) -> bool {
+    let e = err.to_lowercase();
+    e.contains("rejected") || e.contains("stale info") || e.contains("non-fast-forward")
+}
+
+/// Fetches `origin/<branch>` and rebases the worktree onto it, so commits
+/// pushed there by someone else survive the next push. Patches this branch
+/// already carries (its own earlier, pre-rebase pushes) are dropped by the
+/// rebase's patch-id check. Aborts cleanly on conflict.
+fn integrate_remote_branch(worktree_path: &Path, branch: &str) -> Result<(), String> {
+    let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
+    run_git_timeout(worktree_path, &["fetch", "origin", &refspec], 30)?;
+    let remote = format!("refs/remotes/origin/{branch}");
+    match run_git_timeout(worktree_path, &["rebase", &remote], REBASE_TIMEOUT_SECS) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let _ = heal_interrupted_git_state(worktree_path, true);
+            Err(e)
+        }
+    }
 }
 
 /// Outcome of [`rebase_item_worktree`].
@@ -1028,12 +1380,12 @@ pub enum RebaseOutcome {
 /// automatically. Soft-fails (`Skipped`) on no worktree / no reachable
 /// remote, matching every other network step in this file.
 pub fn rebase_item_worktree(item: &Item, repo_root: &Path, target_branch: &str) -> RebaseOutcome {
-    let worktree_path = repo_root
-        .join(".worktrees")
-        .join("task")
-        .join(item.sequence_id.to_string());
+    let worktree_path = item_worktree_path(repo_root, item.sequence_id);
     if !worktree_path.is_dir() {
         return RebaseOutcome::Skipped;
+    }
+    if let Err(e) = heal_interrupted_git_state(&worktree_path, false) {
+        return RebaseOutcome::Conflict(e);
     }
     let fetch_timeout_secs = 30;
     let fetch_result = fetch_with_retry(
@@ -1061,25 +1413,25 @@ pub fn rebase_item_worktree(item: &Item, repo_root: &Path, target_branch: &str) 
     ) {
         return RebaseOutcome::UpToDate;
     }
-    let rebase_timeout_secs = 60;
-    match run_output_timeout(
-        crate::shell::git_binary(),
-        &["rebase", &remote_ref],
+    match run_git_timeout(
         &worktree_path,
-        rebase_timeout_secs,
+        &["rebase", &remote_ref],
+        REBASE_TIMEOUT_SECS,
     ) {
-        Ok(out) if out.status.success() => RebaseOutcome::Rebased,
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            let _ = run_git_in(&worktree_path, &["rebase", "--abort"]);
-            RebaseOutcome::Conflict(stderr)
-        }
+        Ok(_) => RebaseOutcome::Rebased,
         Err(e) => {
-            let _ = run_git_in(&worktree_path, &["rebase", "--abort"]);
-            RebaseOutcome::Conflict(e)
+            // A timed-out rebase was killed while holding `index.lock`, so
+            // the lock is ours to clear before `--abort` can run; checked,
+            // not discarded -- a failed abort leaves the worktree wedged.
+            match heal_interrupted_git_state(&worktree_path, true) {
+                Ok(()) => RebaseOutcome::Conflict(e),
+                Err(stuck) => RebaseOutcome::Conflict(format!("{e}; {stuck}")),
+            }
         }
     }
 }
+
+const REBASE_TIMEOUT_SECS: u64 = 60;
 
 /// Information about an orphaned worktree detected during audit.
 pub struct OrphanWorktree {
@@ -1139,7 +1491,7 @@ pub fn audit_orphans(
             match std::fs::read_to_string(&dot_git) {
                 Ok(content) => {
                     let gitdir = content.trim().trim_start_matches("gitdir: ");
-                    !std::path::Path::new(gitdir).exists()
+                    !resolve_gitdir_pointer(path, gitdir).exists()
                 }
                 Err(_) => false,
             }
@@ -1223,11 +1575,13 @@ pub fn gc_orphans(repo_root: &Path, names: &[String]) -> Vec<String> {
             continue;
         }
         if remove_worktree_dir(&worktree_path, name) {
+            // Scoped to this path, never a repo-wide `worktree prune`: prune
+            // also drops registrations of other worktrees whose gitdir merely
+            // looks stale, orphaning their live work (see `create_worktree`).
+            remove_stale_registration_for_path(repo_root, &worktree_path);
             deleted.push(name.clone());
         }
     }
-    // Prune git's worktree metadata after removal.
-    crate::shell::prune_worktree_metadata_if(repo_root, !deleted.is_empty());
     deleted
 }
 
@@ -1245,10 +1599,19 @@ pub fn gc_orphans(repo_root: &Path, names: &[String]) -> Vec<String> {
 /// destructive.
 pub fn cleanup_item_worktree(item: &Item, repo_root: &Path) -> bool {
     let name = item.sequence_id.to_string();
-    let worktree_path = repo_root.join(".worktrees").join("task").join(&name);
+    let worktree_path = item_worktree_path(repo_root, item.sequence_id);
     if !worktree_path.exists() {
         return false;
     }
+    if !is_own_checkout(&worktree_path) {
+        eprintln!(
+            "worktree: leaving {} in place -- not a valid checkout",
+            worktree_path.display()
+        );
+        return false;
+    }
+    // Commits made on a detached HEAD live only in this checkout's reflog.
+    rescue_detached_head(&worktree_path, &format!("task-{name}"));
     match run_git_in(&worktree_path, &["status", "--porcelain"]) {
         Ok(out) if out.trim().is_empty() => {}
         Ok(_) => {
@@ -1304,10 +1667,7 @@ pub enum CommitOutcome {
 /// failure is reported as `Failed` rather than silently folded into the same
 /// "nothing to do" bucket.
 pub fn commit_uncommitted(item: &Item, repo_root: &Path, message: &str) -> CommitOutcome {
-    let worktree_path = repo_root
-        .join(".worktrees")
-        .join("task")
-        .join(item.sequence_id.to_string());
+    let worktree_path = item_worktree_path(repo_root, item.sequence_id);
     commit_uncommitted_at(&worktree_path, message, false)
 }
 
@@ -1327,6 +1687,20 @@ pub fn commit_uncommitted_at(
     message: &str,
     no_verify: bool,
 ) -> CommitOutcome {
+    if !worktree_path.is_dir() {
+        return CommitOutcome::NothingToCommit;
+    }
+    // A checkout with a broken `.git` pointer would otherwise commit into
+    // the enclosing main repository's current branch.
+    if !is_own_checkout(worktree_path) {
+        return CommitOutcome::Failed(format!(
+            "{} is not a valid git checkout",
+            worktree_path.display()
+        ));
+    }
+    if let Err(e) = heal_interrupted_git_state(worktree_path, false) {
+        return CommitOutcome::Failed(e);
+    }
     match run_git_in(worktree_path, &["status", "--porcelain"]) {
         Ok(out) if !out.trim().is_empty() => {}
         _ => return CommitOutcome::NothingToCommit,
@@ -1349,9 +1723,7 @@ pub fn commit_uncommitted_at(
 /// per-turn commit, so `finalize` can later fold every checkpoint commit
 /// back into an uncommitted diff via `squash_since`.
 pub fn head_sha(worktree_path: &Path) -> Option<String> {
-    run_git_in(worktree_path, &["rev-parse", "HEAD"])
-        .ok()
-        .map(|s| s.trim().to_string())
+    run_git_in(worktree_path, &["rev-parse", "HEAD"]).ok()
 }
 
 /// Folds every commit made since `base_sha` back into the index and working
@@ -1362,6 +1734,17 @@ pub fn head_sha(worktree_path: &Path) -> Option<String> {
 /// gate evaluates the whole run's changes as one commit instead of turn by
 /// turn. A no-op if `base_sha` is already `HEAD`.
 pub fn squash_since(worktree_path: &Path, base_sha: &str) -> Result<(), String> {
+    // After an intervening rebase `base_sha` is no longer in HEAD's history;
+    // a soft reset to it would fold every upstream change since into this
+    // item's diff.
+    if !run_git_in_ok(
+        worktree_path,
+        &["merge-base", "--is-ancestor", base_sha, "HEAD"],
+    ) {
+        return Err(format!(
+            "squash base {base_sha} is not an ancestor of HEAD (branch was rebased)"
+        ));
+    }
     run_git_in(worktree_path, &["reset", "--soft", base_sha]).map(|_| ())
 }
 
