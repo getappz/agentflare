@@ -61,13 +61,16 @@ pub enum BranchCleanup {
     Foreign,
     /// Somebody (or GitHub) already deleted it.
     AlreadyGone,
+    /// The branch tip is no longer the merged PR's head commit (something
+    /// was pushed after the merge) -- deleting it would lose that commit.
+    Advanced,
 }
 
 /// Deletes merged PR `number`'s head branch from `repo`, the remote half of
 /// branch hygiene after an auto-merge -- local branches/worktrees are left to
 /// worktree cleanup. Re-reads the PR rather than trusting the caller's
 /// snapshot, and refuses anything that is not a merged, same-repo,
-/// unprotected, non-default branch.
+/// unprotected, non-default branch still pointing at the PR's merged head.
 pub fn delete_merged_pr_branch(
     client: &Client,
     repo: &RepoId,
@@ -97,6 +100,10 @@ pub fn delete_merged_pr_branch(
     match client.request("GET", &branch_path, None) {
         Ok(json) if json["protected"].as_bool().unwrap_or(false) => {
             return Ok(BranchCleanup::Protected);
+        }
+        // Fail closed: a tip we can't read counts as advanced too.
+        Ok(json) if json["commit"]["sha"].as_str() != Some(head.sha.as_str()) => {
+            return Ok(BranchCleanup::Advanced);
         }
         Ok(_) => {}
         Err(GitHubError::NotFound) => return Ok(BranchCleanup::AlreadyGone),
@@ -177,7 +184,10 @@ mod tests {
                 200,
                 r#"{"default_branch":"main","delete_branch_on_merge":false}"#,
             ),
-            MockResponse::json(200, r#"{"name":"task/5","protected":false}"#),
+            MockResponse::json(
+                200,
+                r#"{"name":"task/5","protected":false,"commit":{"sha":"abc"}}"#,
+            ),
             MockResponse::json(204, ""),
         ]);
         let client = server.client(Some("tok"));
@@ -189,6 +199,32 @@ mod tests {
         assert_eq!(reqs[2].path, "/repos/o/r/branches/task/5");
         assert_eq!(reqs[3].method, "DELETE");
         assert_eq!(reqs[3].path, "/repos/o/r/git/refs/heads/task/5");
+    }
+
+    #[test]
+    fn delete_merged_pr_branch_keeps_a_branch_advanced_past_the_merged_head() {
+        let server = MockServer::start(vec![
+            MockResponse::json(200, &merged_pr("o/r", "task/5")),
+            MockResponse::json(
+                200,
+                r#"{"default_branch":"main","delete_branch_on_merge":false}"#,
+            ),
+            MockResponse::json(
+                200,
+                r#"{"name":"task/5","protected":false,"commit":{"sha":"pushed-after-merge"}}"#,
+            ),
+        ]);
+        let client = server.client(Some("tok"));
+        assert_eq!(
+            delete_merged_pr_branch(&client, &repo(), 5).unwrap(),
+            BranchCleanup::Advanced
+        );
+        let reqs = server.requests();
+        assert_eq!(reqs.len(), 3);
+        assert!(
+            reqs.iter().all(|r| r.method == "GET"),
+            "no DELETE may be sent"
+        );
     }
 
     #[test]

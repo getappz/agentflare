@@ -302,9 +302,16 @@ pub(super) fn delete_merged_head_branch_with(
                 "agentflare-supervisor: deleted merged head branch of PR #{number} in {repo}"
             );
         }
+        Ok(crate::github::repos::BranchCleanup::Advanced) => {
+            eprintln!(
+                "agentflare-supervisor: kept head branch of merged PR #{number} in {repo} -- \
+                 it has commits pushed after the merge"
+            );
+        }
         Ok(_) => {}
         Err(e) => eprintln!(
-            "agentflare-supervisor: could not delete merged head branch of PR #{number} in {repo}: {e}"
+            "agentflare-supervisor: could not delete merged head branch of PR #{number} in {repo}: {}",
+            e.log_safe()
         ),
     }
 }
@@ -423,7 +430,10 @@ pub(super) fn merge_approved_pr(
             false
         }
         Err(e) => {
-            eprintln!("agentflare-supervisor: auto-merge failed for PR #{number} in {repo}: {e}");
+            eprintln!(
+                "agentflare-supervisor: auto-merge failed for PR #{number} in {repo}: {}",
+                e.log_safe()
+            );
             false
         }
     }

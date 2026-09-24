@@ -461,6 +461,31 @@ fn audit_orphans_preserves_a_dirty_worktree_stranded_on_the_default_branch() {
 }
 
 #[test]
+fn audit_orphans_skips_a_task_dir_that_is_not_its_own_checkout() {
+    // No `.git` of its own: git commands run "in" it fall through to the
+    // enclosing main repo, which is clean and on the default branch -- that
+    // must not make the directory read as a clean stranded orphan.
+    let repo = init_repo();
+    let item = test_item(1);
+    let target = resolve_default_branch(&repo.path);
+    create_worktree(&item, &repo.path, &target, None).unwrap();
+    let bare_dir = repo.path.join(".worktrees").join("task").join("42");
+    std::fs::create_dir_all(&bare_dir).unwrap();
+    std::fs::write(bare_dir.join("work.txt"), "unsaved work").unwrap();
+    assert_eq!(
+        crate::branch::current_branch(&bare_dir).unwrap_or_default(),
+        target,
+        "precondition: git in the dir resolves to the main repo"
+    );
+
+    let orphans = audit_orphans(&repo.path, Some(&std::collections::HashSet::new()));
+    assert!(
+        orphans.iter().all(|o| o.name != "42"),
+        "a dir that isn't its own checkout must not be gc-able"
+    );
+}
+
+#[test]
 fn audit_orphans_ignores_a_claimed_or_own_branch_worktree() {
     let repo = init_repo();
     let item = test_item(8);

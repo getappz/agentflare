@@ -71,15 +71,64 @@ pub enum Liveness {
     Unknown,
 }
 
+/// This machine's identity for pid-liveness checks: a session row whose
+/// `host` matches is judged by its pid, so two machines sharing a db must
+/// never compare equal. `HOSTNAME`, else `/etc/hostname`, else the OS
+/// machine id (macOS has neither of the first two for a non-shell process,
+/// and every Mac falling back to one shared `"localhost"` would have pid
+/// checks run against another machine's pids). `"localhost"` only when
+/// even that is unavailable. Resolved once per process.
 pub fn this_host() -> String {
-    std::env::var("HOSTNAME")
-        .ok()
-        .filter(|h| !h.is_empty())
+    static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HOST.get_or_init(|| {
+        resolve_host(
+            os_hostname(),
+            || std::fs::read_to_string("/etc/hostname").ok(),
+            || machine_uid::get().ok(),
+        )
+    })
+    .clone()
+}
+
+/// The kernel's hostname -- the same for every process on the machine,
+/// unlike `$HOSTNAME`, which is a shell variable a launchd/systemd daemon
+/// usually doesn't have (every such Mac would otherwise be "localhost").
+fn os_hostname() -> Option<String> {
+    #[cfg(unix)]
+    {
+        let mut buf = [0u8; 256];
+        // SAFETY: `buf` is a valid writable buffer of the length passed.
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+        if rc != 0 {
+            return None;
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        Some(String::from_utf8_lossy(&buf[..end]).into_owned())
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::var("COMPUTERNAME").ok()
+    }
+}
+
+/// Pure core of [`this_host`]: the first non-blank of the OS hostname,
+/// the hostname file, and the machine id (prefixed, so it can't collide
+/// with a real hostname), else `"localhost"`.
+fn resolve_host(
+    env: Option<String>,
+    file: impl FnOnce() -> Option<String>,
+    machine_id: impl FnOnce() -> Option<String>,
+) -> String {
+    let non_blank = |h: String| {
+        let h = h.trim().to_string();
+        (!h.is_empty()).then_some(h)
+    };
+    env.and_then(non_blank)
+        .or_else(|| file().and_then(non_blank))
         .or_else(|| {
-            std::fs::read_to_string("/etc/hostname")
-                .ok()
-                .map(|h| h.trim().to_string())
-                .filter(|h| !h.is_empty())
+            machine_id()
+                .and_then(non_blank)
+                .map(|id| format!("machine-id:{id}"))
         })
         .unwrap_or_else(|| "localhost".to_string())
 }
@@ -136,6 +185,15 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
 
 const COLUMNS: &str =
     "key, agent, name, item_id, cwd, host, pid, started_at, last_seen_at, ended_at";
+
+/// Deletes `key`'s row outright (unlike [`end`], which records it as
+/// ended -- i.e. `Liveness::Dead` -- for claim liveness). For a key that
+/// was only ever a stand-in, whose owner may still be alive and holding
+/// claims under it: no row means `Liveness::Unknown`, so claim liveness
+/// falls back to its own pid/TTL checks instead of releasing them.
+pub fn forget(conn: &Connection, key: &str) -> rusqlite::Result<bool> {
+    Ok(conn.execute("DELETE FROM agent_sessions WHERE key = ?1", [key])? > 0)
+}
 
 pub fn get(conn: &Connection, key: &str) -> rusqlite::Result<Option<Session>> {
     conn.query_row(
@@ -262,6 +320,26 @@ mod tests {
         end(&c, "codex:y", 101).unwrap();
         assert_eq!(liveness(&c, "codex:y", 102).unwrap(), Liveness::Dead);
         assert_eq!(liveness(&c, "nobody:1", 102).unwrap(), Liveness::Unknown);
+        // Forgetting a row makes it unknown, not dead.
+        touch_key(&c, "codex:z", None, 100);
+        assert!(forget(&c, "codex:z").unwrap());
+        assert_eq!(liveness(&c, "codex:z", 102).unwrap(), Liveness::Unknown);
+    }
+
+    #[test]
+    fn host_identity_falls_back_to_the_machine_id_before_localhost() {
+        let none = || None::<String>;
+        assert_eq!(resolve_host(Some("box".into()), none, none), "box");
+        assert_eq!(
+            resolve_host(Some("  ".into()), || Some("file-host\n".into()), none),
+            "file-host"
+        );
+        // macOS: no HOSTNAME for a non-shell process, no /etc/hostname.
+        assert_eq!(
+            resolve_host(None, none, || Some("ABCD-1234".into())),
+            "machine-id:ABCD-1234"
+        );
+        assert_eq!(resolve_host(None, none, none), "localhost");
     }
 
     #[test]

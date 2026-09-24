@@ -244,24 +244,28 @@ fn run_in_process(
         let _ = tx.send(result);
     });
 
+    // Records a successful attempt, whether it finished within the timeout
+    // or only during the abandon grace period below.
+    let record_success = |stdout_path: std::path::PathBuf, stderr_path: std::path::PathBuf| {
+        let stdout_total_bytes = std::fs::metadata(&stdout_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let output = JobOutput {
+            exit_code: Some(0),
+            timed_out: false,
+            stdout_path,
+            stderr_path,
+            stdout_total_bytes,
+            stderr_total_bytes: 0,
+        };
+        if let Err(e) = queue.complete(id, &output, true) {
+            eprintln!("agentflare-jobs: failed to complete job {id}: {e}");
+        }
+    };
+
     let outcome = rx.recv_timeout(Duration::from_secs(job.timeout_secs.max(1)));
     match outcome {
-        Ok(Ok(())) => {
-            let stdout_total_bytes = std::fs::metadata(&stdout_path)
-                .map(|m| m.len())
-                .unwrap_or(0);
-            let output = JobOutput {
-                exit_code: Some(0),
-                timed_out: false,
-                stdout_path,
-                stderr_path,
-                stdout_total_bytes,
-                stderr_total_bytes: 0,
-            };
-            if let Err(e) = queue.complete(id, &output, true) {
-                eprintln!("agentflare-jobs: failed to complete job {id}: {e}");
-            }
-        }
+        Ok(Ok(())) => record_success(stdout_path, stderr_path),
         Ok(Err(failure)) => {
             record_output_best_effort(queue, id, &stdout_path, &stderr_path);
             record_fail(&failure.message, failure.retry_after_secs, failure.fatal);
@@ -274,7 +278,13 @@ fn run_in_process(
             // give it a bounded grace period to actually wind down before
             // the retry can be dequeued.
             abandoned.store(true, Ordering::SeqCst);
-            let _ = rx.recv_timeout(abandon_grace(job.timeout_secs));
+            if let Ok(Ok(())) = rx.recv_timeout(abandon_grace(job.timeout_secs)) {
+                // The attempt finished its work during the grace period:
+                // record it done rather than failing (and possibly
+                // retrying, i.e. redoing) work that already succeeded.
+                record_success(stdout_path, stderr_path);
+                return;
+            }
             let msg = format!(
                 "in-process job exceeded its {}s timeout and was abandoned \
                  (a coordination step may be stuck — the agent CLI subprocess \
@@ -387,5 +397,59 @@ mod tests {
             "the watchdog's own reason is what gets recorded, got: {:?}",
             final_info.error
         );
+    }
+
+    /// Ignores cancellation and finishes successfully a little after its
+    /// job's 1s watchdog fires -- inside the abandon grace period.
+    struct FinishesDuringGraceExecutor {
+        runs: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl InProcessExecutor for FinishesDuringGraceExecutor {
+        fn execute(
+            &self,
+            _job_id: &str,
+            _args: &[String],
+            _log: &mut dyn std::io::Write,
+        ) -> Result<(), JobFailure> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(1300));
+            Ok(())
+        }
+    }
+
+    // An attempt that completes its work during the grace period succeeded:
+    // recording it as a timeout failure would retry (redo) finished work.
+    #[test]
+    fn attempt_finishing_during_the_abandon_grace_is_recorded_as_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::open_memory(dir.path().join("logs")).unwrap();
+        let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut pool = WorkerPool::new(q.clone())
+            .with_executor(Arc::new(FinishesDuringGraceExecutor { runs: runs.clone() }));
+        pool.start(1);
+
+        let info = q
+            .enqueue(
+                &AgentJob::new("label-only")
+                    .in_process()
+                    .timeout(1)
+                    .max_retries(3),
+            )
+            .unwrap();
+        let mut final_info = q.get(&info.id).unwrap();
+        for _ in 0..500 {
+            if final_info.state.is_terminal() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            final_info = q.get(&info.id).unwrap();
+        }
+        // Give a (wrong) retry the chance to be dequeued before asserting.
+        std::thread::sleep(Duration::from_millis(200));
+        pool.shutdown();
+        assert_eq!(final_info.state, JobState::Exited, "{:?}", final_info.error);
+        assert_eq!(q.get(&info.id).unwrap().retries, 0, "never retried");
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "work done exactly once");
     }
 }

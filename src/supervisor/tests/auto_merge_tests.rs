@@ -76,7 +76,10 @@ fn delete_merged_head_branch_with_deletes_the_merged_head_ref() {
             200,
             r#"{"default_branch":"main","delete_branch_on_merge":false}"#,
         ),
-        crate::github::test_support::MockResponse::json(200, r#"{"protected":false}"#),
+        crate::github::test_support::MockResponse::json(
+            200,
+            r#"{"protected":false,"commit":{"sha":"abc"}}"#,
+        ),
         crate::github::test_support::MockResponse::json(204, ""),
     ]);
     let client = server.client(Some("tok"));

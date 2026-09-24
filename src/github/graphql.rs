@@ -83,12 +83,15 @@ fn pr_subquery(number: u64) -> String {
 /// Maps a GraphQL response's `errors` array to a `GitHubError`: GitHub
 /// reports an exhausted GraphQL budget as a 200 whose errors carry
 /// `"type": "RATE_LIMITED"`, which must read as `RateLimited` (so callers
-/// back off) rather than as a malformed response.
-pub(crate) fn graphql_error(errors: &serde_json::Value) -> GitHubError {
+/// back off) rather than as a malformed response. Since that 200 never goes
+/// through the client's status-code backoff path, a rate limit here also
+/// arms `client`'s shared host backoff so no further calls go out.
+pub(crate) fn graphql_error(client: &Client, errors: &serde_json::Value) -> GitHubError {
     let rate_limited = errors
         .as_array()
         .is_some_and(|errs| errs.iter().any(|e| e["type"] == "RATE_LIMITED"));
     if rate_limited {
+        client.arm_backoff(None);
         GitHubError::RateLimited(format!("GitHub GraphQL rate limit hit: {errors}"))
     } else {
         GitHubError::Parse(format!("GraphQL error: {errors}"))
@@ -118,7 +121,7 @@ pub fn batch_pr_status(
     });
     let json = client.request("POST", "/graphql", Some(body))?;
     if let Some(errors) = json.get("errors") {
-        return Err(graphql_error(errors));
+        return Err(graphql_error(client, errors));
     }
     let Some(repository) = json.get("data").and_then(|d| d.get("repository")) else {
         return Err(GitHubError::Parse(
@@ -154,10 +157,17 @@ pub fn batch_pr_status_chunked(
     for chunk in numbers.chunks(GRAPHQL_PR_BATCH_SIZE) {
         match batch_pr_status(client, repo, chunk) {
             Ok(map) => out.extend(map),
-            Err(e) => eprintln!(
-                "github: batch PR status GraphQL query failed for {} PR(s) in {repo}: {e}",
-                chunk.len()
-            ),
+            Err(e) => {
+                eprintln!(
+                    "github: batch PR status GraphQL query failed for {} PR(s) in {repo}: {e}",
+                    chunk.len()
+                );
+                // The budget is spent (and the host backoff armed): the
+                // remaining chunks would only be refused too.
+                if matches!(e, GitHubError::RateLimited(_)) {
+                    break;
+                }
+            }
         }
     }
     out
@@ -410,6 +420,29 @@ mod tests {
             2,
             "{} numbers must split into two chunks of at most {GRAPHQL_PR_BATCH_SIZE}",
             numbers.len()
+        );
+    }
+
+    #[test]
+    fn batch_pr_status_chunked_stops_and_arms_backoff_on_graphql_rate_limit() {
+        let numbers: Vec<u64> = (1..=(GRAPHQL_PR_BATCH_SIZE as u64 + 1)).collect();
+        let server = MockServer::start(vec![
+            MockResponse::json(
+                200,
+                r#"{"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded"}]}"#,
+            ),
+            MockResponse::json(200, r#"{"data":{"repository":{}}}"#),
+            MockResponse::json(200, r#"{"ok":true}"#),
+        ]);
+        let client = server.client(Some("tok"));
+        assert!(batch_pr_status_chunked(&client, &repo(), &numbers).is_empty());
+        // The host backoff is armed, so even an unrelated call stays local.
+        let err = client.request("GET", "/other", None).unwrap_err();
+        assert!(matches!(err, GitHubError::RateLimited(_)));
+        assert_eq!(
+            server.requests().len(),
+            1,
+            "no chunk after the rate-limited one may be sent"
         );
     }
 

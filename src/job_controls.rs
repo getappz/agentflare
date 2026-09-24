@@ -174,9 +174,11 @@ pub(crate) fn set_item_label(
 }
 
 /// `agentflare job cancel <job-id>` / `POST /api/jobs/:id/cancel`: stops one
-/// job for good. A queued job never starts; a running one has its agent
-/// killed (the executor polls the cancel flag) and is finished as `killed`,
-/// never retried. For a work-item job the item is parked on
+/// job for good. A queued job never starts; a running in-process job has its
+/// agent killed (the executor polls the cancel flag) and is finished as
+/// `killed`, never retried. A running subprocess job can't observe the flag
+/// and is refused (`agentflare_jobs::Error::NotCancellable`) rather than
+/// reported cancelled while it runs on. For a work-item job the item is parked on
 /// `needs-manual-dispatch` so neither discovery nor the claim-liveness sweep
 /// re-queues it behind the operator's back; `redispatch` re-arms it.
 pub(crate) fn cancel_job(job_id: &str) -> Result<serde_json::Value, String> {

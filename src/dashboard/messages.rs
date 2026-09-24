@@ -8,7 +8,8 @@
 //!   `message` event per message. Sends made in this process are pushed off
 //!   the in-process bus at once; sends from other processes (agents' MCP
 //!   servers, the CLI) are picked up by a 500ms db poll. With `take=true`
-//!   each streamed message is marked delivered (the stream *is* the
+//!   each streamed message is marked delivered (and handed back if the
+//!   client disconnects before it's sent -- the stream *is* the
 //!   recipient's delivery path, e.g. `agentflare message watch`); otherwise
 //!   the stream only observes, starting after `after` (default: now).
 
@@ -145,6 +146,17 @@ fn next_batch(
     .unwrap_or_default()
 }
 
+/// Undoes the `take` of messages a stream claimed but never sent.
+async fn requeue_unsent(conn: Option<rusqlite::Connection>, ids: Vec<i64>) {
+    let _ = tokio::task::spawn_blocking(move || {
+        let conn = conn.or_else(|| crate::db::open().ok());
+        if let Some(c) = conn {
+            let _ = messages::requeue(&c, &ids);
+        }
+    })
+    .await;
+}
+
 async fn stream_handler(
     Query(q): Query<StreamQuery>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
@@ -184,9 +196,9 @@ async fn stream_handler(
                 Err(_) => return,
             };
             conn = c;
-            for m in batch {
+            for (i, m) in batch.iter().enumerate() {
                 after = after.max(m.id);
-                let Ok(data) = serde_json::to_string(&m) else {
+                let Ok(data) = serde_json::to_string(m) else {
                     continue;
                 };
                 let event = Event::default()
@@ -194,6 +206,12 @@ async fn stream_handler(
                     .id(m.id.to_string())
                     .data(data);
                 if tx.send(event).await.is_err() {
+                    // The client went away: this and the rest of a taken
+                    // batch were never sent -- hand them back to the mailbox.
+                    if take {
+                        let ids: Vec<i64> = batch[i..].iter().map(|m| m.id).collect();
+                        requeue_unsent(conn, ids).await;
+                    }
                     return;
                 }
             }

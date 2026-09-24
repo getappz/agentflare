@@ -45,15 +45,20 @@ struct RawFile {
 
 /// Parses the `[failover]` table out of a config.toml-shaped document,
 /// ignoring every other table. Absent table = defaults. Unknown agent names
-/// are dropped, like `parse_router_config` does.
+/// are dropped, like `parse_router_config` does -- except that a non-empty
+/// `agents` list in which *no* name resolves disables failover: an empty
+/// list means "any installed agent", so silently dropping every (typo'd)
+/// entry would widen an operator's restriction instead of honoring it.
 pub fn parse_failover_config(text: &str) -> Result<FailoverConfig, String> {
     let file: RawFile = toml::from_str(text).map_err(|e| e.to_string())?;
     let Some(raw) = file.failover else {
         return Ok(FailoverConfig::default());
     };
+    let agents: Vec<Agent> = raw.agents.iter().filter_map(|s| agent_by_name(s)).collect();
+    let all_unknown = !raw.agents.is_empty() && agents.is_empty();
     Ok(FailoverConfig {
-        enabled: raw.enabled.unwrap_or(true),
-        agents: raw.agents.iter().filter_map(|s| agent_by_name(s)).collect(),
+        enabled: raw.enabled.unwrap_or(true) && !all_unknown,
+        agents,
     })
 }
 
@@ -200,5 +205,17 @@ mod tests {
             parse_failover_config("").unwrap(),
             FailoverConfig::default()
         );
+    }
+
+    #[test]
+    fn an_allow_list_of_only_unknown_names_disables_failover() {
+        let config = parse_failover_config("[failover]\nagents = [\"open-code\"]\n").unwrap();
+        assert!(
+            !config.enabled,
+            "typo-only allow-list must not widen to any agent"
+        );
+        assert!(config.agents.is_empty());
+        let empty = parse_failover_config("[failover]\nagents = []\n").unwrap();
+        assert!(empty.enabled);
     }
 }

@@ -47,8 +47,11 @@ const DEFAULT_SECONDARY_BACKOFF: Duration = Duration::from_secs(60);
 /// throttle each other; production only ever talks to one host, so there it
 /// is effectively process-wide.
 struct HostThrottle {
-    /// No request to this host before this instant (a rate-limit backoff).
-    backoff_until: Mutex<Option<Instant>>,
+    /// No request to this host before this instant (a rate-limit backoff),
+    /// indexed by [`backoff_slot`]: anonymous and authenticated requests
+    /// draw on separate GitHub budgets (60/hr per IP vs 5000/hr per
+    /// credential), so exhausting one must not lock out the other.
+    backoff_until: [Mutex<Option<Instant>>; 2],
     /// Held for the whole of a mutating request, so writes go out one at a
     /// time; stores when the previous one finished, for spacing.
     last_mutation: Mutex<Option<Instant>>,
@@ -62,10 +65,15 @@ fn host_throttle(base_url: &str) -> Arc<HostThrottle> {
         .unwrap_or_else(|e| e.into_inner());
     Arc::clone(hosts.entry(base_url.to_string()).or_insert_with(|| {
         Arc::new(HostThrottle {
-            backoff_until: Mutex::new(None),
+            backoff_until: [Mutex::new(None), Mutex::new(None)],
             last_mutation: Mutex::new(None),
         })
     }))
+}
+
+/// Which [`HostThrottle::backoff_until`] entry a request with `token` uses.
+fn backoff_slot(token: Option<&str>) -> usize {
+    usize::from(token.is_some())
 }
 
 /// The rate-limit headers GitHub attaches to an error response.
@@ -208,27 +216,36 @@ impl Client {
         &self.base_url
     }
 
-    /// Time left on this host's rate-limit backoff, if one is active.
-    fn backoff_remaining(&self) -> Option<Duration> {
-        let until = *self
-            .throttle
-            .backoff_until
+    /// Time left on this host's rate-limit backoff for requests made with
+    /// `token` (anonymous or authenticated), if one is active.
+    fn backoff_remaining(&self, token: Option<&str>) -> Option<Duration> {
+        let until = *self.throttle.backoff_until[backoff_slot(token)]
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         until.and_then(|t| t.checked_duration_since(Instant::now()))
     }
 
-    /// Extends (never shortens) this host's backoff deadline.
-    fn extend_backoff(&self, wait: Duration) {
+    /// Extends (never shortens) this host's backoff deadline for requests
+    /// made with `token`.
+    fn extend_backoff(&self, token: Option<&str>, wait: Duration) {
         let deadline = Instant::now() + wait;
-        let mut until = self
-            .throttle
-            .backoff_until
+        let mut until = self.throttle.backoff_until[backoff_slot(token)]
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if until.is_none_or(|t| t < deadline) {
             *until = Some(deadline);
         }
+    }
+
+    /// Arms this client's shared host backoff for a rate limit detected
+    /// outside the HTTP status path -- e.g. GraphQL's `RATE_LIMITED`, which
+    /// arrives as a 200 -- so every client for the host stops calling.
+    /// `None` uses the default secondary-limit wait.
+    pub(crate) fn arm_backoff(&self, wait: Option<Duration>) {
+        self.extend_backoff(
+            self.token.as_deref(),
+            wait.unwrap_or(DEFAULT_SECONDARY_BACKOFF),
+        );
     }
 
     pub fn request(
@@ -310,7 +327,7 @@ impl Client {
         accept: &str,
         token: Option<&str>,
     ) -> Result<serde_json::Value, GitHubError> {
-        if let Some(left) = self.backoff_remaining() {
+        if let Some(left) = self.backoff_remaining(token) {
             return Err(GitHubError::RateLimited(format!(
                 "GitHub rate-limit backoff active; no calls for another {}s.",
                 left.as_secs().max(1)
@@ -348,7 +365,7 @@ impl Client {
                 };
                 let body = resp.into_string().unwrap_or_default();
                 if let Some(wait) = backoff_for(code, &headers, &body, now_epoch()) {
-                    self.extend_backoff(wait);
+                    self.extend_backoff(token, wait);
                 }
                 Err(map_status(code, &headers, body))
             }
@@ -588,6 +605,37 @@ mod tests {
             1,
             "the backoff must stop the second call locally"
         );
+    }
+
+    #[test]
+    fn an_anonymous_rate_limit_does_not_back_off_authenticated_calls() {
+        let server = MockServer::start(vec![
+            MockResponse::json(403, r#"{"message":"API rate limit exceeded"}"#)
+                .with_header("x-ratelimit-remaining", "0")
+                .with_header("x-ratelimit-reset", "99999999999"),
+            MockResponse::json(200, r#"{"ok":true}"#),
+        ]);
+        let anon = server.client(None);
+        let err = anon.request("GET", "/anon", None).unwrap_err();
+        assert!(matches!(err, GitHubError::RateLimited(_)));
+        // The anonymous budget stays backed off...
+        let err = anon.request("GET", "/anon-again", None).unwrap_err();
+        assert!(matches!(err, GitHubError::RateLimited(_)));
+        // ...but an authenticated client for the same host is unaffected.
+        let authed = server.client(Some("tok"));
+        assert_eq!(authed.request("GET", "/authed", None).unwrap()["ok"], true);
+        let paths: Vec<_> = server.requests().into_iter().map(|r| r.path).collect();
+        assert_eq!(paths, ["/anon", "/authed"]);
+    }
+
+    #[test]
+    fn arm_backoff_refuses_later_calls_locally() {
+        let server = MockServer::start(vec![]);
+        let client = server.client(Some("tok"));
+        client.arm_backoff(None);
+        let err = client.request("GET", "/x", None).unwrap_err();
+        assert!(matches!(err, GitHubError::RateLimited(_)));
+        assert!(server.requests().is_empty());
     }
 
     #[test]

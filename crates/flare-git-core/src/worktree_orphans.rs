@@ -90,6 +90,12 @@ pub fn audit_orphans(
         // out, which blocks both deleting it and gh's merge flow.
         let mut on_default_branch = false;
         if !has_broken_gitdir {
+            // A dir with no working `.git` of its own would have the branch
+            // and status checks below silently run against the enclosing
+            // main repo -- never classify (and gc) it from that.
+            if !super::is_own_checkout(path) {
+                continue;
+            }
             on_default_branch = crate::branch::current_branch(path)
                 .map(|b| !b.is_empty() && b == default_branch)
                 .unwrap_or(false);

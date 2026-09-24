@@ -200,7 +200,10 @@ pub fn mcp_key(conn: &Connection, now: i64) -> String {
             .is_some_and(|s| s.ended_at.is_none())
         {
             let _ = crate::messages::reroute_undelivered(conn, &provisional, &key);
-            let _ = sessions::end(conn, &provisional, now);
+            // Forget, don't `end`: the provisional key is also this live
+            // MCP server's claim owner, and an ended row reads as
+            // `Liveness::Dead` -- claim liveness would release its claims.
+            let _ = sessions::forget(conn, &provisional);
         }
         return key;
     }
@@ -298,12 +301,12 @@ mod tests {
         assert_eq!(attached_key(&c).as_deref(), Some("claude-code:sess-1"));
         let moved = crate::messages::take_undelivered(&c, "claude-code:sess-1", 5, 103).unwrap();
         assert_eq!(moved.len(), 1, "provisional mail follows the session");
-        assert!(
-            sessions::get(&c, &provisional)
-                .unwrap()
-                .unwrap()
-                .ended_at
-                .is_some()
+        // The stand-in row is gone, not ended: its key is still this live
+        // server's claim owner, which must not read as dead.
+        assert!(sessions::get(&c, &provisional).unwrap().is_none());
+        assert_eq!(
+            sessions::liveness(&c, &provisional, 104).unwrap(),
+            sessions::Liveness::Unknown
         );
     }
 }

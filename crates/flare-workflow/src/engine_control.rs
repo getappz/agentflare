@@ -103,12 +103,40 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 tracing::warn!(run_id = %run_id, workflow_id = %state.workflow_id, "cancel_workflow_with_rollback: definition not registered, skipping rollback phase");
             }
         }
+        // Only a non-terminal run becomes Cancelled: a run that already
+        // settled (e.g. completed while the rollback above ran) keeps its
+        // real outcome, and no cancellation event is published for it.
+        let mut cancelled = false;
         self.state_store
-            .update(run_id, |s| s.status = WorkflowStatus::Cancelled)
+            .update(run_id, |s| {
+                if !matches!(
+                    s.status,
+                    WorkflowStatus::Completed | WorkflowStatus::Failed | WorkflowStatus::Cancelled
+                ) {
+                    s.status = WorkflowStatus::Cancelled;
+                    cancelled = true;
+                }
+            })
             .await?;
-        self.event_bus
-            .publish(WorkflowEvent::WorkflowCancelled { run_id })
-            .await;
+        if cancelled {
+            self.event_bus
+                .publish(WorkflowEvent::WorkflowCancelled { run_id })
+                .await;
+        }
         Ok(())
+    }
+
+    /// Wait until every step task `execute_workflow` spawned has reported
+    /// back, so a driver stopping early (pause/takeover) doesn't return, and
+    /// release its `driving` claim, while parallel siblings still execute.
+    pub(super) async fn drain_running(
+        tracker: &parking_lot::RwLock<super::StepTracker>,
+        rx: &mut tokio::sync::mpsc::Receiver<(StepId, StepResult)>,
+    ) {
+        while !tracker.read().running.is_empty() {
+            // Bounded wait: re-check `running` even if a completion signal
+            // was dropped (a full channel is only logged by the sender).
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        }
     }
 }

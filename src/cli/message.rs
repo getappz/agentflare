@@ -184,17 +184,25 @@ impl MessageArgs {
     }
 }
 
-fn emit(m: &messages::Message, json: bool) {
+/// Prints `m`; `false` when the consumer went away (closed pipe).
+fn emit(m: &messages::Message, json: bool) -> bool {
     let line = if json {
         serde_json::to_string(m).unwrap_or_default()
     } else {
         messages::format_line(m)
     };
     let mut out = std::io::stdout().lock();
-    if writeln!(out, "{line}").and_then(|_| out.flush()).is_err() {
-        // The consumer went away (closed pipe): nothing left to do.
-        std::process::exit(0);
+    writeln!(out, "{line}").and_then(|()| out.flush()).is_ok()
+}
+
+/// The consumer went away (closed pipe) while printing `m`: when `m` was
+/// taken for this watch, hand it back to the mailbox so the next delivery
+/// point gets it instead of it being lost, then stop.
+fn consumer_gone(m: &messages::Message, take: bool) -> ! {
+    if take {
+        let _ = messages::requeue(&open(), &[m.id]);
     }
+    std::process::exit(0);
 }
 
 fn encode(s: &str) -> String {
@@ -210,7 +218,9 @@ fn encode(s: &str) -> String {
 
 /// Streams `to`'s messages: over the daemon's SSE endpoint when it's up
 /// (pushed the moment they're sent), else by polling the db every second.
-/// With `take`, each message is marked delivered as it's printed.
+/// With `take`, each message is marked delivered as it's printed -- claimed
+/// one at a time and handed back if printing it fails, so a consumer that
+/// closes the pipe mid-batch never costs the rest of the batch.
 fn watch(to: &str, take: bool, json: bool, port: u16) {
     let mut after = open_after_cursor(take);
     loop {
@@ -221,16 +231,29 @@ fn watch(to: &str, take: bool, json: bool, port: u16) {
         let conn = open();
         let mut ticks = 0u32;
         loop {
-            let now = crate::claims::now();
-            let batch = if take {
-                messages::take_undelivered(&conn, to, messages::MAX_BATCH, now)
+            if take {
+                for _ in 0..messages::MAX_BATCH {
+                    let now = crate::claims::now();
+                    let Some(m) = messages::take_undelivered(&conn, to, 1, now)
+                        .unwrap_or_default()
+                        .pop()
+                    else {
+                        break;
+                    };
+                    after = after.max(m.id);
+                    if !emit(&m, json) {
+                        consumer_gone(&m, take);
+                    }
+                }
             } else {
-                messages::since(&conn, Some(to), after, messages::MAX_BATCH)
-            }
-            .unwrap_or_default();
-            for m in &batch {
-                after = after.max(m.id);
-                emit(m, json);
+                for m in
+                    messages::since(&conn, Some(to), after, messages::MAX_BATCH).unwrap_or_default()
+                {
+                    after = after.max(m.id);
+                    if !emit(&m, json) {
+                        consumer_gone(&m, take);
+                    }
+                }
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
             ticks += 1;
@@ -269,7 +292,10 @@ fn watch_sse(to: &str, take: bool, json: bool, port: u16, after: i64) -> Option<
         };
         if let Ok(m) = serde_json::from_str::<messages::Message>(data.trim()) {
             last = last.max(m.id);
-            emit(&m, json);
+            if !emit(&m, json) {
+                // The daemon already marked it delivered when streaming it.
+                consumer_gone(&m, take);
+            }
         }
     }
     Some(last)

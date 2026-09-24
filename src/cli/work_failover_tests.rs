@@ -196,6 +196,20 @@ fn short_rate_limit_retries_the_same_agent() {
         .unwrap();
         assert!(!outcome.fatal);
         assert_eq!(outcome.retry_after_secs, Some(30));
+        let comments = comments_of(mcp, &item.id);
+        assert!(comments.iter().any(|c| {
+            c.body
+                .starts_with(crate::dispatch_failure_ceiling::AGENT_UNAVAILABLE_MARKER)
+        }));
+        assert!(
+            !comments.iter().any(|c| c.body.contains("agentflare work — failed")),
+            "a deliberate short retry must not post a failure comment"
+        );
+        assert_eq!(
+            crate::dispatch_failure_ceiling::consecutive_failure_count_any_reason(&comments),
+            0,
+            "a short rate-limit retry must not burn the failure ceiling"
+        );
     });
 }
 
@@ -242,6 +256,19 @@ fn stop_on_request_classification() {
         Some(StopOnRequest::RunCancelled)
     );
     assert_eq!(stop_on_request("workflow run failed", false), None);
+}
+
+#[test]
+fn a_run_already_cancelled_before_the_dispatch_is_not_its_cancellation() {
+    // Resumed run cancelled mid-dispatch.
+    assert!(run_cancelled_by_this_dispatch(None, Some("run-1")));
+    // Stale cancelled run replaced by a fresh one, which was then cancelled.
+    assert!(run_cancelled_by_this_dispatch(Some("run-1"), Some("run-2")));
+    // Setup error before the fresh run's id was persisted: the stale
+    // cancelled id is still stored -- a failure, not a cancel-on-request.
+    assert!(!run_cancelled_by_this_dispatch(Some("run-1"), Some("run-1")));
+    assert!(!run_cancelled_by_this_dispatch(Some("run-1"), None));
+    assert!(!run_cancelled_by_this_dispatch(None, None));
 }
 
 #[test]

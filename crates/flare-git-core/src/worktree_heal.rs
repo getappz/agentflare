@@ -301,17 +301,30 @@ pub(super) fn is_push_rejection(err: &str) -> bool {
     e.contains("rejected") || e.contains("stale info") || e.contains("non-fast-forward")
 }
 
-/// Fetches `origin/<branch>` and rebases the worktree onto it, so commits
-/// pushed there by someone else survive the next push. Patches this branch
-/// already carries (its own earlier, pre-rebase pushes) are dropped by the
-/// rebase's patch-id check. Aborts cleanly on conflict.
+/// Fetches `origin/<branch>` and merges it into the worktree, so commits
+/// pushed there by someone else survive the next push.
+///
+/// Deliberately a merge, not a rebase: `push_branch` has usually just
+/// rebased the local branch onto a newer target tip, so `rebase
+/// origin/<branch>` would replay every local commit missing from the remote
+/// branch -- including the target's new upstream commits -- as fresh copies
+/// that then show up as this item's own commits in the PR. A merge keeps
+/// those upstream commits under their original SHAs (already in the target,
+/// so absent from the PR diff), and keeps the remote tip as an ancestor so
+/// the follow-up `--force-with-lease --force-if-includes` push is a plain
+/// fast-forward. Aborts cleanly on conflict.
 pub(super) fn integrate_remote_branch(worktree_path: &Path, branch: &str) -> Result<(), String> {
     let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
     run_git_timeout(worktree_path, &["fetch", "origin", &refspec], 30)?;
     let remote = format!("refs/remotes/origin/{branch}");
-    match run_git_timeout(worktree_path, &["rebase", &remote], REBASE_TIMEOUT_SECS) {
+    match run_git_timeout(
+        worktree_path,
+        &["merge", "--no-edit", &remote],
+        REBASE_TIMEOUT_SECS,
+    ) {
         Ok(_) => Ok(()),
         Err(e) => {
+            let _ = run_git_timeout(worktree_path, &["merge", "--abort"], REBASE_TIMEOUT_SECS);
             let _ = heal_interrupted_git_state(worktree_path, true);
             Err(e)
         }

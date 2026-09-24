@@ -355,7 +355,7 @@ pub fn resolved_review_comment_ids(
     });
     let json = client.request("POST", "/graphql", Some(body))?;
     if let Some(errors) = json.get("errors") {
-        return Err(crate::github::graphql::graphql_error(errors));
+        return Err(crate::github::graphql::graphql_error(client, errors));
     }
     let threads = json["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
         .as_array()
