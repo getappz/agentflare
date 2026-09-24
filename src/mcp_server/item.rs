@@ -226,18 +226,26 @@ fn plan_already_submitted(metadata_str: &str, plan_asset_id_field: Option<&str>)
 /// shapes reach here: the request's own `plan_asset_id` field (the
 /// schema-documented "attach a plan on create/update" path -- see its
 /// `#[schemars(description = ...)]` in `types.rs`), or a caller having put
-/// `plan_asset_id` directly inside the `metadata` blob. Before this fix,
-/// both were only ever read by `plan_already_submitted` as bypass evidence
-/// for `validate_plan_gate_claimable`'s "unclaimable" check -- neither
-/// actually set `plan_status`, so the item ended up gated with a plan
-/// attached but `plan_status` permanently absent, and `approve_plan` then
-/// refuses it forever (item #289 live incident: item #281). A `plan_status`
-/// already present in `metadata` is left alone -- on `update` that's reached
-/// only via a prior stored value (e.g. an already-`"approved"` item), since
-/// `strip_plan_transition_fields` already stripped any caller-supplied one.
+/// `plan_asset_id` directly inside the `metadata` blob. Before item #289's
+/// fix, both were only ever read by `plan_already_submitted` as bypass
+/// evidence for `validate_plan_gate_claimable`'s "unclaimable" check --
+/// neither actually set `plan_status`, so the item ended up gated with a
+/// plan attached but `plan_status` permanently absent, and `approve_plan`
+/// then refused it forever (item #289 live incident: item #281).
+///
+/// Resets to `"pending"` whenever the *resulting* `plan_asset_id` differs
+/// from `current_metadata`'s stored one, not just when `plan_status` is
+/// absent -- a caller attaching a revised plan to an already-`"approved"`/
+/// `"rejected"` item (the resubmission shape this function's own doc used to
+/// wave through, since `restore_plan_transition_fields` now forces the prior
+/// `plan_status` back onto `metadata` before this runs) must not have the
+/// new, unreviewed plan silently inherit the old approval (item #300 code
+/// review finding). Attaching the *same* `plan_asset_id` again is a no-op,
+/// same as before.
 fn merge_submitted_plan(
     metadata: Option<String>,
     plan_asset_id_field: Option<&str>,
+    current_metadata: &str,
 ) -> Option<String> {
     let plan_asset_id_field = plan_asset_id_field.map(str::trim).filter(|s| !s.is_empty());
     let base = match (&metadata, plan_asset_id_field) {
@@ -253,8 +261,11 @@ fn merge_submitted_plan(
         None => base,
     };
     let gate = agentflare_backend::item::plan_gate::read_plan_gate(&with_field);
+    let current_asset_id = agentflare_backend::item::plan_gate::read_plan_gate(current_metadata)
+        .plan_asset_id;
+    let is_new_submission = gate.plan_asset_id.is_some() && gate.plan_asset_id != current_asset_id;
     Some(
-        if gate.plan_asset_id.is_some() && gate.plan_status.is_none() {
+        if gate.plan_asset_id.is_some() && (gate.plan_status.is_none() || is_new_submission) {
             agentflare_backend::item::plan_gate::merge_metadata_patch(
                 &with_field,
                 serde_json::json!({"plan_status": "pending"}),
@@ -796,7 +807,7 @@ impl AgentflareMcp {
                 Some(patched) => Some(patched),
                 None => metadata_str,
             };
-            let metadata = merge_submitted_plan(metadata, req.plan_asset_id.as_deref());
+            let metadata = merge_submitted_plan(metadata, req.plan_asset_id.as_deref(), "{}");
             if let Some(m) = &metadata {
                 validate_plan_gate_claimable(
                     m,
@@ -1024,7 +1035,8 @@ impl AgentflareMcp {
                 (None, Some(pid)) if !pid.trim().is_empty() => Some(current_metadata.clone()),
                 _ => metadata,
             };
-            let metadata = merge_submitted_plan(metadata, req.plan_asset_id.as_deref());
+            let metadata =
+                merge_submitted_plan(metadata, req.plan_asset_id.as_deref(), &current_metadata);
             if let Some(m) = &metadata {
                 let effective_assignee = match req.assignee_agent.as_deref() {
                     Some(a) => Some(a.to_string()),

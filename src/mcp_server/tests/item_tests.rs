@@ -699,6 +699,65 @@ fn update_with_unrelated_metadata_does_not_erase_an_existing_approval() {
     assert_eq!(metadata["workflow_run_id"], "01a0b3ad-test-run");
 }
 
+/// Item #300 code review finding: `restore_plan_transition_fields` forces
+/// the item's *current* `plan_status` back onto outgoing metadata to stop an
+/// unrelated write from erasing an approval (the test above) -- but that
+/// must not also defeat a genuine resubmission. Attaching a *new*
+/// `plan_asset_id` to an already-`"approved"` item is exactly the shape
+/// `merge_submitted_plan` exists to reset to `"pending"`; if the new plan
+/// silently inherited the old approval instead, it would reach dispatch
+/// without ever being reviewed.
+#[test]
+fn update_attaching_a_new_plan_asset_id_resets_an_approved_item_to_pending() {
+    let (tmp, s) = harness();
+    let item_id = pending_plan_item(&s, "human");
+    s.item_approve_plan_via_channel(ItemRequest {
+        action: "approve_plan".into(),
+        id: Some(item_id.clone()),
+        ..Default::default()
+    })
+    .unwrap();
+
+    s.item(Parameters(ItemRequest {
+        action: "update".into(),
+        id: Some(item_id.clone()),
+        plan_asset_id: Some("asset-2-revised".into()),
+        ..Default::default()
+    }))
+    .unwrap();
+
+    let conn = backend_conn(&tmp);
+    let item = agentflare_backend::item::get(&conn, &item_id).unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(&item.metadata).unwrap();
+    assert_eq!(
+        metadata["plan_status"], "pending",
+        "a revised plan must go back to pending for re-review, not inherit the old approval: {metadata}"
+    );
+    assert_eq!(metadata["plan_asset_id"], "asset-2-revised");
+
+    // Re-attaching the *same* asset id again is a no-op, same as before.
+    s.item_approve_plan_via_channel(ItemRequest {
+        action: "approve_plan".into(),
+        id: Some(item_id.clone()),
+        ..Default::default()
+    })
+    .unwrap();
+    s.item(Parameters(ItemRequest {
+        action: "update".into(),
+        id: Some(item_id.clone()),
+        plan_asset_id: Some("asset-2-revised".into()),
+        ..Default::default()
+    }))
+    .unwrap();
+    let conn = backend_conn(&tmp);
+    let item = agentflare_backend::item::get(&conn, &item_id).unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(&item.metadata).unwrap();
+    assert_eq!(
+        metadata["plan_status"], "approved",
+        "re-attaching the same plan_asset_id must not reset an approval that already covers it: {metadata}"
+    );
+}
+
 /// Item #573 final review, Fix 5: an explicit `plan_approver` override is an
 /// explicit gate choice ("gate this, but let an agent sign off") and must
 /// survive the urgent/high default policy, which previously only looked for
