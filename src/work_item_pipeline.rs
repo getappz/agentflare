@@ -1176,15 +1176,20 @@ pub(crate) fn run_or_resume_with_sender(
             match state.status {
                 WorkflowStatus::Completed => return Ok(()),
                 WorkflowStatus::Paused => return Err(paused_message()),
-                // Ended while this job was cancelled (an operator cancel, or
-                // the killed agent turn failing its step): report it as the
-                // deliberate stop it is, not a failure.
-                WorkflowStatus::Failed | WorkflowStatus::Cancelled
+                // A cancelled run, or one that failed while this job was
+                // cancelled (the killed agent turn failing its step), is the
+                // deliberate stop it is, not a failure. A Cancelled run needs
+                // no job-flag check: an operator cancel marks the run before
+                // it flags the job, and that window must not read as failure.
+                WorkflowStatus::Cancelled => {
+                    return Err(agentflare_jobs::cancel::CANCELLED_MESSAGE.to_string());
+                }
+                WorkflowStatus::Failed
                     if crate::agent_launch::owner_job_cancelled(&heartbeat_owner) =>
                 {
                     return Err(agentflare_jobs::cancel::CANCELLED_MESSAGE.to_string());
                 }
-                WorkflowStatus::Failed | WorkflowStatus::Cancelled => {
+                WorkflowStatus::Failed => {
                     return Err(state
                         .error
                         .unwrap_or_else(|| "workflow run failed".to_string()));
