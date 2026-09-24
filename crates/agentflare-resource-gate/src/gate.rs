@@ -4,7 +4,7 @@
 //! decision.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use crate::config::{GateConfig, GateMode};
@@ -14,6 +14,16 @@ use crate::signals::Signals;
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
 
 static STATE: OnceLock<RwLock<Policy>> = OnceLock::new();
+
+/// Serializes the sampler thread against [`force_resume`]/[`clear_force_resume`]
+/// so a slower writer can't clobber a faster one's result (e.g. the 30s
+/// sampler tick overwriting a just-applied `force_resume()` with a stale
+/// decision it started computing beforehand). Deliberately separate from
+/// `STATE`'s `RwLock`: `sample_policy` sleeps ~`MINIMUM_CPU_UPDATE_INTERVAL`
+/// (~250ms) inside `Signals::sample()`, and `STATE`'s write guard must never
+/// be held across that sleep or `current_policy()`'s `.read()` — meant to be
+/// cheap on every dispatch decision — would block behind it too.
+static WRITER_LOCK: Mutex<()> = Mutex::new(());
 
 /// Set by [`force_resume`], cleared by [`clear_force_resume`]. Persists
 /// across sampler ticks (unlike a one-shot `STATE` write) so a
@@ -56,9 +66,10 @@ pub fn init_global() {
         .spawn(move || {
             loop {
                 std::thread::sleep(SAMPLE_INTERVAL);
+                let _writer = WRITER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                let decision = sample_policy(&cfg);
                 if let Some(lock) = STATE.get() {
-                    let mut policy = lock.write().unwrap_or_else(|e| e.into_inner());
-                    *policy = sample_policy(&cfg);
+                    *lock.write().unwrap_or_else(|e| e.into_inner()) = decision;
                 }
             }
         })
@@ -84,27 +95,27 @@ pub fn current_policy() -> Policy {
 /// no-op on a gate paused for `PauseReason::CpuPressure` instead: that
 /// reason self-clears once CPU drops, and isn't what this override targets.
 pub fn force_resume() {
-    if let Some(lock) = STATE.get() {
-        let mut policy = lock.write().unwrap_or_else(|e| e.into_inner());
-        FORCE_RESUME.store(true, Ordering::SeqCst);
-        let cfg = GateConfig::from_env();
-        *policy = sample_policy(&cfg);
-    } else {
-        FORCE_RESUME.store(true, Ordering::SeqCst);
-    }
+    set_force_resume(true);
 }
 
 /// Restores normal `AGENTFLARE_DISPATCH_GATE_MODE` handling after
 /// [`force_resume`]. Mostly for tests/symmetry today — there's no CLI path
 /// that re-pauses a gate, so nothing currently calls this in production.
 pub fn clear_force_resume() {
+    set_force_resume(false);
+}
+
+/// Shared body for [`force_resume`]/[`clear_force_resume`]: takes the
+/// `WRITER_LOCK` so a concurrent sampler tick can't race this update, flips
+/// the flag, then re-samples and applies the result immediately rather than
+/// waiting for the next `SAMPLE_INTERVAL` tick.
+fn set_force_resume(active: bool) {
+    let _writer = WRITER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    FORCE_RESUME.store(active, Ordering::SeqCst);
     if let Some(lock) = STATE.get() {
-        let mut policy = lock.write().unwrap_or_else(|e| e.into_inner());
-        FORCE_RESUME.store(false, Ordering::SeqCst);
         let cfg = GateConfig::from_env();
-        *policy = sample_policy(&cfg);
-    } else {
-        FORCE_RESUME.store(false, Ordering::SeqCst);
+        let decision = sample_policy(&cfg);
+        *lock.write().unwrap_or_else(|e| e.into_inner()) = decision;
     }
 }
 
