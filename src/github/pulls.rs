@@ -213,11 +213,8 @@ pub fn get(client: &Client, repo: &RepoId, number: u64) -> Result<PullRequest, G
     serde_json::from_value(json).map_err(|e| GitHubError::Parse(e.to_string()))
 }
 
-pub fn merge(client: &Client, repo: &RepoId, number: u64, method: &str) -> Result<(), GitHubError> {
-    merge_at_head(client, repo, number, method, None)
-}
-
-/// `merge`, pinned to `head_sha` when given: GitHub then refuses with 409
+/// Merges PR `number`, pinned to `head_sha` when given: GitHub then refuses
+/// with 409
 /// if the PR's head has moved since -- a commit pushed after the caller
 /// judged CI green must never ride along into the merge unchecked. Callers
 /// treat that 409 as "look again next tick" (see [`is_head_moved`]).
@@ -657,10 +654,10 @@ mod tests {
     }
 
     #[test]
-    fn merge_puts_the_chosen_method() {
+    fn merge_at_head_puts_the_chosen_method() {
         let server = MockServer::start(vec![MockResponse::json(200, r#"{"merged":true}"#)]);
         let client = server.client(Some("tok"));
-        merge(&client, &repo(), 3, "squash").unwrap();
+        merge_at_head(&client, &repo(), 3, "squash", None).unwrap();
         let reqs = server.requests();
         assert_eq!(reqs[0].method, "PUT");
         assert_eq!(reqs[0].path, "/repos/o/r/pulls/3/merge");

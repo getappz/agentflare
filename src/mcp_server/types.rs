@@ -554,6 +554,11 @@ pub(crate) struct GitHubRequest {
     #[schemars(description = "Merge method for pr_merge: merge|squash|rebase (default merge)")]
     #[serde(default)]
     pub(crate) merge_method: Option<String>,
+    #[schemars(
+        description = "pr_merge: the head commit SHA you last saw (pr_get/pr_status/pr_wait report it as head_sha). The merge is refused if the PR head has moved since; omit to pin to the head read at merge time"
+    )]
+    #[serde(default)]
+    pub(crate) head_sha: Option<String>,
     #[schemars(description = "Reviewer logins (pr_request_review)")]
     #[serde(default)]
     pub(crate) reviewers: Option<Vec<String>>,

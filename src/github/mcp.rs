@@ -92,6 +92,9 @@ pub fn pr_status_json(
         "dels": pr.deletions,
         "files": pr.changed_files,
         "head": pr.head.as_ref().map(|h| &h.git_ref),
+        // What `pr_merge` pins to: a caller that judged CI on this snapshot
+        // passes it back so a commit pushed in between can't ride along.
+        "head_sha": pr.head.as_ref().map(|h| &h.sha),
         "base": pr.base.as_ref().map(|h| &h.git_ref),
         "url": pr.html_url,
         "checks_ok": checks_ok,
