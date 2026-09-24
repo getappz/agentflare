@@ -881,7 +881,7 @@ pub(crate) struct ItemRequest {
     #[serde(default)]
     pub(crate) reclaim: Option<bool>,
     #[schemars(
-        description = "doctor: with reclaim=true, also delete lanes flagged dirty (uncommitted changes). Default false. Refused when `worktree` is omitted (an unscoped force-reclaim force-deletes EVERY dirty lane in the repo, including other agents' uncommitted work) unless `repo_wide=true` explicitly confirms repo-wide intent. release|done|check_merge: override another owner's live (unexpired) claim — requires `force_reason`, and is refused unless the owner's job is confirmed dead, a terminal `agentflare work — failed` comment was posted since the claim was taken, or this item's PR is pushed with passing/merged CI. check_merge additionally promotes a not-in_review item whose PR is merged. Every override is logged as an audit comment."
+        description = "doctor: with reclaim=true, also delete lanes flagged dirty (uncommitted changes). Default false. Refused when `worktree` is omitted (an unscoped force-reclaim force-deletes EVERY dirty lane in the repo, including other agents' uncommitted work) unless `repo_wide=true` explicitly confirms repo-wide intent. release|done|check_merge: override another owner's live (unexpired) claim — requires `force_reason`, and is refused unless the owner's job is confirmed dead, a terminal `agentflare work — failed` comment was posted since the claim was taken, or the caller is on the item's branch with HEAD pushed and its PR passing/merged. check_merge additionally promotes a not-in_review item whose PR is merged. Every override is logged as an audit comment."
     )]
     #[serde(default)]
     pub(crate) force: Option<bool>,
