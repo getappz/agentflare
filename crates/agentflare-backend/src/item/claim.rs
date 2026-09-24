@@ -460,3 +460,34 @@ pub fn redispatch(
         assignee_agent: agent,
     })
 }
+
+/// The abandoned-claim steal `done`/`release` run when the caller doesn't
+/// hold the lease (item #83): a live claim by someone else comes back as
+/// `Held`; a stale one is taken over. A MISSING claim row is re-created only
+/// when the item isn't assigned to a different agent -- no row plus another
+/// assignee means the item was released and reassigned since, and re-minting
+/// the lease would let the job that lost it publish anyway. That case is
+/// reported as `Held` by the new assignee.
+pub fn steal_abandoned_claim(
+    conn: &Connection,
+    item_id: &str,
+    owner: &str,
+    now: i64,
+    ttl_secs: i64,
+) -> Result<crate::claim::Acquire> {
+    let ttl = crate::claim::effective_ttl_secs(conn, item_id, ttl_secs);
+    if let Some(outcome) = crate::claim::acquire_if_stale_only(conn, item_id, owner, now, ttl)? {
+        return Ok(outcome);
+    }
+    let reassigned_to = super::get(conn, item_id)
+        .ok()
+        .and_then(|i| i.assignee_agent)
+        .filter(|a| agent_part(a) != agent_part(owner));
+    if let Some(assignee) = reassigned_to {
+        return Ok(crate::claim::Acquire::Held {
+            owner: assignee,
+            age_secs: 0,
+        });
+    }
+    Ok(crate::claim::acquire(conn, item_id, owner, now, ttl)?)
+}

@@ -52,11 +52,16 @@ fn list_claim_comments(
 /// synced) and would otherwise each create their own duplicate tracking
 /// item; this marker comment is the one thing both can see.
 ///
-/// Read comments; if a `Claim` marker already exists, someone (possibly this
-/// same workstation, on an earlier run) already claimed it -- reject before
-/// posting anything. Otherwise post our own marker, re-read, and only report
-/// success if ours is now the earliest -- closing the window where another
-/// workstation's claim raced in between the two reads.
+/// Read comments; if another workstation's `Claim` marker is already the
+/// earliest, it owns the PR -- reject before posting anything. If the
+/// earliest marker is *ours*, this workstation already won the claim on an
+/// earlier run: `discover_untracked_prs` only asks about PRs no local item
+/// tracks, so reaching here means that run's item creation never landed
+/// (it runs after the claim, and a failure there is only logged). Report
+/// success so the item gets created now -- rejecting our own marker used to
+/// leave the PR untracked forever. Otherwise post our own marker, re-read,
+/// and only report success if ours is now the earliest -- closing the window
+/// where another workstation's claim raced in between the two reads.
 pub(crate) fn claim_pr_for_discovery(
     client: &crate::github::Client,
     repo: &crate::github::RepoId,
@@ -70,8 +75,8 @@ pub(crate) fn claim_pr_for_discovery(
             return false;
         }
     };
-    if earliest_claim_owner(&before).is_some() {
-        return false;
+    if let Some((_, existing_owner)) = earliest_claim_owner(&before) {
+        return existing_owner == owner;
     }
     let marker = crate::github::bridge::marker::Marker {
         action: crate::github::bridge::marker::Action::Claim,
@@ -348,6 +353,37 @@ mod tests {
         // Reject before doing anything else -- no comment posted, no
         // re-read -- once the PR is already claimed.
         assert_eq!(server.requests().len(), 1);
+    }
+
+    #[test]
+    fn claim_pr_for_discovery_resumes_its_own_earlier_claim() {
+        // An earlier run of this same workstation won the claim but its item
+        // creation never landed. The claim must be honored (no second marker
+        // posted) so the item can be created now, not rejected forever.
+        let ours = crate::github::bridge::marker::Marker {
+            action: crate::github::bridge::marker::Action::Claim,
+            owner: "flared:box-a".into(),
+            item: "pr-discovery".into(),
+            ts: 1,
+            hash: String::new(),
+        };
+        let server = crate::github::test_support::MockServer::start(vec![
+            crate::github::test_support::MockResponse::json(
+                200,
+                &format!(
+                    r#"[{{"id":10,"user":{{"login":"bot"}},"body":"{}"}}]"#,
+                    ours.render()
+                ),
+            ),
+        ]);
+        let client = server.client(Some("tok"));
+        let repo = crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+
+        assert!(claim_pr_for_discovery(&client, &repo, 42, "flared:box-a"));
+        assert_eq!(server.requests().len(), 1, "no second marker is posted");
     }
 
     #[test]

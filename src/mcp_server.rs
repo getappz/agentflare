@@ -50,6 +50,63 @@ use std::path::PathBuf;
 
 use types::*;
 
+/// Read-merge-write of an item's `metadata` JSON object as one atomic unit:
+/// re-reads the row's current metadata, lets `merge` edit it, and writes it
+/// back, all inside a single IMMEDIATE transaction (or the caller's own, if
+/// one is already open on `conn`). Every metadata writer must go through
+/// this rather than merging into an `Item` it fetched earlier and writing
+/// the whole blob back: writers run on separate connections (the daemon,
+/// `item_done`'s PR-identity write, the work-item pipeline), and a
+/// snapshot-based write silently drops whatever keys another writer stored
+/// in between. Non-object (or unparseable) metadata is treated as `{}`.
+pub(crate) fn merge_item_metadata(
+    conn: &rusqlite::Connection,
+    item_id: &str,
+    merge: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) -> agentflare_backend::error::Result<agentflare_backend::item::Item> {
+    in_immediate_tx(conn, agentflare_backend::error::Error::from, || {
+        let current = agentflare_backend::item::get(conn, item_id)?;
+        let mut map = serde_json::from_str::<serde_json::Value>(&current.metadata)
+            .ok()
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        merge(&mut map);
+        agentflare_backend::item::update(
+            conn,
+            item_id,
+            agentflare_backend::item::UpdateItem {
+                metadata: Some(serde_json::Value::Object(map).to_string()),
+                ..Default::default()
+            },
+        )
+    })
+}
+
+/// Runs `f` inside a `BEGIN IMMEDIATE` transaction on `conn`, committing on
+/// `Ok` and rolling back on `Err` -- or, when the caller already has a
+/// transaction open on `conn`, just runs `f` inside that one. IMMEDIATE
+/// takes the write lock up front, so a read inside `f` can't be invalidated
+/// by another connection's write before `f`'s own write lands.
+pub(crate) fn in_immediate_tx<T, E>(
+    conn: &rusqlite::Connection,
+    sql_err: impl Fn(rusqlite::Error) -> E,
+    f: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    if !conn.is_autocommit() {
+        return f();
+    }
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(&sql_err)?;
+    let result = f();
+    let finish = if result.is_ok() { "COMMIT" } else { "ROLLBACK" };
+    if let Err(e) = conn.execute_batch(finish) {
+        let _ = conn.execute_batch("ROLLBACK");
+        if result.is_ok() {
+            return Err(sql_err(e));
+        }
+    }
+    result
+}
+
 #[derive(Default)]
 pub struct AgentflareMcp {
     /// Persisted across calls so `Registry::ensure_fresh`'s 60s debounce is
@@ -91,7 +148,12 @@ pub struct AgentflareMcp {
     /// fresh connection per call would re-run migrations every time. Unlike
     /// skills (filesystem-derived, needs ensure_fresh), the backend DB is
     /// its own source of truth, so nothing to refresh.
-    backend_db: std::sync::Mutex<Option<rusqlite::Connection>>,
+    ///
+    /// `Arc` so `scoped_to_project` can hand a per-project view of this
+    /// instance the very same connection (and lock) instead of opening a
+    /// second one -- an in-memory test DB would otherwise not even be the
+    /// same database.
+    backend_db: std::sync::Arc<std::sync::Mutex<Option<rusqlite::Connection>>>,
     /// Tests inject a temp path here so they never touch the shared backend.db.
     pub(crate) backend_db_override: Option<std::path::PathBuf>,
     /// Tests inject a job queue here to observe reassignment cancelling the
@@ -108,6 +170,13 @@ pub struct AgentflareMcp {
     /// never runs real git worktree/branch operations against this actual
     /// repository (worktree add, force-remove, branch -D).
     worktree_repo_root_override: Option<std::path::PathBuf>,
+    /// Pins `resolve_project` to this exact project id, bypassing the
+    /// link-file/remote/cwd resolution entirely. Set only by
+    /// `scoped_to_project`, for daemon-side callers (the review sweep) that
+    /// already know which project an item belongs to from the
+    /// `project_dirs` registry and must never fall back to whatever project
+    /// this process's own cwd happens to resolve to.
+    project_id_override: Option<String>,
     /// Lazily-opened agentflare-store (documents + blobs), replacing the
     /// hand-rolled `assets` table. Persisted across calls so migrations
     /// and the one-time backfill run only once per process lifetime.
@@ -764,6 +833,123 @@ impl AgentflareMcp {
                 repo_root.join(Self::LINK_MARKER).join("project.json"),
             ),
             worktree_repo_root_override: Some(repo_root),
+            ..Default::default()
+        }
+    }
+
+    /// Undoes a just-acquired claim whose worktree could not be created:
+    /// releases `owner`'s lease and puts the item's state and assignee back
+    /// to what they were before `item::claim` ran, in one transaction.
+    /// Returns whether the rollback landed; failures are logged, and the
+    /// lease then simply ages out like any abandoned claim.
+    fn roll_back_claim(
+        &self,
+        item_id: &str,
+        owner: &str,
+        prev_state_id: &str,
+        prev_assignee: Option<&str>,
+    ) -> bool {
+        let outcome = self.with_backend_db(|conn| {
+            crate::mcp_server::in_immediate_tx(conn, agentflare_backend::error::Error::from, || {
+                if !agentflare_backend::claim::release(conn, item_id, owner)? {
+                    return Ok(false);
+                }
+                agentflare_backend::item::update_state(conn, item_id, prev_state_id)?;
+                match prev_assignee {
+                    Some(assignee) => {
+                        agentflare_backend::item::update(
+                            conn,
+                            item_id,
+                            agentflare_backend::item::UpdateItem {
+                                assignee_agent: Some(assignee.to_string()),
+                                ..Default::default()
+                            },
+                        )?;
+                    }
+                    None => {
+                        conn.execute(
+                            "UPDATE items SET assignee_agent = NULL WHERE id = ?1",
+                            rusqlite::params![item_id],
+                        )?;
+                    }
+                }
+                Ok(true)
+            })
+        });
+        match outcome {
+            Ok(Ok(rolled_back)) => rolled_back,
+            Ok(Err(e)) => {
+                eprintln!("worktree: could not roll back claim on item {item_id}: {e}");
+                false
+            }
+            Err(e) => {
+                eprintln!("worktree: could not roll back claim on item {item_id}: {e:?}");
+                false
+            }
+        }
+    }
+
+    /// Records why a completed item with real commits has no PR (a repo with
+    /// no origin, a non-GitHub remote, or no GitHub credentials): a
+    /// `metadata.no_pr` entry plus one comment, so the completion is never
+    /// mistaken for a reviewed-and-merged one. Best-effort -- the state
+    /// transition has already happened.
+    fn record_no_pr_completion(&self, item_id: &str, pushed: bool, reason: &str) {
+        let note = serde_json::json!({ "reason": reason, "pushed": pushed });
+        let recorded = self.with_backend_db(|conn| {
+            crate::mcp_server::merge_item_metadata(conn, item_id, |metadata| {
+                metadata.insert("no_pr".into(), note);
+            })
+        });
+        match recorded {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                eprintln!("worktree: could not record no_pr metadata for item {item_id}: {e}")
+            }
+            Err(e) => {
+                eprintln!("worktree: could not record no_pr metadata for item {item_id}: {e:?}")
+            }
+        }
+        let where_ = if pushed {
+            "The branch was pushed to `origin`"
+        } else {
+            "The commits stay on the item's local branch"
+        };
+        let _ = self.comment_impl(CommentRequest {
+            action: "create".into(),
+            item_id: Some(item_id.to_string()),
+            body: Some(format!(
+                "## agentflare work — completed without a PR\n\nNo pull request can be opened \
+                 for this repository ({reason}). {where_}; marked completed without review."
+            )),
+            ..Default::default()
+        });
+    }
+
+    /// A view of this instance pinned to one already-known project and its
+    /// registered folder -- for daemon-side loops (`supervisor::run_review_sweep`)
+    /// that walk every `project_dirs` row rather than the one project this
+    /// process's cwd resolves to. Unlike `for_project_dir`, this shares the
+    /// parent's backend connection and every test-injected store override,
+    /// and it resolves the project by id rather than re-deriving it from the
+    /// folder's link file or git remote, so a missing/stale link in that
+    /// folder can never mint a different project.
+    pub(crate) fn scoped_to_project(
+        &self,
+        project_id: String,
+        repo_root: std::path::PathBuf,
+    ) -> Self {
+        Self {
+            backend_db: self.backend_db.clone(),
+            backend_db_override: self.backend_db_override.clone(),
+            job_queue_override: self.job_queue_override.clone(),
+            store_override: self.store_override.clone(),
+            flare_docs_store_override: self.flare_docs_store_override.clone(),
+            backend_project_link_override: Some(
+                repo_root.join(Self::LINK_MARKER).join("project.json"),
+            ),
+            worktree_repo_root_override: Some(repo_root),
+            project_id_override: Some(project_id),
             ..Default::default()
         }
     }

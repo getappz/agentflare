@@ -49,12 +49,26 @@ pub fn list(client: &Client, repo: &RepoId, state: &str) -> Result<Vec<PullReque
 /// the same branch is perfectly legal to create, which is how `item done`
 /// re-running on an already-merged branch ended up opening a redundant PR
 /// (2026-07-25, PR #328 duplicating already-merged #327).
+///
+/// Asks GitHub for just this branch (`head=<owner>:<branch>`) in a single
+/// request rather than paginating every PR the repo has ever had: that
+/// unbounded walk cost one request per 100 PRs on every call and was the
+/// call most likely to trip the rate limit. The `head.ref` check is kept as
+/// a guard in case the filter is ever ignored.
 pub fn find_existing(
     client: &Client,
     repo: &RepoId,
     branch: &str,
 ) -> Result<Option<PullRequest>, GitHubError> {
-    let prs = list(client, repo, "all")?;
+    let path = format!(
+        "/repos/{}/{}/pulls?state=all&head={}&per_page=100",
+        repo.owner,
+        repo.repo,
+        crate::github::encode_query(&format!("{}:{branch}", repo.owner))
+    );
+    let json = client.request("GET", &path, None)?;
+    let prs: Vec<PullRequest> =
+        serde_json::from_value(json).map_err(|e| GitHubError::Parse(e.to_string()))?;
     Ok(prs
         .into_iter()
         .find(|pr| pr.head.as_ref().is_some_and(|h| h.git_ref == branch)))
@@ -393,9 +407,11 @@ mod tests {
         let client = server.client(None);
         let found = find_existing(&client, &repo(), "task/348").unwrap();
         assert_eq!(found.unwrap().number, 5);
+        let reqs = server.requests();
+        assert_eq!(reqs.len(), 1, "one head-filtered request, no pagination");
         assert_eq!(
-            server.requests()[0].path,
-            "/repos/o/r/pulls?state=all&per_page=100&page=1"
+            reqs[0].path,
+            "/repos/o/r/pulls?state=all&head=o%3Atask/348&per_page=100"
         );
     }
 

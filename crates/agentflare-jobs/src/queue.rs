@@ -413,6 +413,35 @@ impl Queue {
         Ok(jobs)
     }
 
+    /// Number of queued or running jobs whose `args` carry `value` -- at
+    /// position `index` when given, anywhere in `args` otherwise. Unlike
+    /// `list`, which only returns the 100 newest rows, this counts every
+    /// active row, so an old but still-queued job is never missed by a
+    /// single-flight or per-project fairness check built on it.
+    pub fn count_active_with_arg(&self, value: &str, index: Option<usize>) -> Result<u64, Error> {
+        let conn = self.conn.lock();
+        let count: i64 = match index {
+            Some(index) => conn.query_row(
+                "SELECT COUNT(*) FROM agent_jobs
+                 WHERE state IN ('queued', 'running')
+                   AND json_extract(payload, '$.args[' || ?2 || ']') = ?1",
+                params![value, index as i64],
+                |r| r.get(0),
+            )?,
+            None => conn.query_row(
+                "SELECT COUNT(*) FROM agent_jobs
+                 WHERE state IN ('queued', 'running')
+                   AND EXISTS (
+                       SELECT 1 FROM json_each(agent_jobs.payload, '$.args') a
+                       WHERE a.value = ?1
+                   )",
+                params![value],
+                |r| r.get(0),
+            )?,
+        };
+        Ok(count.max(0) as u64)
+    }
+
     pub fn get(&self, id: &str) -> Result<JobInfo, Error> {
         let conn = self.conn.lock();
         let row = conn.query_row(

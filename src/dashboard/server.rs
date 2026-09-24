@@ -250,14 +250,16 @@ fn spawn_supervisor_review_sweep(
                         || s.self_repaired > 0
                         || s.review_repaired > 0
                         || s.waiting > 0
-                        || s.updated > 0 =>
+                        || s.updated > 0
+                        || s.requeued > 0 =>
                 {
                     eprintln!(
-                        "agentflare-supervisor: review sweep promoted {}, self-repaired {}, review-repaired {}, updated {}, skipped {}, waiting {}",
+                        "agentflare-supervisor: review sweep promoted {}, self-repaired {}, review-repaired {}, updated {}, requeued {}, skipped {}, waiting {}",
                         s.promoted,
                         s.self_repaired,
                         s.review_repaired,
                         s.updated,
+                        s.requeued,
                         s.skipped,
                         s.waiting
                     );
@@ -694,6 +696,66 @@ fn is_local_bind(host: &str) -> bool {
 /// parse step so the override logic is testable without mutating
 /// process-global env state — env vars are shared across the whole test
 /// binary, unlike this narrow seam.
+/// How often a failed boot-time `engine().recover()` is retried.
+const PIPELINE_RECOVERY_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Starts everything that claims or dispatches work -- the worker pool and
+/// the supervisor's discovery/review/approval ticks. Only ever called once
+/// the work-item pipeline's in-flight runs have been recovered, so a fresh
+/// dispatch can never race a resumed run for the same item.
+fn start_work_dispatch(queue: &agentflare_jobs::Queue) {
+    let mut worker_pool = agentflare_jobs::WorkerPool::new(queue.clone())
+        .with_executor(std::sync::Arc::new(crate::cli::work::WorkItemExecutor))
+        .with_terminal_failure_hook(std::sync::Arc::new(|_job_id, job| {
+            super::orphan_reconcile::handle_terminal_job_failure(job);
+        }));
+    worker_pool.start(work_max_concurrency());
+    spawn_supervisor_discovery(
+        queue.clone(),
+        std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default()),
+        SUPERVISOR_DISCOVERY_INTERVAL,
+    );
+    spawn_supervisor_review_sweep(
+        queue.clone(),
+        std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default()),
+        SUPERVISOR_REVIEW_SWEEP_INTERVAL,
+    );
+    spawn_supervisor_telegram_approvals(
+        std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default()),
+        SUPERVISOR_TELEGRAM_POLL_INTERVAL,
+    );
+}
+
+/// Retries `engine().recover()` every `PIPELINE_RECOVERY_RETRY_INTERVAL`
+/// after it failed at boot, logging each failure, and starts work dispatch
+/// the first time it succeeds.
+fn spawn_pipeline_recovery_retry(queue: agentflare_jobs::Queue) {
+    tokio::spawn(async move {
+        let mut attempt: u32 = 1;
+        loop {
+            tokio::time::sleep(PIPELINE_RECOVERY_RETRY_INTERVAL).await;
+            attempt += 1;
+            match crate::work_item_pipeline::engine()
+                .recover_with(crate::work_item_pipeline::should_recover_at_boot)
+                .await
+            {
+                Ok(_) => {
+                    eprintln!(
+                        "agentflare: work-item pipeline recovery succeeded on attempt {attempt} \
+                         -- starting work dispatch"
+                    );
+                    start_work_dispatch(&queue);
+                    return;
+                }
+                Err(e) => crate::ui::error(&format!(
+                    "work-item pipeline recovery attempt {attempt} failed: {e} -- retrying in {}s",
+                    PIPELINE_RECOVERY_RETRY_INTERVAL.as_secs()
+                )),
+            }
+        }
+    });
+}
+
 fn parse_work_max_concurrency(raw: Option<&str>) -> Option<usize> {
     raw.and_then(|s| s.parse::<usize>().ok()).filter(|n| *n > 0)
 }
@@ -829,46 +891,33 @@ pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {
             // resume state is untrustworthy, so dispatch stays disabled
             // here too -- same "fail closed, dashboard stays up" contract
             // as the smoke-test gate this block is already nested inside.
-            let pipeline_ready =
-                match crate::work_item_pipeline::engine().register_workflow(boot_definition) {
-                    Ok(()) => match crate::work_item_pipeline::engine().recover().await {
-                        Ok(_) => true,
-                        Err(e) => {
-                            crate::ui::error(&format!(
-                                "failed to recover in-flight work-item pipeline runs at boot: {e}"
-                            ));
-                            false
-                        }
-                    },
+            match crate::work_item_pipeline::engine().register_workflow(boot_definition) {
+                Ok(()) => match crate::work_item_pipeline::engine()
+                    .recover_with(crate::work_item_pipeline::should_recover_at_boot)
+                    .await
+                {
+                    Ok(_) => start_work_dispatch(&queue),
                     Err(e) => {
+                        // A recovery failure is often transient (a locked
+                        // store, one bad run the engine can't yet isolate),
+                        // and failing closed forever used to leave the
+                        // daemon with no worker pool and no supervisor at
+                        // all until someone restarted it by hand. Keep the
+                        // "no dispatch until recovery succeeds" contract,
+                        // but keep retrying it in the background.
                         crate::ui::error(&format!(
-                            "failed to register work-item pipeline definition at boot: {e}"
+                            "failed to recover in-flight work-item pipeline runs at boot: {e} \
+                             -- retrying every {}s; work dispatch stays off until it succeeds",
+                            PIPELINE_RECOVERY_RETRY_INTERVAL.as_secs()
                         ));
-                        false
+                        spawn_pipeline_recovery_retry(queue.clone());
                     }
-                };
-
-            if pipeline_ready {
-                let mut worker_pool = agentflare_jobs::WorkerPool::new(queue.clone())
-                    .with_executor(std::sync::Arc::new(crate::cli::work::WorkItemExecutor))
-                    .with_terminal_failure_hook(std::sync::Arc::new(|_job_id, job| {
-                        super::orphan_reconcile::handle_terminal_job_failure(job);
-                    }));
-                worker_pool.start(work_max_concurrency());
-                spawn_supervisor_discovery(
-                    queue.clone(),
-                    std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default()),
-                    SUPERVISOR_DISCOVERY_INTERVAL,
-                );
-                spawn_supervisor_review_sweep(
-                    queue.clone(),
-                    std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default()),
-                    SUPERVISOR_REVIEW_SWEEP_INTERVAL,
-                );
-                spawn_supervisor_telegram_approvals(
-                    std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default()),
-                    SUPERVISOR_TELEGRAM_POLL_INTERVAL,
-                );
+                },
+                Err(e) => {
+                    crate::ui::error(&format!(
+                        "failed to register work-item pipeline definition at boot: {e}"
+                    ));
+                }
             }
         }
         Err(e) => {

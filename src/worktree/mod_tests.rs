@@ -276,7 +276,10 @@
         let reqs = server.requests();
         assert_eq!(
             reqs[0].path,
-            "/repos/o/r/pulls?state=all&per_page=100&page=1"
+            format!(
+                "/repos/o/r/pulls?state=all&head=o%3A{}&per_page=100",
+                crate::github::encode_query(&branch)
+            )
         );
     }
 
@@ -406,6 +409,7 @@
     ) -> crate::github::graphql::BatchPrData {
         crate::github::graphql::BatchPrData {
             merged,
+            closed: false,
             mergeable,
             mergeable_state: mergeable_state.map(str::to_string),
             checks,
@@ -592,11 +596,28 @@
         )
         .unwrap();
 
+        // Another writer stores a key after `item` (the caller's snapshot,
+        // taken before a long push) was read. Merging into the snapshot and
+        // writing it back whole used to drop this key.
+        agentflare_backend::item::update(
+            &conn,
+            &item.id,
+            agentflare_backend::item::UpdateItem {
+                metadata: Some(r#"{"size":"S","workflow_run_id":"run-1"}"#.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
         merge_and_persist_pr_identity(&conn, &item, 619, "task/191-slug");
 
         let updated = agentflare_backend::item::get(&conn, &item.id).unwrap();
         let metadata: serde_json::Value = serde_json::from_str(&updated.metadata).unwrap();
         assert_eq!(metadata["size"], "S");
+        assert_eq!(
+            metadata["workflow_run_id"], "run-1",
+            "a key written after the snapshot must survive: {metadata}"
+        );
         assert_eq!(metadata["pr"]["number"], 619);
         assert_eq!(metadata["pr"]["branch"], "task/191-slug");
     }
@@ -726,4 +747,92 @@
         let item = item_with_metadata(259, "{}");
 
         assert!(recover_pr_after_failed_create(&client, &repo(), "task/259", &item).is_none());
+    }
+
+    #[test]
+    fn pr_ci_status_reports_closed_for_a_pr_closed_without_merging() {
+        let server = crate::github::test_support::MockServer::start(vec![
+            crate::github::test_support::MockResponse::json(
+                200,
+                r#"{"number":77,"html_url":"u","state":"closed","title":"t","merged_at":null}"#,
+            ),
+        ]);
+        let client = server.client(Some("tok"));
+        let item = item_with_metadata(5, r#"{"pr":{"number":77,"branch":"task/5"}}"#);
+
+        let status = pr_ci_status_impl(&item, Path::new("/does/not/exist"), &client, &repo());
+
+        assert!(matches!(status, PrCiStatus::Closed { number: 77 }));
+    }
+
+    #[test]
+    fn pr_ci_status_from_batch_reports_closed_before_checks() {
+        let mut data = batch_data(false, Some(true), Some("clean"), vec![], vec![]);
+        data.closed = true;
+        assert!(matches!(
+            pr_ci_status_from_batch(9, &data),
+            PrCiStatus::Closed { number: 9 }
+        ));
+    }
+
+    // A lookup failure (here a rate limit) must not fall through to
+    // `create`: "couldn't check" used to open a duplicate PR on every retry.
+    #[test]
+    fn open_pr_for_pushed_branch_never_creates_when_the_lookup_fails() {
+        let server = crate::github::test_support::MockServer::start(vec![
+            crate::github::test_support::MockResponse::json(
+                403,
+                r#"{"message":"API rate limit exceeded"}"#,
+            )
+            .with_header("x-ratelimit-remaining", "0"),
+        ]);
+        let client = server.client(Some("tok"));
+        let item = item_with_metadata(7, "{}");
+
+        let outcome =
+            open_pr_for_pushed_branch(&client, &repo(), &item, "task/7", "master", "b", "m", None);
+
+        assert!(matches!(outcome, PrOutcome::Failed(_)), "{outcome:?}");
+        let reqs = server.requests();
+        assert_eq!(reqs.len(), 1, "only the lookup, never a create: {reqs:?}");
+        assert_eq!(reqs[0].method, "GET");
+    }
+
+    // The recorded `metadata.pr.number` is looked up directly; a lookup
+    // error there is likewise a retryable failure, not a blind create.
+    #[test]
+    fn open_pr_for_pushed_branch_prefers_the_recorded_pr_number() {
+        let server = crate::github::test_support::MockServer::start(vec![
+            crate::github::test_support::MockResponse::json(500, r#"{"message":"boom"}"#),
+        ]);
+        let client = server.client(Some("tok"));
+        let item = item_with_metadata(7, r#"{"pr":{"number":70,"branch":"task/7"}}"#);
+
+        let outcome =
+            open_pr_for_pushed_branch(&client, &repo(), &item, "task/7", "master", "b", "m", None);
+
+        assert!(matches!(outcome, PrOutcome::Failed(_)), "{outcome:?}");
+        let reqs = server.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].path, "/repos/o/r/pulls/70");
+    }
+
+    #[test]
+    fn reusable_own_pr_rejects_this_items_own_pr_once_closed_unmerged() {
+        let body = "_Opened by claude-code on box for item #7 via agentflare._";
+        let closed: crate::github::models::PullRequest =
+            serde_json::from_value(serde_json::json!({
+                "number": 70, "html_url": "u", "state": "closed", "title": "t", "body": body
+            }))
+            .unwrap();
+        let merged: crate::github::models::PullRequest =
+            serde_json::from_value(serde_json::json!({
+                "number": 70, "html_url": "u", "state": "closed", "title": "t", "body": body,
+                "merged_at": "2026-08-20T00:00:00Z"
+            }))
+            .unwrap();
+        let item = item_with_metadata(7, "{}");
+
+        assert!(!reusable_own_pr(&closed, &item));
+        assert!(reusable_own_pr(&merged, &item));
     }

@@ -180,8 +180,10 @@ fn is_pr_merged_impl(
 /// only relabeled once `marks_item` confirms it's this item's own PR, so an
 /// unrelated PR that happens to share the branch name never gets its
 /// labels touched on this item's behalf (item #63).
+///
+/// Prefers `metadata.pr.number` when present, same as `is_pr_merged`: the
+/// recorded number needs no branch reconstruction or PR search at all.
 pub fn relabel_pr_completed(item: &agentflare_backend::item::Item, repo_root: &Path) {
-    let branch = flare_git_core::worktree::resolve_item_task_branch(item, repo_root);
     let Some(repo) = RepoId::resolve_from_remote(repo_root) else {
         return;
     };
@@ -189,7 +191,48 @@ pub fn relabel_pr_completed(item: &agentflare_backend::item::Item, repo_root: &P
         Ok(c) => c,
         Err(_) => return,
     };
-    let pr = match crate::github::pulls::find_existing(&client, &repo, &branch) {
+    relabel_pr_completed_impl(item, repo_root, &client, &repo);
+}
+
+fn relabel_pr_completed_impl(
+    item: &agentflare_backend::item::Item,
+    repo_root: &Path,
+    client: &crate::github::Client,
+    repo: &RepoId,
+) {
+    let number = match pr_number_from_metadata(item) {
+        Some(number) => number,
+        None => match find_own_pr_by_branch(item, repo_root, client, repo) {
+            Some(number) => number,
+            None => return,
+        },
+    };
+    if let Err(e) =
+        crate::github::issues::remove_label(client, repo, number, "agentflare:in-review")
+    {
+        eprintln!("worktree: could not remove agentflare:in-review from PR #{number}: {e}");
+    }
+    if let Err(e) = crate::github::issues::add_labels(
+        client,
+        repo,
+        number,
+        &["agentflare:completed".to_string()],
+    ) {
+        eprintln!("worktree: could not add agentflare:completed to PR #{number}: {e}");
+    }
+}
+
+/// The branch-heuristic fallback for items with no recorded
+/// `metadata.pr.number`: a `find_existing` match, trusted only once
+/// `marks_this_item` confirms it is this item's own PR.
+fn find_own_pr_by_branch(
+    item: &agentflare_backend::item::Item,
+    repo_root: &Path,
+    client: &crate::github::Client,
+    repo: &RepoId,
+) -> Option<u64> {
+    let branch = flare_git_core::worktree::resolve_item_task_branch(item, repo_root);
+    let pr = match crate::github::pulls::find_existing(client, repo, &branch) {
         Ok(Some(pr))
             if crate::github::pulls::marks_this_item(
                 pr.body.as_deref(),
@@ -199,34 +242,16 @@ pub fn relabel_pr_completed(item: &agentflare_backend::item::Item, repo_root: &P
         {
             pr
         }
-        Ok(Some(_)) | Ok(None) => return,
+        Ok(Some(_)) | Ok(None) => return None,
         Err(e) => {
             eprintln!(
                 "worktree: could not look up PR to relabel for item {}: {e}",
                 item.id
             );
-            return;
+            return None;
         }
     };
-    if let Err(e) =
-        crate::github::issues::remove_label(&client, &repo, pr.number, "agentflare:in-review")
-    {
-        eprintln!(
-            "worktree: could not remove agentflare:in-review from PR #{}: {e}",
-            pr.number
-        );
-    }
-    if let Err(e) = crate::github::issues::add_labels(
-        &client,
-        &repo,
-        pr.number,
-        &["agentflare:completed".to_string()],
-    ) {
-        eprintln!(
-            "worktree: could not add agentflare:completed to PR #{}: {e}",
-            pr.number
-        );
-    }
+    Some(pr.number)
 }
 
 /// CI signal the in-review sweep (`supervisor::run_review_sweep`, item #65)
@@ -279,6 +304,12 @@ pub enum PrCiStatus {
     /// conflicted PR's existing check runs ran against a merge base that's
     /// about to be invalidated regardless of what they say.
     Conflicting {
+        number: u64,
+    },
+    /// The PR was closed without being merged. Nothing on that PR will ever
+    /// land, so `run_review_sweep` sends the item back for a fresh attempt
+    /// instead of polling a dead PR (or self-repairing it) forever.
+    Closed {
         number: u64,
     },
     Unknown,
@@ -347,6 +378,9 @@ fn pr_ci_status_impl(
     };
     if pr.merged_at.is_some() {
         return PrCiStatus::Merged;
+    }
+    if pr.state == "closed" {
+        return PrCiStatus::Closed { number: pr.number };
     }
     if pr.mergeable == Some(true) && pr.mergeable_state.as_deref() == Some("behind") {
         return PrCiStatus::Behind { number: pr.number };
@@ -440,6 +474,9 @@ pub(crate) fn pr_ci_status_from_batch(
 ) -> PrCiStatus {
     if data.merged {
         return PrCiStatus::Merged;
+    }
+    if data.closed {
+        return PrCiStatus::Closed { number };
     }
     if data.mergeable == Some(true) && data.mergeable_state.as_deref() == Some("behind") {
         return PrCiStatus::Behind { number };
@@ -595,35 +632,32 @@ fn conventional_pr_title(name: &str) -> String {
     format!("{inferred}: {trimmed}")
 }
 
-/// Merges `{"pr": {"number": N, "branch": "..."}}` into `item`'s existing
+/// Merges `{"pr": {"number": N, "branch": "..."}}` into `item`'s stored
 /// metadata (without clobbering unrelated keys like `size`/`workflow_run_id`)
 /// and persists it -- the identity `is_pr_merged`/`pr_ci_status` read back
 /// directly instead of reconstructing the branch name to rediscover the
 /// same PR (item #191: that reconstruction drifted from the PR's real
 /// branch, and `check_merge` reported "not merged yet" for a PR that had
-/// actually merged). Coerces non-object metadata to an empty object first,
-/// same defensive stance as `work_item_pipeline::persist_run_id` -- `Value`
-/// indexing panics assigning into anything that isn't already `Object`.
+/// actually merged).
+///
+/// Re-reads the row's *current* metadata and writes it back inside one
+/// IMMEDIATE transaction rather than merging into `item.metadata`: `item`
+/// is a snapshot taken before a push that can run for up to two minutes,
+/// and writing that stale blob back whole used to silently undo any
+/// metadata another writer (the pipeline's `workflow_run_id`, a repair
+/// tracker) stored in the meantime. Non-object metadata is coerced to an
+/// empty object first -- `Value` indexing panics assigning into anything
+/// that isn't already `Object`.
 fn merge_and_persist_pr_identity(
     conn: &rusqlite::Connection,
     item: &agentflare_backend::item::Item,
     number: u64,
     branch: &str,
 ) {
-    let mut merged = serde_json::from_str::<serde_json::Value>(&item.metadata)
-        .ok()
-        .and_then(|v| v.as_object().cloned())
-        .map(serde_json::Value::Object)
-        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
-    merged["pr"] = serde_json::json!({ "number": number, "branch": branch });
-    if let Err(e) = agentflare_backend::item::update(
-        conn,
-        &item.id,
-        agentflare_backend::item::UpdateItem {
-            metadata: Some(merged.to_string()),
-            ..Default::default()
-        },
-    ) {
+    let pr = serde_json::json!({ "number": number, "branch": branch });
+    if let Err(e) = crate::mcp_server::merge_item_metadata(conn, &item.id, |merged| {
+        merged.insert("pr".into(), pr);
+    }) {
         eprintln!(
             "worktree: could not persist PR identity for item {}: {e}",
             item.id
@@ -675,19 +709,38 @@ fn recover_pr_after_failed_create(
     item: &agentflare_backend::item::Item,
 ) -> Option<crate::github::models::PullRequest> {
     match crate::github::pulls::find_existing(client, repo, branch) {
-        Ok(Some(existing)) if is_own_pr(&existing, item) => Some(existing),
+        Ok(Some(existing)) if reusable_own_pr(&existing, item) => Some(existing),
         _ => None,
     }
+}
+
+/// What `push_and_open_pr` achieved -- `item_done` has to tell "a PR can
+/// never result here, by configuration" apart from "this attempt failed and
+/// a retry may succeed", which the old bare `Option<String>` couldn't: a
+/// repo with no GitHub remote or no credentials errored `done` forever.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PrOutcome {
+    /// A PR exists for this item's branch (freshly created, or already
+    /// open/merged from an earlier `done`). Carries its URL.
+    Opened(String),
+    /// Nothing to publish: no worktree was ever created, or the branch never
+    /// diverged from its target.
+    NothingToPush,
+    /// A PR is impossible for configuration reasons -- no `origin` remote at
+    /// all, a non-GitHub remote, or no GitHub credentials. `pushed` says
+    /// whether the branch did reach `origin`. Retrying can't change this.
+    NoPrPossible { pushed: bool, reason: String },
+    /// A push or GitHub call failed in a way a retry may fix (network, rate
+    /// limit, rejected push).
+    Failed(String),
 }
 
 /// Pushes `item`'s isolated worktree branch and opens a PR against
 /// `target_branch` — the `done`-side counterpart to `create_worktree`.
 /// Deliberately never merges: unreviewed code should never land on the
 /// target branch automatically, so the worktree/branch are left in place
-/// for the PR to actually get reviewed and merged. Soft-fails (eprintln, no
-/// error surfaced, returns `None`) on any failure — nothing here, including
-/// `gh`/GitHub credentials being unavailable, should block `done` since the
-/// item's completion is already committed to the DB by the time this runs.
+/// for the PR to actually get reviewed and merged. Never errors itself;
+/// every failure is classified into a `PrOutcome` for `item_done` to act on.
 pub fn push_and_open_pr(
     item: &agentflare_backend::item::Item,
     agent: &str,
@@ -695,13 +748,40 @@ pub fn push_and_open_pr(
     target_branch: &str,
     progress: Option<&ProgressSender>,
     summary: Option<&str>,
-) -> Option<String> {
-    let branch = flare_git_core::worktree::push_branch(
+) -> PrOutcome {
+    let worktree_path = repo_root
+        .join(".worktrees")
+        .join("task")
+        .join(item.sequence_id.to_string());
+    if !worktree_path.exists() {
+        return PrOutcome::NothingToPush;
+    }
+    // No `origin` at all: there is nowhere to push, and never will be until
+    // someone configures one -- not a failure worth retrying.
+    if flare_git_core::shell::run_in_opt(repo_root, &["remote", "get-url", "origin"]).is_none() {
+        eprintln!(
+            "worktree: no origin remote configured, skipping push/PR for item {}",
+            item.id
+        );
+        return PrOutcome::NoPrPossible {
+            pushed: false,
+            reason: "no origin remote is configured".into(),
+        };
+    }
+    let Some(branch) = flare_git_core::worktree::push_branch(
         item,
         repo_root,
         target_branch,
         as_progress(progress),
-    )?;
+    ) else {
+        // `push_branch` returns `None` both for "nothing to push" and for a
+        // push that failed; divergence tells the two apart.
+        return if branch_diverged(item, repo_root, target_branch) {
+            PrOutcome::Failed("git push failed (see server logs)".into())
+        } else {
+            PrOutcome::NothingToPush
+        };
+    };
     if let Some(p) = progress {
         p.send(0.5, Some(1.0), Some("Creating PR...".into()));
     }
@@ -715,10 +795,13 @@ pub fn push_and_open_pr(
         Some(r) => r,
         None => {
             eprintln!(
-                "worktree: cannot resolve origin remote, skipping PR for item {}",
+                "worktree: origin is not a GitHub remote, skipping PR for item {}",
                 item.id
             );
-            return None;
+            return PrOutcome::NoPrPossible {
+                pushed: true,
+                reason: "origin is not a GitHub remote".into(),
+            };
         }
     };
     let client = match crate::github::Client::new() {
@@ -728,63 +811,123 @@ pub fn push_and_open_pr(
                 "worktree: no GitHub credentials, skipping PR for item {}: {e}",
                 item.id
             );
-            return None;
+            return PrOutcome::NoPrPossible {
+                pushed: true,
+                reason: format!("no GitHub credentials: {e}"),
+            };
         }
     };
+    open_pr_for_pushed_branch(
+        &client,
+        &repo,
+        item,
+        &branch,
+        target_branch,
+        &body,
+        &machine,
+        progress,
+    )
+}
+
+/// Whether an existing PR on this item's branch should be returned instead
+/// of opening a new one: it must be this item's own PR, and not one that was
+/// closed without merging -- a closed attempt is dead (the review sweep
+/// sends its item back for a fresh try), so reusing it would bounce the item
+/// straight back into "in_review" on a PR that can never merge.
+fn reusable_own_pr(
+    existing: &crate::github::models::PullRequest,
+    item: &agentflare_backend::item::Item,
+) -> bool {
+    is_own_pr(existing, item) && (existing.state != "closed" || existing.merged_at.is_some())
+}
+
+/// The GitHub half of `push_and_open_pr`, once the branch is pushed and a
+/// repo/client are in hand -- split out so it can be driven against a mock
+/// server.
+///
+/// Prefers the item's recorded `metadata.pr.number` (a direct `pulls::get`,
+/// no branch search at all), then a head-filtered `find_existing`. A lookup
+/// *error* is reported as `Failed` without creating anything: under a rate
+/// limit, "couldn't check" used to fall through to `create` and open a
+/// duplicate PR every time `done` was retried.
+#[allow(clippy::too_many_arguments)]
+fn open_pr_for_pushed_branch(
+    client: &crate::github::Client,
+    repo: &RepoId,
+    item: &agentflare_backend::item::Item,
+    branch: &str,
+    target_branch: &str,
+    body: &str,
+    machine: &str,
+    progress: Option<&ProgressSender>,
+) -> PrOutcome {
+    let found_existing = |existing: crate::github::models::PullRequest| {
+        persist_pr_identity(item, existing.number, branch);
+        if let Some(p) = progress {
+            p.send(1.0, Some(1.0), Some("PR already exists".into()));
+        }
+        PrOutcome::Opened(existing.html_url)
+    };
+    if let Some(number) = pr_number_from_metadata(item) {
+        match crate::github::pulls::get(client, repo, number) {
+            Ok(existing)
+                if reusable_own_pr(&existing, item)
+                    && existing.head.as_ref().is_none_or(|h| h.git_ref == branch) =>
+            {
+                return found_existing(existing);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!(
+                    "worktree: could not look up recorded PR #{number} for item {}: {e}",
+                    item.id
+                );
+                return PrOutcome::Failed(format!("could not look up PR #{number}: {e}"));
+            }
+        }
+    }
     // Check for an existing PR on this branch before opening a new one.
     // GitHub's own API only rejects a duplicate while the existing PR is
-    // still open -- once it's merged (or manually closed), a second PR
-    // against the same branch is perfectly legal to create, which is
-    // exactly how a `done` re-run on an already-merged item ended up
-    // opening a redundant PR (2026-07-25). A lookup failure here is
-    // soft-failed the same way the rest of this function is: log and fall
-    // through to `create`, since a rare duplicate is a far smaller harm
-    // than silently never opening a PR on a lookup hiccup.
+    // still open -- once it's merged, a second PR against the same branch is
+    // perfectly legal to create, which is exactly how a `done` re-run on an
+    // already-merged item ended up opening a redundant PR (2026-07-25).
     //
-    // A closed/merged match is only trusted as *this item's own* prior PR
-    // when its body carries this item's marker -- branch names get reused
-    // across items over time, and `find_existing` matches on branch name
-    // alone, so an unrelated, already-merged PR from a past item can share
-    // this branch's name (item #63: that stale match got returned as
-    // `pr_url`, which made `in_review` true and skipped the
-    // `nothing_was_ever_committed` safety net for real, uncommitted work).
-    // An open match is always trusted regardless of its body, since GitHub
-    // itself would reject creating a genuine duplicate against it anyway.
-    match crate::github::pulls::find_existing(&client, &repo, &branch) {
-        Ok(Some(existing)) if is_own_pr(&existing, item) => {
-            persist_pr_identity(item, existing.number, &branch);
-            if let Some(p) = progress {
-                p.send(1.0, Some(1.0), Some("PR already exists".into()));
-            }
-            return Some(existing.html_url);
+    // A match is only trusted as *this item's own* prior PR when its body
+    // carries this item's marker -- branch names get reused across items
+    // over time, so an unrelated, already-merged PR from a past item can
+    // share this branch's name (item #63).
+    match crate::github::pulls::find_existing(client, repo, branch) {
+        Ok(Some(existing)) if reusable_own_pr(&existing, item) => {
+            return found_existing(existing);
         }
         Ok(Some(existing)) => {
             eprintln!(
-                "worktree: found a {} PR #{} on branch {branch} but it isn't item {}'s own PR -- opening a new one",
+                "worktree: found a {} PR #{} on branch {branch} but it isn't a reusable PR of item {} -- opening a new one",
                 existing.state, existing.number, item.id
             );
         }
         Ok(None) => {}
         Err(e) => {
             eprintln!(
-                "worktree: could not check for an existing PR for item {}: {e} -- creating one anyway",
+                "worktree: could not check for an existing PR for item {}: {e} -- not creating one blind",
                 item.id
             );
+            return PrOutcome::Failed(format!("could not check for an existing PR: {e}"));
         }
     }
     match crate::github::pulls::create(
-        &client,
-        &repo,
+        client,
+        repo,
         &conventional_pr_title(&item.name),
-        &branch,
+        branch,
         target_branch,
-        Some(&body),
+        Some(body),
     ) {
         Ok(pr) => {
-            persist_pr_identity(item, pr.number, &branch);
+            persist_pr_identity(item, pr.number, branch);
             if let Err(e) = crate::github::issues::add_labels(
-                &client,
-                &repo,
+                client,
+                repo,
                 pr.number,
                 &[
                     "agentflare:in-review".to_string(),
@@ -799,35 +942,22 @@ pub fn push_and_open_pr(
             if let Some(p) = progress {
                 p.send(1.0, Some(1.0), Some("PR created".into()));
             }
-            Some(pr.html_url)
+            PrOutcome::Opened(pr.html_url)
         }
         Err(e) => {
             // `create` fails this way when two workstations independently
-            // dispatched the same item raced: both `find_existing` checks
-            // above ran before either had created a PR yet, both saw
-            // nothing, both called `create`, and GitHub accepted only one
-            // (rejecting the loser with a duplicate-branch error). Without
-            // this recheck the loser used to just log and give up here,
-            // leaving the item without a linked PR even though the winner's
-            // PR -- the one the item actually needs to track -- already
-            // exists. This is the failure mode `push_and_open_pr`'s own
-            // success branch left unguarded (item #261: PR #688 ended up
-            // carrying two different workstations' `beacon:` labels because
-            // both reached the `Ok(pr)` branch above instead of one of them
-            // landing here and linking up with the other's PR instead).
+            // dispatched the same item raced: both lookups above ran before
+            // either had created a PR yet, both called `create`, and GitHub
+            // accepted only one (rejecting the loser with a duplicate-branch
+            // error). Recheck so the loser links up with the winner's PR
+            // instead of leaving the item without one (item #261).
             eprintln!(
                 "worktree: PR creation failed for item {}: {e} -- rechecking for a racing PR",
                 item.id
             );
-            match recover_pr_after_failed_create(&client, &repo, &branch, item) {
-                Some(existing) => {
-                    persist_pr_identity(item, existing.number, &branch);
-                    if let Some(p) = progress {
-                        p.send(1.0, Some(1.0), Some("PR already exists".into()));
-                    }
-                    Some(existing.html_url)
-                }
-                None => None,
+            match recover_pr_after_failed_create(client, repo, branch, item) {
+                Some(existing) => found_existing(existing),
+                None => PrOutcome::Failed(format!("PR creation failed: {e}")),
             }
         }
     }

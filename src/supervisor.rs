@@ -261,6 +261,32 @@ struct ProjectBatch {
     ready_id: String,
 }
 
+/// Most work jobs one project may have queued or running at once while
+/// other projects also have ready-for-work items waiting, so one project's
+/// backlog can't take every worker. `AGENTFLARE_WORK_MAX_PER_PROJECT`
+/// overrides it; otherwise half the worker pool (the same
+/// `AGENTFLARE_WORK_MAX_CONCURRENCY` / resource-gate sizing the daemon's
+/// `WorkerPool` starts with), never less than one.
+fn per_project_work_cap() -> u64 {
+    let parse = |var: &str| {
+        std::env::var(var)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|n| *n > 0)
+    };
+    if let Some(cap) = parse("AGENTFLARE_WORK_MAX_PER_PROJECT") {
+        return cap;
+    }
+    let workers = parse("AGENTFLARE_WORK_MAX_CONCURRENCY").unwrap_or_else(|| {
+        let available_parallelism = std::thread::available_parallelism().map_or(1, |n| n.get());
+        agentflare_resource_gate::pool_size::resolve_pool_size(
+            available_parallelism,
+            agentflare_resource_gate::pool_size::memory_budget_bytes(),
+        ) as u64
+    });
+    (workers / 2).max(1)
+}
+
 /// One pass: across every project registered in `project_dirs` (see
 /// `AgentflareMcp::register_project_dir`, called wherever an agentflare
 /// CLI/MCP call runs inside a linked repo) — not just whichever project
@@ -285,7 +311,29 @@ pub(crate) fn run_discovery_tick(
         let dirs = agentflare_backend::project_dir::list(conn).ok()?;
         let mut batches = Vec::new();
         for dir in dirs {
-            let labels = agentflare_backend::label::list_by_project(conn, &dir.project_id).ok()?;
+            // One project's broken or vanished folder (repo deleted/moved,
+            // unmounted drive) must not stall dispatch for every other
+            // project -- skip just this one, loudly, and look again next tick.
+            if !std::path::Path::new(&dir.folder_path).is_dir() {
+                eprintln!(
+                    "agentflare-supervisor: project {} is registered at {} but that folder does \
+                     not exist -- skipping its ready-for-work items this tick",
+                    dir.project_id, dir.folder_path
+                );
+                continue;
+            }
+            // Same isolation for a per-project DB read failure: `?` here
+            // used to abort the whole tick, for every project.
+            let labels = match agentflare_backend::label::list_by_project(conn, &dir.project_id) {
+                Ok(labels) => labels,
+                Err(e) => {
+                    eprintln!(
+                        "agentflare-supervisor: could not list labels for project {}: {e}",
+                        dir.project_id
+                    );
+                    continue;
+                }
+            };
             let mut label_id_by_name = std::collections::HashMap::new();
             for l in &labels {
                 label_id_by_name.insert(l.name.clone(), l.id.clone());
@@ -296,7 +344,17 @@ pub(crate) fn run_discovery_tick(
                 continue;
             };
             let items =
-                agentflare_backend::item::list_by_label(conn, &dir.project_id, &ready_id).ok()?;
+                match agentflare_backend::item::list_by_label(conn, &dir.project_id, &ready_id) {
+                    Ok(items) => items,
+                    Err(e) => {
+                        eprintln!(
+                            "agentflare-supervisor: could not list ready-for-work items for \
+                             project {}: {e}",
+                            dir.project_id
+                        );
+                        continue;
+                    }
+                };
             batches.push(ProjectBatch {
                 folder_path: dir.folder_path,
                 items,
@@ -311,6 +369,11 @@ pub(crate) fn run_discovery_tick(
         return result;
     };
 
+    // Per-project fairness: only once more than one project is competing
+    // for workers this tick -- a lone project may use the whole pool.
+    let contended = batches.iter().filter(|b| !b.items.is_empty()).count() > 1;
+    let project_cap = per_project_work_cap();
+
     for batch in batches {
         let ProjectBatch {
             folder_path,
@@ -318,6 +381,13 @@ pub(crate) fn run_discovery_tick(
             label_id_by_name,
             ready_id,
         } = batch;
+        let mut project_in_flight = if contended {
+            queue
+                .count_active_with_arg(&folder_path, Some(2))
+                .unwrap_or(0)
+        } else {
+            0
+        };
         for item in items {
             if let Some(gate_id) = label_id_by_name.get(NEEDS_DECISION_LABEL) {
                 let gated = mcp
@@ -381,6 +451,18 @@ pub(crate) fn run_discovery_tick(
                         result.waiting += 1;
                         continue;
                     }
+                    if contended && project_in_flight >= project_cap {
+                        // Leave ready-for-work in place, same as the other
+                        // Wait paths: the next tick re-checks the cap.
+                        eprintln!(
+                            "agentflare-supervisor: item #{} ({}) is ready-for-work but its \
+                             project already has {project_in_flight} work job(s) queued or \
+                             running (per-project cap {project_cap})",
+                            item.sequence_id, item.id
+                        );
+                        result.waiting += 1;
+                        continue;
+                    }
                     match dispatch_item(
                         mcp,
                         queue,
@@ -390,7 +472,10 @@ pub(crate) fn run_discovery_tick(
                         &label_id_by_name,
                         &ready_id,
                     ) {
-                        DispatchOutcome::Dispatched => result.dispatched += 1,
+                        DispatchOutcome::Dispatched => {
+                            result.dispatched += 1;
+                            project_in_flight += 1;
+                        }
                         DispatchOutcome::WaitingOnPlan => result.waiting += 1,
                         DispatchOutcome::NotDispatched => {}
                     }
@@ -1085,6 +1170,9 @@ pub(crate) struct ReviewSweepResult {
     /// item is picked up by the *next* tick's normal per-item loop, not this
     /// one.
     pub discovered: usize,
+    /// Items whose PR was closed without merging, sent back to the backlog
+    /// for a fresh attempt instead of sitting in "in_review" forever.
+    pub requeued: usize,
 }
 
 /// Why `self_repair_or_gate` did or didn't dispatch. A plain `bool` can't
@@ -1157,6 +1245,7 @@ pub(crate) fn run_review_sweep(
         waiting: 0,
         updated: 0,
         discovered: 0,
+        requeued: 0,
     };
     // Computed once, not per-project/per-PR: identifies this workstation to
     // `claim_pr_for_discovery`'s marker comment so two workstations racing to
@@ -1281,6 +1370,15 @@ pub(crate) fn run_review_sweep(
             stray_candidates,
         } = batch;
         let repo_root = std::path::PathBuf::from(&folder_path);
+        // Every per-item call below (`item_check_merge`, `comment_impl`,
+        // `item_add_label`, ...) resolves ids through `resolve_item_id`,
+        // which only accepts items of the instance's own project. The
+        // daemon's `mcp` is linked to whatever repo it was started in, so
+        // with it an in_review item from any other registered project could
+        // never be promoted, relabeled or cleaned up and sat in_review
+        // forever. Pin a view of it to this batch's project and folder.
+        let scoped = mcp.scoped_to_project(project_id.clone(), repo_root.clone());
+        let mcp = &scoped;
         // Resolved once per project and reused for discovery, the batched
         // GraphQL fetch below, and (implicitly, inside `pr_ci_status`) the
         // per-item REST fallback -- rather than every one of those re-doing
@@ -1587,8 +1685,100 @@ fn handle_pr_status(
                 result.skipped += 1;
             }
         }
+        crate::worktree::PrCiStatus::Closed { number } => {
+            if requeue_closed_pr_item(mcp, item, number) {
+                result.requeued += 1;
+            } else {
+                result.skipped += 1;
+            }
+        }
         crate::worktree::PrCiStatus::Pending | crate::worktree::PrCiStatus::Unknown => {
             result.skipped += 1;
+        }
+    }
+}
+
+/// A PR closed without merging will never land, and nothing in the sweep
+/// would ever move its item out of "in_review" again -- it used to sit there
+/// forever, holding its claim lease. Sends the item back for a fresh attempt
+/// instead: `item::redispatch` resets it to "backlog", re-attaches
+/// `ready-for-work` and clears `metadata.pr` (so the stray-PR self-heal
+/// can't drag it straight back), then the abandoned attempt's lease is
+/// released so the next dispatch can claim it. One comment records why.
+///
+/// Re-checks the item's live state first: the sweep's snapshot can be stale,
+/// and the state move out of "in_review" is what makes this run once per
+/// closed PR rather than once per tick. Returns whether the item was moved.
+fn requeue_closed_pr_item(
+    mcp: &AgentflareMcp,
+    item: &agentflare_backend::item::Item,
+    number: u64,
+) -> bool {
+    let author = crate::claims::owner_id();
+    let outcome = mcp.with_backend_db(|conn| -> agentflare_backend::error::Result<bool> {
+        let current = agentflare_backend::item::get(conn, &item.id)?;
+        let state = agentflare_backend::state::get(conn, &current.state_id)?;
+        if state.group_name != "in_review" {
+            return Ok(false);
+        }
+        // A different PR recorded since the snapshot was taken is not the
+        // one that was just seen closed.
+        if crate::worktree::pr_number_from_metadata(&current).is_some_and(|n| n != number) {
+            return Ok(false);
+        }
+        let rearmed = match agentflare_backend::item::redispatch(conn, &item.id, None)? {
+            agentflare_backend::item::RedispatchOutcome::Ready { .. } => true,
+            agentflare_backend::item::RedispatchOutcome::NoAssignee => {
+                // Nobody to hand it back to automatically: still leave
+                // "in_review" and drop the dead PR, so it waits in the
+                // backlog for an assignee instead of polling a closed PR.
+                let backlog =
+                    agentflare_backend::state::first_in_group(conn, &current.project_id, "backlog")?;
+                agentflare_backend::item::update_state(conn, &item.id, &backlog.id)?;
+                conn.execute(
+                    "UPDATE items SET metadata = json_remove(metadata, '$.pr') \
+                     WHERE id = ?1 AND json_valid(metadata)",
+                    rusqlite::params![item.id],
+                )?;
+                false
+            }
+        };
+        if let Some(owner) = agentflare_backend::claim::current_owner(conn, &item.id) {
+            agentflare_backend::claim::release(conn, &item.id, &owner)?;
+        }
+        let next = if rearmed {
+            "It has been moved back to the backlog and re-armed with `ready-for-work` for a fresh attempt."
+        } else {
+            "It has been moved back to the backlog; it has no assignee, so assign one to have it picked up again."
+        };
+        agentflare_backend::comment::create(
+            conn,
+            &item.id,
+            &author,
+            &format!(
+                "## supervisor — PR closed without merging\n\nPR #{number} was closed without \
+                 being merged, so nothing from it will land. {next}"
+            ),
+        )?;
+        Ok(true)
+    });
+    match outcome {
+        Ok(Ok(moved)) => moved,
+        Ok(Err(e)) => {
+            eprintln!(
+                "agentflare-supervisor: could not requeue item #{} ({}) after its PR #{number} \
+                 was closed: {e}",
+                item.sequence_id, item.id
+            );
+            false
+        }
+        Err(e) => {
+            eprintln!(
+                "agentflare-supervisor: could not requeue item #{} ({}) after its PR #{number} \
+                 was closed: {e:?}",
+                item.sequence_id, item.id
+            );
+            false
         }
     }
 }
@@ -1828,15 +2018,14 @@ pub(crate) fn cascade_unblock_dependents(conn: &rusqlite::Connection, item_id: &
 /// returning and the job actually reaching `item_claim`, during which the
 /// item's state group hasn't flipped out of "in_review" yet and a second
 /// sweep tick could otherwise dispatch a duplicate.
+///
+/// A targeted count over every active row, not `Queue::list` -- that only
+/// returns the 100 newest jobs, so an older still-queued job for this item
+/// was invisible to this guard once enough other work piled up behind it.
 fn job_in_flight(queue: &agentflare_jobs::Queue, item_id: &str) -> bool {
-    [
-        agentflare_jobs::JobState::Queued,
-        agentflare_jobs::JobState::Running,
-    ]
-    .into_iter()
-    .filter_map(|state| queue.list(Some(state)).ok())
-    .flatten()
-    .any(|job| job.args.contains(&item_id.to_string()))
+    queue
+        .count_active_with_arg(item_id, None)
+        .is_ok_and(|n| n > 0)
 }
 
 /// Telegram notifications and the inbound channel-approval poll. Split out

@@ -895,6 +895,21 @@ pub(crate) fn build_finalize_step(
                         })?;
                     let done_val: serde_json::Value =
                         serde_json::from_str(&done_resp).unwrap_or(serde_json::Value::Null);
+                    // "unchanged": nothing was ever committed on the item's
+                    // branch, so `item_done` released the claim and left the
+                    // item in "started" -- no PR, no completion. Reporting
+                    // that as success left the item parked there with no
+                    // claim, no `ready-for-work` label and no job, forever.
+                    // Fail the run instead, so the terminal-failure hook
+                    // re-arms it (bounded by the dispatch failure ceiling).
+                    // `StepResult::Failed`, not an error: a retry of this
+                    // step would just find the same empty branch again.
+                    if done_val["status"].as_str() == Some("unchanged") {
+                        return Ok(StepResult::Failed(format!(
+                            "finalize: item {item_id} has no committed changes on its branch -- \
+                             nothing to publish, so it was not marked done"
+                        )));
+                    }
                     ctx.data.pr_url = done_val["pr_url"].as_str().map(str::to_string);
                     let leave_claim_held = done_val["status"].as_str() == Some("in_review");
                     finalize_release_claim_best_effort(&mcp, &item_id, leave_claim_held);
@@ -1366,10 +1381,11 @@ pub(crate) fn run_or_resume_with_sender(
                 ) =>
             {
                 // Non-terminal, and confirmed above to be this item's own
-                // run: either already resumed by the boot-time `recover()`
-                // sweep (Task 8) or genuinely still running in this same
-                // live process. Either way, do NOT start a second run
-                // against it — just await this one.
+                // run: resumed by the boot-time `recover()` sweep (Task 8),
+                // still running in this same live process, or left behind
+                // by a process that died. Never start a second run against
+                // it — adopt it (see `adopt_existing_run`) and await it.
+                adopt_existing_run(eng, run_id, &state, &owner).await?;
                 run_id
             }
             _ => {
@@ -1392,6 +1408,12 @@ pub(crate) fn run_or_resume_with_sender(
         // against this loop's 200ms poll cadence.
         let mut last_heartbeat = std::time::Instant::now();
         const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+        // Job-cancel checks read SQLite; ~1/s is plenty for a loop whose
+        // only job is to notice.
+        let mut last_cancel_check = std::time::Instant::now();
+        const CANCEL_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+        let waiter = attach_run_waiter(run_id);
+        let mut takeovers = 0u32;
 
         loop {
             let state = eng.get_status(run_id).await.map_err(|e| e.to_string())?;
@@ -1403,14 +1425,58 @@ pub(crate) fn run_or_resume_with_sender(
                         .unwrap_or_else(|| "workflow run failed".to_string()));
                 }
                 _ => {
+                    if waiter.is_superseded() {
+                        // A newer dispatch in this process adopted the run
+                        // and reports its outcome; stepping aside quietly
+                        // (no release/comment) keeps this attempt from
+                        // touching a claim that may now be the newer one's.
+                        eprintln!(
+                            "work_item_pipeline: item {}: a newer dispatch attached to run                              {run_id}; this waiter is stepping aside",
+                            item.id
+                        );
+                        return Ok(());
+                    }
+                    // Nobody is executing it (its process died, or its
+                    // driver here exited without settling it): take it over
+                    // rather than wait on a run that will never move.
+                    if !eng.is_driving(run_id) && !eng.is_leased_elsewhere(&state) {
+                        takeovers += 1;
+                        if takeovers > MAX_RUN_TAKEOVERS {
+                            return Err(format!(
+                                "workflow run {run_id} keeps stalling without an executor \
+                                 (taken over {MAX_RUN_TAKEOVERS} times); giving up"
+                            ));
+                        }
+                        if eng.resume_run(run_id).await.map_err(|e| e.to_string())? {
+                            eprintln!(
+                                "work_item_pipeline: item {}: took over orphaned run {run_id}",
+                                item.id
+                            );
+                        }
+                    }
+                    if last_cancel_check.elapsed() >= CANCEL_CHECK_INTERVAL {
+                        last_cancel_check = std::time::Instant::now();
+                        if crate::agent_launch::owner_job_cancelled(&heartbeat_owner) {
+                            let _ = eng.cancel_workflow(run_id).await;
+                            return Err(agentflare_jobs::cancel::CANCELLED_MESSAGE.to_string());
+                        }
+                    }
                     if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
-                        let _ = crate::claims::with_owner_override(heartbeat_owner.clone(), || {
-                            mcp.item_heartbeat(ItemRequest {
-                                action: "heartbeat".into(),
-                                id: Some(item.id.clone()),
-                                ..Default::default()
-                            })
-                        });
+                        let heartbeat =
+                            crate::claims::with_owner_override(heartbeat_owner.clone(), || {
+                                mcp.item_heartbeat(ItemRequest {
+                                    action: "heartbeat".into(),
+                                    id: Some(item.id.clone()),
+                                    ..Default::default()
+                                })
+                            });
+                        if heartbeat_lost_claim(&heartbeat)
+                            && let Some(msg) =
+                                stop_run_after_lost_claim(eng, run_id, &item.id, &heartbeat_owner)
+                                    .await
+                        {
+                            return Err(msg);
+                        }
                         poll_pending_corrections(&mcp, eng, run_id, &item.id, &heartbeat_owner)
                             .await;
                         last_heartbeat = std::time::Instant::now();
@@ -1422,49 +1488,193 @@ pub(crate) fn run_or_resume_with_sender(
     })
 }
 
-/// Merge `workflow_run_id` into the item's *current* metadata JSON and save
-/// it via `item_update` — how a fresh/re-dispatched run's id gets recorded
-/// so `run_or_resume`'s next call (or a boot-time `recover()`) can find it.
+/// Boot-time `recover_with` filter: don't resurrect a run whose item was
+/// completed or cancelled while the daemon was down — resuming it would just
+/// spend agent turns on (and possibly `item_done`) an item that's finished.
+/// Fail-open: a run whose item can't be looked up is still recovered.
+/// Pass it to `engine().recover_with(..)` in `dashboard::server`'s boot path.
+pub(crate) fn should_recover_at_boot(state: &flare_workflow::WorkflowState<WorkItemData>) -> bool {
+    let item_id = &state.context.data.item_id;
+    if item_id.is_empty() {
+        return true;
+    }
+    let group = AgentflareMcp::default()
+        .with_backend_db(|conn| {
+            let item = agentflare_backend::item::get(conn, item_id).ok()?;
+            agentflare_backend::state::get(conn, &item.state_id)
+                .ok()
+                .map(|s| s.group_name)
+        })
+        .ok()
+        .flatten();
+    !matches!(group.as_deref(), Some("completed" | "cancelled"))
+}
+
+/// How many times one `run_or_resume_with_sender` call will re-drive a run
+/// it finds with no live executor before giving up — bounds a run whose
+/// execution keeps erroring out straight away (e.g. a broken store) instead
+/// of spinning on it at the wait loop's poll cadence.
+const MAX_RUN_TAKEOVERS: u32 = 3;
+
+/// Adopt an existing non-terminal run for the dispatch now awaiting it.
 ///
-/// Re-fetches the item's metadata immediately before merging, rather than
-/// reusing `run_or_resume_with_sender`'s stale function-entry snapshot —
-/// same pattern `persist_comment_cursor`/`supervisor::persist_repair_track`
-/// use. Merging into a stale snapshot silently reverts metadata written in
-/// between; live-confirmed on item #281, where a human's plan approval was
-/// wiped back to "pending" by exactly this wholesale overwrite.
+/// 1. Rebind its persisted claim owner to `owner`. After a restart the run
+///    still carries the dead job's `<agent>:<job-id>`, whose claim the boot
+///    reconcile released; this dispatch re-claimed under a new id, so
+///    without the rebind every later turn's `AGENTFLARE_CLAIM_OWNER` and
+///    `finalize`'s `item_done` would run as the old owner and be refused
+///    for owner drift. `patch_run_data` also re-applies it over a step that
+///    was already mid-flight, so its write-back can't revert it.
+/// 2. Take it over if nothing is executing it: a run left `Running` by a
+///    process that died has a stale (or no) executor lease and would never
+///    progress on its own. A fresh lease held by another live process
+///    (e.g. a concurrent `agentflare work`) is left to that process.
+async fn adopt_existing_run(
+    eng: &WorkflowEngine<WorkItemData, SqliteStore<WorkItemData>>,
+    run_id: flare_workflow::WorkflowRunId,
+    state: &flare_workflow::WorkflowState<WorkItemData>,
+    owner: &str,
+) -> Result<(), String> {
+    if state.context.data.owner != owner {
+        eprintln!(
+            "work_item_pipeline: rebinding run {run_id}'s claim owner {:?} -> {owner:?}",
+            state.context.data.owner
+        );
+        let new_owner = owner.to_string();
+        eng.patch_run_data(run_id, move |data: &mut WorkItemData| {
+            data.owner = new_owner.clone();
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    if !eng.is_driving(run_id)
+        && !eng.is_leased_elsewhere(state)
+        && eng.resume_run(run_id).await.map_err(|e| e.to_string())?
+    {
+        eprintln!("work_item_pipeline: took over orphaned run {run_id} for this dispatch");
+    }
+    Ok(())
+}
+
+/// Whether an `item_heartbeat` response says the claim is no longer held by
+/// the heartbeating owner. A transport/DB error is not evidence either way.
+fn heartbeat_lost_claim<E>(response: &Result<String, E>) -> bool {
+    response
+        .as_ref()
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|v| v["heartbeat"].as_bool())
+        == Some(false)
+}
+
+/// The claim this waiter heartbeats for is gone (expired and re-claimed,
+/// released, or stolen), so the run is now working an item it doesn't own —
+/// stop it instead of heartbeating a lease that isn't ours forever. `None`
+/// when the run is in `finalize` or already terminal: `finalize` releases
+/// the claim itself right before the run settles, which reads the same way.
+async fn stop_run_after_lost_claim(
+    eng: &WorkflowEngine<WorkItemData, SqliteStore<WorkItemData>>,
+    run_id: flare_workflow::WorkflowRunId,
+    item_id: &str,
+    owner: &str,
+) -> Option<String> {
+    let state = eng.get_status(run_id).await.ok()?;
+    let finishing = matches!(
+        state.status,
+        WorkflowStatus::Completed | WorkflowStatus::Failed | WorkflowStatus::Cancelled
+    ) || state.current_step == Some(StepId::new("finalize"));
+    if finishing {
+        return None;
+    }
+    let _ = eng.cancel_workflow(run_id).await;
+    Some(format!(
+        "claim on item {item_id} is no longer held by {owner}; cancelled workflow run {run_id}"
+    ))
+}
+
+/// The waiter currently attached to each run in this process. A second
+/// dispatch awaiting the same run (e.g. a watchdog retry whose timed-out
+/// attempt is still alive) supersedes the first, so there is only ever one
+/// waiter heartbeating and reporting for a run.
+type RunWaiters = std::collections::HashMap<
+    flare_workflow::WorkflowRunId,
+    (u64, std::sync::Arc<std::sync::atomic::AtomicBool>),
+>;
+static RUN_WAITERS: std::sync::LazyLock<std::sync::Mutex<RunWaiters>> =
+    std::sync::LazyLock::new(Default::default);
+static NEXT_WAITER_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+struct RunWaiter {
+    run_id: flare_workflow::WorkflowRunId,
+    token: u64,
+    superseded: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RunWaiter {
+    fn is_superseded(&self) -> bool {
+        self.superseded.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for RunWaiter {
+    fn drop(&mut self) {
+        let mut waiters = RUN_WAITERS.lock().unwrap_or_else(|e| e.into_inner());
+        if waiters
+            .get(&self.run_id)
+            .is_some_and(|(token, _)| *token == self.token)
+        {
+            waiters.remove(&self.run_id);
+        }
+    }
+}
+
+fn attach_run_waiter(run_id: flare_workflow::WorkflowRunId) -> RunWaiter {
+    let token = NEXT_WAITER_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let superseded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let previous = RUN_WAITERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(run_id, (token, superseded.clone()));
+    if let Some((_, previous)) = previous {
+        previous.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    RunWaiter {
+        run_id,
+        token,
+        superseded,
+    }
+}
+
+/// Merge `workflow_run_id` into the item's *current* metadata JSON and save
+/// it -- how a fresh/re-dispatched run's id gets recorded so
+/// `run_or_resume`'s next call (or a boot-time `recover()`) can find it.
+///
+/// The read of the stored metadata and the write back happen inside one
+/// IMMEDIATE transaction (`merge_item_metadata`), never against a snapshot:
+/// merging into a stale copy silently reverts metadata written in between
+/// (live-confirmed on item #281, where a human's plan approval was wiped
+/// back to "pending" by exactly this wholesale overwrite), and a re-fetch
+/// followed by a separate `item_update` still left a window for another
+/// process's write to land between the two.
 fn persist_run_id(
     mcp: &AgentflareMcp,
     item_id: &str,
     run_id: flare_workflow::WorkflowRunId,
 ) -> Result<(), String> {
-    let raw = mcp
-        .item_get(ItemRequest {
-            action: "get".into(),
-            id: Some(item_id.to_string()),
-            ..Default::default()
+    mcp.with_backend_db(|conn| {
+        let id = mcp
+            .resolve_item_id(conn, item_id)
+            .map_err(|e| e.message.to_string())?;
+        crate::mcp_server::merge_item_metadata(conn, &id, |metadata| {
+            metadata.insert(
+                "workflow_run_id".into(),
+                serde_json::Value::String(run_id.to_string()),
+            );
         })
-        .map_err(|e| e.message.to_string())?;
-    let item: agentflare_backend::item::Item =
-        serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-    // `item.metadata` can be a non-object (e.g. a double-JSON-encoded
-    // string, confirmed live on item #331) when the item's stored metadata
-    // is corrupted -- `Value`'s `IndexMut` panics assigning a key into
-    // anything that isn't already `Object`, so coerce defensively instead
-    // of trusting the stored value's shape.
-    let mut merged = serde_json::from_str::<serde_json::Value>(&item.metadata)
-        .ok()
-        .and_then(|v| v.as_object().cloned())
-        .map(serde_json::Value::Object)
-        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
-    merged["workflow_run_id"] = serde_json::Value::String(run_id.to_string());
-    mcp.item_update(ItemRequest {
-        action: "update".into(),
-        id: Some(item_id.to_string()),
-        metadata: Some(merged),
-        ..Default::default()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
     })
-    .map(|_| ())
-    .map_err(|e| e.message.to_string())
+    .map_err(|e| e.message.to_string())?
 }
 
 include!("work_item_pipeline/task_sourcing.rs");

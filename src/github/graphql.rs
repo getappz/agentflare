@@ -31,6 +31,9 @@ pub const GRAPHQL_PR_BATCH_SIZE: usize = 40;
 #[derive(Debug)]
 pub struct BatchPrData {
     pub merged: bool,
+    /// GraphQL `state == CLOSED` -- closed without merging (a merged PR
+    /// reports `MERGED` instead, so this and `merged` are never both true).
+    pub closed: bool,
     pub mergeable: Option<bool>,
     /// Lowercased to match REST's `mergeable_state` string values ("behind",
     /// "clean", ...) -- GraphQL's `mergeStateStatus` enum comes back
@@ -50,7 +53,7 @@ fn pr_alias(number: u64) -> String {
 
 fn pr_subquery(number: u64) -> String {
     format!(
-        "{}: pullRequest(number: {number}) {{ merged mergeable mergeStateStatus \
+        "{}: pullRequest(number: {number}) {{ state merged mergeable mergeStateStatus \
          labels(first: 20) {{ nodes {{ name }} }} \
          commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ contexts(first: 100) {{ \
          nodes {{ __typename ... on CheckRun {{ name status conclusion }} }} }} }} }} }} }} }}",
@@ -128,6 +131,7 @@ pub fn batch_pr_status_chunked(
 
 fn parse_batch_pr(node: &serde_json::Value) -> BatchPrData {
     let merged = node["merged"].as_bool().unwrap_or(false);
+    let closed = !merged && node["state"].as_str() == Some("CLOSED");
     let mergeable = match node["mergeable"].as_str() {
         Some("MERGEABLE") => Some(true),
         Some("CONFLICTING") => Some(false),
@@ -161,6 +165,7 @@ fn parse_batch_pr(node: &serde_json::Value) -> BatchPrData {
         .unwrap_or_default();
     BatchPrData {
         merged,
+        closed,
         mergeable,
         mergeable_state,
         checks,

@@ -979,8 +979,13 @@ fn run_discovery_tick_dispatches_ready_items_from_every_registered_project_not_j
     // inside it) must get its ready-for-work items picked up too.
     let mcp = test_mcp();
     let queue = test_queue();
-    let item_a = seed_ready_item_in_project(&mcp, "proj-a", "/repo/a");
-    let item_b = seed_ready_item_in_project(&mcp, "proj-b", "/repo/b");
+    // Real folders: discovery skips a project whose folder doesn't exist.
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let path_a = dir_a.path().to_string_lossy().to_string();
+    let path_b = dir_b.path().to_string_lossy().to_string();
+    let item_a = seed_ready_item_in_project(&mcp, "proj-a", &path_a);
+    let item_b = seed_ready_item_in_project(&mcp, "proj-b", &path_b);
 
     let auth_conn = test_auth_conn();
     let result = run_discovery_tick(
@@ -999,13 +1004,13 @@ fn run_discovery_tick_dispatches_ready_items_from_every_registered_project_not_j
 
     let job_a = jobs.iter().find(|j| j.args.contains(&item_a)).unwrap();
     assert!(
-        job_a.args.contains(&"/repo/a".to_string()),
+        job_a.args.contains(&path_a),
         "job for proj-a's item must carry proj-a's own folder path, got {:?}",
         job_a.args
     );
     let job_b = jobs.iter().find(|j| j.args.contains(&item_b)).unwrap();
     assert!(
-        job_b.args.contains(&"/repo/b".to_string()),
+        job_b.args.contains(&path_b),
         "job for proj-b's item must carry proj-b's own folder path, got {:?}",
         job_b.args
     );
@@ -1359,6 +1364,9 @@ fn run_review_sweep_skips_a_numbered_item_the_same_way_when_no_remote_resolves()
 
 #[path = "supervisor/tests/stray_pr_tests.rs"]
 mod stray_pr_tests;
+
+#[path = "supervisor/tests/multi_project_sweep_tests.rs"]
+mod multi_project_sweep_tests;
 
 #[test]
 fn run_review_sweep_scans_in_review_items_from_every_registered_project_not_just_one() {

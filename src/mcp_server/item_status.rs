@@ -46,6 +46,7 @@ fn pr_status_summary(
         crate::worktree::PrCiStatus::Conflicting { number } => {
             ("conflicting", Some(number), vec![], vec![])
         }
+        crate::worktree::PrCiStatus::Closed { number } => ("closed", Some(number), vec![], vec![]),
         crate::worktree::PrCiStatus::Unknown => ("unknown", known_number, vec![], vec![]),
     };
     PrStatusSummary {

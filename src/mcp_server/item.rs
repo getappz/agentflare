@@ -986,15 +986,36 @@ impl AgentflareMcp {
         })?
     }
 
-    pub(crate) fn item_update(&self, req: ItemRequest) -> Result<String, ErrorData> {
+    pub(crate) fn item_update(&self, mut req: ItemRequest) -> Result<String, ErrorData> {
         let raw = req
             .id
+            .take()
             .ok_or_else(|| ErrorData::invalid_params("id is required for update", None))?;
         if raw.trim().is_empty() {
             return Err(ErrorData::invalid_params("id is required", None));
         }
+        // One IMMEDIATE transaction around the read of the current metadata
+        // (which `restore_plan_transition_fields`/`default_plan_gate_patch`/
+        // `merge_submitted_plan` all merge against) and the write below:
+        // other processes write metadata on their own connections, and a
+        // write landing between the two used to be silently overwritten.
         self.with_backend_db(|conn| {
-            let id = self.resolve_item_id(conn, &raw)?;
+            crate::mcp_server::in_immediate_tx(
+                conn,
+                |e| ErrorData::internal_error(e.to_string(), None),
+                || self.item_update_in(conn, &raw, req),
+            )
+        })?
+    }
+
+    fn item_update_in(
+        &self,
+        conn: &Connection,
+        raw: &str,
+        req: ItemRequest,
+    ) -> Result<String, ErrorData> {
+        {
+            let id = self.resolve_item_id(conn, raw)?;
             // `parent_id` used to be accepted and silently dropped here (#377).
             // An explicit empty string detaches the item; anything else is a
             // sequence_id or UUID resolved the same way `id` is.
@@ -1086,7 +1107,7 @@ impl AgentflareMcp {
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
             }
             Ok(serde_json::to_string_pretty(&item).unwrap_or_default())
-        })?
+        }
     }
 
     pub(super) fn item_update_state(&self, req: ItemRequest) -> Result<String, ErrorData> {
@@ -1144,9 +1165,15 @@ impl AgentflareMcp {
         // backend lock; `git worktree add` below is a blocking
         // filesystem+subprocess operation that has no business
         // running while the shared DB mutex is held.
-        let (outcome, item_id, item, target_branch, ttl_used) =
-            self.with_backend_db(|conn| {
+        let (outcome, item_id, item, target_branch, ttl_used, before_claim) = self
+            .with_backend_db(|conn| {
                 let item_id = self.resolve_item_id(conn, &raw)?;
+                // What `item::claim` is about to change (state -> "started",
+                // assignee), so a claim whose worktree then can't be created
+                // can be put back exactly as it was found.
+                let before_claim = agentflare_backend::item::get(conn, &item_id)
+                    .ok()
+                    .map(|i| (i.state_id, i.assignee_agent));
                 // Read again (cheap) so a `Held` response can report the TTL it
                 // was actually gated by -- `item::claim` computes this internally
                 // for in-review items but doesn't hand it back (item #108).
@@ -1163,7 +1190,14 @@ impl AgentflareMcp {
                     } else {
                         (None, None)
                     };
-                Ok::<_, ErrorData>((outcome, item_id, item, target_branch, ttl_used))
+                Ok::<_, ErrorData>((
+                    outcome,
+                    item_id,
+                    item,
+                    target_branch,
+                    ttl_used,
+                    before_claim,
+                ))
             })??;
         let worktree_result = match (&item, &target_branch) {
             (Some(item), Some(target)) => Some(
@@ -1176,6 +1210,20 @@ impl AgentflareMcp {
                     }),
             ),
             _ => None,
+        };
+        // A claim with no worktree is a wedge: the item sits "started" under
+        // a live lease with nowhere to do the work. Unless the failure is a
+        // transient registration/lock race (the job path retries those with
+        // the same owner, so the claim must stay), give the claim back and
+        // restore the item's prior state/assignee right here, rather than
+        // relying on every caller to clean up after it.
+        let claim_rolled_back = match (&worktree_result, &before_claim) {
+            (Some(Err(e)), Some((prev_state_id, prev_assignee)))
+                if !flare_git_core::worktree::is_retryable_worktree_race(e) =>
+            {
+                self.roll_back_claim(&item_id, &owner, prev_state_id, prev_assignee.as_deref())
+            }
+            _ => false,
         };
         // A re-claimed/redispatched worktree is never refreshed by
         // `create_worktree` itself (its own fetch only ever runs on first
@@ -1218,6 +1266,13 @@ impl AgentflareMcp {
                     }
                     Some(Err(e)) => {
                         resp["worktree_error"] = serde_json::Value::String(e);
+                        // The response shape (`status: acquired` plus
+                        // `worktree_error`) is what `cli::work` keys its
+                        // comment + retry/fatal classification off, so it is
+                        // kept; this flag says the lease is already gone.
+                        if claim_rolled_back {
+                            resp["claim_released"] = serde_json::Value::Bool(true);
+                        }
                     }
                     // Only reachable when `item::get` fails to read the item
                     // back right after this same claim acquired it —
@@ -1496,8 +1551,10 @@ impl AgentflareMcp {
                 if let agentflare_backend::claim::Acquire::Held {
                     owner: holder,
                     age_secs,
-                } = agentflare_backend::claim::acquire(conn, &item_id, &owner, now, ttl)
+                } = agentflare_backend::claim::acquire_if_stale_only(conn, &item_id, &owner, now, ttl)
                     .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+                    // No claim row: nothing to release (e.g. redispatched away).
+                    .unwrap_or(agentflare_backend::claim::Acquire::Acquired)
                 {
                     return Err(ErrorData::invalid_params(
                         format!(
@@ -1546,6 +1603,21 @@ impl AgentflareMcp {
         // even when a PR ends up open and unreviewed (item #420).
         let (item_id, owns_claim, item, target_branch) = self.with_backend_db(|conn| {
             let item_id = self.resolve_item_id(conn, &raw)?;
+            // A finished item has nothing left to publish: re-running `done`
+            // on it would steal its (released) lease, re-push its branch and
+            // possibly open a second PR. Refuse up front, non-retryably.
+            let state = agentflare_backend::item::get(conn, &item_id)
+                .and_then(|i| agentflare_backend::state::get(conn, &i.state_id))
+                .map_err(map_backend_err)?;
+            if matches!(state.group_name.as_str(), "completed" | "cancelled") {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "item {item_id} is already {} -- refusing to mark it done again",
+                        state.group_name
+                    ),
+                    None,
+                ));
+            }
             let mut owns_claim = agentflare_backend::claim::is_owner(conn, &item_id, &owner)
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
             if !owns_claim {
@@ -1555,8 +1627,10 @@ impl AgentflareMcp {
                 // stale/absent one is fair game, and stealing it here
                 // means the rest of `done` below runs exactly as if we'd
                 // claimed it ourselves.
-                owns_claim = match agentflare_backend::claim::acquire(conn, &item_id, &owner, now, ttl)
-                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+                owns_claim = match agentflare_backend::item::steal_abandoned_claim(
+                    conn, &item_id, &owner, now, ttl,
+                )
+                .map_err(map_backend_err)?
                 {
                     agentflare_backend::claim::Acquire::Held {
                         owner: holder,
@@ -1654,7 +1728,7 @@ impl AgentflareMcp {
             }
         }
         let agent = crate::claims::agent_of(&owner);
-        let pr_url = match (&item, &target_branch) {
+        let pr_outcome = match (&item, &target_branch) {
             (Some(item), Some(target)) if should_push => PROGRESS_SENDER
                 .try_with(|ps| {
                     crate::worktree::push_and_open_pr(
@@ -1671,7 +1745,15 @@ impl AgentflareMcp {
                         item, agent, &repo_root, target, None, summary,
                     )
                 }),
-            _ => None,
+            _ => crate::worktree::PrOutcome::NothingToPush,
+        };
+        let (pr_url, no_pr, pr_failure) = match pr_outcome {
+            crate::worktree::PrOutcome::Opened(url) => (Some(url), None, None),
+            crate::worktree::PrOutcome::NoPrPossible { pushed, reason } => {
+                (None, Some((pushed, reason)), None)
+            }
+            crate::worktree::PrOutcome::Failed(reason) => (None, None, Some(reason)),
+            crate::worktree::PrOutcome::NothingToPush => (None, None, None),
         };
         // An open PR (freshly created, or already existed) means the work
         // isn't actually finished: move to "in_review" instead of
@@ -1703,15 +1785,24 @@ impl AgentflareMcp {
         // and sailed straight through to `mark_completed` below with zero
         // code changed.
         let nothing_was_ever_committed = !in_review && owns_claim && !diverged;
-        // A real commit exists but push/PR creation soft-failed and never
-        // produced a PR (item #109) -- hard-error instead of completing.
-        let push_or_pr_failed = !in_review && owns_claim && should_push && diverged;
+        // A real commit exists but push/PR creation failed in a way a retry
+        // may fix (item #109) -- hard-error instead of completing, so the
+        // caller (finalize's retry, or the failure hook's redispatch) tries
+        // again. A PR that is impossible by configuration (`no_pr`: no
+        // origin, a non-GitHub remote, no credentials) is NOT this case:
+        // retrying can never change it, and erroring here used to make
+        // `done` fail forever in such repos. Those complete below instead.
+        let push_or_pr_failed =
+            !in_review && owns_claim && should_push && diverged && no_pr.is_none();
         if push_or_pr_failed {
+            let detail = pr_failure
+                .as_deref()
+                .unwrap_or("no pull request resulted; check server logs");
             let _ = self.comment_impl(CommentRequest {
                 action: "create".into(),
                 item_id: Some(item_id.clone()),
                 body: Some(format!(
-                    "## agentflare work — PR creation failed\n\nThe branch has real commits but no pull request resulted; check server logs for item {item_id}. Left in place rather than completed."
+                    "## agentflare work — PR creation failed\n\nThe branch has real commits but no pull request resulted ({detail}) for item {item_id}. Left in place rather than completed."
                 )),
                 ..Default::default()
             });
@@ -1770,9 +1861,9 @@ impl AgentflareMcp {
             if !marked {
                 return Err(ErrorData::internal_error(
                     format!(
-                        "item {item_id}: PR was opened but the claim was lost before the item \
-                         could be marked in_review (owner mismatch) -- item state was NOT \
-                         updated"
+                        "item {item_id}: PR was opened but the claim was lost, or the item left \
+                         started/in_review (cancelled, completed or redispatched), before it \
+                         could be marked in_review -- item state was NOT updated"
                     ),
                     None,
                 ));
@@ -1784,6 +1875,11 @@ impl AgentflareMcp {
                     .map_err(map_backend_err)
             })??;
             if moved {
+                if let Some((pushed, reason)) = &no_pr
+                    && diverged
+                {
+                    self.record_no_pr_completion(&item_id, *pushed, reason);
+                }
                 release_claim_and_cleanup(&item);
             }
             moved
@@ -1798,6 +1894,12 @@ impl AgentflareMcp {
         let mut resp = serde_json::json!({"done": done, "item_id": item_id, "status": status});
         if let Some(url) = pr_url {
             resp["pr_url"] = serde_json::Value::String(url.clone());
+        }
+        if done
+            && diverged
+            && let Some((_, reason)) = &no_pr
+        {
+            resp["no_pr"] = serde_json::Value::String(reason.clone());
         }
         Ok(resp.to_string())
     }
@@ -1846,8 +1948,15 @@ impl AgentflareMcp {
             .to_string());
         }
         let promoted = self.with_backend_db(|conn| {
-            agentflare_backend::item::promote_in_review_to_completed(conn, &item_id)
-                .map_err(map_backend_err)
+            // Compare-and-set on the PR verified merged above: a redispatch +
+            // new PR landing during that network check must not complete the
+            // item off the old one.
+            agentflare_backend::item::promote_in_review_to_completed_if_pr(
+                conn,
+                &item_id,
+                crate::worktree::pr_number_from_metadata(&item),
+            )
+            .map_err(map_backend_err)
         })??;
         if promoted {
             self.with_backend_db(|conn| {
