@@ -733,6 +733,28 @@ const CI_SELF_REPAIR_MARKER: &str = "## supervisor — CI self-repair dispatched
 /// attempt, and vice versa.
 const CONFLICT_REPAIR_MARKER: &str = "## supervisor — merge-conflict repair dispatched";
 
+/// Marker prefix on the one-time repair-complete summary for each trigger --
+/// counterparts to `CI_SELF_REPAIR_MARKER`/`CONFLICT_REPAIR_MARKER`'s dispatch
+/// announcements, mirroring `CODERABBIT_REPAIR_COMPLETE_MARKER` below.
+const CI_SELF_REPAIR_COMPLETE_MARKER: &str = "## supervisor — CI self-repair complete";
+const CONFLICT_REPAIR_COMPLETE_MARKER: &str = "## supervisor — merge-conflict repair complete";
+
+/// Item-metadata keys tracking CI-self-repair announcements (item #303: same
+/// class of bug item #633 fixed for `coderabbit_repair_or_gate` -- see
+/// `CODERABBIT_REPAIR_ANNOUNCED_KEY` below for the shared rationale). Kept
+/// under their own key namespace, not reused from the CodeRabbit set, so the
+/// two repair paths' caps/fingerprints can never bleed into each other.
+const CI_SELF_REPAIR_ANNOUNCED_KEY: &str = "ci_self_repair_announced_for";
+const CI_SELF_REPAIR_SILENT_KEY: &str = "ci_self_repair_silent_attempts";
+const CI_SELF_REPAIR_COMPLETED_KEY: &str = "ci_self_repair_completed_for";
+/// Same convention, for the merge-conflict-repair trigger -- kept separate
+/// from the CI-self-repair keys above for the same reason
+/// `CONFLICT_REPAIR_MARKER` is kept separate from `CI_SELF_REPAIR_MARKER`:
+/// burning one trigger's cap must not block the other's.
+const CONFLICT_REPAIR_ANNOUNCED_KEY: &str = "conflict_repair_announced_for";
+const CONFLICT_REPAIR_SILENT_KEY: &str = "conflict_repair_silent_attempts";
+const CONFLICT_REPAIR_COMPLETED_KEY: &str = "conflict_repair_completed_for";
+
 /// What triggered `self_repair_or_gate` -- lets one dispatch/cap/claim/
 /// cooldown/host-policy/routing implementation serve both the pre-existing
 /// CI self-repair path and the new merge-conflict repair path
@@ -747,6 +769,43 @@ impl RepairTrigger<'_> {
         match self {
             Self::FailingChecks(_) => CI_SELF_REPAIR_MARKER,
             Self::MergeConflict => CONFLICT_REPAIR_MARKER,
+        }
+    }
+
+    fn announced_key(&self) -> &'static str {
+        match self {
+            Self::FailingChecks(_) => CI_SELF_REPAIR_ANNOUNCED_KEY,
+            Self::MergeConflict => CONFLICT_REPAIR_ANNOUNCED_KEY,
+        }
+    }
+
+    fn silent_key(&self) -> &'static str {
+        match self {
+            Self::FailingChecks(_) => CI_SELF_REPAIR_SILENT_KEY,
+            Self::MergeConflict => CONFLICT_REPAIR_SILENT_KEY,
+        }
+    }
+
+    fn completed_key(&self) -> &'static str {
+        match self {
+            Self::FailingChecks(_) => CI_SELF_REPAIR_COMPLETED_KEY,
+            Self::MergeConflict => CONFLICT_REPAIR_COMPLETED_KEY,
+        }
+    }
+
+    /// Stable fingerprint of "what's wrong" right now -- sorted failing-check
+    /// names for `FailingChecks` (so a re-fetch in a different order doesn't
+    /// re-announce, but a genuinely different failing set does), a constant
+    /// for `MergeConflict` since there's only ever one such state. Mirrors
+    /// `coderabbit_findings_fingerprint`'s role for the CodeRabbit path.
+    fn fingerprint(&self) -> String {
+        match self {
+            Self::FailingChecks(checks) => {
+                let mut sorted = checks.to_vec();
+                sorted.sort();
+                sorted.join(",")
+            }
+            Self::MergeConflict => "merge-conflict".to_string(),
         }
     }
 
@@ -835,30 +894,42 @@ fn coderabbit_findings_fingerprint(findings: &[crate::github::models::ReviewComm
     rows.join("\n").chars().take(2000).collect()
 }
 
-/// Reads the repair-tracking keys off an item's metadata: the announced
+/// Reads a repair-tracking triple off an item's metadata: the announced
 /// fingerprint, the silent re-dispatch count, and the completed fingerprint.
-/// Missing/corrupt metadata reads as all-empty, never an error.
-fn repair_track(item: &agentflare_backend::item::Item) -> (Option<String>, u32, Option<String>) {
+/// Missing/corrupt metadata reads as all-empty, never an error. Key names are
+/// parameters (not hardcoded) so `self_repair_or_gate`'s CI-self-repair and
+/// merge-conflict-repair triggers and `coderabbit_repair_or_gate` can each
+/// track their own state under their own metadata keys without duplicating
+/// this function -- see `RepairTrigger::announced_key`/`silent_key`/
+/// `completed_key` and the `CODERABBIT_REPAIR_*_KEY` constants for the actual
+/// key sets.
+fn repair_track(
+    item: &agentflare_backend::item::Item,
+    announced_key: &str,
+    silent_key: &str,
+    completed_key: &str,
+) -> (Option<String>, u32, Option<String>) {
     let meta: serde_json::Value = serde_json::from_str(&item.metadata).unwrap_or_default();
     let text = |k: &str| meta.get(k).and_then(|v| v.as_str()).map(str::to_string);
     let count = meta
-        .get(CODERABBIT_REPAIR_SILENT_KEY)
+        .get(silent_key)
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0) as u32;
-    (
-        text(CODERABBIT_REPAIR_ANNOUNCED_KEY),
-        count,
-        text(CODERABBIT_REPAIR_COMPLETED_KEY),
-    )
+    (text(announced_key), count, text(completed_key))
 }
 
-/// Merges repair-tracking keys into the item's current metadata (re-fetched,
-/// not reused from any snapshot, so a concurrent metadata write isn't
-/// clobbered — same pattern as `persist_comment_cursor`). Each key is
-/// `Option`: `None` leaves it untouched.
+/// Merges a repair-tracking triple into the item's current metadata
+/// (re-fetched, not reused from any snapshot, so a concurrent metadata write
+/// isn't clobbered — same pattern as `persist_comment_cursor`). Each value is
+/// `Option`/`bool`: `None`/`false` leaves that key untouched. Key names are
+/// parameters, mirroring `repair_track` above.
+#[allow(clippy::too_many_arguments)]
 fn persist_repair_track(
     mcp: &AgentflareMcp,
     item_id: &str,
+    announced_key: &str,
+    silent_key: &str,
+    completed_key: &str,
     announced: Option<&str>,
     silent_bump: bool,
     completed: Option<&str>,
@@ -879,17 +950,17 @@ fn persist_repair_track(
         .map(serde_json::Value::Object)
         .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
     if let Some(fp) = announced {
-        merged[CODERABBIT_REPAIR_ANNOUNCED_KEY] = serde_json::Value::String(fp.to_string());
+        merged[announced_key] = serde_json::Value::String(fp.to_string());
     }
     if silent_bump {
         let current = merged
-            .get(CODERABBIT_REPAIR_SILENT_KEY)
+            .get(silent_key)
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
-        merged[CODERABBIT_REPAIR_SILENT_KEY] = serde_json::Value::from(current + 1);
+        merged[silent_key] = serde_json::Value::from(current + 1);
     }
     if let Some(fp) = completed {
-        merged[CODERABBIT_REPAIR_COMPLETED_KEY] = serde_json::Value::String(fp.to_string());
+        merged[completed_key] = serde_json::Value::String(fp.to_string());
     }
     let _ = mcp.item_update(ItemRequest {
         action: "update".into(),
@@ -899,16 +970,28 @@ fn persist_repair_track(
     });
 }
 
-/// Posts the one-time repair summary once the announced findings are clean,
+/// Posts the one-time repair summary once the announced trigger has cleared
+/// (no more findings / CI green / conflict resolved, depending on the caller),
 /// and returns an excerpt for the PR-side clear message when the repair run
 /// left a recorded outcome. Returns `None` when there is nothing to announce
 /// (never dispatched) or the summary already went out — callers post nothing
-/// more in either case.
+/// more in either case. `dispatch_marker`/`complete_marker`/`resolved_text`
+/// and the metadata key triple are parameters so this one function serves
+/// `coderabbit_repair_or_gate` and both `self_repair_or_gate` triggers
+/// without duplicating it -- mirrors `repair_track`/`persist_repair_track`.
+#[allow(clippy::too_many_arguments)]
 fn maybe_post_repair_complete_summary(
     mcp: &AgentflareMcp,
     item: &agentflare_backend::item::Item,
+    dispatch_marker: &str,
+    complete_marker: &str,
+    resolved_text: &str,
+    announced_key: &str,
+    silent_key: &str,
+    completed_key: &str,
 ) -> Option<String> {
-    let (announced_for, _, completed_for) = repair_track(item);
+    let (announced_for, _, completed_for) =
+        repair_track(item, announced_key, silent_key, completed_key);
     let announced = announced_for?;
     if completed_for.as_deref() == Some(announced.as_str()) {
         return None;
@@ -921,7 +1004,7 @@ fn maybe_post_repair_complete_summary(
         .and_then(|comments| {
             let last_dispatch = comments
                 .iter()
-                .rposition(|c| c.body.starts_with(CODERABBIT_REPAIR_MARKER))?;
+                .rposition(|c| c.body.starts_with(dispatch_marker))?;
             comments[last_dispatch..].iter().rev().find_map(|c| {
                 c.body
                     .strip_prefix(crate::dispatch_failure_ceiling::WORK_SUCCESS_MARKER)
@@ -939,12 +1022,11 @@ fn maybe_post_repair_complete_summary(
         })
         .filter(|text| !text.trim().is_empty());
     let body = match &excerpt {
-        Some(text) => format!(
-            "{CODERABBIT_REPAIR_COMPLETE_MARKER}\n\nAll CodeRabbit findings are resolved. \
-             What the repair run reported:\n\n{text}"
-        ),
+        Some(text) => {
+            format!("{complete_marker}\n\n{resolved_text}. What the repair run reported:\n\n{text}")
+        }
         None => format!(
-            "{CODERABBIT_REPAIR_COMPLETE_MARKER}\n\nAll CodeRabbit findings are resolved \
+            "{complete_marker}\n\n{resolved_text} \
              (no repair-run summary on record — likely fixed by a manual push)."
         ),
     };
@@ -954,7 +1036,16 @@ fn maybe_post_repair_complete_summary(
         body: Some(body),
         ..Default::default()
     });
-    persist_repair_track(mcp, &item.id, None, false, Some(&announced));
+    persist_repair_track(
+        mcp,
+        &item.id,
+        announced_key,
+        silent_key,
+        completed_key,
+        None,
+        false,
+        Some(&announced),
+    );
     excerpt
 }
 
@@ -1377,6 +1468,32 @@ fn handle_pr_status(
                     "## supervisor — CI green\n\nChecks are passing again.",
                 );
             }
+            // Item #303: post the one-time completion summary for whichever
+            // `self_repair_or_gate` trigger(s) were previously announced on
+            // this item -- each call is a no-op unless that trigger actually
+            // has an unresolved announcement recorded, so it's safe to check
+            // both unconditionally rather than trying to infer from the PR
+            // label above which trigger (if either) was in play.
+            maybe_post_repair_complete_summary(
+                mcp,
+                item,
+                CI_SELF_REPAIR_MARKER,
+                CI_SELF_REPAIR_COMPLETE_MARKER,
+                "CI checks are passing again",
+                CI_SELF_REPAIR_ANNOUNCED_KEY,
+                CI_SELF_REPAIR_SILENT_KEY,
+                CI_SELF_REPAIR_COMPLETED_KEY,
+            );
+            maybe_post_repair_complete_summary(
+                mcp,
+                item,
+                CONFLICT_REPAIR_MARKER,
+                CONFLICT_REPAIR_COMPLETE_MARKER,
+                "The merge conflict is resolved",
+                CONFLICT_REPAIR_ANNOUNCED_KEY,
+                CONFLICT_REPAIR_SILENT_KEY,
+                CONFLICT_REPAIR_COMPLETED_KEY,
+            );
             // Namespaced ("pr-approval:<id>", not the bare item id): the
             // underlying set is keyed globally across every gate type in
             // this file (see `dispatch_item`'s "plan:" comment) -- an
@@ -1548,7 +1665,16 @@ fn merge_or_repair_findings(
             folder_path,
         ));
     }
-    let summary = maybe_post_repair_complete_summary(mcp, item);
+    let summary = maybe_post_repair_complete_summary(
+        mcp,
+        item,
+        CODERABBIT_REPAIR_MARKER,
+        CODERABBIT_REPAIR_COMPLETE_MARKER,
+        "All CodeRabbit findings are resolved",
+        CODERABBIT_REPAIR_ANNOUNCED_KEY,
+        CODERABBIT_REPAIR_SILENT_KEY,
+        CODERABBIT_REPAIR_COMPLETED_KEY,
+    );
     clear_stale_coderabbit_repair_label(folder_path, number, labels, summary.as_deref());
     if merge_if_approved(mcp, item, repo_root, number, labels) {
         PassingPrOutcome::Merged
@@ -1811,7 +1937,21 @@ fn self_repair_or_gate(
         return SelfRepairOutcome::Skipped;
     }
 
-    let prior_attempts = mcp
+    // Item #303: marker-comment counting alone stayed at 0 across hundreds of
+    // real dispatches (`list_by_item` returning an empty/stale result, live
+    // on items #300/#54), so the cap never tripped. A metadata-persisted
+    // silent-attempt counter (same fix as item #633's `coderabbit_repair_or_gate`)
+    // backstops it: `prior_attempts` is the marker-comment count PLUS this
+    // counter, so a retry that intentionally skips the marker comment (the
+    // fingerprint-unchanged branch below) still counts toward the cap.
+    let (announced_for, silent_attempts, _) = repair_track(
+        item,
+        trigger.announced_key(),
+        trigger.silent_key(),
+        trigger.completed_key(),
+    );
+    let fingerprint = trigger.fingerprint();
+    let prior_markers = mcp
         .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &item.id))
         .ok()
         .and_then(Result::ok)
@@ -1822,6 +1962,7 @@ fn self_repair_or_gate(
                 .count() as u32
         })
         .unwrap_or(0);
+    let prior_attempts = prior_markers + silent_attempts;
 
     if prior_attempts >= crate::quota::decide::SELF_REPAIR_CAP {
         let cap_message = format!(
@@ -1933,6 +2074,44 @@ fn self_repair_or_gate(
     let Some(info) = enqueue_work_job(queue, item, agent, Some(folder_path), Some(&reason)) else {
         return SelfRepairOutcome::Skipped;
     };
+    if announced_for.as_deref() == Some(fingerprint.as_str()) {
+        // Same "what's wrong" already announced — re-dispatch the retry
+        // silently instead of posting the identical announcement again
+        // (mirrors `coderabbit_repair_or_gate`'s own fingerprint-unchanged
+        // branch, item #633/#303).
+        persist_repair_track(
+            mcp,
+            &item.id,
+            trigger.announced_key(),
+            trigger.silent_key(),
+            trigger.completed_key(),
+            None,
+            true,
+            None,
+        );
+        // The PR stage label may have been reverted out-of-band; ensure it
+        // without commenting (empty comment = label bookkeeping only).
+        if !labels.iter().any(|l| l == SELF_REPAIR_PR_LABEL) {
+            update_pr_stage(
+                folder_path,
+                pr_number,
+                stale_stage_label(labels),
+                SELF_REPAIR_PR_LABEL,
+                "",
+            );
+        }
+        return SelfRepairOutcome::Dispatched;
+    }
+    persist_repair_track(
+        mcp,
+        &item.id,
+        trigger.announced_key(),
+        trigger.silent_key(),
+        trigger.completed_key(),
+        Some(&fingerprint),
+        false,
+        None,
+    );
     let dispatch_message = format!(
         "{}\n\n{}.\n\n{}\n\njob: {}",
         trigger.marker(),
@@ -2074,12 +2253,26 @@ fn coderabbit_repair_or_gate(
     }
 
     if findings.is_empty() {
-        let summary = maybe_post_repair_complete_summary(mcp, item);
+        let summary = maybe_post_repair_complete_summary(
+            mcp,
+            item,
+            CODERABBIT_REPAIR_MARKER,
+            CODERABBIT_REPAIR_COMPLETE_MARKER,
+            "All CodeRabbit findings are resolved",
+            CODERABBIT_REPAIR_ANNOUNCED_KEY,
+            CODERABBIT_REPAIR_SILENT_KEY,
+            CODERABBIT_REPAIR_COMPLETED_KEY,
+        );
         clear_stale_coderabbit_repair_label(folder_path, pr_number, labels, summary.as_deref());
         return SelfRepairOutcome::Skipped;
     }
 
-    let (announced_for, silent_attempts, _) = repair_track(item);
+    let (announced_for, silent_attempts, _) = repair_track(
+        item,
+        CODERABBIT_REPAIR_ANNOUNCED_KEY,
+        CODERABBIT_REPAIR_SILENT_KEY,
+        CODERABBIT_REPAIR_COMPLETED_KEY,
+    );
     let fingerprint = coderabbit_findings_fingerprint(findings);
     let prior_markers = mcp
         .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &item.id))
@@ -2215,7 +2408,16 @@ fn coderabbit_repair_or_gate(
     if announced_for.as_deref() == Some(fingerprint.as_str()) {
         // Same findings already announced — re-dispatch the retry silently
         // instead of posting the identical announcement again.
-        persist_repair_track(mcp, &item.id, None, true, None);
+        persist_repair_track(
+            mcp,
+            &item.id,
+            CODERABBIT_REPAIR_ANNOUNCED_KEY,
+            CODERABBIT_REPAIR_SILENT_KEY,
+            CODERABBIT_REPAIR_COMPLETED_KEY,
+            None,
+            true,
+            None,
+        );
         // The PR stage label may have been reverted out-of-band; ensure it
         // without commenting (empty comment = label bookkeeping only).
         if !labels.iter().any(|l| l == CODERABBIT_REPAIR_PR_LABEL) {
@@ -2229,7 +2431,16 @@ fn coderabbit_repair_or_gate(
         }
         return SelfRepairOutcome::Dispatched;
     }
-    persist_repair_track(mcp, &item.id, Some(&fingerprint), false, None);
+    persist_repair_track(
+        mcp,
+        &item.id,
+        CODERABBIT_REPAIR_ANNOUNCED_KEY,
+        CODERABBIT_REPAIR_SILENT_KEY,
+        CODERABBIT_REPAIR_COMPLETED_KEY,
+        Some(&fingerprint),
+        false,
+        None,
+    );
     let dispatch_message = format!(
         "{CODERABBIT_REPAIR_MARKER}\n\nCodeRabbit left {} unresolved finding(s) on this PR:\n\n\
          {}{overflow_line}\n\nPlease address them and push a fix.\n\njob: {}",
@@ -2329,3 +2540,7 @@ mod tests;
 #[cfg(test)]
 #[path = "supervisor_coderabbit_tests.rs"]
 mod coderabbit_tests;
+
+#[cfg(test)]
+#[path = "supervisor_self_repair_tests.rs"]
+mod self_repair_tests;
