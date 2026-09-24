@@ -8,6 +8,7 @@ pub mod auth;
 pub mod bridge;
 pub mod client;
 pub mod contents;
+pub(crate) mod etag_cache;
 pub mod graphql;
 pub mod identity;
 pub mod init_auth;
