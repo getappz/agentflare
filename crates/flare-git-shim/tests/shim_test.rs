@@ -467,7 +467,8 @@ fn canonical_repo_branch_create_is_denied_with_accurate_message() {
     assert!(stderr.contains("create a new branch"), "{stderr}");
     assert!(!stderr.contains("detach HEAD"), "{stderr}");
 
-    // Escape hatch still lifts it.
+    // Item #637: an agent-invoked caller cannot self-clear this by setting
+    // the override itself -- still denied, same message, even with it set.
     let out = Command::new(env!("CARGO_BIN_EXE_git"))
         .args(["checkout", "-b", "feature/x"])
         .current_dir(repo.path())
@@ -476,7 +477,9 @@ fn canonical_repo_branch_create_is_denied_with_accurate_message() {
         .env("AGENTFLARE_GIT_ALLOW_CANONICAL_MUTATE", "1")
         .output()
         .unwrap();
-    assert!(out.status.success(), "{out:?}");
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("create a new branch"), "{stderr}");
 }
 
 #[test]
@@ -517,7 +520,10 @@ fn canonical_repo_default_branch_return_is_allowed_with_escape_hatch() {
 }
 
 #[test]
-fn canonical_repo_detach_allowed_with_escape_hatch() {
+fn canonical_repo_detach_still_denied_for_agent_even_with_escape_hatch() {
+    // Item #637: `deny_canonical_detach_reason` checks agent-invocation
+    // before honoring `AGENTFLARE_GIT_ALLOW_CANONICAL_MUTATE`, so an
+    // agent-invoked caller can no longer clear this guard on itself.
     let repo = init_repo();
     let home = tempfile::TempDir::new().unwrap();
     let sha = flare_git_core::shell::run_in(repo.path(), &["rev-parse", "HEAD"]).unwrap();
@@ -530,6 +536,21 @@ fn canonical_repo_detach_allowed_with_escape_hatch() {
         .env("AGENTFLARE_GIT_ALLOW_CANONICAL_MUTATE", "1")
         .output()
         .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("detach HEAD"), "{stderr}");
+}
+
+#[test]
+fn canonical_repo_detach_allowed_for_human_without_escape_hatch() {
+    // The override was never needed for human/interactive use -- this guard
+    // exempts non-agent-invoked calls before the override is even
+    // consulted, override set or not.
+    let repo = init_repo();
+    let home = tempfile::TempDir::new().unwrap();
+    let sha = flare_git_core::shell::run_in(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+
+    let out = human_shim(repo.path(), home.path(), &["checkout", &sha]);
     assert!(out.status.success(), "{out:?}");
 }
 
