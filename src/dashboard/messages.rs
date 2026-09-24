@@ -187,10 +187,12 @@ const TAKE_IN_FLIGHT: usize = TAKE_CHANNEL_CAPACITY + 1;
 
 /// The `take=true` delivery loop, at-least-once: a message is taken (marked
 /// delivered) only after a send permit is held, one at a time, and the last
-/// [`TAKE_IN_FLIGHT`] taken ids are remembered until they're known consumed.
-/// When the client goes away, those are requeued -- so a disconnect can
-/// deliver a message twice (it may have reached the client just before the
-/// drop), which is preferred over marking it delivered and losing it.
+/// [`TAKE_IN_FLIGHT`] taken ids are remembered for as long as the stream is
+/// open, since SSE gives no receipt. When the client goes away, those are
+/// requeued -- so a disconnect can deliver a message twice (it may have
+/// reached the client just before the drop), which is preferred over
+/// marking it delivered and losing it. `agentflare message watch` skips ids
+/// it already printed when it reconnects.
 async fn pump_taken(tx: tokio::sync::mpsc::Sender<Event>, to: String) {
     let mut bus = messages::bus().subscribe();
     let mut conn: Option<rusqlite::Connection> = None;
@@ -227,13 +229,9 @@ async fn pump_taken(tx: tokio::sync::mpsc::Sender<Event>, to: String) {
         drop(permit);
         tokio::select! {
             _ = bus.recv() => {}
-            _ = tokio::time::sleep(STREAM_POLL) => {
-                // Idle a full poll with everything pulled off the channel
-                // and the client still connected: what was in flight made it.
-                if tx.capacity() == tx.max_capacity() && !tx.is_closed() {
-                    in_flight.clear();
-                }
-            }
+            // Being pulled off the channel doesn't prove the client got
+            // it, so in-flight ids stay requeueable until the stream closes.
+            () = tokio::time::sleep(STREAM_POLL) => {}
             () = tx.closed() => {
                 requeue_unsent(conn, in_flight.into()).await;
                 return;
@@ -347,6 +345,31 @@ mod tests {
             let bodies: Vec<&str> = back.iter().map(|m| m.body.as_str()).collect();
             assert!(bodies.contains(&"two"), "{bodies:?}");
             assert!(bodies.contains(&"three"), "{bodies:?}");
+        });
+    }
+
+    #[test]
+    fn a_pulled_event_stays_requeueable_through_an_idle_poll() {
+        crate::paths::test_support::with_temp_home(|| {
+            const TO: &str = "human:probe-idle";
+            let conn = crate::db::open().unwrap();
+            messages::send(&conn, "x:1", TO, "only", None, 100, |_| Err(String::new())).unwrap();
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(TAKE_CHANNEL_CAPACITY);
+                let pump = tokio::spawn(pump_taken(tx, TO.to_string()));
+                // Pulled off the channel, but not proven to reach the client:
+                // the stream idles past a poll, then the client drops.
+                assert!(rx.recv().await.is_some());
+                tokio::time::sleep(STREAM_POLL * 3).await;
+                drop(rx);
+                tokio::time::timeout(std::time::Duration::from_secs(5), pump)
+                    .await
+                    .expect("the pump stops once the client is gone")
+                    .unwrap();
+            });
+            let back = messages::take_undelivered(&conn, TO, 10, 200).unwrap();
+            assert_eq!(back.len(), 1, "{back:?}");
         });
     }
 
