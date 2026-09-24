@@ -73,11 +73,11 @@ pub enum Liveness {
 
 /// This machine's identity for pid-liveness checks: a session row whose
 /// `host` matches is judged by its pid, so two machines sharing a db must
-/// never compare equal. `HOSTNAME`, else `/etc/hostname`, else the OS
-/// machine id (macOS has neither of the first two for a non-shell process,
-/// and every Mac falling back to one shared `"localhost"` would have pid
-/// checks run against another machine's pids). `"localhost"` only when
-/// even that is unavailable. Resolved once per process.
+/// never compare equal. The OS hostname (else `/etc/hostname`) for
+/// readability, qualified by the OS machine id so two machines that share
+/// a hostname stay distinct; the machine id alone when there's no
+/// hostname; `"localhost"` only when neither is available. Resolved once
+/// per process.
 pub fn this_host() -> String {
     static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     HOST.get_or_init(|| {
@@ -111,9 +111,10 @@ fn os_hostname() -> Option<String> {
     }
 }
 
-/// Pure core of [`this_host`]: the first non-blank of the OS hostname,
-/// the hostname file, and the machine id (prefixed, so it can't collide
-/// with a real hostname), else `"localhost"`.
+/// Pure core of [`this_host`]: `<hostname>@<machine-id>`, where the
+/// hostname is the first non-blank of the OS hostname and the hostname
+/// file; either half alone when the other is missing (a bare machine id is
+/// prefixed so it can't collide with a real hostname), else `"localhost"`.
 fn resolve_host(
     env: Option<String>,
     file: impl FnOnce() -> Option<String>,
@@ -123,14 +124,15 @@ fn resolve_host(
         let h = h.trim().to_string();
         (!h.is_empty()).then_some(h)
     };
-    env.and_then(non_blank)
-        .or_else(|| file().and_then(non_blank))
-        .or_else(|| {
-            machine_id()
-                .and_then(non_blank)
-                .map(|id| format!("machine-id:{id}"))
-        })
-        .unwrap_or_else(|| "localhost".to_string())
+    let name = env
+        .and_then(non_blank)
+        .or_else(|| file().and_then(non_blank));
+    match (name, machine_id().and_then(non_blank)) {
+        (Some(name), Some(id)) => format!("{name}@{id}"),
+        (Some(name), None) => name,
+        (None, Some(id)) => format!("machine-id:{id}"),
+        (None, None) => "localhost".to_string(),
+    }
 }
 
 /// Upserts `t.key` as live now. Clears `ended_at`: a key seen again is live.
@@ -340,6 +342,14 @@ mod tests {
             "machine-id:ABCD-1234"
         );
         assert_eq!(resolve_host(None, none, none), "localhost");
+    }
+
+    #[test]
+    fn machines_sharing_a_hostname_get_distinct_host_identities() {
+        let a = resolve_host(Some("ci-runner".into()), || None, || Some("aaaa".into()));
+        let b = resolve_host(Some("ci-runner".into()), || None, || Some("bbbb".into()));
+        assert_eq!(a, "ci-runner@aaaa");
+        assert_ne!(a, b);
     }
 
     #[test]
