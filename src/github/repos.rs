@@ -12,6 +12,9 @@ pub struct RepoSettings {
     /// GitHub's own "Automatically delete head branches" setting -- when on,
     /// GitHub already deleted the branch at merge time.
     pub delete_branch_on_merge: bool,
+    /// The repository's GraphQL node id (`node_id`), which the atomic
+    /// `updateRefs` branch deletion addresses the repo by.
+    pub node_id: Option<String>,
 }
 
 /// `repo`'s settings, fetched once per process per host+repo: they change
@@ -37,6 +40,7 @@ pub fn settings(client: &Client, repo: &RepoId) -> Result<RepoSettings, GitHubEr
             .ok_or_else(|| GitHubError::Parse("missing default_branch".to_string()))?
             .to_string(),
         delete_branch_on_merge: json["delete_branch_on_merge"].as_bool().unwrap_or(false),
+        node_id: json["node_id"].as_str().map(str::to_string),
     };
     cache
         .lock()
@@ -63,14 +67,99 @@ pub enum BranchCleanup {
     AlreadyGone,
     /// The branch tip is no longer the merged PR's head commit (something
     /// was pushed after the merge) -- deleting it would lose that commit.
+    /// Also what an `updateRefs` rejection reads as: its only precondition
+    /// is `beforeOid`, i.e. the tip moved (or vanished) since the check.
     Advanced,
+    /// The atomic compare-and-delete (GraphQL `updateRefs`) isn't available
+    /// -- no repository node id, or the endpoint/schema lacks the mutation.
+    /// Deliberately NOT retried via the REST ref DELETE, which has no
+    /// expected-sha guard and could delete a commit pushed after the check.
+    AtomicDeleteUnavailable(String),
+}
+
+/// All-zero object id: as `afterOid` it deletes the ref.
+const NULL_OID: &str = "0000000000000000000000000000000000000000";
+
+/// Deletes `refs/heads/<branch>` only if it still points at `expected_sha`,
+/// atomically, via GitHub GraphQL's `updateRefs` (`RefUpdate { name,
+/// beforeOid, afterOid }`): GitHub applies the update only when the ref is
+/// at `beforeOid`, so a push landing between our tip check and the delete
+/// is never lost -- unlike REST's `DELETE /git/refs`, which takes no
+/// expected sha.
+fn delete_ref_if_at(
+    client: &Client,
+    repository_id: &str,
+    branch: &str,
+    expected_sha: &str,
+) -> Result<BranchCleanup, GitHubError> {
+    const MUTATION: &str =
+        "mutation($input:UpdateRefsInput!){updateRefs(input:$input){clientMutationId}}";
+    let body = serde_json::json!({
+        "query": MUTATION,
+        "variables": { "input": {
+            "repositoryId": repository_id,
+            "refUpdates": [{
+                "name": format!("refs/heads/{branch}"),
+                "beforeOid": expected_sha,
+                "afterOid": NULL_OID,
+            }],
+        }},
+    });
+    let json = match client.graphql(body) {
+        Ok(json) => json,
+        // No GraphQL endpoint at this host at all.
+        Err(GitHubError::NotFound) => {
+            return Ok(BranchCleanup::AtomicDeleteUnavailable(
+                "GraphQL endpoint not found".to_string(),
+            ));
+        }
+        Err(e) => return Err(e),
+    };
+    if let Some(errors) = json.get("errors") {
+        return classify_update_refs_errors(errors);
+    }
+    if json["data"]["updateRefs"].is_null() {
+        return Err(GitHubError::Parse(
+            "updateRefs response missing data.updateRefs".to_string(),
+        ));
+    }
+    Ok(BranchCleanup::Deleted)
+}
+
+/// Reads a failed `updateRefs` call. A schema that lacks the mutation (or
+/// its input type) means the atomic path is unavailable; a permission error
+/// stays an error; anything else is the ref update itself being rejected,
+/// whose only precondition is `beforeOid` -- the tip moved -- so it reads
+/// as `Advanced` (fail closed: nothing was deleted either way).
+fn classify_update_refs_errors(errors: &serde_json::Value) -> Result<BranchCleanup, GitHubError> {
+    let errs = errors.as_array().map(Vec::as_slice).unwrap_or_default();
+    let unsupported = errs.iter().any(|e| {
+        let code = e["extensions"]["code"].as_str().unwrap_or_default();
+        let msg = e["message"].as_str().unwrap_or_default();
+        matches!(
+            code,
+            "undefinedField" | "undefinedType" | "argumentNotAccepted"
+        ) || ((msg.contains("updateRefs") || msg.contains("UpdateRefsInput"))
+            && msg.contains("exist"))
+    });
+    if unsupported {
+        return Ok(BranchCleanup::AtomicDeleteUnavailable(errors.to_string()));
+    }
+    if errs.iter().any(|e| e["type"] == "FORBIDDEN") {
+        return Err(GitHubError::Forbidden(format!(
+            "updateRefs refused: {errors}"
+        )));
+    }
+    Ok(BranchCleanup::Advanced)
 }
 
 /// Deletes merged PR `number`'s head branch from `repo`, the remote half of
 /// branch hygiene after an auto-merge -- local branches/worktrees are left to
 /// worktree cleanup. Re-reads the PR rather than trusting the caller's
 /// snapshot, and refuses anything that is not a merged, same-repo,
-/// unprotected, non-default branch still pointing at the PR's merged head.
+/// unprotected, non-default branch still pointing at the PR's merged head --
+/// that last condition enforced atomically by GitHub (`updateRefs` with
+/// `beforeOid`), never by a racy read-then-delete.
 pub fn delete_merged_pr_branch(
     client: &Client,
     repo: &RepoId,
@@ -109,18 +198,14 @@ pub fn delete_merged_pr_branch(
         Err(GitHubError::NotFound) => return Ok(BranchCleanup::AlreadyGone),
         Err(e) => return Err(e),
     }
-    let ref_path = format!(
-        "/repos/{}/{}/git/refs/heads/{branch}",
-        repo.owner, repo.repo
-    );
-    match client.request("DELETE", &ref_path, None) {
-        Ok(_) => Ok(BranchCleanup::Deleted),
-        // 422 "Reference does not exist": deleted between the two calls.
-        Err(GitHubError::NotFound) | Err(GitHubError::Http { status: 422, .. }) => {
-            Ok(BranchCleanup::AlreadyGone)
-        }
-        Err(e) => Err(e),
-    }
+    // The tip check above is only a cheap early-out; the delete itself is a
+    // compare-and-swap on `head.sha`, so a push between the two is kept.
+    let Some(node_id) = settings.node_id.as_deref() else {
+        return Ok(BranchCleanup::AtomicDeleteUnavailable(
+            "repository node_id unknown".to_string(),
+        ));
+    };
+    delete_ref_if_at(client, node_id, &head.git_ref, &head.sha)
 }
 
 /// Fetches `repo`'s default branch via the GitHub API. Used when an explicit
@@ -176,8 +261,103 @@ mod tests {
 
     // Each test uses its own mock server, so the host-keyed settings cache
     // never carries one test's repo settings into another.
+    const SETTINGS: &str =
+        r#"{"default_branch":"main","delete_branch_on_merge":false,"node_id":"R_node"}"#;
+
     #[test]
     fn delete_merged_pr_branch_deletes_an_unprotected_same_repo_head() {
+        let server = MockServer::start(vec![
+            MockResponse::json(200, &merged_pr("o/r", "task/5")),
+            MockResponse::json(200, SETTINGS),
+            MockResponse::json(
+                200,
+                r#"{"name":"task/5","protected":false,"commit":{"sha":"abc"}}"#,
+            ),
+            MockResponse::json(200, r#"{"data":{"updateRefs":{"clientMutationId":null}}}"#),
+        ]);
+        let client = server.client(Some("tok"));
+        assert_eq!(
+            delete_merged_pr_branch(&client, &repo(), 5).unwrap(),
+            BranchCleanup::Deleted
+        );
+        let reqs = server.requests();
+        assert_eq!(reqs[2].path, "/repos/o/r/branches/task/5");
+        assert_eq!(reqs[3].method, "POST");
+        assert_eq!(reqs[3].path, "/graphql");
+        let sent: serde_json::Value = serde_json::from_str(&reqs[3].body).unwrap();
+        assert!(
+            sent["query"]
+                .as_str()
+                .unwrap()
+                .contains("updateRefs(input:$input)")
+        );
+        let input = &sent["variables"]["input"];
+        assert_eq!(input["repositoryId"], "R_node");
+        assert_eq!(
+            input["refUpdates"],
+            serde_json::json!([{
+                "name": "refs/heads/task/5",
+                "beforeOid": "abc",
+                "afterOid": NULL_OID,
+            }])
+        );
+        assert!(
+            reqs.iter().all(|r| r.method != "DELETE"),
+            "the non-atomic REST ref DELETE must never be used"
+        );
+    }
+
+    fn unprotected_at_abc() -> Vec<MockResponse> {
+        vec![
+            MockResponse::json(200, &merged_pr("o/r", "task/5")),
+            MockResponse::json(200, SETTINGS),
+            MockResponse::json(
+                200,
+                r#"{"name":"task/5","protected":false,"commit":{"sha":"abc"}}"#,
+            ),
+        ]
+    }
+
+    #[test]
+    fn delete_merged_pr_branch_keeps_a_branch_pushed_between_check_and_delete() {
+        // The tip check passes, then a push lands before the delete:
+        // `updateRefs`'s `beforeOid` no longer matches and GitHub rejects it.
+        let mut responses = unprotected_at_abc();
+        responses.push(MockResponse::json(
+            200,
+            r#"{"data":{"updateRefs":null},"errors":[{"type":"UNPROCESSABLE","message":"Reference cannot be updated: expected abc"}]}"#,
+        ));
+        let server = MockServer::start(responses);
+        let client = server.client(Some("tok"));
+        assert_eq!(
+            delete_merged_pr_branch(&client, &repo(), 5).unwrap(),
+            BranchCleanup::Advanced
+        );
+        let reqs = server.requests();
+        assert_eq!(reqs.len(), 4);
+        assert!(reqs.iter().all(|r| r.method != "DELETE"));
+    }
+
+    #[test]
+    fn delete_merged_pr_branch_does_not_fall_back_to_rest_when_update_refs_is_unsupported() {
+        let mut responses = unprotected_at_abc();
+        responses.push(MockResponse::json(
+            200,
+            r#"{"errors":[{"message":"Field 'updateRefs' doesn't exist on type 'Mutation'","extensions":{"code":"undefinedField"}}]}"#,
+        ));
+        let server = MockServer::start(responses);
+        let client = server.client(Some("tok"));
+        assert!(matches!(
+            delete_merged_pr_branch(&client, &repo(), 5).unwrap(),
+            BranchCleanup::AtomicDeleteUnavailable(_)
+        ));
+        let reqs = server.requests();
+        assert_eq!(reqs.len(), 4, "no REST DELETE fallback may follow");
+        assert!(reqs.iter().all(|r| r.method != "DELETE"));
+    }
+
+    #[test]
+    fn delete_merged_pr_branch_does_not_delete_without_a_repository_node_id() {
         let server = MockServer::start(vec![
             MockResponse::json(200, &merged_pr("o/r", "task/5")),
             MockResponse::json(
@@ -188,17 +368,15 @@ mod tests {
                 200,
                 r#"{"name":"task/5","protected":false,"commit":{"sha":"abc"}}"#,
             ),
-            MockResponse::json(204, ""),
         ]);
         let client = server.client(Some("tok"));
-        assert_eq!(
+        assert!(matches!(
             delete_merged_pr_branch(&client, &repo(), 5).unwrap(),
-            BranchCleanup::Deleted
-        );
+            BranchCleanup::AtomicDeleteUnavailable(_)
+        ));
         let reqs = server.requests();
-        assert_eq!(reqs[2].path, "/repos/o/r/branches/task/5");
-        assert_eq!(reqs[3].method, "DELETE");
-        assert_eq!(reqs[3].path, "/repos/o/r/git/refs/heads/task/5");
+        assert_eq!(reqs.len(), 3);
+        assert!(reqs.iter().all(|r| r.method == "GET"));
     }
 
     #[test]

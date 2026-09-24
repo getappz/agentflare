@@ -83,9 +83,11 @@ fn pr_subquery(number: u64) -> String {
 /// Maps a GraphQL response's `errors` array to a `GitHubError`: GitHub
 /// reports an exhausted GraphQL budget as a 200 whose errors carry
 /// `"type": "RATE_LIMITED"`, which must read as `RateLimited` (so callers
-/// back off) rather than as a malformed response. Since that 200 never goes
-/// through the client's status-code backoff path, a rate limit here also
-/// arms `client`'s shared host backoff so no further calls go out.
+/// back off) rather than as a malformed response. `Client::graphql` already
+/// intercepts that case -- arming the host backoff from the response's
+/// `retry-after` / `x-ratelimit-reset` headers -- so the rate-limit branch
+/// here is only a fallback for a response that bypassed it, and arms the
+/// default wait since no headers are at hand.
 pub(crate) fn graphql_error(client: &Client, errors: &serde_json::Value) -> GitHubError {
     let rate_limited = errors
         .as_array()
@@ -119,7 +121,7 @@ pub fn batch_pr_status(
         "query": query,
         "variables": { "owner": repo.owner, "repo": repo.repo }
     });
-    let json = client.request("POST", "/graphql", Some(body))?;
+    let json = client.graphql(body)?;
     if let Some(errors) = json.get("errors") {
         return Err(graphql_error(client, errors));
     }
@@ -362,6 +364,37 @@ mod tests {
         let client = server.client(Some("tok"));
         let err = batch_pr_status(&client, &repo(), &[1]).unwrap_err();
         assert!(matches!(err, GitHubError::RateLimited(_)));
+    }
+
+    #[test]
+    fn batch_pr_status_rate_limited_200_backs_off_until_x_ratelimit_reset() {
+        let reset = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let server = MockServer::start(vec![
+            MockResponse::json(
+                200,
+                r#"{"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded"}]}"#,
+            )
+            .with_header("x-ratelimit-remaining", "0")
+            .with_header("x-ratelimit-reset", &reset.to_string()),
+        ]);
+        let client = server.client(Some("tok"));
+        let err = batch_pr_status(&client, &repo(), &[1]).unwrap_err();
+        assert!(matches!(err, GitHubError::RateLimited(_)));
+        // Still refused locally, and the message names a wait out to the
+        // reset (~3600s), not the 60s default.
+        let GitHubError::RateLimited(msg) = client.request("GET", "/x", None).unwrap_err() else {
+            panic!("expected RateLimited");
+        };
+        let secs: u64 = msg
+            .split_whitespace()
+            .find_map(|w| w.strip_suffix("s.").and_then(|n| n.parse().ok()))
+            .unwrap();
+        assert!(secs > 3000, "backoff must run to the reset: {msg}");
+        assert_eq!(server.requests().len(), 1);
     }
 
     #[test]

@@ -74,13 +74,16 @@ fn delete_merged_head_branch_with_deletes_the_merged_head_ref() {
         ),
         crate::github::test_support::MockResponse::json(
             200,
-            r#"{"default_branch":"main","delete_branch_on_merge":false}"#,
+            r#"{"default_branch":"main","delete_branch_on_merge":false,"node_id":"R_node"}"#,
         ),
         crate::github::test_support::MockResponse::json(
             200,
             r#"{"protected":false,"commit":{"sha":"abc"}}"#,
         ),
-        crate::github::test_support::MockResponse::json(204, ""),
+        crate::github::test_support::MockResponse::json(
+            200,
+            r#"{"data":{"updateRefs":{"clientMutationId":null}}}"#,
+        ),
     ]);
     let client = server.client(Some("tok"));
     let repo = crate::github::RepoId {
@@ -88,12 +91,17 @@ fn delete_merged_head_branch_with_deletes_the_merged_head_ref() {
         repo: "r".into(),
     };
     delete_merged_head_branch_with(&client, &repo, 42);
+    // Deleted atomically via GraphQL `updateRefs` guarded on the merged
+    // head sha -- never the unguarded REST ref DELETE.
     let reqs = server.requests();
-    assert_eq!(reqs.last().unwrap().method, "DELETE");
-    assert_eq!(
-        reqs.last().unwrap().path,
-        "/repos/o/r/git/refs/heads/task/42"
-    );
+    let last = reqs.last().unwrap();
+    assert_eq!(last.method, "POST");
+    assert_eq!(last.path, "/graphql");
+    let sent: serde_json::Value = serde_json::from_str(&last.body).unwrap();
+    let update = &sent["variables"]["input"]["refUpdates"][0];
+    assert_eq!(update["name"], "refs/heads/task/42");
+    assert_eq!(update["beforeOid"], "abc");
+    assert!(reqs.iter().all(|r| r.method != "DELETE"));
 }
 
 #[test]

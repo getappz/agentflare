@@ -308,6 +308,13 @@ pub(super) fn delete_merged_head_branch_with(
                  it has commits pushed after the merge"
             );
         }
+        Ok(crate::github::repos::BranchCleanup::AtomicDeleteUnavailable(why)) => {
+            eprintln!(
+                "agentflare-supervisor: kept head branch of merged PR #{number} in {repo} -- \
+                 atomic (sha-guarded) ref deletion unavailable ({why}); not falling back to \
+                 an unguarded delete"
+            );
+        }
         Ok(_) => {}
         Err(e) => eprintln!(
             "agentflare-supervisor: could not delete merged head branch of PR #{number} in {repo}: {}",

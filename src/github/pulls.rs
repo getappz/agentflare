@@ -353,7 +353,7 @@ pub fn resolved_review_comment_ids(
         "query": QUERY,
         "variables": { "owner": repo.owner, "repo": repo.repo, "number": number }
     });
-    let json = client.request("POST", "/graphql", Some(body))?;
+    let json = client.graphql(body)?;
     if let Some(errors) = json.get("errors") {
         return Err(crate::github::graphql::graphql_error(client, errors));
     }
