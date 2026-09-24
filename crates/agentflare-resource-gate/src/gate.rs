@@ -56,9 +56,9 @@ pub fn init_global() {
         .spawn(move || {
             loop {
                 std::thread::sleep(SAMPLE_INTERVAL);
-                let decision = sample_policy(&cfg);
                 if let Some(lock) = STATE.get() {
-                    *lock.write().unwrap_or_else(|e| e.into_inner()) = decision;
+                    let mut policy = lock.write().unwrap_or_else(|e| e.into_inner());
+                    *policy = sample_policy(&cfg);
                 }
             }
         })
@@ -84,11 +84,13 @@ pub fn current_policy() -> Policy {
 /// no-op on a gate paused for `PauseReason::CpuPressure` instead: that
 /// reason self-clears once CPU drops, and isn't what this override targets.
 pub fn force_resume() {
-    FORCE_RESUME.store(true, Ordering::SeqCst);
     if let Some(lock) = STATE.get() {
+        let mut policy = lock.write().unwrap_or_else(|e| e.into_inner());
+        FORCE_RESUME.store(true, Ordering::SeqCst);
         let cfg = GateConfig::from_env();
-        let decision = sample_policy(&cfg);
-        *lock.write().unwrap_or_else(|e| e.into_inner()) = decision;
+        *policy = sample_policy(&cfg);
+    } else {
+        FORCE_RESUME.store(true, Ordering::SeqCst);
     }
 }
 
@@ -96,7 +98,14 @@ pub fn force_resume() {
 /// [`force_resume`]. Mostly for tests/symmetry today — there's no CLI path
 /// that re-pauses a gate, so nothing currently calls this in production.
 pub fn clear_force_resume() {
-    FORCE_RESUME.store(false, Ordering::SeqCst);
+    if let Some(lock) = STATE.get() {
+        let mut policy = lock.write().unwrap_or_else(|e| e.into_inner());
+        FORCE_RESUME.store(false, Ordering::SeqCst);
+        let cfg = GateConfig::from_env();
+        *policy = sample_policy(&cfg);
+    } else {
+        FORCE_RESUME.store(false, Ordering::SeqCst);
+    }
 }
 
 /// Whether [`force_resume`]'s override is currently active.
