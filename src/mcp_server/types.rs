@@ -577,7 +577,9 @@ pub(crate) struct GitHubRequest {
     #[schemars(description = "Release name (release_create)")]
     #[serde(default)]
     pub(crate) name: Option<String>,
-    #[schemars(description = "Mark release as draft (release_create, default false)")]
+    #[schemars(
+        description = "Open as a draft (pr_create) / mark release as draft (release_create); default false"
+    )]
     #[serde(default)]
     pub(crate) draft: Option<bool>,
     #[schemars(description = "Mark release as prerelease (release_create, default false)")]

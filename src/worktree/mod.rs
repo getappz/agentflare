@@ -98,6 +98,8 @@ pub(crate) fn pr_number_from_metadata(item: &agentflare_backend::item::Item) -> 
 
 mod discovery;
 pub(crate) use discovery::{discover_untracked_prs, tracked_pr_numbers};
+mod draft;
+pub(crate) use draft::{mark_pr_ready, pr_marked_ready};
 
 /// Checks whether `item`'s branch already has a merged PR — the promotion
 /// signal `check_merge` uses to move an item out of "in_review" (item
@@ -352,6 +354,19 @@ pub enum PrCiStatus {
     Closed {
         number: u64,
     },
+    /// Still a draft. `push_and_open_pr` opens every PR as one and
+    /// `item_done` marks it ready once the item is in review, so a draft on
+    /// an in-review item means that flip never landed (`run_review_sweep`
+    /// retries it, see `draft::mark_pr_ready`) -- or a human converted it
+    /// back on purpose, which the sweep respects. Checked before CI state:
+    /// a draft can neither merge nor be handed to reviewers, so its checks
+    /// are not yet actionable either way.
+    Draft {
+        number: u64,
+        /// The GraphQL node id the ready-for-review mutation needs, when the
+        /// fetch had it.
+        node_id: Option<String>,
+    },
     Unknown,
 }
 
@@ -421,6 +436,12 @@ fn pr_ci_status_impl(
     }
     if pr.state == "closed" {
         return PrCiStatus::Closed { number: pr.number };
+    }
+    if pr.draft {
+        return PrCiStatus::Draft {
+            number: pr.number,
+            node_id: pr.node_id.clone(),
+        };
     }
     let head_sha = pr
         .head
@@ -650,6 +671,12 @@ pub(crate) fn pr_ci_status_from_batch(
     if data.closed {
         return PrCiStatus::Closed { number };
     }
+    if data.is_draft {
+        return PrCiStatus::Draft {
+            number,
+            node_id: data.node_id.clone(),
+        };
+    }
     if data.mergeable == Some(true) && data.mergeable_state.as_deref() == Some("behind") {
         return PrCiStatus::Behind {
             number,
@@ -876,8 +903,18 @@ fn merge_and_persist_pr_identity(
     number: u64,
     branch: &str,
 ) {
-    let pr = serde_json::json!({ "number": number, "branch": branch });
     if let Err(e) = crate::mcp_server::merge_item_metadata(conn, &item.id, |merged| {
+        // `pr.ready` (see `draft::persist_pr_ready`) survives a re-run of
+        // `done` that finds the same PR again; a different PR number is a
+        // different PR, whose readiness is unknown.
+        let ready = merged
+            .get("pr")
+            .filter(|pr| pr["number"].as_u64() == Some(number))
+            .is_some_and(|pr| pr["ready"] == true);
+        let mut pr = serde_json::json!({ "number": number, "branch": branch });
+        if ready {
+            pr["ready"] = serde_json::Value::Bool(true);
+        }
         merged.insert("pr".into(), pr);
     }) {
         eprintln!(
@@ -940,11 +977,33 @@ fn recover_pr_after_failed_create(
 /// never result here, by configuration" apart from "this attempt failed and
 /// a retry may succeed", which the old bare `Option<String>` couldn't: a
 /// repo with no GitHub remote or no credentials errored `done` forever.
+/// The PR `push_and_open_pr` created or found, as much of it as `item_done`
+/// needs afterwards: the URL for its response, and what flipping a draft to
+/// ready takes (`draft::mark_pr_ready`) without a second lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenedPr {
+    pub url: String,
+    pub number: u64,
+    pub node_id: Option<String>,
+    pub draft: bool,
+}
+
+impl From<crate::github::models::PullRequest> for OpenedPr {
+    fn from(pr: crate::github::models::PullRequest) -> Self {
+        OpenedPr {
+            url: pr.html_url,
+            number: pr.number,
+            node_id: pr.node_id,
+            draft: pr.draft,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum PrOutcome {
     /// A PR exists for this item's branch (freshly created, or already
-    /// open/merged from an earlier `done`). Carries its URL.
-    Opened(String),
+    /// open/merged from an earlier `done`).
+    Opened(OpenedPr),
     /// Nothing to publish: no worktree was ever created, or the branch never
     /// diverged from its target.
     NothingToPush,
@@ -1097,7 +1156,7 @@ fn open_pr_for_pushed_branch(
         if let Some(p) = progress {
             p.send(1.0, Some(1.0), Some("PR already exists".into()));
         }
-        PrOutcome::Opened(existing.html_url)
+        PrOutcome::Opened(existing.into())
     };
     if let Some(number) = pr_number_from_metadata(item) {
         match crate::github::pulls::get(client, repo, number) {
@@ -1146,14 +1205,34 @@ fn open_pr_for_pushed_branch(
             return PrOutcome::Failed(format!("could not check for an existing PR: {e}"));
         }
     }
-    match crate::github::pulls::create(
-        client,
-        repo,
-        &conventional_pr_title(&item.name),
-        branch,
-        target_branch,
-        Some(body),
-    ) {
+    // Opened as a draft: CI starts, but nobody is asked to review and
+    // nothing can merge until `item_done` has recorded the item as
+    // in_review and flips it ready (`draft::mark_pr_ready`) -- so a `done`
+    // that fails between here and there leaves a PR nobody is chasing yet.
+    let title = conventional_pr_title(&item.name);
+    let create = |draft: bool| {
+        crate::github::pulls::create(
+            client,
+            repo,
+            &title,
+            branch,
+            target_branch,
+            Some(body),
+            draft,
+        )
+    };
+    let created = match create(true) {
+        Err(e) if crate::github::pulls::drafts_unsupported(&e) => {
+            eprintln!(
+                "worktree: {repo} does not support draft PRs ({e}); opening item {}'s PR as \
+                 ready for review",
+                item.id
+            );
+            create(false)
+        }
+        other => other,
+    };
+    match created {
         Ok(pr) => {
             persist_pr_identity(item, pr.number, branch);
             if let Err(e) = crate::github::issues::add_labels(
@@ -1173,7 +1252,7 @@ fn open_pr_for_pushed_branch(
             if let Some(p) = progress {
                 p.send(1.0, Some(1.0), Some("PR created".into()));
             }
-            PrOutcome::Opened(pr.html_url)
+            PrOutcome::Opened(pr.into())
         }
         Err(e) => {
             // `create` fails this way when two workstations independently

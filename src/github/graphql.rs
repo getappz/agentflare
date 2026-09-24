@@ -67,6 +67,10 @@ pub struct BatchPrData {
     pub merge_queue_enabled: bool,
     /// `isInMergeQueue`: already enqueued; the queue's own CI decides now.
     pub in_merge_queue: bool,
+    /// `isDraft`: still a draft, so it can't merge and nobody was asked to
+    /// review it -- agentflare opens every PR as one and is expected to have
+    /// flipped it by the time the item is in review.
+    pub is_draft: bool,
 }
 
 /// One aliased sub-query for PR `number` -- `pr<number>` is a valid GraphQL
@@ -80,7 +84,7 @@ fn pr_alias(number: u64) -> String {
 fn pr_subquery(number: u64) -> String {
     format!(
         "{}: pullRequest(number: {number}) {{ id state merged mergeable mergeStateStatus \
-         reviewDecision headRefOid \
+         isDraft reviewDecision headRefOid \
          isMergeQueueEnabled isInMergeQueue autoMergeRequest {{ enabledAt }} \
          labels(first: 20) {{ nodes {{ name }} }} \
          commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state contexts(first: 100) {{ \
@@ -213,7 +217,21 @@ fn parse_batch_pr(node: &serde_json::Value) -> BatchPrData {
         auto_merge_enabled: node["autoMergeRequest"].is_object(),
         merge_queue_enabled: node["isMergeQueueEnabled"].as_bool().unwrap_or(false),
         in_merge_queue: node["isInMergeQueue"].as_bool().unwrap_or(false),
+        is_draft: node["isDraft"].as_bool().unwrap_or(false),
     }
+}
+
+/// Flips a draft PR to "ready for review" -- the moment reviewers get asked
+/// and a merge becomes possible. Idempotent on GitHub's side: an already
+/// ready PR answers with an error naming that, which callers treat as done.
+pub fn mark_ready_for_review(client: &Client, pr_node_id: &str) -> Result<(), GitHubError> {
+    mutate(
+        client,
+        "mutation($input: MarkPullRequestReadyForReviewInput!) { \
+         markPullRequestReadyForReview(input: $input) { pullRequest { isDraft } } }",
+        serde_json::json!({ "input": { "pullRequestId": pr_node_id } }),
+    )?;
+    Ok(())
 }
 
 /// Runs one GraphQL mutation and returns its `data`, mapping a top-level
@@ -482,6 +500,39 @@ mod tests {
         let client = server.client(Some("tok"));
         let err = enable_auto_merge(&client, "PR_1", "SQUASH", None).unwrap_err();
         assert!(err.to_string().contains("clean status"), "{err}");
+    }
+
+    #[test]
+    fn batch_pr_status_reads_is_draft() {
+        let server = MockServer::start(vec![MockResponse::json(
+            200,
+            r#"{"data":{"repository":{
+                "pr3":{"isDraft":true,"merged":false,"labels":{"nodes":[]},"commits":{"nodes":[]}}
+            }}}"#,
+        )]);
+        let client = server.client(Some("tok"));
+        let out = batch_pr_status(&client, &repo(), &[3]).unwrap();
+        assert!(out[&3].is_draft);
+        let sent: serde_json::Value = serde_json::from_str(&server.requests()[0].body).unwrap();
+        assert!(sent["query"].as_str().unwrap().contains(" isDraft "));
+    }
+
+    #[test]
+    fn mark_ready_for_review_sends_the_mutation() {
+        let server = MockServer::start(vec![MockResponse::json(
+            200,
+            r#"{"data":{"markPullRequestReadyForReview":{"pullRequest":{"isDraft":false}}}}"#,
+        )]);
+        let client = server.client(Some("tok"));
+        mark_ready_for_review(&client, "PR_1").unwrap();
+        let sent: serde_json::Value = serde_json::from_str(&server.requests()[0].body).unwrap();
+        assert!(
+            sent["query"]
+                .as_str()
+                .unwrap()
+                .contains("markPullRequestReadyForReview(input: $input)")
+        );
+        assert_eq!(sent["variables"]["input"]["pullRequestId"], "PR_1");
     }
 
     #[test]

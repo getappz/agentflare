@@ -1661,6 +1661,21 @@ fn handle_pr_status(
                 result.skipped += 1;
             }
         }
+        // An in-review item's PR is agentflare's to keep ready for review:
+        // `item_done` flips the draft it opened, and this is the retry when
+        // that flip failed (network, a lost race). A draft the item already
+        // records as flipped was converted back by a human on purpose --
+        // held, never re-flipped, and never merged or self-repaired either,
+        // since `Draft` is decided before any CI state is looked at.
+        crate::worktree::PrCiStatus::Draft { number, node_id } => {
+            if crate::worktree::pr_marked_ready(item) {
+                result.waiting += 1;
+            } else if crate::worktree::mark_pr_ready(item, repo_root, number, node_id.as_deref()) {
+                result.updated += 1;
+            } else {
+                result.skipped += 1;
+            }
+        }
         crate::worktree::PrCiStatus::Pending | crate::worktree::PrCiStatus::Unknown => {
             result.skipped += 1;
         }

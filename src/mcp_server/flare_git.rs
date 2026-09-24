@@ -69,9 +69,23 @@ impl AgentflareMcp {
                     .base
                     .as_deref()
                     .ok_or_else(|| ErrorData::invalid_params("base is required", None))?;
-                let pr = pulls::create(&client, &repo, title, head, base, req.body.as_deref())
-                    .map_err(to_mcp_error)?;
-                format!("Opened PR #{}: {}", pr.number, pr.html_url)
+                let draft = req.draft.unwrap_or(false);
+                let pr = pulls::create(
+                    &client,
+                    &repo,
+                    title,
+                    head,
+                    base,
+                    req.body.as_deref(),
+                    draft,
+                )
+                .map_err(to_mcp_error)?;
+                format!(
+                    "Opened {}PR #{}: {}",
+                    if draft { "draft " } else { "" },
+                    pr.number,
+                    pr.html_url
+                )
             }
             "pr_list" => {
                 let state = req.state.as_deref().unwrap_or("open");
