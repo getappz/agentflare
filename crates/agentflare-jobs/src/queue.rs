@@ -182,13 +182,21 @@ impl Queue {
         Ok(Some((id, job)))
     }
 
+    /// Records a finished attempt's outcome. A job an operator cancelled
+    /// while it ran (`cancel_requested`, via `request_cancel`/
+    /// `cancel_for_item`) finishes as `killed` whatever the attempt returned
+    /// -- an executor that finished its work anyway (never polled the flag,
+    /// or returned `Ok` during the abandon grace) must not flip a deliberate
+    /// cancel into `exited`. The check is part of the same UPDATE, so it can't
+    /// race a concurrent cancel request from another connection.
     pub fn complete(&self, id: &str, output: &JobOutput, success: bool) -> Result<(), Error> {
         let now = db_kit::ids::now();
         let state = if success { "exited" } else { "failed" };
         let conn = self.conn.lock();
         conn.execute(
             "UPDATE agent_jobs
-             SET state = ?1,
+             SET state = CASE WHEN cancel_requested != 0 THEN 'killed' ELSE ?1 END,
+                 error = CASE WHEN cancel_requested != 0 THEN ?10 ELSE error END,
                  exit_code = ?2,
                  timed_out = ?3,
                  stdout_log_path = ?4,
@@ -206,7 +214,8 @@ impl Queue {
                 output.stdout_total_bytes as i64,
                 output.stderr_total_bytes as i64,
                 now,
-                id
+                id,
+                crate::cancel::CANCELLED_MESSAGE
             ],
         )?;
         Ok(())

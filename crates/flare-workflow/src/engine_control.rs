@@ -106,13 +106,13 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         // Only a non-terminal run becomes Cancelled: a run that already
         // settled (e.g. completed while the rollback above ran) keeps its
         // real outcome, and no cancellation event is published for it.
+        // This is the sole `WorkflowCancelled` publication site: a live
+        // driver observing the status just stops, so the event fires exactly
+        // once whether or not anything is driving the run.
         let mut cancelled = false;
         self.state_store
             .update(run_id, |s| {
-                if !matches!(
-                    s.status,
-                    WorkflowStatus::Completed | WorkflowStatus::Failed | WorkflowStatus::Cancelled
-                ) {
+                if !s.status.is_terminal() {
                     s.status = WorkflowStatus::Cancelled;
                     cancelled = true;
                 }

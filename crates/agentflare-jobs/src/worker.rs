@@ -245,7 +245,9 @@ fn run_in_process(
     });
 
     // Records a successful attempt, whether it finished within the timeout
-    // or only during the abandon grace period below.
+    // or only during the abandon grace period below. An attempt an operator
+    // cancelled mid-run is finished as `killed` by `Queue::complete` itself
+    // (atomically against the cancel request), not as `exited`.
     let record_success = |stdout_path: std::path::PathBuf, stderr_path: std::path::PathBuf| {
         let stdout_total_bytes = std::fs::metadata(&stdout_path)
             .map(|m| m.len())
@@ -451,5 +453,73 @@ mod tests {
         assert_eq!(final_info.state, JobState::Exited, "{:?}", final_info.error);
         assert_eq!(q.get(&info.id).unwrap().retries, 0, "never retried");
         assert_eq!(runs.load(Ordering::SeqCst), 1, "work done exactly once");
+    }
+
+    /// Signals once it's running, then waits for the test's go-ahead and
+    /// returns `Ok` without ever polling the cancel registry.
+    struct IgnoresCancelExecutor {
+        started: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl InProcessExecutor for IgnoresCancelExecutor {
+        fn execute(
+            &self,
+            _job_id: &str,
+            _args: &[String],
+            _log: &mut dyn std::io::Write,
+        ) -> Result<(), JobFailure> {
+            let _ = self.started.send(());
+            let _ = self
+                .release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5));
+            Ok(())
+        }
+    }
+
+    // An operator cancel of a running job is deliberate: an executor that
+    // finishes its work anyway must not turn it into `exited`.
+    #[test]
+    fn cancelled_running_job_whose_executor_returns_ok_finishes_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::open_memory(dir.path().join("logs")).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut pool = WorkerPool::new(q.clone()).with_executor(Arc::new(IgnoresCancelExecutor {
+            started: started_tx,
+            release: std::sync::Mutex::new(release_rx),
+        }));
+        pool.start(1);
+
+        let info = q
+            .enqueue(
+                &AgentJob::new("label-only")
+                    .in_process()
+                    .timeout(30)
+                    .max_retries(0),
+            )
+            .unwrap();
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("executor must start");
+        assert!(q.request_cancel(&info.id).unwrap(), "running job flagged");
+        release_tx.send(()).unwrap();
+
+        let mut final_info = q.get(&info.id).unwrap();
+        for _ in 0..500 {
+            if final_info.state.is_terminal() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            final_info = q.get(&info.id).unwrap();
+        }
+        pool.shutdown();
+        assert_eq!(final_info.state, JobState::Killed);
+        assert_eq!(
+            final_info.error.as_deref(),
+            Some(crate::cancel::CANCELLED_MESSAGE)
+        );
     }
 }

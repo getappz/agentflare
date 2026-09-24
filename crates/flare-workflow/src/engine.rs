@@ -598,10 +598,10 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         }
 
         loop {
+            // `cancel_workflow_impl` announced the cancel when it set the
+            // status (the one publication site, which also covers a run with
+            // no live driver); the driver just stops.
             if self.state_store.is_cancelled(run_id).await? {
-                self.event_bus
-                    .publish(WorkflowEvent::WorkflowCancelled { run_id })
-                    .await;
                 return Ok(());
             }
             // Paused (`pause_workflow`) or taken over by another executor:
@@ -1050,18 +1050,19 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                     },
                 )
                 .await?;
-            let mut fenced = false;
+            let mut settled = false;
             self.state_store
                 .update(run_id, |s| {
-                    // Fence: never settle a run another executor now holds.
-                    fenced = self.is_leased_elsewhere(s);
-                    if !fenced {
+                    // Fence: never settle a run another executor now holds,
+                    // nor overwrite one already settled (a concurrent cancel).
+                    settled = !self.is_leased_elsewhere(s) && !s.status.is_terminal();
+                    if settled {
                         s.status = WorkflowStatus::Completed;
                     }
                 })
                 .await?;
 
-            if !fenced {
+            if settled {
                 let duration = start_time.elapsed();
                 self.event_bus
                     .publish(WorkflowEvent::WorkflowCompleted { run_id, duration })
@@ -1098,12 +1099,13 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         // `recover()` (which only resumes `Running`/`Pending` runs) picks it
         // back up and `run_rollback_phase` resumes from whatever `Rollback`
         // entries already exist.
-        let mut fenced = false;
+        let mut settled = false;
         self.state_store
             .update(run_id, |s| {
-                // Fence: never settle a run another executor now holds.
-                fenced = self.is_leased_elsewhere(s);
-                if fenced {
+                // Fence: never settle a run another executor now holds, nor
+                // overwrite one already settled (a concurrent cancel).
+                settled = !self.is_leased_elsewhere(s) && !s.status.is_terminal();
+                if !settled {
                     return;
                 }
                 s.status = WorkflowStatus::Failed;
@@ -1116,7 +1118,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 });
             })
             .await?;
-        if fenced {
+        if !settled {
             return Ok(());
         }
         self.event_bus
