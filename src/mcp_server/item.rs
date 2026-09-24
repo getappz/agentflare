@@ -1490,6 +1490,8 @@ impl AgentflareMcp {
         let now = crate::claims::now();
         let ttl = backend_claim_ttl_secs();
         let repo_root = self.worktree_repo_root();
+        let forced =
+            self.force_if_requested(req.force, req.force_reason.as_deref(), &raw, "release")?;
         // Confirm we still hold the claim, and clean up the worktree,
         // *before* actually releasing -- releasing first (as this used to)
         // opens a window where a concurrent `claim` grabs the item and
@@ -1544,7 +1546,8 @@ impl AgentflareMcp {
         let ok = self.with_backend_db(|conn| {
             agentflare_backend::item::release(conn, &item_id, &owner).map_err(map_backend_err)
         })??;
-        Ok(serde_json::json!({"released": ok, "item_id": item_id}).to_string())
+        let resp = serde_json::json!({"released": ok, "item_id": item_id});
+        Ok(super::item_force::with_forced(resp, forced))
     }
 
     pub(crate) fn item_done(&self, req: ItemRequest) -> Result<String, ErrorData> {
@@ -1553,6 +1556,8 @@ impl AgentflareMcp {
         let now = crate::claims::now();
         let ttl = backend_claim_ttl_secs();
         let repo_root = self.worktree_repo_root();
+        let forced =
+            self.force_if_requested(req.force, req.force_reason.as_deref(), &raw, "done")?;
         // Resolve + authorize (DB reads) under the backend lock, then run
         // the blocking git/gh push+PR outside it — `git push`/`gh pr
         // create` have no business running while the shared DB mutex is
@@ -1847,7 +1852,7 @@ impl AgentflareMcp {
         {
             resp["no_pr"] = serde_json::Value::String(reason.clone());
         }
-        Ok(resp.to_string())
+        Ok(super::item_force::with_forced(resp, forced))
     }
 
     /// Promotes an item sitting in "in_review" to "completed" once its PR
@@ -1864,6 +1869,8 @@ impl AgentflareMcp {
     pub(crate) fn item_check_merge(&self, req: ItemRequest) -> Result<String, ErrorData> {
         let raw = require_id(req.id, "check_merge")?;
         let repo_root = self.worktree_repo_root();
+        let forced =
+            self.force_if_requested(req.force, req.force_reason.as_deref(), &raw, "check_merge")?;
         let (item_id, item, in_review) = self.with_backend_db(|conn| {
             let item_id = self.resolve_item_id(conn, &raw)?;
             let item = agentflare_backend::item::get(conn, &item_id).map_err(map_backend_err)?;
@@ -1872,6 +1879,11 @@ impl AgentflareMcp {
             let in_review = state.group_name == "in_review";
             Ok::<_, ErrorData>((item_id, item, in_review))
         })??;
+        if !in_review && req.force == Some(true) {
+            // `force_if_requested` above already rejected a missing/blank reason.
+            let reason = req.force_reason.as_deref().unwrap_or_default().trim();
+            return self.force_complete_merged(&item_id, &item, forced, reason);
+        }
         if !in_review {
             return Ok(serde_json::json!({
                 "item_id": item_id,

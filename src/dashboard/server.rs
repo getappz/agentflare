@@ -204,6 +204,7 @@ fn spawn_supervisor_discovery(
                 crate::claim_liveness::run_sweep(&mcp, &queue);
                 let auth_conn = crate::auth_db::open_or_rebuild();
                 let host_policy = agentflare_resource_gate::current_policy();
+                crate::mcp_server::item_force::auto_release_dead_claims(&mcp, &queue);
                 crate::supervisor::run_discovery_tick(&mcp, &queue, &auth_conn, host_policy)
             })
             .await;

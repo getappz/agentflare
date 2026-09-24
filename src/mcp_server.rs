@@ -14,6 +14,7 @@ mod flare_git;
 mod handoff;
 pub(crate) mod item;
 mod item_doctor;
+pub(crate) mod item_force;
 mod item_reports;
 mod item_status;
 mod memory_tool;

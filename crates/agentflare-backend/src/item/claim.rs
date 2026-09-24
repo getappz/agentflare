@@ -213,6 +213,26 @@ pub fn release(conn: &Connection, item_id: &str, owner: &str) -> Result<bool> {
 /// item has since left the started/in_review groups (see
 /// `in_finalizable_state`).
 pub fn mark_completed(conn: &Connection, item_id: &str, owner: &str) -> Result<bool> {
+    complete_if(conn, item_id, owner, |group| {
+        matches!(group, "started" | "in_review")
+    })
+}
+
+/// [`mark_completed`] for an audited forced promotion of an item whose PR
+/// is already merged but which never went through `done` (so it can still
+/// sit in backlog/todo): any group except an already-terminal one.
+pub fn mark_completed_forced(conn: &Connection, item_id: &str, owner: &str) -> Result<bool> {
+    complete_if(conn, item_id, owner, |group| {
+        !matches!(group, "completed" | "cancelled")
+    })
+}
+
+fn complete_if(
+    conn: &Connection,
+    item_id: &str,
+    owner: &str,
+    allowed_from: impl Fn(&str) -> bool,
+) -> Result<bool> {
     // One transaction start to finish so the ownership check can't go stale
     // between the guard and the write — without this, a concurrent
     // release()+claim() by a different owner could slip in between the
@@ -223,7 +243,7 @@ pub fn mark_completed(conn: &Connection, item_id: &str, owner: &str) -> Result<b
         return Ok(false);
     }
     let item = get(&tx, item_id)?;
-    if !in_finalizable_state(&tx, &item)? {
+    if !allowed_from(crate::state::get(&tx, &item.state_id)?.group_name.as_str()) {
         return Ok(false);
     }
     let completed_state = crate::state::first_in_group(&tx, &item.project_id, "completed")?;

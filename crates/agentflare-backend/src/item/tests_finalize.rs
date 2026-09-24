@@ -190,3 +190,25 @@ fn finalize_paths_survive_concurrent_writers_on_a_shared_file_db() {
         .collect();
     assert!(errors.is_empty(), "{errors:#?}");
 }
+
+#[test]
+fn forced_completion_promotes_from_backlog_but_never_revives_a_cancelled_item() {
+    // The audited force path (merged PR, `done` never ran) may complete an
+    // item still in backlog; it must still not revive a cancelled one.
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let item = make_item(&conn, &pid, &sid);
+    crate::claim::acquire(&conn, &item.id, "agent:1", 1000, TTL).unwrap();
+    set_state_group(&conn, &item.id, &pid, "backlog");
+    assert!(!mark_completed(&conn, &item.id, "agent:1").unwrap());
+    assert!(mark_completed_forced(&conn, &item.id, "agent:1").unwrap());
+    assert_eq!(
+        get(&conn, &item.id).unwrap().state_id,
+        state_in_group(&conn, &pid, "completed")
+    );
+
+    let other = make_item(&conn, &pid, &sid);
+    crate::claim::acquire(&conn, &other.id, "agent:1", 1000, TTL).unwrap();
+    set_state_group(&conn, &other.id, &pid, "cancelled");
+    assert!(!mark_completed_forced(&conn, &other.id, "agent:1").unwrap());
+}
