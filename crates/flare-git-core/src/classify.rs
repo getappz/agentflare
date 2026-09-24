@@ -122,12 +122,19 @@ pub fn extra_trust_root_paths_from_env() -> Vec<String> {
 /// `flare-code::detect` each already carry -- `agent-detector` covers a much
 /// wider agent catalog (opencode, codex, gemini, cursor, windsurf, aider,
 /// devin, ...), not just the handful this crate used to check directly. The
-/// `AGENTFLARE_AGENT` OR-clause stays as a second check alongside it: it's
-/// agentflare's own internal marker (set by its orchestrator on subagents),
-/// not something `agent-detector`'s external, tool-agnostic catalog knows
-/// about, and `bypass_agent_env_var_bypasses_only_for_the_matching_agent`
-/// (flare-git-shim's own tests) depends on it alone being sufficient to
-/// count as agent-invoked.
+/// `AGENTFLARE_AGENT` and `LEAN_CTX_AGENT` OR-clauses stay as second checks
+/// alongside it: both are agentflare's own internal markers (the former set
+/// by its orchestrator on subagents, the latter by `agentflare-shim`'s PATH
+/// dispatcher and lean-ctx's own hook before it routes a command through
+/// `lean-ctx -c git`), neither is something `agent-detector`'s external,
+/// tool-agnostic catalog knows about, and `bypass_agent_env_var_bypasses_only_for_the_matching_agent`
+/// (flare-git-shim's own tests) depends on `AGENTFLARE_AGENT` alone being
+/// sufficient to count as agent-invoked. Without the `LEAN_CTX_AGENT` clause,
+/// a caller reaching this shim through the dispatcher with only that marker
+/// set (no recognized `agent-detector` marker, no `AGENTFLARE_AGENT`) would
+/// be dispatched through `lean-ctx -c git` yet still classify as human here
+/// -- letting it bypass the canonical-mutate guard this function backs
+/// (item #637).
 ///
 /// `AGENTFLARE_GIT_ASSUME_HUMAN`, when set to a non-empty value,
 /// short-circuits this to `false` before either check runs. This crate is
@@ -143,6 +150,7 @@ pub fn agent_invocation_detected() -> bool {
     }
     agent_detector::is_agent()
         || std::env::var_os("AGENTFLARE_AGENT").is_some_and(|s| !s.is_empty())
+        || std::env::var_os("LEAN_CTX_AGENT").is_some_and(|s| !s.is_empty())
 }
 
 /// `true` if `subcommand`/`args` is a branch-*creating* form: `git checkout
