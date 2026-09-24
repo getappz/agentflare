@@ -102,13 +102,63 @@ fn strip_plan_transition_fields(metadata_str: &str) -> String {
         return metadata_str.to_string();
     };
     if let Some(obj) = value.as_object_mut() {
-        for key in [
-            "plan_status",
-            "plan_approved_by",
-            "plan_approved_at",
-            "plan_rejection_reason",
-        ] {
+        for key in PLAN_TRANSITION_FIELDS {
             obj.remove(key);
+        }
+    }
+    value.to_string()
+}
+
+/// Server-authoritative plan-gate transition fields -- see
+/// `strip_plan_transition_fields`/`restore_plan_transition_fields`.
+const PLAN_TRANSITION_FIELDS: [&str; 4] = [
+    "plan_status",
+    "plan_approved_by",
+    "plan_approved_at",
+    "plan_rejection_reason",
+];
+
+/// `item_update`'s counterpart to `strip_plan_transition_fields`: an update
+/// (unlike a create) is patching metadata onto an item that may already
+/// carry a real, human-set approval, so blindly deleting these keys from the
+/// outgoing metadata doesn't just refuse a *forged* value -- it destroys a
+/// legitimate one every single time, because `UpdateItem::metadata` replaces
+/// the column wholesale rather than merging (see `merge_metadata_patch`'s doc
+/// comment). Any internal read-merge-write helper that copies the item's
+/// current metadata forward while patching in an unrelated key (e.g.
+/// `work_item_pipeline::persist_run_id` adding `workflow_run_id`,
+/// `persist_comment_cursor` advancing `last_seen_comment_at`,
+/// `supervisor::persist_repair_track`'s CodeRabbit bookkeeping -- all three
+/// go through this same `item_update` entry point) would otherwise silently
+/// wipe out `plan_status`/`plan_approved_by`/`plan_approved_at` the moment it
+/// ran after a human approved the plan (live incident, item #281: a human's
+/// approval was erased minutes after the supervisor's own dispatch persisted
+/// its `workflow_run_id`).
+///
+/// Instead of deleting the caller-supplied value, each field is forced to
+/// whatever the item's row in the DB currently holds *right now*, discarding
+/// whatever the caller/helper put there -- exactly like the delete used to,
+/// EXCEPT when the current value is the caller's own unrelated pass-through
+/// copy, in which case this makes the write a no-op for that field instead of
+/// a destructive one. The only two writers allowed to actually change these
+/// fields (`item_submit_plan`, `set_plan_status` -- approve/reject) both
+/// write through `agentflare_backend::item::update` directly, bypassing this
+/// MCP entry point entirely, so they are unaffected.
+fn restore_plan_transition_fields(metadata_str: &str, current_metadata: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(metadata_str) else {
+        return metadata_str.to_string();
+    };
+    let current = serde_json::from_str::<serde_json::Value>(current_metadata).ok();
+    if let Some(obj) = value.as_object_mut() {
+        for key in PLAN_TRANSITION_FIELDS {
+            match current.as_ref().and_then(|c| c.get(key)) {
+                Some(v) => {
+                    obj.insert(key.to_string(), v.clone());
+                }
+                None => {
+                    obj.remove(key);
+                }
+            }
         }
     }
     value.to_string()
@@ -935,10 +985,13 @@ impl AgentflareMcp {
                 Some(p) if p.trim().is_empty() => Some(None),
                 Some(p) => Some(Some(self.resolve_item_id(conn, p)?)),
             };
+            let current_metadata = agentflare_backend::item::get(conn, &id)
+                .map(|i| i.metadata)
+                .unwrap_or_else(|_| "{}".to_string());
             let metadata_str = req
                 .metadata
                 .map(metadata_to_json_string)
-                .map(|m| strip_plan_transition_fields(&m));
+                .map(|m| restore_plan_transition_fields(&m, &current_metadata));
             // Only recompute the default plan-gate policy when priority is
             // actually changing in this call -- an update that leaves
             // priority untouched shouldn't re-derive gating from it.
@@ -953,9 +1006,7 @@ impl AgentflareMcp {
                     // every other metadata key the item already has.
                     let base = match &metadata_str {
                         Some(m) => m.clone(),
-                        None => agentflare_backend::item::get(conn, &id)
-                            .map(|i| i.metadata)
-                            .unwrap_or_else(|_| "{}".to_string()),
+                        None => current_metadata.clone(),
                     };
                     match default_plan_gate_patch(priority, &base) {
                         Some(patched) => Some(patched),
@@ -970,11 +1021,7 @@ impl AgentflareMcp {
             // priority branch above, so seed it from the item's current
             // stored metadata rather than an empty object.
             let metadata = match (&metadata, req.plan_asset_id.as_deref()) {
-                (None, Some(pid)) if !pid.trim().is_empty() => Some(
-                    agentflare_backend::item::get(conn, &id)
-                        .map(|i| i.metadata)
-                        .unwrap_or_else(|_| "{}".to_string()),
-                ),
+                (None, Some(pid)) if !pid.trim().is_empty() => Some(current_metadata.clone()),
                 _ => metadata,
             };
             let metadata = merge_submitted_plan(metadata, req.plan_asset_id.as_deref());

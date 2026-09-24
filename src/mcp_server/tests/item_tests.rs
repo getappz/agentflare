@@ -645,6 +645,60 @@ fn channel_approve_plan_succeeds_for_a_human_approver_item() {
     assert_eq!(metadata["plan_status"], "approved");
 }
 
+/// Live incident, item #281: a human approved a plan, the supervisor
+/// dispatched a job off that state, and within minutes the approval record
+/// was gone -- `plan_status` back to unset, `plan_approved_at`/
+/// `plan_approved_by` wiped, because a later unrelated metadata write (e.g.
+/// `work_item_pipeline::persist_run_id` recording the dispatch's
+/// `workflow_run_id`) went through `item(action="update")`, which used to
+/// unconditionally strip the plan-transition fields out of ANY outgoing
+/// metadata -- including a write that was only ever trying to add an
+/// unrelated key on top of the item's own current metadata. An update that
+/// never mentions the plan-gate fields at all must leave the approval intact.
+#[test]
+fn update_with_unrelated_metadata_does_not_erase_an_existing_approval() {
+    let (tmp, s) = harness();
+    let item_id = pending_plan_item(&s, "human");
+    s.item_approve_plan_via_channel(ItemRequest {
+        action: "approve_plan".into(),
+        id: Some(item_id.clone()),
+        ..Default::default()
+    })
+    .unwrap();
+
+    // Mirrors `persist_run_id`'s own shape: read-current, patch in one
+    // unrelated key, write the whole object back.
+    let conn = backend_conn(&tmp);
+    let current = agentflare_backend::item::get(&conn, &item_id).unwrap().metadata;
+    drop(conn);
+    let mut merged: serde_json::Value = serde_json::from_str(&current).unwrap();
+    merged["workflow_run_id"] = serde_json::json!("01a0b3ad-test-run");
+    s.item(Parameters(ItemRequest {
+        action: "update".into(),
+        id: Some(item_id.clone()),
+        metadata: Some(merged),
+        ..Default::default()
+    }))
+    .unwrap();
+
+    let conn = backend_conn(&tmp);
+    let item = agentflare_backend::item::get(&conn, &item_id).unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(&item.metadata).unwrap();
+    assert_eq!(
+        metadata["plan_status"], "approved",
+        "an unrelated metadata write must not revert the approval: {metadata}"
+    );
+    assert!(
+        metadata.get("plan_approved_by").is_some(),
+        "plan_approved_by must survive an unrelated metadata write: {metadata}"
+    );
+    assert!(
+        metadata.get("plan_approved_at").is_some(),
+        "plan_approved_at must survive an unrelated metadata write: {metadata}"
+    );
+    assert_eq!(metadata["workflow_run_id"], "01a0b3ad-test-run");
+}
+
 /// Item #573 final review, Fix 5: an explicit `plan_approver` override is an
 /// explicit gate choice ("gate this, but let an agent sign off") and must
 /// survive the urgent/high default policy, which previously only looked for
@@ -748,9 +802,16 @@ fn update_strips_plan_transition_fields_from_caller_metadata() {
     .unwrap();
     let metadata: serde_json::Value =
         serde_json::from_str(updated["metadata"].as_str().unwrap()).unwrap();
-    assert!(
-        metadata.get("plan_status").is_none(),
-        "update must not accept a caller-supplied plan_status: {metadata}"
+    // The item's real state (set by `submit_plan` inside `pending_plan_item`)
+    // is "pending" -- the write must restore that true current value, not
+    // just delete the key, or a later good-faith merge (e.g.
+    // `work_item_pipeline::persist_run_id` patching in `workflow_run_id`)
+    // would silently erase a real approval the same way (item #281).
+    assert_eq!(
+        metadata.get("plan_status").and_then(|v| v.as_str()),
+        Some("pending"),
+        "update must not accept a caller-supplied plan_status, and must restore the item's \
+         real current one instead of dropping it: {metadata}"
     );
 }
 
