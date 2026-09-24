@@ -423,6 +423,19 @@ pub fn json_output_args(agent: Agent) -> Option<&'static [&'static str]> {
     }
 }
 
+/// The flag that carries `agentflare run --mode <m>` / `agents launch --mode
+/// <m>` to an interactive launch. Claude Code spells it `--permission-mode`
+/// (confirmed via `claude --help`; a bare `--mode` is rejected as an unknown
+/// option). Every other agent keeps the historical pass-through `--mode`
+/// until its own spelling is confirmed.
+#[must_use]
+pub fn mode_flag(agent: Agent) -> &'static str {
+    match agent {
+        Agent::ClaudeCode => "--permission-mode",
+        _ => "--mode",
+    }
+}
+
 /// The flag that resumes a prior session by id (e.g. `claude --resume
 /// <session_id>`, `cursor-agent --resume <chatId>`), appended after
 /// print-mode flags and before the prompt. `None` for agents with no known
@@ -560,6 +573,13 @@ mod tests {
         );
         assert_eq!(json_output_args(Agent::Opencode), None);
         assert_eq!(json_output_args(Agent::Codex), None);
+    }
+
+    #[test]
+    fn mode_flag_is_permission_mode_for_claude_code_and_mode_elsewhere() {
+        assert_eq!(mode_flag(Agent::ClaudeCode), "--permission-mode");
+        assert_eq!(mode_flag(Agent::Codex), "--mode");
+        assert_eq!(mode_flag(Agent::Cursor), "--mode");
     }
 
     #[test]

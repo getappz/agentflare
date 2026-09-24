@@ -99,7 +99,7 @@ pub fn run_launch_env(
         cmd.arg("--model").arg(m);
     }
     if let Some(m) = mode {
-        cmd.arg("--mode").arg(m);
+        cmd.arg(agent_registry::mode_flag(spec.id)).arg(m);
     }
     for a in args {
         cmd.arg(a);
@@ -673,9 +673,54 @@ pub enum HeadlessOutcome {
     Failed(String),
 }
 
+/// Print-mode argv tail: the registry's JSON-output flags (when the caller
+/// asked for a structured reply) followed by `extra_args` — unless
+/// `extra_args` already pin `--output-format` themselves, in which case the
+/// caller's choice stands and no second `--output-format` is emitted.
+///
+/// `cli::work::build_extra_args` pins `stream-json` for liveness. Emitting
+/// `--output-format json` ahead of it made the CLI (last flag wins) stream
+/// multi-line output that `parse_json_reply` then failed to parse as one
+/// object, so every `agentflare work` dispatch silently lost its
+/// `session_id` and `total_cost_usd` — the SDD loop's `--resume` between fix
+/// rounds never fired in real dispatch (audit 2026-09-24, finding #1).
+pub(crate) fn headless_full_args(
+    agent: Agent,
+    request_json: bool,
+    extra_args: &[String],
+) -> Vec<String> {
+    let pins_output_format = extra_args.iter().any(|a| {
+        a == "--output-format" || a.starts_with("--output-format=") || a == "--stream-json"
+    });
+    let mut full_args: Vec<String> = Vec::with_capacity(extra_args.len() + 2);
+    if request_json
+        && !pins_output_format
+        && let Some(flags) = json_output_args(agent)
+    {
+        full_args.extend(flags.iter().map(|s| (*s).to_string()));
+    }
+    full_args.extend(extra_args.iter().cloned());
+    full_args
+}
+
+/// Structured reply off a headless run's stdout. Accepts both shapes the
+/// registry's `json_output_args` agents produce: `--output-format json` (the
+/// whole stdout is one object) and `--output-format stream-json` (one object
+/// per line, the final line carrying the same `{"result", "session_id",
+/// "total_cost_usd"}` fields). Anything else comes back as raw text with no
+/// session or cost — never an error.
 fn parse_json_reply(stdout: &str) -> HeadlessReply {
-    match serde_json::from_str::<serde_json::Value>(stdout.trim()) {
-        Ok(value) => HeadlessReply {
+    let trimmed = stdout.trim();
+    let value = serde_json::from_str::<serde_json::Value>(trimmed)
+        .ok()
+        .or_else(|| {
+            trimmed
+                .lines()
+                .next_back()
+                .and_then(|last| serde_json::from_str::<serde_json::Value>(last).ok())
+        });
+    match value {
+        Some(value) => HeadlessReply {
             text: value
                 .get("result")
                 .and_then(serde_json::Value::as_str)
@@ -689,7 +734,7 @@ fn parse_json_reply(stdout: &str) -> HeadlessReply {
                 .get("total_cost_usd")
                 .and_then(serde_json::Value::as_f64),
         },
-        Err(_) => HeadlessReply {
+        None => HeadlessReply {
             text: stdout.to_string(),
             session_id: None,
             cost_usd: None,
@@ -843,11 +888,7 @@ fn run_headless_impl(
             spec.binary_names.join(" / ")
         ));
     };
-    let mut full_args: Vec<String> = Vec::with_capacity(extra_args.len() + 2);
-    if request_json && let Some(flags) = json_output_args(spec.id) {
-        full_args.extend(flags.iter().map(|s| (*s).to_string()));
-    }
-    full_args.extend(extra_args.iter().cloned());
+    let full_args = headless_full_args(spec.id, request_json, extra_args);
     let Some(argv) = headless_argv(spec.id, &binary, &full_args) else {
         return HeadlessOutcome::NotHeadless(format!(
             "{} has no headless print mode",

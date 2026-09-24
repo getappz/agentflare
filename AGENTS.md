@@ -15,7 +15,7 @@ with four layers:
 |---------|-------------------------------|---------------------------------------|
 | output  | `agentflare optimize output`  | LLM-based prose compression (was caveman) |
 | code    | `agentflare optimize code`    | Lazy senior dev code minimalism (was ponytail) |
-| context | `agentflare optimize context` | Session transcript compaction via BM25 |
+| context | `agentflare optimize context` | On-demand BM25 relevance scoring over a session transcript (`score`); the `PreCompact` hook is inert |
 | runtime | (automatic via hooks)         | Session hygiene, model routing nudges  |
 
 `agentflare flare` / `agentflare opt` still work as backward-compatible aliases for

@@ -137,13 +137,12 @@ Confirmed absent from every launch path (grep over `src/`, `crates/`, `apps/`):
    `encode_session` writes no marker, `resume_args_for` returns nothing on the
    next round, and the run's cost is never recorded.
 
-Fix sketch: in `run_headless_impl`, skip `json_output_args` when
-`extra_args` already contains `--output-format`; and make
-`parse_json_reply` fall back to the last-line parse (`parse_claude_reply`)
-when the whole-stdout parse fails. Add a test that feeds a stream-json
-transcript through `run_headless_impl`'s parsing path rather than through
-`parse_claude_reply` directly. Confirm with one live `agentflare work` run
-that `agent_sessions` gains a session id.
+Fixed on this branch (commit following the audit): `headless_full_args`
+(`src/agent_launch.rs`) skips `json_output_args` when `extra_args` already
+pin `--output-format` (any spelling, including `--stream-json`), and
+`parse_json_reply` falls back to the final line when the whole stdout is
+not one object. Unit tests cover both shapes. Still to do: confirm with one
+live `agentflare work` run that `agent_sessions` gains a session id.
 
 ---
 
@@ -397,13 +396,23 @@ Ranked by leverage. Each names the universal mechanism agentflare already has.
 
 **P0: make the headless worker build on Claude Code**
 
-1. Fix the `--output-format` collision and the last-line fallback (§2.3);
-   add a live-shaped test; verify `agent_sessions` gets a session id.
-2. Introduce `RoleSpec` in `build_extra_args` (`src/cli/work.rs:241`) and
-   `real_agent_send_hook` (`src/work_item_pipeline.rs:725`); registry gains
-   `role_args(agent, &RoleSpec)`, Claude first: `--append-system-prompt-file`,
-   `--allowedTools`/`--disallowedTools`, `--permission-mode`, `--effort`,
-   `--name`, `--json-schema`.
+Status legend: **done** on this branch, **started** (first slice landed),
+otherwise open.
+
+1. **done.** Fix the `--output-format` collision and the last-line fallback
+   (§2.3); live verification of `agent_sessions` still pending.
+2. **started.** `agent_registry::role` now holds `RoleSpec` (system prompt,
+   allowed/disallowed tools, permission mode) and `compile_role(agent,
+   &spec)`; Claude Code compiles to `--append-system-prompt`,
+   `--allowedTools`, `--disallowedTools`, `--permission-mode`, every other
+   agent gets an empty argv and the identity folded into the prompt
+   (`prompt_with_system_fallback`). The SDD loop
+   (`src/work_item_pipeline/roles.rs`) defines implementer, analyst,
+   reviewer and judge specs: reviewers and the plain analyst lose the
+   editing tools, the judge also loses the shell. Open: `--effort`,
+   `--name`, `--json-schema`, `permission_mode` values per role, confirmed
+   flag mappings for Codex/Gemini/OpenCode/Cursor, and `agentflare run
+   --print`/workflow steps adopting `RoleSpec`.
 3. Replace marker parsing in the SDD loop with schema verdicts; parse the
    full stream-json `result` (usage, `num_turns`, `subtype`).
 4. Job-scoped `--settings` and `--mcp-config` files generated under the
@@ -417,7 +426,9 @@ Ranked by leverage. Each names the universal mechanism agentflare already has.
 
 6. `SessionStart` reads `source`; add `PostCompact` re-injection; delete or
    implement `PreCompact`; fix README/AGENTS.md wording for `optimize context`.
-7. Replace `--mode` with `--permission-mode` in `run_launch_env`.
+7. **done.** `agent_registry::mode_flag` maps `--mode` to
+   `--permission-mode` for Claude Code in `run_launch_env`; other agents
+   keep the historical pass-through until their spelling is confirmed.
 8. Honour `CLAUDE_CONFIG_DIR` in `src/paths.rs`; make auth isolation use it
    instead of `HOME`; make `statusLine` writes additive; make `uninstall`
    remove everything `init` wrote.
@@ -446,9 +457,10 @@ Ranked by leverage. Each names the universal mechanism agentflare already has.
 ## 7. Bugs and documentation drift found during the audit
 
 - Double `--output-format` on `agentflare work` dispatch (§2.3):
-  `src/agent_launch.rs:847`, `src/cli/work.rs:254`.
+  `src/agent_launch.rs:847`, `src/cli/work.rs:254`. **Fixed on this branch.**
 - `agentflare run --mode` passes `--mode` to `claude`
   (`src/agent_launch.rs:101-103`); Claude Code's flag is `--permission-mode`.
+  **Fixed on this branch.**
 - `wire_optimize_claude_code` overwrites an existing `statusLine`
   (`src/init.rs:665-671`).
 - `uninstall` leaves `PreCompact`, `PostToolUse`, `PostToolUseFailure`,
