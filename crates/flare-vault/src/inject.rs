@@ -47,22 +47,28 @@ mod tests {
 
     #[test]
     fn load_from_global_vault() {
-        with_temp_home(|| {
-            let app = "flare-vault-test";
-            let vault_path = VaultPaths::global(app).global_vault_path();
+        crate::session::with_keyring_env(|| {
+            // Deterministic shared mock: the real OS backends hang without an
+            // interactive session, which would wedge the suite.
+            crate::session::test_support::use_shared_mock_keyring();
+            with_temp_home(|| {
+                let app = "flare-vault-test";
+                let vault_path = VaultPaths::global(app).global_vault_path();
 
-            create_vault(&vault_path, "pw").unwrap();
-            let dek = open_vault(&vault_path, "pw").unwrap();
-            let mut body = read_vault_body(&vault_path).unwrap();
-            set_secret_value(&mut body, &dek.dek, "MY_SECRET", "test-value").unwrap();
-            write_vault_body(&vault_path, &body).unwrap();
-            crate::session::store_session(app, &vault_path, &dek.dek);
+                create_vault(&vault_path, "pw").unwrap();
+                let dek = open_vault(&vault_path, "pw").unwrap();
+                let mut body = read_vault_body(&vault_path).unwrap();
+                set_secret_value(&mut body, &dek.dek, "MY_SECRET", "test-value").unwrap();
+                write_vault_body(&vault_path, &body).unwrap();
+                crate::session::store_session(app, &vault_path, &dek.dek);
 
-            // A working dir with no .git/.agentflare/Cargo.toml marker, so
-            // this only exercises the global vault, not project scoping.
-            let cwd = TempDir::new().unwrap();
-            let env = load_vault_env(app, cwd.path()).unwrap();
-            assert_eq!(env.get("MY_SECRET").map(String::as_str), Some("test-value"));
+                // A working dir with no .git/.agentflare/Cargo.toml marker, so
+                // this only exercises the global vault, not project scoping.
+                let cwd = TempDir::new().unwrap();
+                let env = load_vault_env(app, cwd.path()).unwrap();
+                assert_eq!(env.get("MY_SECRET").map(String::as_str), Some("test-value"));
+                crate::session::clear_session(app, &vault_path);
+            });
         });
     }
 }
