@@ -758,6 +758,43 @@ fn update_attaching_a_new_plan_asset_id_resets_an_approved_item_to_pending() {
     );
 }
 
+/// Item #300 code review, second pass: `merge_submitted_plan` resets
+/// `plan_status` on resubmission but must also clear a stale
+/// `plan_rejection_reason` left over from a prior rejection, mirroring
+/// `item_submit_plan`'s own patch -- otherwise a freshly-`"pending"`,
+/// unreviewed plan sits next to a rejection reason that no longer applies
+/// to it.
+#[test]
+fn update_attaching_a_new_plan_asset_id_after_rejection_clears_the_stale_reason() {
+    let (tmp, s) = harness();
+    let item_id = pending_plan_item(&s, "human");
+    s.item(Parameters(ItemRequest {
+        action: "reject_plan".into(),
+        id: Some(item_id.clone()),
+        reason: Some("needs more detail on rollback".into()),
+        ..Default::default()
+    }))
+    .unwrap();
+
+    s.item(Parameters(ItemRequest {
+        action: "update".into(),
+        id: Some(item_id.clone()),
+        plan_asset_id: Some("asset-2-revised".into()),
+        ..Default::default()
+    }))
+    .unwrap();
+
+    let conn = backend_conn(&tmp);
+    let item = agentflare_backend::item::get(&conn, &item_id).unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(&item.metadata).unwrap();
+    assert_eq!(metadata["plan_status"], "pending");
+    assert_eq!(metadata["plan_asset_id"], "asset-2-revised");
+    assert!(
+        metadata.get("plan_rejection_reason").is_none_or(|v| v.is_null()),
+        "a resubmission must clear the previous rejection reason: {metadata}"
+    );
+}
+
 /// Item #573 final review, Fix 5: an explicit `plan_approver` override is an
 /// explicit gate choice ("gate this, but let an agent sign off") and must
 /// survive the urgent/high default policy, which previously only looked for

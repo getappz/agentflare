@@ -266,9 +266,16 @@ fn merge_submitted_plan(
     let is_new_submission = gate.plan_asset_id.is_some() && gate.plan_asset_id != current_asset_id;
     Some(
         if gate.plan_asset_id.is_some() && (gate.plan_status.is_none() || is_new_submission) {
+            // Mirrors `item_submit_plan`'s own patch (L1296-1301): clears a
+            // stale `plan_rejection_reason` left over from a prior rejection
+            // so it doesn't sit next to a freshly-`"pending"` resubmission
+            // implying it still applies (item #300 code review finding).
+            // `plan_approved_by`/`plan_approved_at` are deliberately left as
+            // historical record, same as `item_submit_plan` -- `plan_status`
+            // already signals the current plan isn't approved.
             agentflare_backend::item::plan_gate::merge_metadata_patch(
                 &with_field,
-                serde_json::json!({"plan_status": "pending"}),
+                serde_json::json!({"plan_status": "pending", "plan_rejection_reason": null}),
             )
         } else {
             with_field
