@@ -312,6 +312,25 @@ fn wire_claude_code() {
         format!("\"{bin}\" hook pre-compact"),
         5,
     );
+    // Inter-agent messaging: Stop blocks an about-to-idle agent to deliver
+    // messages that arrived during its turn; SessionEnd takes the session
+    // out of the live-session registry so it stops being addressable.
+    added |= add_hook_entry(
+        hooks_obj,
+        "Stop",
+        "hook stop",
+        None,
+        format!("\"{bin}\" hook stop"),
+        5,
+    );
+    added |= add_hook_entry(
+        hooks_obj,
+        "SessionEnd",
+        "hook session-end",
+        None,
+        format!("\"{bin}\" hook session-end"),
+        5,
+    );
     // Retire the old prompt-type PostToolUseFailure hook (identified by its
     // "genuine FRICTION" judge-prompt marker) before wiring the deterministic
     // command hook that replaces it, so an upgraded install doesn't end up
@@ -987,14 +1006,23 @@ mod tests {
     }
 
     #[test]
-    fn wire_claude_code_does_not_wire_session_end() {
-        // SessionEnd used to fire an engram-cli handoff; that integration is
-        // gone (`hook session-end` is now a backward-compat no-op for old
-        // installs, see hook.rs), so fresh installs must not wire it at all.
+    fn wire_claude_code_wires_stop_and_session_end_for_messaging_once() {
         with_temp_home(|| {
             wire_claude_code();
+            wire_claude_code();
             let content = fs::read_to_string(home().join(".claude").join("settings.json")).unwrap();
-            assert!(!content.contains("SessionEnd"));
+            let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+            for (event, marker) in [("Stop", "hook stop"), ("SessionEnd", "hook session-end")] {
+                let entries = v["hooks"][event].as_array().unwrap();
+                assert_eq!(
+                    entries
+                        .iter()
+                        .filter(|e| e.to_string().contains(marker))
+                        .count(),
+                    1,
+                    "{event} wired exactly once"
+                );
+            }
         });
     }
 

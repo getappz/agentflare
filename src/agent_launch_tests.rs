@@ -629,6 +629,8 @@
             timed_out: true,
             idle_killed: false,
             cancelled: false,
+            stalled: false,
+            exhausted: None,
         };
         assert_eq!(diagnostic_suffix(&c, None), " (no output captured)");
     }
@@ -648,6 +650,8 @@
             timed_out: true,
             idle_killed: false,
             cancelled: false,
+            stalled: false,
+            exhausted: None,
         };
         let suffix = diagnostic_suffix(&c, None);
         assert!(suffix.contains("last stdout before kill"));
@@ -666,6 +670,8 @@
             timed_out: true,
             idle_killed: false,
             cancelled: false,
+            stalled: false,
+            exhausted: None,
         };
         let suffix = diagnostic_suffix(&c, None);
         assert!(suffix.contains("last stderr before kill"));
@@ -685,6 +691,8 @@
             timed_out: true,
             idle_killed: true,
             cancelled: false,
+            stalled: false,
+            exhausted: None,
         };
         let suffix = diagnostic_suffix(&c, Some("level=INFO message=\"tool call\" tool=lean_ctx"));
         assert!(suffix.contains("sandbox-side agent log tail"));
@@ -700,6 +708,8 @@
             timed_out: false,
             idle_killed: false,
             cancelled: false,
+            stalled: false,
+            exhausted: None,
         };
         let msg = match Ok::<_, std::io::Error>(captured) {
             Ok(c) if c.success => unreachable!(),
@@ -900,4 +910,179 @@
         let child_pid = child.id();
         child.wait().unwrap();
         assert_eq!(process_start_token(child_pid), None);
+    }
+
+    // --- hung-but-chatty detection (agent_launch_progress.rs) ---
+
+    fn looping_progress(lines: &[&str]) -> OutputProgress {
+        let mut p = OutputProgress::new(std::time::Instant::now());
+        for _ in 0..3 {
+            for line in lines {
+                p.feed(1, &format!("{line}\n"), std::time::Instant::now());
+            }
+        }
+        p
+    }
+
+    #[test]
+    fn normalize_line_folds_counters_but_keeps_names() {
+        assert_eq!(
+            normalize_line("Rate limited, retrying in 5s (attempt 3 of 10) at 12:01:07"),
+            normalize_line("Rate limited, retrying in 7s (attempt 4 of 10) at 12:01:19")
+        );
+        assert_ne!(
+            normalize_line("test case_1 ... ok"),
+            normalize_line("test case_2 ... ok")
+        );
+    }
+
+    #[test]
+    fn a_retry_loop_is_repetitive_but_varied_output_is_not() {
+        let looping = looping_progress(&[
+            "API error (429), retrying in 5s... attempt 1",
+            "API error (429), retrying in 10s... attempt 2",
+            "API error (429), retrying in 20s... attempt 3",
+            "API error (429), retrying in 40s... attempt 4",
+        ]);
+        assert!(looping.is_repetitive());
+
+        let varied = looping_progress(&[
+            "test parser::handles_empty_input ... ok",
+            "test parser::rejects_trailing_comma ... ok",
+            "test lexer::tokenizes_strings ... ok",
+            "test lexer::tokenizes_numbers ... ok",
+            "test eval::adds ... ok",
+        ]);
+        assert!(!varied.is_repetitive());
+    }
+
+    #[test]
+    fn stall_needs_repetition_and_no_worktree_change_for_the_window() {
+        let t0 = std::time::Instant::now();
+        let window = std::time::Duration::from_secs(45 * 60);
+        let later = t0 + window + std::time::Duration::from_secs(1);
+        // Repetitive output, worktree and output both stale: stalled.
+        assert!(is_stalled(later, t0, t0, true, window));
+        // Varied output: never stalled, however long.
+        assert!(!is_stalled(later, t0, t0, false, window));
+        // Worktree changed recently: progress, not stalled.
+        assert!(!is_stalled(later, later, t0, true, window));
+        // A novel output line recently: progress, not stalled.
+        assert!(!is_stalled(later, t0, later, true, window));
+        // Window 0 disables detection.
+        assert!(!is_stalled(later, t0, t0, true, std::time::Duration::ZERO));
+    }
+
+    #[test]
+    fn exhaustion_mid_run_needs_repeated_spaced_sightings() {
+        let t0 = std::time::Instant::now();
+        let line = "Error: Credit balance is too low\n";
+        let mut spread = OutputProgress::new(t0);
+        for i in 0..3 {
+            spread.feed(1, line, t0 + std::time::Duration::from_secs(20 * i));
+        }
+        assert_eq!(spread.exhausted(), Some("Error: Credit balance is too low"));
+
+        // Printed three times at once (e.g. a file dump): not enough.
+        let mut burst = OutputProgress::new(t0);
+        for _ in 0..3 {
+            burst.feed(1, line, t0);
+        }
+        assert_eq!(burst.exhausted(), None);
+
+        // A transcript JSON line that merely contains the phrase isn't the
+        // agent's own error.
+        let mut echoed = OutputProgress::new(t0);
+        for i in 0..3 {
+            echoed.feed(
+                0,
+                "{\"type\":\"user\",\"content\":\"grep: Credit balance is too low\"}\n",
+                t0 + std::time::Duration::from_secs(20 * i),
+            );
+        }
+        assert_eq!(echoed.exhausted(), None);
+    }
+
+    fn fast_stall() -> StallConfig {
+        StallConfig {
+            window: std::time::Duration::from_secs(2),
+            check_every: std::time::Duration::from_secs(1),
+            exhaustion_kill: true,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_captured_kills_a_chatty_loop_that_makes_no_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = std::time::Instant::now();
+        let mut cmd = Command::new("sh");
+        cmd.current_dir(dir.path()).arg("-c").arg(
+            "while true; do echo 'rate limited, retrying in 5s'; sleep 0.05; done",
+        );
+        let out = run_captured_with_stall(
+            cmd,
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+            None,
+            None,
+            fast_stall(),
+        )
+        .unwrap();
+        assert!(out.stalled, "a looping, progress-free child is stalled");
+        assert!(!out.success && !out.timed_out);
+        assert!(start.elapsed() < std::time::Duration::from_secs(20));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_captured_leaves_varied_output_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cmd = Command::new("sh");
+        cmd.current_dir(dir.path()).arg("-c").arg(
+            "for i in $(seq 1 80); do echo \"step $(tr -dc a-z </dev/urandom | head -c 12)\"; sleep 0.05; done",
+        );
+        let out = run_captured_with_stall(
+            cmd,
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+            None,
+            None,
+            fast_stall(),
+        )
+        .unwrap();
+        assert!(!out.stalled, "varied output is progress");
+        assert!(out.success);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_captured_leaves_a_repetitive_child_that_changes_its_worktree_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        let mut cmd = Command::new("sh");
+        cmd.current_dir(dir.path()).arg("-c").arg(
+            "for i in $(seq 1 100); do echo 'building...'; echo $i >> work.txt; sleep 0.05; done",
+        );
+        let out = run_captured_with_stall(
+            cmd,
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+            None,
+            None,
+            StallConfig {
+                window: std::time::Duration::from_secs(3),
+                ..fast_stall()
+            },
+        )
+        .unwrap();
+        assert!(!out.stalled, "worktree changes are progress");
+        assert!(out.success);
     }

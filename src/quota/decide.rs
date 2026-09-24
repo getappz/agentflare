@@ -275,7 +275,19 @@ pub fn decide_for_supervisor(
         .flatten();
 
     match decision.effective_action {
-        EffectiveActionInternal::Run => EffectiveAction::Run,
+        EffectiveActionInternal::Run => {
+            // Assignee known to be out of credit/quota: move the item to an
+            // available agent instead of waiting out the cooldown. The
+            // caller still holds the pre-move item, so dispatch happens on
+            // the next tick against the new assignee.
+            if let Some(to) = super::failover::failover_before_dispatch(mcp, item) {
+                return EffectiveAction::Wait(format!(
+                    "assignee unavailable -- moved to {}; dispatching on the next tick",
+                    to.as_str()
+                ));
+            }
+            EffectiveAction::Run
+        }
         EffectiveActionInternal::SelfRepair => {
             if let Some((goal_item, mut meta)) = goal {
                 meta.consecutive_self_repairs += 1;

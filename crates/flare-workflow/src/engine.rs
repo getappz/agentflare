@@ -919,6 +919,14 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                     .await;
                 return Ok(());
             }
+            // Paused (`pause_workflow`): stop driving at this step boundary
+            // without settling the run. Whatever a step in flight left behind
+            // stays unjournaled, so `resume_workflow`/`resume_run` re-drives
+            // from exactly the persisted step.
+            if self.state_store.is_paused(run_id).await? {
+                tracing::info!(run_id = %run_id, "Workflow paused; stopping at step boundary");
+                return Ok(());
+            }
 
             // Phase 0: drain completion signals so dependents are added.
             // Forward on *any* terminal result, not just Success/Skip: a
@@ -1239,6 +1247,9 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                                 t.skipped.insert(step_id.clone());
                                 (StepResult::Skip, false)
                             }
+                            // Stopped by a pause: neither done nor failed, so
+                            // the resumed run schedules it again.
+                            Err(WorkflowError::Paused(_)) => (StepResult::Failure, false),
                             Ok(StepResult::Failure) | Ok(StepResult::Failed(_)) | Err(_) => {
                                 match step.on_failure {
                                     FailureAction::FailWorkflow
@@ -1429,6 +1440,9 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             if self.state_store.is_cancelled(run_id).await? {
                 return Err(WorkflowError::Cancelled(run_id));
             }
+            if self.state_store.is_paused(run_id).await? {
+                return Err(WorkflowError::Paused(run_id));
+            }
 
             self.state_store
                 .update(run_id, |s| {
@@ -1540,6 +1554,13 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 | Ok(Ok(StepResult::Failed(_)))
                 | Ok(Err(_))
                 | Err(_) => {
+                    // The failure is the pause killing this step's work (an
+                    // agent turn stopped via its job's cancel flag): not a
+                    // real failure, so nothing is retried or journaled.
+                    if self.state_store.is_paused(run_id).await? {
+                        self.mark_step_paused(run_id, &step.id).await?;
+                        return Err(WorkflowError::Paused(run_id));
+                    }
                     let (error_msg, should_retry) = match result {
                         Ok(Err(e)) => {
                             let retryable = step.executor.is_retryable(&e);
@@ -1630,6 +1651,68 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 }
             }
         }
+    }
+
+    /// Pause a non-terminal run: the engine driving it stops at the next
+    /// step boundary (a step already executing finishes or is stopped by its
+    /// own cancellation, and is then re-run on resume rather than recorded
+    /// as failed). The run's state, journal and data are kept as they are;
+    /// paused runs are not picked up by `recover`. Returns whether the run
+    /// was actually paused (false if it had already finished or was paused).
+    pub async fn pause_workflow(&self, run_id: WorkflowRunId) -> WorkflowResult<bool> {
+        let mut paused = false;
+        self.state_store
+            .update(run_id, |s| {
+                if matches!(
+                    s.status,
+                    WorkflowStatus::Pending | WorkflowStatus::Running | WorkflowStatus::Waiting
+                ) {
+                    s.status = WorkflowStatus::Paused;
+                    paused = true;
+                }
+            })
+            .await?;
+        if paused {
+            tracing::info!(run_id = %run_id, "Workflow pause requested");
+        }
+        Ok(paused)
+    }
+
+    /// Resume a paused run on this engine, re-driving it from its persisted
+    /// step (completed steps stay memoized via the journal). Returns false
+    /// when the run isn't paused. Refused while the run is still being
+    /// driven -- the paused driver hasn't reached its step boundary yet --
+    /// since flipping it back to running then would let that driver carry
+    /// on and count the stopped step as failed.
+    pub async fn resume_workflow(&self, run_id: WorkflowRunId) -> WorkflowResult<bool> {
+        let state = self.state_store.load(run_id).await?;
+        if state.status != WorkflowStatus::Paused {
+            return Ok(false);
+        }
+        if self.is_driving(run_id) || self.is_leased_elsewhere(&state) {
+            return Err(WorkflowError::InvalidStateTransition {
+                from: WorkflowStatus::Paused,
+                to: WorkflowStatus::Running,
+            });
+        }
+        self.resume_run(run_id).await
+    }
+
+    /// Put a step stopped by a pause back to `Pending` so its status doesn't
+    /// read as failed/retrying while the run is paused.
+    pub(crate) async fn mark_step_paused(
+        &self,
+        run_id: WorkflowRunId,
+        step_id: &StepId,
+    ) -> WorkflowResult<()> {
+        self.state_store
+            .update(run_id, |s| {
+                if let Some(ss) = s.step_states.get_mut(step_id) {
+                    ss.status = StepStatus::Pending;
+                    ss.completed_at = None;
+                }
+            })
+            .await
     }
 
     /// Cancel a running workflow. Already-succeeded steps are left

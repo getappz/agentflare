@@ -43,6 +43,13 @@ pub trait StateStore<D: WorkflowData>: Send + Sync + Clone {
     /// Check if a workflow is cancelled without loading full state.
     async fn is_cancelled(&self, run_id: WorkflowRunId) -> WorkflowResult<bool>;
 
+    /// Check if a workflow is paused. The engine polls this at every step
+    /// boundary, so stores with a cheaper status lookup should override the
+    /// full-state default.
+    async fn is_paused(&self, run_id: WorkflowRunId) -> WorkflowResult<bool> {
+        Ok(self.load(run_id).await?.status == WorkflowStatus::Paused)
+    }
+
     /// Clean up old terminal workflows beyond a time threshold.
     async fn cleanup_old_workflows(&self, ttl: Duration) -> usize;
 

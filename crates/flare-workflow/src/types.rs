@@ -522,6 +522,11 @@ pub enum WorkflowError {
     #[error("workflow cancelled: {0}")]
     Cancelled(WorkflowRunId),
 
+    /// A step stopped because an operator paused the run; nothing about the
+    /// step is recorded as failed, so a resume re-runs it.
+    #[error("workflow paused: {0}")]
+    Paused(WorkflowRunId),
+
     #[error("invalid state transition: {from:?} -> {to:?}")]
     InvalidStateTransition {
         from: WorkflowStatus,

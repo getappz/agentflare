@@ -28,6 +28,12 @@ pub(crate) const DISPATCHED_LABEL: &str = "dispatched";
 /// on `READY_LABEL`, so it doesn't retry-loop against the same broken agent
 /// or a persistently orphaning job (items #463/#506/#164).
 pub(crate) const NEEDS_MANUAL_LABEL: &str = "needs-manual-dispatch";
+/// Set by an operator pause (`item(action="pause")`, `agentflare item
+/// pause`): the item's run is parked with its worktree and run state kept,
+/// and its claim released. Discovery never dispatches an item carrying it,
+/// even if `ready-for-work` is added back by hand -- only a resume (which
+/// removes it) re-arms the item.
+pub(crate) const PAUSED_LABEL: &str = "paused";
 const NEEDS_HUMAN_GATE_LABEL: &str = "needs-human-gate";
 /// Blocks auto-dispatch even while `READY_LABEL` is also present -- for a
 /// go/no-go candidate item whose description says "not dispatched, awaiting
@@ -389,6 +395,17 @@ pub(crate) fn run_discovery_tick(
             0
         };
         for item in items {
+            if let Some(paused_id) = label_id_by_name.get(PAUSED_LABEL) {
+                let paused = mcp
+                    .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item.id))
+                    .ok()
+                    .and_then(Result::ok)
+                    .is_some_and(|ids| ids.contains(paused_id));
+                if paused {
+                    result.waiting += 1;
+                    continue;
+                }
+            }
             if let Some(gate_id) = label_id_by_name.get(NEEDS_DECISION_LABEL) {
                 let gated = mcp
                     .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item.id))

@@ -15,6 +15,63 @@ pub(crate) const DISPATCH_MARKER: &str = "## supervisor — dispatched";
 pub(crate) const DISPATCH_FAILURE_CAP_MARKER: &str =
     "## supervisor — identical failure cap reached";
 
+/// Prefix on the comment `cli::work` posts when it moved an item to another
+/// agent because the one running it ran out of credit/quota or hit a long
+/// rate limit. Neutral for both caps: the agent failed, not the item.
+pub(crate) const AGENT_FAILOVER_MARKER: &str = "## agentflare work — moved to another agent";
+/// Prefix on the comment posted when the agent ran out and no other agent was
+/// available, so the run waits for the agent's reset. Neutral, same reason.
+pub(crate) const AGENT_UNAVAILABLE_MARKER: &str = "## agentflare work — agent unavailable";
+/// Prefix on the comment posted when a run was stopped on request (workflow
+/// cancelled, or paused). Neutral for both caps, and tells the terminal-job
+/// hook not to put the item back on `ready-for-work` (see
+/// [`stopped_on_request`]).
+pub(crate) const STOPPED_ON_REQUEST_MARKER: &str = "## agentflare work — stopped on request";
+
+/// Outcome comments that say nothing about whether the item itself is
+/// broken -- a cycle whose latest outcome is one of these is skipped by both
+/// counts: it neither adds to a streak nor breaks one.
+fn is_neutral_outcome(body: &str) -> bool {
+    [
+        AGENT_FAILOVER_MARKER,
+        AGENT_UNAVAILABLE_MARKER,
+        STOPPED_ON_REQUEST_MARKER,
+    ]
+    .iter()
+    .any(|m| body.starts_with(m))
+}
+
+/// A segment's latest outcome comment is a neutral one (a later real failure
+/// on a retry of the same job still counts).
+fn segment_ended_neutral(segment: &[agentflare_backend::comment::ItemComment]) -> bool {
+    segment
+        .iter()
+        .rev()
+        .find(|c| failure_reason(&c.body).is_some() || is_neutral_outcome(&c.body))
+        .is_some_and(|c| is_neutral_outcome(&c.body))
+}
+
+/// Whether the item's most recent outcome is a stop-on-request (cancel or
+/// pause) -- the terminal-job hook must then leave it off `ready-for-work`.
+pub(crate) fn stopped_on_request(comments: &[agentflare_backend::comment::ItemComment]) -> bool {
+    comments
+        .iter()
+        .rev()
+        .find(|c| {
+            [
+                WORK_FAILURE_MARKER,
+                WORK_SUCCESS_MARKER,
+                DISPATCH_MARKER,
+                AGENT_FAILOVER_MARKER,
+                AGENT_UNAVAILABLE_MARKER,
+                STOPPED_ON_REQUEST_MARKER,
+            ]
+            .iter()
+            .any(|m| c.body.starts_with(m))
+        })
+        .is_some_and(|c| c.body.starts_with(STOPPED_ON_REQUEST_MARKER))
+}
+
 /// After this many consecutive dispatch cycles whose terminal failure reason
 /// is identical/near-identical, the daemon stops swapping an item back to
 /// `ready-for-work` for auto-redispatch.
@@ -85,6 +142,9 @@ fn dispatch_cycle_failure_reasons(
             cycles.clear();
             continue;
         }
+        if segment_ended_neutral(segment) {
+            continue;
+        }
         let Some(reason) = segment
             .iter()
             .rev()
@@ -134,7 +194,7 @@ fn dispatch_cycle_coarse_outcomes(
     dispatch_indices
         .iter()
         .enumerate()
-        .map(|(idx, &start)| {
+        .filter_map(|(idx, &start)| {
             let end = dispatch_indices
                 .get(idx + 1)
                 .copied()
@@ -144,14 +204,16 @@ fn dispatch_cycle_coarse_outcomes(
                 .iter()
                 .any(|c| c.body.starts_with(WORK_SUCCESS_MARKER))
             {
-                CoarseOutcome::Success
+                Some(CoarseOutcome::Success)
+            } else if segment_ended_neutral(segment) {
+                None
             } else {
                 let cap_already_reported = segment
                     .iter()
                     .any(|c| c.body.starts_with(DISPATCH_FAILURE_CAP_MARKER));
-                CoarseOutcome::NotSuccess {
+                Some(CoarseOutcome::NotSuccess {
                     cap_already_reported,
-                }
+                })
             }
         })
         .collect()
@@ -412,6 +474,65 @@ mod tests {
     #[test]
     fn any_reason_count_zero_with_no_dispatch_cycles() {
         assert_eq!(consecutive_failure_count_any_reason(&[]), 0);
+    }
+
+    #[test]
+    fn failover_and_unavailable_cycles_do_not_count_toward_either_cap() {
+        let err = "judge reply was not valid JSON";
+        let comments = vec![
+            comment(&format!("{DISPATCH_MARKER}\n\njob: a")),
+            comment(&format!("{WORK_FAILURE_MARKER}\n\n{err}")),
+            comment(&format!("{DISPATCH_MARKER}\n\njob: b")),
+            comment(&format!(
+                "{AGENT_FAILOVER_MARKER}\n\nmoved from claude-code to codex: out of credit"
+            )),
+            comment(&format!("{DISPATCH_MARKER}\n\njob: c")),
+            comment(&format!(
+                "{AGENT_UNAVAILABLE_MARKER}\n\ncodex: usage limit reached"
+            )),
+            comment(&format!("{DISPATCH_MARKER}\n\njob: d")),
+            comment(&format!("{WORK_FAILURE_MARKER}\n\n{err}")),
+        ];
+        assert_eq!(
+            consecutive_identical_failure_count(&comments),
+            2,
+            "neutral cycles neither count nor break the identical streak"
+        );
+        assert_eq!(consecutive_failure_count_any_reason(&comments), 2);
+        let only_neutral = vec![
+            comment(&format!("{DISPATCH_MARKER}\n\njob: a")),
+            comment(&format!("{AGENT_FAILOVER_MARKER}\n\nmoved")),
+            comment(&format!("{DISPATCH_MARKER}\n\njob: b")),
+            comment(&format!("{AGENT_UNAVAILABLE_MARKER}\n\nwaiting")),
+        ];
+        assert_eq!(consecutive_identical_failure_count(&only_neutral), 0);
+        assert_eq!(consecutive_failure_count_any_reason(&only_neutral), 0);
+    }
+
+    #[test]
+    fn a_real_failure_on_a_later_retry_of_the_same_job_still_counts() {
+        let comments = vec![
+            comment(&format!("{DISPATCH_MARKER}\n\njob: a")),
+            comment(&format!("{AGENT_UNAVAILABLE_MARKER}\n\nwaiting")),
+            comment(&format!("{WORK_FAILURE_MARKER}\n\nreal bug")),
+        ];
+        assert_eq!(consecutive_failure_count_any_reason(&comments), 1);
+    }
+
+    #[test]
+    fn stopped_on_request_reads_the_latest_outcome() {
+        let stopped = vec![
+            comment(&format!("{DISPATCH_MARKER}\n\njob: a")),
+            comment(&format!("{STOPPED_ON_REQUEST_MARKER}\n\ncancelled")),
+        ];
+        assert!(stopped_on_request(&stopped));
+        assert_eq!(consecutive_failure_count_any_reason(&stopped), 0);
+        let redispatched = vec![
+            comment(&format!("{STOPPED_ON_REQUEST_MARKER}\n\ncancelled")),
+            comment(&format!("{DISPATCH_MARKER}\n\njob: b")),
+            comment(&format!("{WORK_FAILURE_MARKER}\n\nboom")),
+        ];
+        assert!(!stopped_on_request(&redispatched));
     }
 
     #[test]

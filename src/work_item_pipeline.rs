@@ -488,7 +488,7 @@ pub(crate) fn build_sdd_loop_step(
                         // classify.
                         // A job cancelled by a reassignment (item #607) is the
                         // same: retrying would just be refused again.
-                        if crate::auth_runner::is_auth_expired(&message)
+                        if crate::auth_runner::skips_step_retry(&message)
                             || message == agentflare_jobs::cancel::CANCELLED_MESSAGE
                         {
                             return Ok(StepResult::Failed(message));
@@ -564,7 +564,7 @@ pub(crate) fn build_sdd_loop_step(
                         // instead of burning 3 guaranteed-useless attempts.
                         // A job cancelled by a reassignment (item #607) is the
                         // same: retrying would just be refused again.
-                        if crate::auth_runner::is_auth_expired(&message)
+                        if crate::auth_runner::skips_step_retry(&message)
                             || message == agentflare_jobs::cancel::CANCELLED_MESSAGE
                         {
                             return Ok(StepResult::Failed(message));
@@ -1119,6 +1119,7 @@ async fn poll_pending_corrections(
     item_id: &str,
     owner: &str,
 ) {
+    poll_agent_messages(eng, run_id, owner).await;
     let Ok(listed) = mcp.comment_impl(CommentRequest {
         action: "list".into(),
         item_id: Some(item_id.to_string()),
@@ -1141,6 +1142,9 @@ async fn poll_pending_corrections(
         .filter(|c| {
             c.created_at > cursor
                 && crate::claims::agent_of(&c.author_agent) != crate::claims::agent_of(owner)
+                // Mirror of an agent message this run already got directly
+                // (see `poll_agent_messages`).
+                && !c.body.starts_with(crate::messages::ITEM_COMMENT_PREFIX)
         })
         .map(|c| c.body)
         .collect();
@@ -1164,6 +1168,8 @@ async fn poll_pending_corrections(
         persist_comment_cursor(mcp, item_id, latest);
     }
 }
+
+include!("work_item_pipeline/agent_messages.rs");
 
 /// Mirrors an advanced comment cursor onto the item's own metadata (the
 /// same merge-then-`item_update` pattern as `persist_run_id`) so it
@@ -1414,11 +1420,31 @@ pub(crate) fn run_or_resume_with_sender(
         const CANCEL_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
         let waiter = attach_run_waiter(run_id);
         let mut takeovers = 0u32;
+        // Registers this run under its claim owner with this process's pid,
+        // so claim liveness judges the claim by whether this process is
+        // alive (exact) rather than by heartbeat age. Ended on every return.
+        let mut session =
+            crate::claim_liveness::HeadlessSession::register(&heartbeat_owner, &item.id, &worktree_path);
+        // An operator pause ends this job as a stop on request (no retry,
+        // not counted as a failure, own claim released, worktree kept -- see
+        // `cli::work::PAUSED_MESSAGE`) while the run itself stays paused for
+        // a later resume to continue.
+        let paused_message =
+            || format!("{}: workflow run {run_id}", crate::cli::work::PAUSED_MESSAGE);
 
         loop {
             let state = eng.get_status(run_id).await.map_err(|e| e.to_string())?;
             match state.status {
                 WorkflowStatus::Completed => return Ok(()),
+                WorkflowStatus::Paused => return Err(paused_message()),
+                // Ended while this job was cancelled (an operator cancel, or
+                // the killed agent turn failing its step): report it as the
+                // deliberate stop it is, not a failure.
+                WorkflowStatus::Failed | WorkflowStatus::Cancelled
+                    if crate::agent_launch::owner_job_cancelled(&heartbeat_owner) =>
+                {
+                    return Err(agentflare_jobs::cancel::CANCELLED_MESSAGE.to_string());
+                }
                 WorkflowStatus::Failed | WorkflowStatus::Cancelled => {
                     return Err(state
                         .error
@@ -1426,6 +1452,9 @@ pub(crate) fn run_or_resume_with_sender(
                 }
                 _ => {
                     if waiter.is_superseded() {
+                        // The newer waiter shares this owner key; leave its
+                        // session registration in place.
+                        session.keep_on_drop();
                         // A newer dispatch in this process adopted the run
                         // and reports its outcome; stepping aside quietly
                         // (no release/comment) keeps this attempt from
@@ -1456,7 +1485,17 @@ pub(crate) fn run_or_resume_with_sender(
                     }
                     if last_cancel_check.elapsed() >= CANCEL_CHECK_INTERVAL {
                         last_cancel_check = std::time::Instant::now();
+                        poll_agent_messages(eng, run_id, &heartbeat_owner).await;
                         if crate::agent_launch::owner_job_cancelled(&heartbeat_owner) {
+                            // A pause cancels the job too, but the run must
+                            // stay paused (resumable), not be cancelled.
+                            if eng
+                                .get_status(run_id)
+                                .await
+                                .is_ok_and(|s| s.status == WorkflowStatus::Paused)
+                            {
+                                return Err(paused_message());
+                            }
                             let _ = eng.cancel_workflow(run_id).await;
                             return Err(agentflare_jobs::cancel::CANCELLED_MESSAGE.to_string());
                         }
@@ -1479,6 +1518,7 @@ pub(crate) fn run_or_resume_with_sender(
                         }
                         poll_pending_corrections(&mcp, eng, run_id, &item.id, &heartbeat_owner)
                             .await;
+                        session.touch();
                         last_heartbeat = std::time::Instant::now();
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1687,6 +1727,8 @@ mod cancel_tests;
 mod cap_tests;
 #[cfg(test)]
 mod judge_decision_tests;
+#[cfg(test)]
+mod pause_tests;
 #[cfg(test)]
 mod pipeline_assembly_tests;
 #[cfg(test)]

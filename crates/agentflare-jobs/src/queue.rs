@@ -469,6 +469,46 @@ impl Queue {
         Ok(())
     }
 
+    /// Operator cancel of one job by id, whatever its state: a queued (or
+    /// retry-pending) job is `killed` at once; a running one only gets
+    /// `cancel_requested`, which its executor observes (`is_cancelled`) to
+    /// stop its agent, after which `fail` finishes the row as `killed` --
+    /// never re-queued, so the cancel is terminal. Returns false when the job
+    /// had already finished (nothing to cancel); `NotFound` for an unknown id.
+    pub fn request_cancel(&self, id: &str) -> Result<bool, Error> {
+        let now = db_kit::ids::now();
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let state: Option<String> = tx
+            .query_row(
+                "SELECT state FROM agent_jobs WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(e),
+            })?;
+        let Some(state) = state else {
+            return Err(Error::NotFound(id.to_string()));
+        };
+        let killed = state == "queued"
+            && tx.execute(
+                "UPDATE agent_jobs SET state = 'killed', finished_at = ?1, error = ?2
+                 WHERE id = ?3 AND state = 'queued'",
+                params![now, crate::cancel::CANCELLED_MESSAGE, id],
+            )? > 0;
+        let flagged = !killed
+            && tx.execute(
+                "UPDATE agent_jobs SET cancel_requested = 1
+                 WHERE id = ?1 AND state IN ('queued', 'running')",
+                params![id],
+            )? > 0;
+        tx.commit()?;
+        Ok(killed || flagged)
+    }
+
     /// Whether the job was cancelled (`cancel`/`cancel_for_item`). A running
     /// in-process job polls this to stop itself; a missing row reads as not
     /// cancelled so a lookup failure can never kill live work.
@@ -922,5 +962,40 @@ mod tests {
             stored.retries, 0,
             "retries must not be incremented on a fatal failure"
         );
+    }
+    // Operator cancel (`agentflare job cancel`) must be terminal for both a
+    // queued and a running job: the running one's retry budget is never
+    // spent, it finishes as `killed` rather than going back to `queued`.
+    #[test]
+    fn request_cancel_is_terminal_for_queued_and_running_jobs() {
+        let (queue, _dir) = test_queue();
+        let queued = queue
+            .enqueue(&AgentJob::new("true").max_retries(3))
+            .unwrap();
+        assert!(queue.request_cancel(&queued.id).unwrap());
+        assert_eq!(queue.get(&queued.id).unwrap().state, JobState::Killed);
+
+        let running = queue
+            .enqueue(&AgentJob::new("true").max_retries(3))
+            .unwrap();
+        let (id, _) = queue.dequeue().unwrap().expect("dequeue running job");
+        assert_eq!(id, running.id);
+        assert!(queue.request_cancel(&running.id).unwrap());
+        assert!(queue.is_cancelled(&running.id));
+        assert!(
+            !queue.fail(&running.id, "stopped", None, false).unwrap(),
+            "a cancelled job's failure is not a terminal failure"
+        );
+        assert_eq!(queue.get(&running.id).unwrap().state, JobState::Killed);
+        assert!(queue.dequeue().unwrap().is_none(), "never re-queued");
+
+        assert!(
+            !queue.request_cancel(&running.id).unwrap(),
+            "already finished"
+        );
+        assert!(matches!(
+            queue.request_cancel("no-such-job"),
+            Err(Error::NotFound(_))
+        ));
     }
 }

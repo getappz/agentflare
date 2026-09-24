@@ -1515,6 +1515,45 @@ impl AgentflareMcp {
         })?
     }
 
+    /// When `item_id`'s claim is held by someone other than `caller` whose
+    /// owner is known dead (`claim_liveness::judge_owner`: its job finished,
+    /// its session ended, its process is gone), release that claim so the
+    /// caller's `release`/`done` below treats it like an abandoned one right
+    /// away instead of refusing until the multi-hour TTL lapses. A live or
+    /// unknown holder is left alone -- the TTL gate still applies to it.
+    fn release_dead_holders_claim(&self, conn: &Connection, item_id: &str, caller: &str, now: i64) {
+        let Ok(Some(holder)) =
+            agentflare_backend::claim::live_claim_on_item(conn, item_id, now, i64::MAX / 4)
+        else {
+            return;
+        };
+        if holder.owner == caller {
+            return;
+        }
+        // Tests on an isolated backend DB must not read the real registry.
+        let sessions = if self.backend_db_override.is_some() {
+            None
+        } else {
+            crate::db::open().ok()
+        };
+        let queue = self.job_queue().ok().flatten();
+        if let crate::claim_liveness::OwnerLiveness::Dead(reason) =
+            crate::claim_liveness::judge_owner(
+                &holder.owner,
+                now - holder.age_secs,
+                now,
+                sessions.as_ref(),
+                queue.as_ref(),
+            )
+        {
+            eprintln!(
+                "agentflare: releasing item {item_id}'s claim held by dead owner {} ({reason})",
+                holder.owner
+            );
+            let _ = agentflare_backend::claim::release(conn, item_id, &holder.owner);
+        }
+    }
+
     pub(crate) fn item_release(&self, req: ItemRequest) -> Result<String, ErrorData> {
         let raw = req
             .id
@@ -1538,6 +1577,7 @@ impl AgentflareMcp {
             let owns_claim = agentflare_backend::claim::is_owner(conn, &item_id, &owner)
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
             if !owns_claim {
+                self.release_dead_holders_claim(conn, &item_id, &owner, now);
                 // Not ours -- steal the lease only if it's abandoned, using
                 // the exact same stale-TTL gate `claim()` already uses to
                 // steal on acquire. A live claim held by someone else is a
@@ -1621,6 +1661,7 @@ impl AgentflareMcp {
             let mut owns_claim = agentflare_backend::claim::is_owner(conn, &item_id, &owner)
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
             if !owns_claim {
+                self.release_dead_holders_claim(conn, &item_id, &owner, now);
                 // Same abandoned-claim steal `item_release` uses (item
                 // #83): a live claim held by someone else is a real
                 // identity conflict (error, don't silently no-op); a
@@ -1976,8 +2017,23 @@ impl AgentflareMcp {
             return Err(ErrorData::invalid_params("id is required", None));
         }
         let owner = crate::claims::owner_id();
-        self.with_backend_db(|conn| {
+        // Stop the work first, then settle the item: a cancel has to actually
+        // stop the agent (not just relabel the item under a job that keeps
+        // running and later pushes), and must be terminal -- the run is
+        // cancelled so no dispatch resumes it, and the jobs are cancelled,
+        // which `Queue::fail` never retries.
+        let (item_id, run_id) = self.with_backend_db(|conn| {
             let item_id = self.resolve_item_id(conn, &raw)?;
+            let item = agentflare_backend::item::get(conn, &item_id).map_err(map_backend_err)?;
+            Ok::<_, ErrorData>((item_id, crate::job_controls::run_id_of(&item.metadata)))
+        })??;
+        let run_cancelled = match run_id {
+            Some(run_id) => crate::job_controls::cancel_run(run_id)
+                .map_err(|e| ErrorData::internal_error(e, None))?,
+            None => false,
+        };
+        let jobs_cancelled = self.cancel_all_jobs_for_item(&item_id);
+        self.with_backend_db(|conn| {
             let project = self.resolve_project(conn)?;
             let cancelled =
                 agentflare_backend::state::first_in_group(conn, &project.id, "cancelled")
@@ -1990,6 +2046,25 @@ impl AgentflareMcp {
             // claim_done release). No-ops if someone else holds it
             // or nobody does — `release` is owner-scoped.
             let _ = agentflare_backend::claim::release(conn, &item_id, &owner);
+            // ...and whichever job or session still holds it: its work was
+            // just stopped above, so the lease guards nothing any more.
+            if let Some(holder) = agentflare_backend::claim::current_owner(conn, &item_id) {
+                let _ = agentflare_backend::claim::release(conn, &item_id, &holder);
+            }
+            let _ = crate::job_controls::set_item_label(
+                conn,
+                &item,
+                crate::supervisor::PAUSED_LABEL,
+                false,
+            );
+            if let Some(reason) = req.reason.as_deref().filter(|r| !r.trim().is_empty()) {
+                let _ = agentflare_backend::comment::create(
+                    conn,
+                    &item_id,
+                    &owner,
+                    &format!("## agentflare — cancelled\n\n{reason}"),
+                );
+            }
             // Best-effort: strip dispatch-lifecycle labels, mirroring what
             // `redispatch` already does in reverse (item #225) — without
             // this a cancel shortly after handoff, before any orphan/failure
@@ -2006,8 +2081,222 @@ impl AgentflareMcp {
                     }
                 }
             }
-            Ok(serde_json::to_string_pretty(&item).unwrap_or_default())
+            let mut resp = serde_json::to_value(&item).unwrap_or_default();
+            if let Some(obj) = resp.as_object_mut() {
+                obj.insert("jobs_cancelled".into(), jobs_cancelled.into());
+                obj.insert("run_cancelled".into(), run_cancelled.into());
+            }
+            Ok(serde_json::to_string_pretty(&resp).unwrap_or_default())
         })?
+    }
+
+    /// Cancels every queued or running dispatch job for `item_id`, whatever
+    /// agent it targets; a running one's agent is killed by its executor.
+    /// Best-effort (0 when there is no queue to reach) -- the callers go on
+    /// to settle the item regardless.
+    fn cancel_all_jobs_for_item(&self, item_id: &str) -> usize {
+        let Ok(Some(queue)) = self.job_queue() else {
+            return 0;
+        };
+        queue
+            .cancel_for_item(item_id, |_| false)
+            .map(|ids| ids.len())
+            .unwrap_or_else(|e| {
+                eprintln!("agentflare: could not cancel jobs for item {item_id}: {e}");
+                0
+            })
+    }
+
+    /// Pauses an item's work: the workflow run stops at its next step
+    /// boundary, the running job is cancelled (killing its agent turn), the
+    /// claim is released and the item is labeled `paused` so nothing
+    /// re-dispatches it. The worktree and the run's persisted state are kept
+    /// for `resume`. See `crate::job_controls` for why the claim is released.
+    pub(crate) fn item_pause(&self, req: ItemRequest) -> Result<String, ErrorData> {
+        let raw = req
+            .id
+            .ok_or_else(|| ErrorData::invalid_params("id is required for pause", None))?;
+        let author = crate::claims::owner_id();
+        let (item_id, run_id) = self.with_backend_db(|conn| {
+            let item_id = self.resolve_item_id(conn, &raw)?;
+            let item = agentflare_backend::item::get(conn, &item_id).map_err(map_backend_err)?;
+            let group = agentflare_backend::state::get(conn, &item.state_id)
+                .map_err(map_backend_err)?
+                .group_name;
+            if matches!(group.as_str(), "completed" | "cancelled") {
+                return Err(ErrorData::invalid_params(
+                    format!("item {item_id} is already {group}; nothing to pause"),
+                    None,
+                ));
+            }
+            Ok((item_id, crate::job_controls::run_id_of(&item.metadata)))
+        })??;
+        // Pause the run before cancelling the job: the job's killed agent
+        // turn must find the run already paused, or the engine would record
+        // that step as failed.
+        let run_paused = match run_id {
+            Some(run_id) => crate::job_controls::pause_run(run_id)
+                .map_err(|e| ErrorData::internal_error(e, None))?,
+            None => false,
+        };
+        let jobs_cancelled = self.cancel_all_jobs_for_item(&item_id);
+        let claim_released = self.with_backend_db(|conn| {
+            let item = agentflare_backend::item::get(conn, &item_id).map_err(map_backend_err)?;
+            let holder = agentflare_backend::claim::current_owner(conn, &item_id);
+            let released = match &holder {
+                Some(holder) => agentflare_backend::claim::release(conn, &item_id, holder)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?,
+                None => false,
+            };
+            for name in [
+                crate::supervisor::READY_LABEL,
+                crate::supervisor::DISPATCHED_LABEL,
+            ] {
+                crate::job_controls::set_item_label(conn, &item, name, false)
+                    .map_err(map_backend_err)?;
+            }
+            crate::job_controls::set_item_label(conn, &item, crate::supervisor::PAUSED_LABEL, true)
+                .map_err(map_backend_err)?;
+            let reason = req
+                .reason
+                .as_deref()
+                .filter(|r| !r.trim().is_empty())
+                .map(|r| format!("\n\n{r}"))
+                .unwrap_or_default();
+            let _ = agentflare_backend::comment::create(
+                conn,
+                &item_id,
+                &author,
+                &format!(
+                    "## agentflare — paused\n\nWork is paused; the worktree and run state are \
+                     kept. Resume with `agentflare item resume {}`.{reason}",
+                    item.sequence_id
+                ),
+            );
+            Ok::<_, ErrorData>(released)
+        })??;
+        Ok(serde_json::json!({
+            "item_id": item_id,
+            "paused": true,
+            "run_id": run_id.map(|r| r.to_string()),
+            "run_paused": run_paused,
+            "jobs_cancelled": jobs_cancelled,
+            "claim_released": claim_released,
+        })
+        .to_string())
+    }
+
+    /// Resumes a paused item: drops the `paused` label and re-arms it for
+    /// dispatch (`item::redispatch`). The dispatched job adopts the item's
+    /// paused run and continues it from its persisted step, in the same
+    /// worktree.
+    pub(crate) fn item_resume(&self, req: ItemRequest) -> Result<String, ErrorData> {
+        let raw = req
+            .id
+            .ok_or_else(|| ErrorData::invalid_params("id is required for resume", None))?;
+        let author = crate::claims::owner_id();
+        let (item_id, run_id, labeled_paused) = self.with_backend_db(|conn| {
+            let item_id = self.resolve_item_id(conn, &raw)?;
+            let item = agentflare_backend::item::get(conn, &item_id).map_err(map_backend_err)?;
+            let paused_label = agentflare_backend::label::list_by_project(conn, &item.project_id)
+                .map_err(map_backend_err)?
+                .into_iter()
+                .find(|l| l.name == crate::supervisor::PAUSED_LABEL);
+            let labeled = match paused_label {
+                Some(label) => agentflare_backend::item::list_labels(conn, &item_id)
+                    .map_err(map_backend_err)?
+                    .contains(&label.id),
+                None => false,
+            };
+            Ok::<_, ErrorData>((
+                item_id,
+                crate::job_controls::run_id_of(&item.metadata),
+                labeled,
+            ))
+        })??;
+        let run_status = run_id.and_then(crate::job_controls::run_status);
+        let run_paused = run_status == Some(flare_workflow::WorkflowStatus::Paused);
+        if !labeled_paused && !run_paused {
+            return Err(ErrorData::invalid_params(
+                format!("item {item_id} is not paused"),
+                None,
+            ));
+        }
+        if let Some(run_id) = run_id.filter(|_| run_paused)
+            && crate::job_controls::run_still_stopping(run_id)
+        {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "item {item_id}'s run {run_id} is still stopping at its step boundary -- \
+                     retry the resume in a few seconds"
+                ),
+                None,
+            ));
+        }
+        self.with_backend_db(|conn| {
+            let item = agentflare_backend::item::get(conn, &item_id).map_err(map_backend_err)?;
+            crate::job_controls::set_item_label(
+                conn,
+                &item,
+                crate::supervisor::PAUSED_LABEL,
+                false,
+            )
+            .map_err(map_backend_err)?;
+            let outcome = agentflare_backend::item::redispatch(conn, &item_id, None)
+                .map_err(map_backend_err)?;
+            let agentflare_backend::item::RedispatchOutcome::Ready { assignee_agent } = outcome
+            else {
+                // Keep it parked rather than half-resumed.
+                let _ = crate::job_controls::set_item_label(
+                    conn,
+                    &item,
+                    crate::supervisor::PAUSED_LABEL,
+                    true,
+                );
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "item {item_id} has no assignee_agent to resume with -- set one via \
+                         item(action=\"redispatch\", assignee_agent=...)"
+                    ),
+                    None,
+                ));
+            };
+            let _ = agentflare_backend::comment::create(
+                conn,
+                &item_id,
+                &author,
+                &format!(
+                    "## agentflare — resumed\n\nRe-queued for {assignee_agent}; the next dispatch \
+                     continues the paused run in the existing worktree."
+                ),
+            );
+            Ok(serde_json::json!({
+                "item_id": item_id,
+                "resumed": true,
+                "assignee_agent": assignee_agent,
+                "run_id": run_id.map(|r| r.to_string()),
+                "continues_run": run_paused,
+            })
+            .to_string())
+        })?
+    }
+
+    /// The operator controls (`cancel`/`pause`/`resume`/`redispatch`) behind
+    /// one entry point for the CLI, dashboard and chat surfaces, which don't
+    /// go through the MCP tool router.
+    pub(crate) fn item_control(&self, req: ItemRequest) -> Result<String, ErrorData> {
+        match req.action.as_str() {
+            "cancel" => self.item_cancel(req),
+            "pause" => self.item_pause(req),
+            "resume" => self.item_resume(req),
+            "redispatch" => self.item_redispatch(req),
+            other => Err(ErrorData::invalid_params(
+                format!(
+                    "unknown control action '{other}' -- expected cancel|pause|resume|redispatch"
+                ),
+                None,
+            )),
+        }
     }
 
     pub(super) fn item_search(&self, req: ItemRequest) -> Result<String, ErrorData> {

@@ -263,6 +263,38 @@ impl AgentflareMcp {
                     };
                     let item = agentflare_backend::item::update(conn, id, input)
                         .map_err(map_backend_err)?;
+                    // Handing an item that another agent still holds to a
+                    // different agent is a reassignment, same as
+                    // `redispatch` with a new `assignee_agent`: cancel the
+                    // old agent's jobs (killing a running one) and release
+                    // its claim, instead of leaving the new assignee blocked
+                    // behind that claim until its TTL lapses. Cancel first,
+                    // release second -- see `item_redispatch` for why.
+                    let held_by_other_agent =
+                        agentflare_backend::claim::current_owner(conn, id).is_some_and(|holder| {
+                            crate::claims::agent_of(&holder) != crate::claims::agent_of(&recipient)
+                        });
+                    if held_by_other_agent {
+                        if let Err(e) = self.cancel_jobs_for_reassignment(id, &recipient) {
+                            eprintln!(
+                                "handoff: could not cancel the previous agent's jobs for item {id}: {e}"
+                            );
+                        }
+                        let released =
+                            crate::claims::reassignment_releases_claim(conn, id, Some(&recipient))
+                                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                        // Work that was in progress under the old agent is
+                        // re-armed for the new one (backlog + ready-for-work),
+                        // exactly as `redispatch` does; the fresh-item gate
+                        // below would otherwise skip a `started` item.
+                        let in_progress = agentflare_backend::state::get(conn, &item.state_id)
+                            .is_ok_and(|s| s.group_name == "started");
+                        if released && in_progress {
+                            agentflare_backend::item::redispatch(conn, id, Some(&recipient))
+                                .map_err(map_backend_err)?;
+                        }
+                    }
+                    let item = agentflare_backend::item::get(conn, id).map_err(map_backend_err)?;
                     // Queue it for autonomous dispatch too, same as the
                     // brand-new-item path below — but only when it's safe:
                     // genuinely fresh (backlog/unstarted/triage) and no live

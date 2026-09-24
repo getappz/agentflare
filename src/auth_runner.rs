@@ -122,7 +122,15 @@ enum ExitKind {
 pub(crate) fn is_rate_limited(text: &str) -> bool {
     let lower = text.to_lowercase();
     RATE_LIMIT_PATTERNS.iter().any(|p| lower.contains(p))
+        || matches!(
+            classify_failure(text),
+            AgentFailure::RateLimited { .. }
+                | AgentFailure::CreditExhausted
+                | AgentFailure::QuotaWindowExhausted { .. }
+        )
 }
+
+include!("auth_runner_classify.rs");
 
 /// Pattern-matches `text` against `AUTH_EXPIRED_PATTERNS` -- same shape as
 /// `is_rate_limited`, but a distinct classification with distinct

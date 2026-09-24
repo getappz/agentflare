@@ -133,7 +133,16 @@ pub struct Captured {
     /// True iff the child was killed because its job was cancelled (see
     /// `agentflare_jobs::cancel`). Never set together with `timed_out`.
     pub cancelled: bool,
+    /// True iff the child was killed as stalled: no worktree change and no
+    /// novel output for the stall window while its output was looping (see
+    /// `agent_launch_progress.rs`).
+    pub stalled: bool,
+    /// The agent's own credit/quota-exhausted error line, when the child
+    /// was killed for printing it repeatedly mid-run.
+    pub exhausted: Option<String>,
 }
+
+include!("agent_launch_progress.rs");
 
 /// Kill `child` and everything it spawned, not just the direct process. A
 /// plain `child.kill()` only signals the direct child; if that child (e.g.
@@ -207,11 +216,31 @@ pub(crate) fn kill_tree(child: &mut std::process::Child) {
 /// works for; the wait loop polls `agentflare_jobs::cancel::job_cancelled` for
 /// it and kills the child once the job is cancelled (see `Captured::cancelled`).
 pub fn run_captured_for_job(
+    cmd: Command,
+    hard_cap: Duration,
+    idle_timeout: Duration,
+    stdin: Option<&str>,
+    cancel_job: Option<&str>,
+) -> std::io::Result<Captured> {
+    run_captured_with_stall(
+        cmd,
+        hard_cap,
+        idle_timeout,
+        stdin,
+        cancel_job,
+        StallConfig::from_env(),
+    )
+}
+
+/// `run_captured_for_job` with an explicit [`StallConfig`] (tests pass
+/// short windows instead of mutating the process env).
+pub(crate) fn run_captured_with_stall(
     mut cmd: Command,
     hard_cap: Duration,
     idle_timeout: Duration,
     stdin: Option<&str>,
     cancel_job: Option<&str>,
+    stall: StallConfig,
 ) -> std::io::Result<Captured> {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -258,9 +287,11 @@ pub fn run_captured_for_job(
     }
 
     let activity = Arc::new(AtomicU64::new(0));
+    let output_progress = Arc::new(std::sync::Mutex::new(OutputProgress::new(Instant::now())));
 
     let mut pipe = child.stdout.take().expect("stdout piped above");
     let stdout_activity = activity.clone();
+    let stdout_progress = output_progress.clone();
     let reader = std::thread::spawn(move || {
         let mut buf: Vec<u8> = Vec::new();
         let mut chunk = [0u8; 8192];
@@ -274,6 +305,9 @@ pub fn run_captured_for_job(
                 Ok(n) => {
                     buf.extend_from_slice(&chunk[..n]);
                     stdout_activity.fetch_add(n as u64, Ordering::Relaxed);
+                    if let Ok(mut p) = stdout_progress.lock() {
+                        p.feed(0, &String::from_utf8_lossy(&chunk[..n]), Instant::now());
+                    }
                 }
             }
         }
@@ -281,6 +315,7 @@ pub fn run_captured_for_job(
     });
     let mut err_pipe = child.stderr.take().expect("stderr piped above");
     let stderr_activity = activity.clone();
+    let stderr_progress = output_progress.clone();
     let err_reader = std::thread::spawn(move || {
         let mut buf: Vec<u8> = Vec::new();
         let mut chunk = [0u8; 8192];
@@ -290,6 +325,9 @@ pub fn run_captured_for_job(
                 Ok(n) => {
                     buf.extend_from_slice(&chunk[..n]);
                     stderr_activity.fetch_add(n as u64, Ordering::Relaxed);
+                    if let Ok(mut p) = stderr_progress.lock() {
+                        p.feed(1, &String::from_utf8_lossy(&chunk[..n]), Instant::now());
+                    }
                 }
             }
         }
@@ -303,6 +341,12 @@ pub fn run_captured_for_job(
     let mut idle_killed = false;
     let mut cancelled = false;
     let mut last_cancel_poll = Instant::now();
+    let mut stalled = false;
+    let mut exhausted: Option<String> = None;
+    let mut last_progress_poll = Instant::now();
+    // Fingerprinted lazily (first poll), so a short-lived child never pays
+    // for a `git status` at all.
+    let mut worktree: Option<WorktreeProgress> = None;
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
@@ -325,6 +369,44 @@ pub fn run_captured_for_job(
             idle_killed = true;
             break status;
         }
+        // Hung-but-chatty detection (see `agent_launch_progress.rs`),
+        // evaluated ~1/s; the worktree itself is only fingerprinted every
+        // `stall.check_every`.
+        if last_progress_poll.elapsed() >= Duration::from_secs(1) {
+            last_progress_poll = Instant::now();
+            let now = Instant::now();
+            let (repetitive, last_novel, exhaustion_seen, exhausted_line) = {
+                let p = output_progress.lock().unwrap_or_else(|e| e.into_inner());
+                (
+                    p.is_repetitive(),
+                    p.last_novel_at(),
+                    p.exhaustion_first_seen(),
+                    p.exhausted().map(str::to_string),
+                )
+            };
+            let wt =
+                worktree.get_or_insert_with(|| WorktreeProgress::new(record_dir.clone(), start));
+            if !stall.window.is_zero() && start.elapsed() >= stall.check_every {
+                wt.poll(now, stall.check_every);
+            }
+            if stall.exhaustion_kill && exhaustion_seen {
+                wt.note_exhaustion_seen();
+            }
+            let stop = if let Some(line) =
+                exhausted_line.filter(|_| stall.exhaustion_kill && wt.unchanged_since_exhaustion())
+            {
+                exhausted = Some(line);
+                true
+            } else {
+                is_stalled(now, wt.last_change, last_novel, repetitive, stall.window)
+            };
+            if stop {
+                kill_tree(&mut child);
+                let status = child.wait()?;
+                stalled = exhausted.is_none();
+                break status;
+            }
+        }
         // A cancelled job (item reassigned to another agent) must not keep its
         // agent CLI running. Polled ~1/s -- it costs a DB read.
         if let Some(job_id) = cancel_job
@@ -343,13 +425,16 @@ pub fn run_captured_for_job(
 
     let stdout = reader.join().unwrap_or_default();
     let stderr = err_reader.join().unwrap_or_default();
+    let killed_early = stalled || exhausted.is_some();
     Ok(Captured {
-        success: status.success() && !timed_out && !cancelled,
+        success: status.success() && !timed_out && !cancelled && !killed_early,
         stdout,
         stderr,
         timed_out,
         idle_killed,
         cancelled,
+        stalled,
+        exhausted,
     })
 }
 
@@ -907,6 +992,21 @@ fn run_headless_impl(
         Ok(c) if c.cancelled => {
             HeadlessOutcome::Failed(agentflare_jobs::cancel::CANCELLED_MESSAGE.to_string())
         }
+        // Killed early for repeatedly printing its own credit/quota error:
+        // the line leads the message so `auth_runner::classify_failure`
+        // routes it to the exhaustion/failover path.
+        Ok(c) if c.exhausted.is_some() => HeadlessOutcome::Failed(format!(
+            "{} stopped mid-run: agent reported {}{}",
+            spec.display_name,
+            c.exhausted.as_deref().unwrap_or_default(),
+            diagnostic_suffix(&c, sandbox_log.as_deref())
+        )),
+        Ok(c) if c.stalled => HeadlessOutcome::Failed(format!(
+            "{} {STALLED_MARKER} for {:?} while its output repeated{}",
+            spec.display_name,
+            StallConfig::from_env().window,
+            diagnostic_suffix(&c, sandbox_log.as_deref())
+        )),
         Ok(c) if c.timed_out => {
             let reason = if c.idle_killed {
                 format!("went idle for {idle_timeout:?} (no new output)")

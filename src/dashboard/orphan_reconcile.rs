@@ -471,6 +471,16 @@ fn restore_after_terminal_failure(
         let at_cap = identical_count >= crate::dispatch_failure_ceiling::DISPATCH_FAILURE_CAP
             || any_reason_count >= crate::dispatch_failure_ceiling::DISPATCH_FAILURE_CAP_ANY_REASON;
         let find = |name: &str| labels.iter().find(|l| l.name == name).map(|l| &l.id);
+        // Stopped on request (workflow cancelled, or paused): drop
+        // `dispatched` but never re-arm `ready-for-work` -- a deliberate
+        // stop must not be auto-redispatched on the next tick.
+        if crate::dispatch_failure_ceiling::stopped_on_request(&comments) {
+            if let Some(dispatched_id) = find(crate::supervisor::DISPATCHED_LABEL) {
+                agentflare_backend::item::remove_label(conn, item_id, dispatched_id)
+                    .map_err(|e| e.to_string())?;
+            }
+            return Ok(None);
+        }
         let ready_id = find(crate::supervisor::READY_LABEL);
         if !at_cap && ready_id.is_none() {
             // Below cap with no ready-for-work label to restore onto: the
@@ -669,6 +679,7 @@ mod tests {
 
     include!("orphan_reconcile_tests.rs");
     include!("orphan_reconcile_assignee_tests.rs");
+    include!("orphan_reconcile_failover_tests.rs");
 
     /// A failure partway through the terminal-failure label swap must roll
     /// the whole swap back, never strand the item with neither `dispatched`

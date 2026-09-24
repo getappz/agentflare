@@ -10,8 +10,11 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
-/// Failure text for a run stopped because its job was cancelled.
-pub const CANCELLED_MESSAGE: &str = "cancelled: item reassigned to another agent";
+/// Failure text for a run stopped because its job was cancelled -- the item
+/// was reassigned, or an operator cancelled or paused it. Callers match on
+/// it (`contains`) to treat the stop as deliberate rather than a failure.
+pub const CANCELLED_MESSAGE: &str =
+    "cancelled: job stopped on request (item reassigned, cancelled or paused)";
 
 type Check = Arc<dyn Fn() -> bool + Send + Sync>;
 
@@ -51,6 +54,14 @@ pub fn register(id: &str, check: impl Fn() -> bool + Send + Sync + 'static) -> R
         id: id.to_string(),
         token,
     }
+}
+
+/// Whether job `id` is executing in this process right now (its check is
+/// registered for exactly the lifetime of its executor). Lets a sweep that
+/// judges claim owners from the outside never mistake this process's own
+/// live job for a dead one.
+pub fn is_registered(id: &str) -> bool {
+    CHECKS.lock().contains_key(id)
 }
 
 /// True when job `id` is registered and reports cancelled; false for an

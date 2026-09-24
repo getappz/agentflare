@@ -199,6 +199,9 @@ fn spawn_supervisor_discovery(
             let queue = queue.clone();
             let mcp = mcp.clone();
             let result = tokio::task::spawn_blocking(move || {
+                // Release dead owners' claims first, so an item they held is
+                // re-armed and dispatched in this same tick.
+                crate::claim_liveness::run_sweep(&mcp, &queue);
                 let auth_conn = crate::auth_db::open_or_rebuild();
                 let host_policy = agentflare_resource_gate::current_policy();
                 crate::supervisor::run_discovery_tick(&mcp, &queue, &auth_conn, host_policy)
@@ -677,7 +680,9 @@ pub fn router(queue: Queue) -> Router {
         .route("/api/cost", get(cost_handler))
         .route("/events", get(events_handler))
         .merge(super::chat::router())
+        .merge(super::messages::router())
         .merge(super::gate::router())
+        .merge(super::controls::router())
         .merge(jobs_router(queue))
         .nest("/artifacts", super::artifacts::router())
         .merge(flare_proxy::router())

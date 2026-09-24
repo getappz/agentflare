@@ -714,7 +714,14 @@ mod tests {
     fn telegram_bot_commands_mirror_chat_specs() {
         let commands = telegram_bot_commands();
         let names: Vec<&str> = commands.iter().map(|c| c.command.as_str()).collect();
-        assert_eq!(names, vec!["status", "project", "new", "help"]);
+        // Every spec must survive `BotCommand::new`'s validation (name
+        // charset, description length), in spec order.
+        let specs: Vec<&str> = crate::mcp_server::chat::CHAT_COMMAND_SPECS
+            .iter()
+            .map(|(name, _, _)| *name)
+            .collect();
+        assert_eq!(names, specs);
+        assert!(names.starts_with(&["status", "project", "new"]) && names.contains(&"help"));
     }
 
     #[test]
