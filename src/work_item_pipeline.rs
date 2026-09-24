@@ -1377,7 +1377,7 @@ pub(crate) fn run_or_resume_with_sender(
                     .start_workflow(WorkflowId::new(WORKFLOW_ID), fresh_data(), String::new())
                     .await
                     .map_err(|e| e.to_string())?;
-                persist_run_id(&mcp, &item.id, &existing_metadata, new_run_id)?;
+                persist_run_id(&mcp, &item.id, new_run_id)?;
                 new_run_id
             }
         };
@@ -1422,23 +1422,38 @@ pub(crate) fn run_or_resume_with_sender(
     })
 }
 
-/// Merge `workflow_run_id` into the item's existing metadata JSON and save
+/// Merge `workflow_run_id` into the item's *current* metadata JSON and save
 /// it via `item_update` — how a fresh/re-dispatched run's id gets recorded
 /// so `run_or_resume`'s next call (or a boot-time `recover()`) can find it.
+///
+/// Re-fetches the item's metadata immediately before merging, rather than
+/// reusing `run_or_resume_with_sender`'s stale function-entry snapshot —
+/// same pattern `persist_comment_cursor`/`supervisor::persist_repair_track`
+/// use. Merging into a stale snapshot silently reverts metadata written in
+/// between; live-confirmed on item #281, where a human's plan approval was
+/// wiped back to "pending" by exactly this wholesale overwrite.
 fn persist_run_id(
     mcp: &AgentflareMcp,
     item_id: &str,
-    existing_metadata: &serde_json::Value,
     run_id: flare_workflow::WorkflowRunId,
 ) -> Result<(), String> {
-    // `existing_metadata` can be a non-object (e.g. a double-JSON-encoded
+    let raw = mcp
+        .item_get(ItemRequest {
+            action: "get".into(),
+            id: Some(item_id.to_string()),
+            ..Default::default()
+        })
+        .map_err(|e| e.message.to_string())?;
+    let item: agentflare_backend::item::Item =
+        serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    // `item.metadata` can be a non-object (e.g. a double-JSON-encoded
     // string, confirmed live on item #331) when the item's stored metadata
     // is corrupted -- `Value`'s `IndexMut` panics assigning a key into
     // anything that isn't already `Object`, so coerce defensively instead
-    // of trusting the caller-supplied value's shape.
-    let mut merged = existing_metadata
-        .as_object()
-        .cloned()
+    // of trusting the stored value's shape.
+    let mut merged = serde_json::from_str::<serde_json::Value>(&item.metadata)
+        .ok()
+        .and_then(|v| v.as_object().cloned())
         .map(serde_json::Value::Object)
         .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
     merged["workflow_run_id"] = serde_json::Value::String(run_id.to_string());

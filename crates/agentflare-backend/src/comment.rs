@@ -89,9 +89,16 @@ pub fn delete(conn: &Connection, id: &str) -> Result<()> {
 
 /// List all comments for an item, oldest first.
 pub fn list_by_item(conn: &Connection, item_id: &str) -> Result<Vec<ItemComment>> {
+    // `created_at` is second-resolution, so two comments posted in the same
+    // second tie on it — broken by SQLite's implicit `rowid`, not `id`: `id`
+    // is a random nanoid (`db_kit::ids::new_id`), not time-ordered, so tying
+    // on it scrambled same-second comments into an arbitrary order. `rowid`
+    // is monotonically assigned on insert (this table has no explicit
+    // `INTEGER PRIMARY KEY`/`WITHOUT ROWID`, so it's SQLite's own implicit
+    // one) and so reflects true insertion order even within one second.
     let mut stmt = conn.prepare(
         "SELECT id, item_id, author_agent, body, created_at, updated_at
-         FROM item_comments WHERE item_id = ?1 ORDER BY created_at ASC, id ASC",
+         FROM item_comments WHERE item_id = ?1 ORDER BY created_at ASC, rowid ASC",
     )?;
     let rows = stmt.query_map(rusqlite::params![item_id], row_to_comment)?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -99,14 +106,11 @@ pub fn list_by_item(conn: &Connection, item_id: &str) -> Result<Vec<ItemComment>
 
 /// Check if this comment is the latest (most recent) on its item.
 pub fn is_latest(conn: &Connection, comment: &ItemComment) -> Result<bool> {
-    // `created_at` is second-resolution, so two comments posted in the same
-    // second tie on MAX(created_at) — comparing timestamps alone would treat
-    // both as "latest". Break ties with `id` (UUIDv7, time-ordered), which
-    // reflects true insertion order even within one second.
+    // Same same-second tie-breaking rationale as `list_by_item` above.
     let latest_id: Option<String> = conn
         .query_row(
             "SELECT id FROM item_comments WHERE item_id = ?1
-             ORDER BY created_at DESC, id DESC LIMIT 1",
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
             rusqlite::params![comment.item_id],
             |row| row.get(0),
         )
