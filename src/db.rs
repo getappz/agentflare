@@ -30,6 +30,7 @@ pub fn open() -> rusqlite::Result<Connection> {
     restrict(&path, 0o600);
     tune(&conn)?;
     crate::claims::migrate(&conn)?;
+    crate::sessions::migrate(&conn)?;
     crate::review::migrate(&conn)?;
     crate::gateway_secrets::migrate(&conn)?;
     // One-time migration: copy secrets from old gateway.db

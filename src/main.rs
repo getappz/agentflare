@@ -61,6 +61,7 @@ mod quota;
 mod review;
 mod rollup;
 mod rule_text;
+mod sessions;
 mod shell;
 mod shim_install;
 mod skill_detect;
