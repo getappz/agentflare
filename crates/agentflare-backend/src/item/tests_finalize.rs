@@ -212,3 +212,33 @@ fn forced_completion_promotes_from_backlog_but_never_revives_a_cancelled_item() 
     set_state_group(&conn, &other.id, &pid, "cancelled");
     assert!(!mark_completed_forced(&conn, &other.id, "agent:1").unwrap());
 }
+
+#[test]
+fn forced_completion_if_pr_only_completes_for_the_pr_that_was_checked() {
+    // A redispatch + fresh PR between the merge check and the promote must
+    // not complete the item off the old attempt's merge.
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let item = make_item(&conn, &pid, &sid);
+    crate::claim::acquire(&conn, &item.id, "agent:1", 1000, TTL).unwrap();
+    set_state_group(&conn, &item.id, &pid, "backlog");
+    set_metadata(&conn, &item.id, r#"{"pr":{"number":43,"branch":"b"}}"#);
+
+    assert!(!mark_completed_forced_if_pr(&conn, &item.id, "agent:1", Some(42)).unwrap());
+    assert!(!mark_completed_forced_if_pr(&conn, &item.id, "agent:1", None).unwrap());
+    assert_eq!(
+        get(&conn, &item.id).unwrap().state_id,
+        state_in_group(&conn, &pid, "backlog")
+    );
+
+    assert!(mark_completed_forced_if_pr(&conn, &item.id, "agent:1", Some(43)).unwrap());
+    assert_eq!(
+        get(&conn, &item.id).unwrap().state_id,
+        state_in_group(&conn, &pid, "completed")
+    );
+
+    let untracked = make_item(&conn, &pid, &sid);
+    crate::claim::acquire(&conn, &untracked.id, "agent:1", 1000, TTL).unwrap();
+    assert!(!mark_completed_forced_if_pr(&conn, &untracked.id, "agent:1", Some(7)).unwrap());
+    assert!(mark_completed_forced_if_pr(&conn, &untracked.id, "agent:1", None).unwrap());
+}

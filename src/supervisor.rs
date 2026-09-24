@@ -89,19 +89,28 @@ fn update_pr_stage(folder_path: &str, number: u64, from: Option<&str>, to: &str,
         return;
     };
     if let Err(e) = crate::github::issues::add_labels(&client, &repo, number, &[to.to_string()]) {
-        eprintln!("agentflare-supervisor: could not add {to} to PR #{number}: {e}");
+        eprintln!(
+            "agentflare-supervisor: could not add {to} to PR #{number}: {}",
+            e.log_safe()
+        );
     }
     if let Some(from) = from
         && let Err(e) = crate::github::issues::remove_label(&client, &repo, number, from)
     {
-        eprintln!("agentflare-supervisor: could not remove {from} from PR #{number}: {e}");
+        eprintln!(
+            "agentflare-supervisor: could not remove {from} from PR #{number}: {}",
+            e.log_safe()
+        );
     }
     // Empty comment = label bookkeeping only (a silent re-dispatch whose
     // announcement already went out) — never post a blank comment to the PR.
     if !comment.is_empty()
         && let Err(e) = crate::github::issues::comment(&client, &repo, number, comment)
     {
-        eprintln!("agentflare-supervisor: could not comment on PR #{number}: {e}");
+        eprintln!(
+            "agentflare-supervisor: could not comment on PR #{number}: {}",
+            e.log_safe()
+        );
     }
 }
 

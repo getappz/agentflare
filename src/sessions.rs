@@ -71,17 +71,68 @@ pub enum Liveness {
     Unknown,
 }
 
+/// This machine's identity for pid-liveness checks: a session row whose
+/// `host` matches is judged by its pid, so two machines sharing a db must
+/// never compare equal. The OS hostname (else `/etc/hostname`) for
+/// readability, qualified by the OS machine id so two machines that share
+/// a hostname stay distinct; the machine id alone when there's no
+/// hostname; `"localhost"` only when neither is available. Resolved once
+/// per process.
 pub fn this_host() -> String {
-    std::env::var("HOSTNAME")
-        .ok()
-        .filter(|h| !h.is_empty())
-        .or_else(|| {
-            std::fs::read_to_string("/etc/hostname")
-                .ok()
-                .map(|h| h.trim().to_string())
-                .filter(|h| !h.is_empty())
-        })
-        .unwrap_or_else(|| "localhost".to_string())
+    static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HOST.get_or_init(|| {
+        resolve_host(
+            os_hostname(),
+            || std::fs::read_to_string("/etc/hostname").ok(),
+            || machine_uid::get().ok(),
+        )
+    })
+    .clone()
+}
+
+/// The kernel's hostname -- the same for every process on the machine,
+/// unlike `$HOSTNAME`, which is a shell variable a launchd/systemd daemon
+/// usually doesn't have (every such Mac would otherwise be "localhost").
+fn os_hostname() -> Option<String> {
+    #[cfg(unix)]
+    {
+        let mut buf = [0u8; 256];
+        // SAFETY: `buf` is a valid writable buffer of the length passed.
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+        if rc != 0 {
+            return None;
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        Some(String::from_utf8_lossy(&buf[..end]).into_owned())
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::var("COMPUTERNAME").ok()
+    }
+}
+
+/// Pure core of [`this_host`]: `<hostname>@<machine-id>`, where the
+/// hostname is the first non-blank of the OS hostname and the hostname
+/// file; either half alone when the other is missing (a bare machine id is
+/// prefixed so it can't collide with a real hostname), else `"localhost"`.
+fn resolve_host(
+    env: Option<String>,
+    file: impl FnOnce() -> Option<String>,
+    machine_id: impl FnOnce() -> Option<String>,
+) -> String {
+    let non_blank = |h: String| {
+        let h = h.trim().to_string();
+        (!h.is_empty()).then_some(h)
+    };
+    let name = env
+        .and_then(non_blank)
+        .or_else(|| file().and_then(non_blank));
+    match (name, machine_id().and_then(non_blank)) {
+        (Some(name), Some(id)) => format!("{name}@{id}"),
+        (Some(name), None) => name,
+        (None, Some(id)) => format!("machine-id:{id}"),
+        (None, None) => "localhost".to_string(),
+    }
 }
 
 /// Upserts `t.key` as live now. Clears `ended_at`: a key seen again is live.
@@ -137,6 +188,15 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
 const COLUMNS: &str =
     "key, agent, name, item_id, cwd, host, pid, started_at, last_seen_at, ended_at";
 
+/// Deletes `key`'s row outright (unlike [`end`], which records it as
+/// ended -- i.e. `Liveness::Dead` -- for claim liveness). For a key that
+/// was only ever a stand-in, whose owner may still be alive and holding
+/// claims under it: no row means `Liveness::Unknown`, so claim liveness
+/// falls back to its own pid/TTL checks instead of releasing them.
+pub fn forget(conn: &Connection, key: &str) -> rusqlite::Result<bool> {
+    Ok(conn.execute("DELETE FROM agent_sessions WHERE key = ?1", [key])? > 0)
+}
+
 pub fn get(conn: &Connection, key: &str) -> rusqlite::Result<Option<Session>> {
     conn.query_row(
         &format!("SELECT {COLUMNS} FROM agent_sessions WHERE key = ?1"),
@@ -161,14 +221,24 @@ pub fn resolve(conn: &Connection, address: &str, now: i64) -> rusqlite::Result<O
         .flatten())
 }
 
+/// Whether [`this_host`] carries the OS machine id. Without it the host is a
+/// bare hostname that another machine can share, so a matching `host` does
+/// not prove the pid is ours.
+fn host_is_machine_unique(host: &str) -> bool {
+    host.contains('@') || host.starts_with("machine-id:")
+}
+
 /// Judges one session: an ended row is dead; a row on this host with a pid is
 /// judged by whether that pid exists (exact, and works for a session idle
-/// for hours); otherwise by `last_seen_at` against [`STALE_AFTER_SECS`].
+/// for hours) -- only when the host identity includes the machine id;
+/// otherwise by `last_seen_at` against [`STALE_AFTER_SECS`].
 pub fn liveness_of(s: &Session, now: i64) -> Liveness {
     if s.ended_at.is_some() {
         return Liveness::Dead;
     }
-    if s.host == this_host()
+    let host = this_host();
+    if host_is_machine_unique(&host)
+        && s.host == host
         && let Some(pid) = s.pid
     {
         return if crate::ipc::process::is_alive(pid) {
@@ -262,6 +332,42 @@ mod tests {
         end(&c, "codex:y", 101).unwrap();
         assert_eq!(liveness(&c, "codex:y", 102).unwrap(), Liveness::Dead);
         assert_eq!(liveness(&c, "nobody:1", 102).unwrap(), Liveness::Unknown);
+        // Forgetting a row makes it unknown, not dead.
+        touch_key(&c, "codex:z", None, 100);
+        assert!(forget(&c, "codex:z").unwrap());
+        assert_eq!(liveness(&c, "codex:z", 102).unwrap(), Liveness::Unknown);
+    }
+
+    #[test]
+    fn host_identity_falls_back_to_the_machine_id_before_localhost() {
+        let none = || None::<String>;
+        assert_eq!(resolve_host(Some("box".into()), none, none), "box");
+        assert_eq!(
+            resolve_host(Some("  ".into()), || Some("file-host\n".into()), none),
+            "file-host"
+        );
+        // macOS: no HOSTNAME for a non-shell process, no /etc/hostname.
+        assert_eq!(
+            resolve_host(None, none, || Some("ABCD-1234".into())),
+            "machine-id:ABCD-1234"
+        );
+        assert_eq!(resolve_host(None, none, none), "localhost");
+    }
+
+    #[test]
+    fn machines_sharing_a_hostname_get_distinct_host_identities() {
+        let a = resolve_host(Some("ci-runner".into()), || None, || Some("aaaa".into()));
+        let b = resolve_host(Some("ci-runner".into()), || None, || Some("bbbb".into()));
+        assert_eq!(a, "ci-runner@aaaa");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn only_a_machine_id_qualified_host_trusts_local_pids() {
+        assert!(host_is_machine_unique("ci-runner@aaaa"));
+        assert!(host_is_machine_unique("machine-id:aaaa"));
+        assert!(!host_is_machine_unique("ci-runner"));
+        assert!(!host_is_machine_unique("localhost"));
     }
 
     #[test]

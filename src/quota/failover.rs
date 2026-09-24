@@ -283,7 +283,13 @@ pub(crate) fn failover_before_dispatch(
     }
     let labels = item_label_names(mcp, &item.id);
     let Some(to) = find_alternative(item, &labels, agent) else {
-        if let Ok(mut cache) = NO_ALTERNATIVE_UNTIL.lock() {
+        // The cache is keyed by agent alone, so it may only record "no
+        // installed agent is available" -- never a `None` caused by this
+        // item's own gates (`failover: false`, `allowed_agents`), which
+        // would block failover for every other item of this agent.
+        if no_alternative_is_agent_wide(&item.metadata)
+            && let Ok(mut cache) = NO_ALTERNATIVE_UNTIL.lock()
+        {
             cache.insert(agent.as_str(), std::time::Instant::now());
         }
         return None;
@@ -295,6 +301,13 @@ pub(crate) fn failover_before_dispatch(
     );
     record_failover(mcp, &item.id, agent, to, &why).ok()?;
     Some(to)
+}
+
+/// Whether a `None` from [`find_alternative`] for an item with `metadata`
+/// says something about the agent rather than the item: failover is on for
+/// it and it carries no `allowed_agents` restriction of its own.
+fn no_alternative_is_agent_wide(metadata: &str) -> bool {
+    failover_enabled_for(metadata) && item_allowed_agents(metadata).is_none()
 }
 
 /// `2026-09-24 15:00 UTC` for a unix timestamp.
@@ -328,6 +341,17 @@ mod tests {
         crate::paths::test_support::with_temp_home(|| {
             assert!(failover_enabled_for("{}"));
             assert!(!failover_enabled_for(r#"{"failover":false}"#));
+        });
+    }
+
+    #[test]
+    fn only_an_unrestricted_item_arms_the_agent_wide_negative_cache() {
+        crate::paths::test_support::with_temp_home(|| {
+            assert!(no_alternative_is_agent_wide("{}"));
+            assert!(!no_alternative_is_agent_wide(r#"{"failover":false}"#));
+            assert!(!no_alternative_is_agent_wide(
+                r#"{"allowed_agents":["codex"]}"#
+            ));
         });
     }
 

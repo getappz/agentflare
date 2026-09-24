@@ -42,8 +42,9 @@ pub(crate) fn mark_pr_ready(
         }
         Err(e) => {
             eprintln!(
-                "worktree: could not mark PR #{number} in {repo} ready for review for item {}: {e}",
-                item.id
+                "worktree: could not mark PR #{number} in {repo} ready for review for item {}: {}",
+                item.id,
+                e.log_safe()
             );
             false
         }

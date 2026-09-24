@@ -374,9 +374,23 @@ pub(super) fn delete_merged_head_branch_with(
                 "agentflare-supervisor: deleted merged head branch of PR #{number} in {repo}"
             );
         }
+        Ok(crate::github::repos::BranchCleanup::Advanced) => {
+            eprintln!(
+                "agentflare-supervisor: kept head branch of merged PR #{number} in {repo} -- \
+                 it has commits pushed after the merge"
+            );
+        }
+        Ok(crate::github::repos::BranchCleanup::AtomicDeleteUnavailable(why)) => {
+            eprintln!(
+                "agentflare-supervisor: kept head branch of merged PR #{number} in {repo} -- \
+                 atomic (sha-guarded) ref deletion unavailable ({why}); not falling back to \
+                 an unguarded delete"
+            );
+        }
         Ok(_) => {}
         Err(e) => eprintln!(
-            "agentflare-supervisor: could not delete merged head branch of PR #{number} in {repo}: {e}"
+            "agentflare-supervisor: could not delete merged head branch of PR #{number} in {repo}: {}",
+            e.log_safe()
         ),
     }
 }
@@ -514,7 +528,8 @@ pub(super) fn disarm_auto_merge_with(
         ),
         Err(e) => eprintln!(
             "agentflare-supervisor: could not disarm GitHub auto-merge on PR #{number} in \
-             {repo}: {e}"
+             {repo}: {}",
+            e.log_safe()
         ),
     }
 }
@@ -550,8 +565,9 @@ pub(super) fn merge_approved_pr(
 ) -> MergeAttempt {
     let settings = crate::github::repos::settings(client, repo).unwrap_or_else(|e| {
         eprintln!(
-            "agentflare-supervisor: could not read {repo}'s merge settings ({e}); assuming \
-             squash and no auto-merge"
+            "agentflare-supervisor: could not read {repo}'s merge settings ({}); assuming \
+             squash and no auto-merge",
+            e.log_safe()
         );
         crate::github::repos::RepoSettings::unknown("")
     });
@@ -579,7 +595,8 @@ pub(super) fn merge_approved_pr(
                 }
                 Err(e) => eprintln!(
                     "agentflare-supervisor: could not arm GitHub auto-merge on PR #{number} in \
-                     {repo}: {e}"
+                     {repo}: {}",
+                    e.log_safe()
                 ),
             }
         }
@@ -597,7 +614,10 @@ pub(super) fn merge_approved_pr(
             MergeAttempt::NotMerged
         }
         Err(e) => {
-            eprintln!("agentflare-supervisor: auto-merge failed for PR #{number} in {repo}: {e}");
+            eprintln!(
+                "agentflare-supervisor: auto-merge failed for PR #{number} in {repo}: {}",
+                e.log_safe()
+            );
             MergeAttempt::NotMerged
         }
     }

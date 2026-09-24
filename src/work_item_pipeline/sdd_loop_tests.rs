@@ -649,10 +649,12 @@ async fn stale_resumed_session_is_cleared_so_the_retry_sends_a_fresh_prompt() {
             Box::pin(async move {
                 match n {
                     0 => {
+                        // Role flags (`roles.rs`) follow the resume pair, so
+                        // pin the pair, not the whole argv.
                         assert_eq!(
-                            args,
-                            vec!["--resume".to_string(), "dead-session".to_string()],
-                            "first attempt must resume the persisted (now-dead) session"
+                            args.get(..2),
+                            Some(&["--resume".to_string(), "dead-session".to_string()][..]),
+                            "first attempt must resume the persisted (now-dead) session; got args: {args:?}"
                         );
                         Err("claude-code exited non-zero — last stderr before kill:\n\
                              No conversation found with session ID: dead-session"
@@ -660,7 +662,7 @@ async fn stale_resumed_session_is_cleared_so_the_retry_sends_a_fresh_prompt() {
                     }
                     1 => {
                         assert!(
-                            args.is_empty(),
+                            !args.iter().any(|a| a == "--resume" || a == "dead-session"),
                             "retry must fall back to a fresh prompt, not repeat --resume \
                              dead-session; got args: {args:?}"
                         );

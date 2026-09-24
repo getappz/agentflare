@@ -213,7 +213,7 @@ pub fn release(conn: &Connection, item_id: &str, owner: &str) -> Result<bool> {
 /// item has since left the started/in_review groups (see
 /// `in_finalizable_state`).
 pub fn mark_completed(conn: &Connection, item_id: &str, owner: &str) -> Result<bool> {
-    complete_if(conn, item_id, owner, |group| {
+    complete_if(conn, item_id, owner, None, |group| {
         matches!(group, "started" | "in_review")
     })
 }
@@ -222,15 +222,35 @@ pub fn mark_completed(conn: &Connection, item_id: &str, owner: &str) -> Result<b
 /// is already merged but which never went through `done` (so it can still
 /// sit in backlog/todo): any group except an already-terminal one.
 pub fn mark_completed_forced(conn: &Connection, item_id: &str, owner: &str) -> Result<bool> {
-    complete_if(conn, item_id, owner, |group| {
-        !matches!(group, "completed" | "cancelled")
-    })
+    complete_if(conn, item_id, owner, None, forced_allowed_from)
+}
+
+/// [`mark_completed_forced`], compare-and-set against the PR the caller
+/// actually confirmed merged -- the same fence
+/// [`promote_in_review_to_completed_if_pr`] applies: also returns
+/// `Ok(false)` unless the item's `metadata.pr.number` still equals
+/// `expected_pr` (`None` meaning "no PR number tracked"). A forced
+/// promotion reads the item, then spends a GitHub round trip confirming
+/// *that* PR merged; a redispatch plus a fresh attempt's own PR landing in
+/// between must not get completed off the old attempt's merge.
+pub fn mark_completed_forced_if_pr(
+    conn: &Connection,
+    item_id: &str,
+    owner: &str,
+    expected_pr: Option<u64>,
+) -> Result<bool> {
+    complete_if(conn, item_id, owner, Some(expected_pr), forced_allowed_from)
+}
+
+fn forced_allowed_from(group: &str) -> bool {
+    !matches!(group, "completed" | "cancelled")
 }
 
 fn complete_if(
     conn: &Connection,
     item_id: &str,
     owner: &str,
+    expected_pr: Option<Option<u64>>,
     allowed_from: impl Fn(&str) -> bool,
 ) -> Result<bool> {
     // One transaction start to finish so the ownership check can't go stale
@@ -244,6 +264,11 @@ fn complete_if(
     }
     let item = get(&tx, item_id)?;
     if !allowed_from(crate::state::get(&tx, &item.state_id)?.group_name.as_str()) {
+        return Ok(false);
+    }
+    if let Some(expected) = expected_pr
+        && metadata_pr_number(&item.metadata) != expected
+    {
         return Ok(false);
     }
     let completed_state = crate::state::first_in_group(&tx, &item.project_id, "completed")?;

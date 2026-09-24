@@ -51,8 +51,11 @@ const DEFAULT_SECONDARY_BACKOFF: Duration = Duration::from_secs(60);
 /// responses; production only ever talks to one host, so there it is
 /// effectively process-wide.
 struct HostThrottle {
-    /// No request to this host before this instant (a rate-limit backoff).
-    backoff_until: Mutex<Option<Instant>>,
+    /// No request to this host before this instant (a rate-limit backoff),
+    /// indexed by [`backoff_slot`]: anonymous and authenticated requests
+    /// draw on separate GitHub budgets (60/hr per IP vs 5000/hr per
+    /// credential), so exhausting one must not lock out the other.
+    backoff_until: [Mutex<Option<Instant>>; 2],
     /// Held for the whole of a mutating request, so writes go out one at a
     /// time; stores when the previous one finished, for spacing.
     last_mutation: Mutex<Option<Instant>>,
@@ -68,11 +71,16 @@ fn host_throttle(base_url: &str) -> Arc<HostThrottle> {
         .unwrap_or_else(|e| e.into_inner());
     Arc::clone(hosts.entry(base_url.to_string()).or_insert_with(|| {
         Arc::new(HostThrottle {
-            backoff_until: Mutex::new(None),
+            backoff_until: [Mutex::new(None), Mutex::new(None)],
             last_mutation: Mutex::new(None),
             etags: Mutex::new(EtagCache::default()),
         })
     }))
+}
+
+/// Which [`HostThrottle::backoff_until`] entry a request with `token` uses.
+fn backoff_slot(token: Option<&str>) -> usize {
+    usize::from(token.is_some())
 }
 
 /// The rate-limit headers GitHub attaches to an error response.
@@ -85,17 +93,35 @@ struct RateHeaders {
     retry_after: Option<String>,
 }
 
-fn is_mutating(method: &str) -> bool {
-    matches!(method, "POST" | "PATCH" | "PUT" | "DELETE")
+impl RateHeaders {
+    fn from_response(resp: &ureq::Response) -> RateHeaders {
+        RateHeaders {
+            remaining: resp.header("x-ratelimit-remaining").map(str::to_string),
+            reset: resp.header("x-ratelimit-reset").map(str::to_string),
+            retry_after: resp.header("retry-after").map(str::to_string),
+        }
+    }
 }
 
-/// Whether a `/graphql` request body carries a mutation (as opposed to a
-/// query): GraphQL documents start with their operation type, and every
-/// mutation agentflare sends spells it out.
-fn is_graphql_mutation(body: &Option<serde_json::Value>) -> bool {
-    body.as_ref()
-        .and_then(|b| b["query"].as_str())
+/// Whether a `/graphql` request body is a mutation (a write) rather than a
+/// query -- the operation keyword leads the document.
+fn is_graphql_mutation(body: Option<&serde_json::Value>) -> bool {
+    body.and_then(|b| b["query"].as_str())
         .is_some_and(|q| q.trim_start().starts_with("mutation"))
+}
+
+/// The wait a GraphQL `RATE_LIMITED` 200 calls for, from that response's
+/// headers: `retry-after` when present, else until `x-ratelimit-reset` when
+/// the primary budget is spent (`x-ratelimit-remaining: 0`). `None` (the
+/// caller's default secondary wait) when neither applies.
+fn graphql_rate_limit_backoff(headers: &RateHeaders, now_epoch: u64) -> Option<Duration> {
+    // Same precedence as the REST status path; 403 selects its
+    // rate-limit branch without implying a secondary limit.
+    backoff_for(403, headers, "", now_epoch)
+}
+
+fn is_mutating(method: &str) -> bool {
+    matches!(method, "POST" | "PATCH" | "PUT" | "DELETE")
 }
 
 /// GitHub's secondary ("abuse") limits come back as a 403 or 429 carrying
@@ -224,27 +250,36 @@ impl Client {
         &self.base_url
     }
 
-    /// Time left on this host's rate-limit backoff, if one is active.
-    fn backoff_remaining(&self) -> Option<Duration> {
-        let until = *self
-            .throttle
-            .backoff_until
+    /// Time left on this host's rate-limit backoff for requests made with
+    /// `token` (anonymous or authenticated), if one is active.
+    fn backoff_remaining(&self, token: Option<&str>) -> Option<Duration> {
+        let until = *self.throttle.backoff_until[backoff_slot(token)]
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         until.and_then(|t| t.checked_duration_since(Instant::now()))
     }
 
-    /// Extends (never shortens) this host's backoff deadline.
-    fn extend_backoff(&self, wait: Duration) {
+    /// Extends (never shortens) this host's backoff deadline for requests
+    /// made with `token`.
+    fn extend_backoff(&self, token: Option<&str>, wait: Duration) {
         let deadline = Instant::now() + wait;
-        let mut until = self
-            .throttle
-            .backoff_until
+        let mut until = self.throttle.backoff_until[backoff_slot(token)]
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if until.is_none_or(|t| t < deadline) {
             *until = Some(deadline);
         }
+    }
+
+    /// Arms this client's shared host backoff for a rate limit detected
+    /// outside the HTTP status path -- e.g. GraphQL's `RATE_LIMITED`, which
+    /// arrives as a 200 -- so every client for the host stops calling.
+    /// `None` uses the default secondary-limit wait.
+    pub(crate) fn arm_backoff(&self, wait: Option<Duration>) {
+        self.extend_backoff(
+            self.token.as_deref(),
+            wait.unwrap_or(DEFAULT_SECONDARY_BACKOFF),
+        );
     }
 
     pub fn request(
@@ -271,6 +306,52 @@ impl Client {
         body: Option<serde_json::Value>,
         accept: &str,
     ) -> Result<serde_json::Value, GitHubError> {
+        self.request_with_headers(method, path, body, accept)
+            .map(|(json, _)| json)
+    }
+
+    /// POSTs a GraphQL `body` to `/graphql`. GitHub reports an exhausted
+    /// GraphQL budget as a *200* whose `errors` carry `"type":
+    /// "RATE_LIMITED"` -- that never reaches the status-code backoff in
+    /// `send_checked`, so it is handled here instead: the host backoff is
+    /// armed from the same response's `retry-after` / `x-ratelimit-reset`
+    /// headers (GitHub's docs require waiting until the reset, which the
+    /// default secondary wait can undershoot), falling back to the default
+    /// wait only when neither header is usable, and `RateLimited` is
+    /// returned. Any other `errors` are left in the returned JSON for the
+    /// caller to interpret.
+    pub(crate) fn graphql(
+        &self,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, GitHubError> {
+        let (json, headers) = self.request_with_headers(
+            "POST",
+            "/graphql",
+            Some(body),
+            "application/vnd.github+json",
+        )?;
+        if let Some(errors) = json.get("errors")
+            && errors
+                .as_array()
+                .is_some_and(|errs| errs.iter().any(|e| e["type"] == "RATE_LIMITED"))
+        {
+            self.arm_backoff(graphql_rate_limit_backoff(&headers, now_epoch()));
+            return Err(GitHubError::RateLimited(format!(
+                "GitHub GraphQL rate limit hit: {errors}"
+            )));
+        }
+        Ok(json)
+    }
+
+    /// `request_with_accept`, also returning the success response's
+    /// rate-limit headers (default/empty on an empty body path).
+    fn request_with_headers(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+        accept: &str,
+    ) -> Result<(serde_json::Value, RateHeaders), GitHubError> {
         if method != "GET" && self.token.is_none() {
             return Err(GitHubError::NoAuth(
                 crate::github::auth::NO_AUTH_MSG.to_string(),
@@ -278,10 +359,11 @@ impl Client {
         }
         // Mutating requests go out one at a time per host, spaced apart,
         // per GitHub's guidance for staying under secondary limits. A
-        // GraphQL POST counts only when its document is a mutation -- the
-        // batched status lookups are queries, and spacing those out would
-        // slow every sweep for nothing.
-        let mutating = is_mutating(method) && (path != "/graphql" || is_graphql_mutation(&body));
+        // `/graphql` POST counts only when it carries a `mutation` (e.g.
+        // `repos::delete_merged_pr_branch`'s `updateRefs`); queries are
+        // reads.
+        let mutating =
+            is_mutating(method) && (path != "/graphql" || is_graphql_mutation(body.as_ref()));
         let mut mutation_slot = mutating.then(|| {
             let slot = self
                 .throttle
@@ -328,8 +410,8 @@ impl Client {
         body: Option<serde_json::Value>,
         accept: &str,
         token: Option<&str>,
-    ) -> Result<serde_json::Value, GitHubError> {
-        if let Some(left) = self.backoff_remaining() {
+    ) -> Result<(serde_json::Value, RateHeaders), GitHubError> {
+        if let Some(left) = self.backoff_remaining(token) {
             return Err(GitHubError::RateLimited(format!(
                 "GitHub rate-limit backoff active; no calls for another {}s.",
                 left.as_secs().max(1)
@@ -374,10 +456,14 @@ impl Client {
                         "GitHub answered 304 to a request that sent no validator".to_string(),
                     ));
                 };
-                serde_json::from_str(&c.body).map_err(|e| GitHubError::Parse(e.to_string()))
+                let headers = RateHeaders::from_response(&resp);
+                serde_json::from_str(&c.body)
+                    .map(|json| (json, headers))
+                    .map_err(|e| GitHubError::Parse(e.to_string()))
             }
             Ok(resp) => {
                 let etag = resp.header("etag").map(str::to_string);
+                let headers = RateHeaders::from_response(&resp);
                 let text = resp
                     .into_string()
                     .map_err(|e| GitHubError::Transport(e.to_string()))?;
@@ -395,19 +481,17 @@ impl Client {
                     }
                 }
                 if text.trim().is_empty() {
-                    return Ok(serde_json::Value::Null);
+                    return Ok((serde_json::Value::Null, headers));
                 }
-                serde_json::from_str(&text).map_err(|e| GitHubError::Parse(e.to_string()))
+                serde_json::from_str(&text)
+                    .map(|json| (json, headers))
+                    .map_err(|e| GitHubError::Parse(e.to_string()))
             }
             Err(ureq::Error::Status(code, resp)) => {
-                let headers = RateHeaders {
-                    remaining: resp.header("x-ratelimit-remaining").map(str::to_string),
-                    reset: resp.header("x-ratelimit-reset").map(str::to_string),
-                    retry_after: resp.header("retry-after").map(str::to_string),
-                };
+                let headers = RateHeaders::from_response(&resp);
                 let body = resp.into_string().unwrap_or_default();
                 if let Some(wait) = backoff_for(code, &headers, &body, now_epoch()) {
-                    self.extend_backoff(wait);
+                    self.extend_backoff(token, wait);
                 }
                 Err(map_status(code, &headers, body))
             }
@@ -538,17 +622,6 @@ mod tests {
         // A plain permission 403 and non-limit statuses arm no backoff.
         assert_eq!(backoff_for(403, &remaining("5"), "", 1000), None);
         assert_eq!(backoff_for(500, &RateHeaders::default(), "", 1000), None);
-    }
-
-    #[test]
-    fn is_graphql_mutation_tells_mutations_from_queries() {
-        let q = |s: &str| Some(serde_json::json!({ "query": s }));
-        assert!(is_graphql_mutation(&q(
-            "mutation($input: X!) { enablePullRequestAutoMerge(input: $input) { x } }"
-        )));
-        assert!(is_graphql_mutation(&q("  mutation { x }")));
-        assert!(!is_graphql_mutation(&q("query($owner:String!){ x }")));
-        assert!(!is_graphql_mutation(&None));
     }
 
     #[test]
@@ -766,6 +839,113 @@ mod tests {
             2,
             "the backoff stopped the third call locally"
         );
+    }
+
+    #[test]
+    fn an_anonymous_rate_limit_does_not_back_off_authenticated_calls() {
+        let server = MockServer::start(vec![
+            MockResponse::json(403, r#"{"message":"API rate limit exceeded"}"#)
+                .with_header("x-ratelimit-remaining", "0")
+                .with_header("x-ratelimit-reset", "99999999999"),
+            MockResponse::json(200, r#"{"ok":true}"#),
+        ]);
+        let anon = server.client(None);
+        let err = anon.request("GET", "/anon", None).unwrap_err();
+        assert!(matches!(err, GitHubError::RateLimited(_)));
+        // The anonymous budget stays backed off...
+        let err = anon.request("GET", "/anon-again", None).unwrap_err();
+        assert!(matches!(err, GitHubError::RateLimited(_)));
+        // ...but an authenticated client for the same host is unaffected.
+        let authed = server.client(Some("tok"));
+        assert_eq!(authed.request("GET", "/authed", None).unwrap()["ok"], true);
+        let paths: Vec<_> = server.requests().into_iter().map(|r| r.path).collect();
+        assert_eq!(paths, ["/anon", "/authed"]);
+    }
+
+    #[test]
+    fn arm_backoff_refuses_later_calls_locally() {
+        let server = MockServer::start(vec![]);
+        let client = server.client(Some("tok"));
+        client.arm_backoff(None);
+        let err = client.request("GET", "/x", None).unwrap_err();
+        assert!(matches!(err, GitHubError::RateLimited(_)));
+        assert!(server.requests().is_empty());
+    }
+
+    #[test]
+    fn graphql_rate_limited_200_backs_off_until_the_primary_reset() {
+        let reset = now_epoch() + 3600;
+        let server = MockServer::start(vec![
+            MockResponse::json(
+                200,
+                r#"{"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded"}]}"#,
+            )
+            .with_header("x-ratelimit-remaining", "0")
+            .with_header("x-ratelimit-reset", &reset.to_string()),
+        ]);
+        let client = server.client(Some("tok"));
+        let err = client
+            .graphql(serde_json::json!({"query": "query{viewer{login}}"}))
+            .unwrap_err();
+        assert!(matches!(err, GitHubError::RateLimited(_)));
+        let left = client.backoff_remaining(Some("tok")).unwrap();
+        assert!(
+            left > DEFAULT_SECONDARY_BACKOFF + Duration::from_secs(3000),
+            "backoff must run to x-ratelimit-reset, not the 60s default: {left:?}"
+        );
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[test]
+    fn graphql_rate_limit_backoff_prefers_retry_after_then_reset_then_default() {
+        let retry = RateHeaders {
+            retry_after: Some("30".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            graphql_rate_limit_backoff(&retry, 1000),
+            Some(Duration::from_secs(30))
+        );
+        let reset = RateHeaders {
+            remaining: Some("0".into()),
+            reset: Some("1090".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            graphql_rate_limit_backoff(&reset, 1000),
+            Some(Duration::from_secs(90))
+        );
+        // No usable header: the caller falls back to the default wait.
+        assert_eq!(
+            graphql_rate_limit_backoff(&RateHeaders::default(), 1000),
+            None
+        );
+    }
+
+    #[test]
+    fn graphql_passes_non_rate_limit_errors_through_without_backoff() {
+        let server = MockServer::start(vec![
+            MockResponse::json(200, r#"{"errors":[{"message":"bad field"}]}"#),
+            MockResponse::json(200, r#"{"ok":true}"#),
+        ]);
+        let client = server.client(Some("tok"));
+        let json = client
+            .graphql(serde_json::json!({"query": "query{x}"}))
+            .unwrap();
+        assert!(json.get("errors").is_some());
+        assert_eq!(client.request("GET", "/next", None).unwrap()["ok"], true);
+        assert_eq!(server.requests().len(), 2);
+    }
+
+    #[test]
+    fn graphql_mutations_are_spaced_but_queries_are_not() {
+        assert!(is_graphql_mutation(Some(
+            &serde_json::json!({"query": " mutation($i:X!){updateRefs(input:$i){clientMutationId}}"})
+        )));
+        assert!(!is_graphql_mutation(Some(
+            &serde_json::json!({"query": "query{viewer{login}}"})
+        )));
+        assert!(!is_graphql_mutation(None));
     }
 
     #[test]

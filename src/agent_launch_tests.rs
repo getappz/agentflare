@@ -796,6 +796,72 @@
         assert_eq!(reply.cost_usd, None);
     }
 
+    #[test]
+    fn parse_json_reply_reads_the_final_line_of_a_stream_json_transcript() {
+        // What `agentflare work` actually captures: `build_extra_args` pins
+        // `--output-format stream-json`, so stdout is one JSON object per
+        // event and only the last line carries the result fields. Before
+        // the fix this parse failed and the whole transcript came back as
+        // `text` with no session id -- so `--resume` never fired.
+        let raw = concat!(
+            r#"{"type":"system","subtype":"init","session_id":"sess-123"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"working..."}]}}"#,
+            "\n",
+            r#"{"type":"result","result":"Fixed it.","session_id":"sess-123","total_cost_usd":0.0842}"#,
+        );
+        let reply = parse_json_reply(raw);
+        assert_eq!(reply.text, "Fixed it.");
+        assert_eq!(reply.session_id.as_deref(), Some("sess-123"));
+        assert_eq!(reply.cost_usd, Some(0.0842));
+    }
+
+    #[test]
+    fn headless_full_args_prepends_json_output_when_caller_pins_no_output_format() {
+        let extra = vec!["--model".to_string(), "sonnet".to_string()];
+        let args = headless_full_args(Agent::ClaudeCode, true, &extra);
+        assert_eq!(args, vec!["--output-format", "json", "--model", "sonnet"]);
+    }
+
+    #[test]
+    fn headless_full_args_keeps_a_caller_pinned_output_format_and_emits_it_once() {
+        // The exact argv `cli::work::build_extra_args` produces for Claude
+        // Code. Prepending `--output-format json` in front of it is the
+        // collision the audit found: two `--output-format` flags, last wins.
+        let extra: Vec<String> = [
+            "--dangerously-skip-permissions",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        let args = headless_full_args(Agent::ClaudeCode, true, &extra);
+        assert_eq!(args, extra);
+        assert_eq!(
+            args.iter().filter(|a| *a == "--output-format").count(),
+            1,
+            "exactly one --output-format must reach the CLI"
+        );
+    }
+
+    #[test]
+    fn headless_full_args_respects_the_equals_and_alias_spellings() {
+        for pinned in ["--output-format=stream-json", "--stream-json"] {
+            let extra = vec![pinned.to_string()];
+            let args = headless_full_args(Agent::ClaudeCode, true, &extra);
+            assert_eq!(args, extra, "{pinned}");
+        }
+    }
+
+    #[test]
+    fn headless_full_args_adds_nothing_when_json_is_not_requested_or_unsupported() {
+        let extra = vec!["--full-auto".to_string()];
+        assert_eq!(headless_full_args(Agent::ClaudeCode, false, &extra), extra);
+        assert_eq!(headless_full_args(Agent::Codex, true, &extra), extra);
+    }
+
     #[cfg(unix)]
     #[test]
     fn run_headless_with_request_json_parses_a_json_reply_from_the_child() {

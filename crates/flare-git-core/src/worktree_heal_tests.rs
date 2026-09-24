@@ -321,6 +321,67 @@ fn push_branch_integrates_commits_pushed_to_the_branch_by_someone_else() {
 }
 
 #[test]
+fn push_branch_integration_does_not_replay_new_target_commits_into_the_pr_branch() {
+    // Rebasing onto a newer target and then *rebasing* onto origin/<branch>
+    // replayed the target's upstream commits as fresh copies, so they showed
+    // up as the item's own commits in its PR. Merging keeps them as-is.
+    let (remote, _c, local) = init_remote_and_local_clone();
+    let item = test_item(1);
+    let wt = create_worktree(&item, &local, "master", None).unwrap();
+    std::fs::write(wt.join("mine.txt"), "m").unwrap();
+    run_git_in(&wt, &["add", "mine.txt"]).unwrap();
+    run_git_in(&wt, &["commit", "-m", "mine"]).unwrap();
+    let branch = push_branch(&item, &local, "master", None).expect("first push");
+
+    let other = TempDir::new().unwrap();
+    let other_path = other.path().join("o");
+    run_git_in(
+        other.path(),
+        &[
+            "clone",
+            "-b",
+            &branch,
+            remote.path.to_str().unwrap(),
+            other_path.to_str().unwrap(),
+        ],
+    )
+    .unwrap();
+    run_git_in(&other_path, &["config", "user.email", "h@h"]).unwrap();
+    run_git_in(&other_path, &["config", "user.name", "H"]).unwrap();
+    std::fs::write(other_path.join("human.txt"), "h").unwrap();
+    run_git_in(&other_path, &["add", "human.txt"]).unwrap();
+    run_git_in(&other_path, &["commit", "-m", "human fixup"]).unwrap();
+    run_git_in(&other_path, &["push", "origin", &branch]).unwrap();
+
+    // Meanwhile the target advances with an unrelated upstream commit.
+    std::fs::write(remote.path.join("upstream.txt"), "u").unwrap();
+    run_git_in(&remote.path, &["add", "upstream.txt"]).unwrap();
+    run_git_in(&remote.path, &["commit", "-m", "upstream only"]).unwrap();
+
+    std::fs::write(wt.join("more.txt"), "more").unwrap();
+    run_git_in(&wt, &["add", "more.txt"]).unwrap();
+    run_git_in(&wt, &["commit", "-m", "more"]).unwrap();
+    assert!(push_branch(&item, &local, "master", None).is_some());
+
+    let range = format!("master..{branch}");
+    let pr_log = run_git_in(&remote.path, &["log", "--format=%s", &range]).unwrap();
+    assert!(
+        !pr_log.contains("upstream only"),
+        "an upstream-only target commit must not appear as a PR commit: {pr_log}"
+    );
+    assert!(pr_log.contains("human fixup"), "{pr_log}");
+    assert!(pr_log.contains("more"), "{pr_log}");
+    let files = run_git_in(
+        &remote.path,
+        &["diff", "--name-only", &format!("master...{branch}")],
+    )
+    .unwrap();
+    let mut files: Vec<&str> = files.lines().collect();
+    files.sort_unstable();
+    assert_eq!(files, ["human.txt", "mine.txt", "more.txt"]);
+}
+
+#[test]
 fn retryable_worktree_race_matches_real_git_lock_messages() {
     assert!(is_retryable_worktree_race(
         "fatal: cannot lock ref 'refs/heads/task/1': Unable to create '/r/.git/refs/heads/task/1.lock': File exists."
@@ -385,4 +446,17 @@ fn git_children_get_english_non_interactive_env() {
         Some(&Some("0".to_string()))
     );
     assert_eq!(envs.get("GIT_OPTIONAL_LOCKS"), Some(&Some("0".to_string())));
+}
+
+#[test]
+fn same_location_matches_a_deleted_dir_through_its_canonical_parent() {
+    let tmp = TempDir::new().unwrap();
+    let real = tmp.path().join("task");
+    std::fs::create_dir_all(&real).unwrap();
+    // A differently-spelled path to the same (existing) parent, like a
+    // Windows 8.3 short name or a symlinked temp dir.
+    let alias = tmp.path().join("task").join("..").join("task").join("1");
+    let gone = real.join("1");
+    assert!(same_location(&alias, &gone));
+    assert!(!same_location(&real.join("2"), &gone));
 }

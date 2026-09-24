@@ -395,6 +395,16 @@ pub(crate) fn build_sdd_loop_step(
 
                 let task = ctx.data.tasks[ctx.data.current_task_index].clone();
 
+                // The first-pass role for a fresh task or an open fix round:
+                // the analyst on a review-only task, else the implementer.
+                let first_pass_role = if ctx.data.review_only {
+                    SddRole::Analyst {
+                        design_spec: ctx.data.design_spec,
+                    }
+                } else {
+                    SddRole::Implementer
+                };
+
                 // 1. Role dispatch — state read from ctx.data decides which
                 // role plays this turn.
                 // Reviewer branches (task-reviewer, re-reviewer) dispatch on
@@ -403,7 +413,7 @@ pub(crate) fn build_sdd_loop_step(
                 // dispatch further down), so a usage-threshold fallback that
                 // swaps `agent_name` to another CLI still leaves real code
                 // review running on the reserved agent.
-                let (role_agent, role_prompt, is_implementer_turn) = if ctx
+                let (role_agent, role_prompt, is_implementer_turn, role_kind) = if ctx
                     .data
                     .review_issues
                     .is_some()
@@ -417,6 +427,7 @@ pub(crate) fn build_sdd_loop_step(
                             judge_agent_name.clone(),
                             build_re_reviewer_prompt(&task, &findings, &fix_report),
                             false,
+                            SddRole::Reviewer,
                         )
                     } else {
                         // Issues open, no fix attempt yet — dispatch the
@@ -428,7 +439,12 @@ pub(crate) fn build_sdd_loop_step(
                         } else {
                             build_implementer_prompt(&task, fix_context, ctx.data.tdd)
                         };
-                        (agent_name.clone(), prompt, !ctx.data.review_only)
+                        (
+                            agent_name.clone(),
+                            prompt,
+                            !ctx.data.review_only,
+                            first_pass_role,
+                        )
                     }
                 } else if ctx.data.last_report.is_some() {
                     // No open issues; a report is pending review.
@@ -438,7 +454,7 @@ pub(crate) fn build_sdd_loop_step(
                     } else {
                         build_task_reviewer_prompt(&task, &report, ctx.data.tdd)
                     };
-                    (judge_agent_name.clone(), prompt, false)
+                    (judge_agent_name.clone(), prompt, false, SddRole::Reviewer)
                 } else {
                     // Fresh task, nothing dispatched yet.
                     let prompt = if ctx.data.review_only {
@@ -446,8 +462,21 @@ pub(crate) fn build_sdd_loop_step(
                     } else {
                         build_implementer_prompt(&task, None, ctx.data.tdd)
                     };
-                    (agent_name.clone(), prompt, !ctx.data.review_only)
+                    (
+                        agent_name.clone(),
+                        prompt,
+                        !ctx.data.review_only,
+                        first_pass_role,
+                    )
                 };
+
+                // Role identity and tool policy (see `roles.rs`): compiled
+                // into the agent's own flags where its CLI has them, folded
+                // into the prompt otherwise. Done before the corrections
+                // below so a mid-flight correction still leads the prompt
+                // text on agents that get the identity folded in.
+                let (role_args, role_prompt) =
+                    compile_sdd_role(&role_agent, role_kind, &role_prompt);
 
                 // Consume any corrections the heartbeat-tick poll picked up
                 // since the last turn (item #269/#270) — prepended once,
@@ -463,10 +492,16 @@ pub(crate) fn build_sdd_loop_step(
                     )
                 };
 
+                // Resume args lead the argv so a resumed round keeps the
+                // same policy it started with.
+                let mut role_invocation_args =
+                    resume_args_for(&role_agent, &ctx.data.agent_sessions);
+                role_invocation_args.extend(role_args);
+
                 let cwd = (!ctx.data.worktree_path.is_empty())
                     .then(|| std::path::PathBuf::from(&ctx.data.worktree_path));
                 let role_invocation = flare_workflow::json::StepInvocation {
-                    args: resume_args_for(&role_agent, &ctx.data.agent_sessions),
+                    args: role_invocation_args,
                     cwd: cwd.clone(),
                     owner: Some(ctx.data.owner.clone()),
                     ..flare_workflow::json::StepInvocation::simple(role_agent.clone(), role_prompt)
@@ -546,8 +581,13 @@ pub(crate) fn build_sdd_loop_step(
                     ctx.data.review_only,
                     ctx.data.design_spec,
                 );
+                let (judge_args, judge_prompt) =
+                    compile_sdd_role(&judge_agent_name, SddRole::Judge, &judge_prompt);
+                let mut judge_invocation_args =
+                    resume_args_for(&judge_agent_name, &ctx.data.agent_sessions);
+                judge_invocation_args.extend(judge_args);
                 let judge_invocation = flare_workflow::json::StepInvocation {
-                    args: resume_args_for(&judge_agent_name, &ctx.data.agent_sessions),
+                    args: judge_invocation_args,
                     cwd,
                     owner: Some(ctx.data.owner.clone()),
                     ..flare_workflow::json::StepInvocation::simple(
@@ -1464,6 +1504,7 @@ fn persist_run_id(
 include!("work_item_pipeline/task_sourcing.rs");
 
 include!("work_item_pipeline/prompt_builders.rs");
+include!("work_item_pipeline/roles.rs");
 
 #[cfg(test)]
 mod cancel_tests;

@@ -4,6 +4,15 @@
 /// A test project/item plus a fresh temp home, so `auth_db` cooldowns and
 /// the backend are both isolated.
 fn with_failover_fixture(f: impl FnOnce(&AgentflareMcp, &agentflare_backend::item::Item)) {
+    with_failover_fixture_claimed(true, f);
+}
+
+/// [`with_failover_fixture`], optionally with the item claimed by this
+/// process's owner (as the real `work` run holds it) or left unclaimed.
+fn with_failover_fixture_claimed(
+    claimed: bool,
+    f: impl FnOnce(&AgentflareMcp, &agentflare_backend::item::Item),
+) {
     crate::paths::test_support::with_temp_home(|| {
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().join("repo");
@@ -15,6 +24,19 @@ fn with_failover_fixture(f: impl FnOnce(&AgentflareMcp, &agentflare_backend::ite
             tmp.path().join("project.json"),
         );
         let item = mcp.with_backend_db(|conn| seeded_item(&mcp, conn)).unwrap();
+        if claimed {
+            mcp.with_backend_db(|conn| {
+                agentflare_backend::claim::acquire(
+                    conn,
+                    &item.id,
+                    &crate::claims::owner_id(),
+                    crate::claims::now(),
+                    3600,
+                )
+            })
+            .unwrap()
+            .unwrap();
+        }
         // One dispatch cycle, as the supervisor would have recorded it.
         mcp.with_backend_db(|conn| {
             agentflare_backend::comment::create(
@@ -196,6 +218,20 @@ fn short_rate_limit_retries_the_same_agent() {
         .unwrap();
         assert!(!outcome.fatal);
         assert_eq!(outcome.retry_after_secs, Some(30));
+        let comments = comments_of(mcp, &item.id);
+        assert!(comments.iter().any(|c| {
+            c.body
+                .starts_with(crate::dispatch_failure_ceiling::AGENT_UNAVAILABLE_MARKER)
+        }));
+        assert!(
+            !comments.iter().any(|c| c.body.contains("agentflare work — failed")),
+            "a deliberate short retry must not post a failure comment"
+        );
+        assert_eq!(
+            crate::dispatch_failure_ceiling::consecutive_failure_count_any_reason(&comments),
+            0,
+            "a short rate-limit retry must not burn the failure ceiling"
+        );
     });
 }
 
@@ -245,6 +281,19 @@ fn stop_on_request_classification() {
 }
 
 #[test]
+fn a_run_already_cancelled_before_the_dispatch_is_not_its_cancellation() {
+    // Resumed run cancelled mid-dispatch.
+    assert!(run_cancelled_by_this_dispatch(None, Some("run-1")));
+    // Stale cancelled run replaced by a fresh one, which was then cancelled.
+    assert!(run_cancelled_by_this_dispatch(Some("run-1"), Some("run-2")));
+    // Setup error before the fresh run's id was persisted: the stale
+    // cancelled id is still stored -- a failure, not a cancel-on-request.
+    assert!(!run_cancelled_by_this_dispatch(Some("run-1"), Some("run-1")));
+    assert!(!run_cancelled_by_this_dispatch(Some("run-1"), None));
+    assert!(!run_cancelled_by_this_dispatch(None, None));
+}
+
+#[test]
 fn a_cancelled_or_paused_run_is_terminal_and_not_counted() {
     with_failover_fixture(|mcp, item| {
         for stop in [StopOnRequest::RunCancelled, StopOnRequest::Paused] {
@@ -267,5 +316,39 @@ fn a_cancelled_or_paused_run_is_terminal_and_not_counted() {
                 0
             );
         }
+    });
+}
+
+#[test]
+fn release_response_released_only_trusts_an_explicit_true() {
+    assert!(release_response_released(r#"{"released":true,"item_id":"x"}"#));
+    assert!(!release_response_released(r#"{"released":false,"item_id":"x"}"#));
+    assert!(!release_response_released(r#"{"item_id":"x"}"#));
+    assert!(!release_response_released("not json"));
+}
+
+#[test]
+fn a_no_op_release_keeps_the_claim_guard_armed_and_does_not_fail_over() {
+    // Nothing to release (not our claim): `item_release` answers
+    // `Ok({"released": false})`, which must not disarm the guard.
+    with_failover_fixture_claimed(false, |mcp, item| {
+        let mut guard = ClaimGuard::new(mcp, &item.id);
+        let mut log = Vec::new();
+        let outcome = handle_agent_exhaustion(
+            mcp,
+            item,
+            &[],
+            agent_registry::Agent::ClaudeCode,
+            CREDIT_OUT,
+            true,
+            &mut guard,
+            None,
+            &mut log,
+            |_, _, _| panic!("an unreleased claim must not fail over"),
+        )
+        .expect("credit exhaustion is handled");
+        assert!(!outcome.fatal);
+        assert!(guard.armed, "a no-op release must not disarm the guard");
+        guard.disarm();
     });
 }

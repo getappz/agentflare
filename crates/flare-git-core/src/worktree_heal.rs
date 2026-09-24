@@ -246,6 +246,30 @@ pub(super) fn is_half_created(worktree_path: &Path) -> bool {
     reason.contains("initializing") && old_enough
 }
 
+/// Whether two spellings name the same checkout location, even after the
+/// directory itself is gone (so plain `canonicalize` can't be used): the
+/// parents are canonicalized instead. Git records the long path while a
+/// caller may hold a Windows 8.3 short-name or differently-cased spelling
+/// of the same directory; a byte comparison then never matches and the
+/// stale registration is never cleared.
+pub(super) fn same_location(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    let key = |p: &Path| {
+        let parent = p
+            .parent()
+            .map(|d| d.canonicalize().unwrap_or_else(|_| d.to_path_buf()));
+        let key = (parent, p.file_name().map(std::ffi::OsStr::to_os_string));
+        if cfg!(windows) {
+            format!("{key:?}").to_lowercase()
+        } else {
+            format!("{key:?}")
+        }
+    };
+    key(a) == key(b)
+}
+
 /// Resolves a gitdir pointer as git itself does: absolute as-is, relative
 /// (`worktree.useRelativePaths`, git 2.48+) against the directory holding
 /// the file it was read from.
@@ -301,17 +325,30 @@ pub(super) fn is_push_rejection(err: &str) -> bool {
     e.contains("rejected") || e.contains("stale info") || e.contains("non-fast-forward")
 }
 
-/// Fetches `origin/<branch>` and rebases the worktree onto it, so commits
-/// pushed there by someone else survive the next push. Patches this branch
-/// already carries (its own earlier, pre-rebase pushes) are dropped by the
-/// rebase's patch-id check. Aborts cleanly on conflict.
+/// Fetches `origin/<branch>` and merges it into the worktree, so commits
+/// pushed there by someone else survive the next push.
+///
+/// Deliberately a merge, not a rebase: `push_branch` has usually just
+/// rebased the local branch onto a newer target tip, so `rebase
+/// origin/<branch>` would replay every local commit missing from the remote
+/// branch -- including the target's new upstream commits -- as fresh copies
+/// that then show up as this item's own commits in the PR. A merge keeps
+/// those upstream commits under their original SHAs (already in the target,
+/// so absent from the PR diff), and keeps the remote tip as an ancestor so
+/// the follow-up `--force-with-lease --force-if-includes` push is a plain
+/// fast-forward. Aborts cleanly on conflict.
 pub(super) fn integrate_remote_branch(worktree_path: &Path, branch: &str) -> Result<(), String> {
     let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
     run_git_timeout(worktree_path, &["fetch", "origin", &refspec], 30)?;
     let remote = format!("refs/remotes/origin/{branch}");
-    match run_git_timeout(worktree_path, &["rebase", &remote], REBASE_TIMEOUT_SECS) {
+    match run_git_timeout(
+        worktree_path,
+        &["merge", "--no-edit", &remote],
+        REBASE_TIMEOUT_SECS,
+    ) {
         Ok(_) => Ok(()),
         Err(e) => {
+            let _ = run_git_timeout(worktree_path, &["merge", "--abort"], REBASE_TIMEOUT_SECS);
             let _ = heal_interrupted_git_state(worktree_path, true);
             Err(e)
         }

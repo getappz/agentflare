@@ -265,9 +265,14 @@ impl AgentflareMcp {
                     // its claim, instead of leaving the new assignee blocked
                     // behind that claim until its TTL lapses. Cancel first,
                     // release second -- see `item_redispatch` for why.
+                    //
+                    // Compared on canonical agent names: `recipient` may be an
+                    // alias (`claude`) of the holder's agent (`claude-code`),
+                    // which is the same agent, not a reassignment.
+                    let recipient_agent = agentflare_backend::item::agent_part(&recipient);
                     let held_by_other_agent =
                         agentflare_backend::claim::current_owner(conn, id).is_some_and(|holder| {
-                            crate::claims::agent_of(&holder) != crate::claims::agent_of(&recipient)
+                            agentflare_backend::item::agent_part(&holder) != recipient_agent
                         });
                     if held_by_other_agent {
                         if let Err(e) = self.cancel_jobs_for_reassignment(id, &recipient) {
@@ -276,7 +281,11 @@ impl AgentflareMcp {
                             );
                         }
                         let released =
-                            crate::claims::reassignment_releases_claim(conn, id, Some(&recipient))
+                            crate::claims::reassignment_releases_claim(
+                                conn,
+                                id,
+                                Some(&recipient_agent),
+                            )
                                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                         // Work that was in progress under the old agent is
                         // re-armed for the new one (backlog + ready-for-work),
@@ -1035,6 +1044,41 @@ mod tests {
         mcp.handoff_impl(reply).unwrap();
 
         assert!(item_label_names(&mcp, &item_id).is_empty());
+    }
+
+    #[test]
+    fn a_handoff_to_an_alias_of_the_claim_holder_keeps_its_claim() {
+        let (_tmp, mcp) = test_mcp();
+        let first = mcp.handoff_impl(base_request()).unwrap();
+        let item_id = serde_json::from_str::<serde_json::Value>(&first).unwrap()["item_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        mcp.with_backend_db(|conn| {
+            agentflare_backend::item::claim(
+                conn,
+                &item_id,
+                "claude-code:test",
+                db_kit::ids::now(),
+                1800,
+            )
+        })
+        .unwrap()
+        .unwrap();
+        // `claude` is an alias of `claude-code`: same agent, not a
+        // reassignment -- the holder's claim must survive.
+        let reply = HandoffRequest {
+            item_id: Some(item_id.clone()),
+            recipient: "claude".to_string(),
+            completed: "more".to_string(),
+            remaining: "less".to_string(),
+            ..base_request()
+        };
+        mcp.handoff_impl(reply).unwrap();
+        let owner = mcp
+            .with_backend_db(|conn| agentflare_backend::claim::current_owner(conn, &item_id))
+            .unwrap();
+        assert_eq!(owner.as_deref(), Some("claude-code:test"));
     }
 
     #[test]

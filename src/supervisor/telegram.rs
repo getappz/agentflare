@@ -369,7 +369,7 @@ pub(crate) fn handle_telegram_callback(
         return;
     };
     let ack_text = match crate::github::Client::new()
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.log_safe())
         .and_then(|client| {
             crate::github::issues::add_labels(
                 &client,
@@ -377,7 +377,7 @@ pub(crate) fn handle_telegram_callback(
                 number,
                 &[PR_APPROVAL_LABEL.to_string()],
             )
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.log_safe())
         }) {
         Ok(()) => "\u{2705} Approved".to_string(),
         Err(e) => {

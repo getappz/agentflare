@@ -929,6 +929,9 @@ fn execute_work_impl(
     // `run_in_worktree` just validates `wpath` is enterable -- the pipeline
     // itself takes `wpath` explicitly rather than relying on process cwd,
     // so concurrent dispatches (item #205) don't need to serialize here. ---
+    // A run already `Cancelled` before this dispatch is not this dispatch's
+    // cancellation (see `run_cancelled_by_this_dispatch`).
+    let cancelled_before = cancelled_workflow_run(&mcp, item_id);
     let result = match run_in_worktree(wpath, || {
         run_pipeline(
             mcp.clone(),
@@ -999,8 +1002,11 @@ fn execute_work_impl(
             // A workflow run cancelled (or paused) on request is terminal, not
             // a failure to retry. A run the waiter cancelled itself after
             // losing its claim is not a request -- it keeps the failure path.
-            let run_cancelled =
-                !msg.contains("is no longer held by") && workflow_run_cancelled(&mcp, item_id);
+            let run_cancelled = !msg.contains("is no longer held by")
+                && run_cancelled_by_this_dispatch(
+                    cancelled_before.as_deref(),
+                    cancelled_workflow_run(&mcp, item_id).as_deref(),
+                );
             if let Some(stop) = stop_on_request(&msg, run_cancelled) {
                 return end_stopped_run(&mcp, item_id, stop, &mut claim_guard, log);
             }

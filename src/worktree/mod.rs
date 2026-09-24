@@ -1224,8 +1224,9 @@ fn open_pr_for_pushed_branch(
     let created = match create(true) {
         Err(e) if crate::github::pulls::drafts_unsupported(&e) => {
             eprintln!(
-                "worktree: {repo} does not support draft PRs ({e}); opening item {}'s PR as \
+                "worktree: {repo} does not support draft PRs ({}); opening item {}'s PR as \
                  ready for review",
+                e.log_safe(),
                 item.id
             );
             create(false)

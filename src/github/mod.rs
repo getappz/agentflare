@@ -85,6 +85,27 @@ impl std::fmt::Display for GitHubError {
 
 impl std::error::Error for GitHubError {}
 
+/// Fixed log text for [`GitHubError::NoAuth`]: auth-failure details are
+/// never written to logs, whatever their payload.
+pub(crate) const NO_AUTH_LOG: &str = "no usable GitHub credentials available";
+
+impl GitHubError {
+    /// Text safe for log files and chat acks: identical to `Display` except
+    /// that an auth failure reads as the fixed [`NO_AUTH_LOG`] string -- its
+    /// payload is never touched, so nothing derived from credential
+    /// handling can reach a log.
+    pub(crate) fn log_safe(&self) -> String {
+        match self {
+            GitHubError::NoAuth(_) => NO_AUTH_LOG.to_string(),
+            GitHubError::Forbidden(m) | GitHubError::RateLimited(m) => m.clone(),
+            GitHubError::NotFound => "not found".to_string(),
+            GitHubError::Http { status, body } => format!("GitHub HTTP {status}: {body}"),
+            GitHubError::Transport(m) => format!("transport error: {m}"),
+            GitHubError::Parse(m) => format!("response parse error: {m}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod encode_tests {
     use super::*;
@@ -103,6 +124,27 @@ mod encode_tests {
     fn encode_query_encodes_multibyte_utf8() {
         // Each byte of a non-ASCII char is percent-encoded individually.
         assert_eq!(encode_query("café"), "caf%C3%A9");
+    }
+
+    #[test]
+    fn log_safe_hides_auth_payloads_and_matches_display_otherwise() {
+        assert_eq!(
+            GitHubError::NoAuth("secret-ish detail".into()).log_safe(),
+            NO_AUTH_LOG
+        );
+        for e in [
+            GitHubError::Forbidden("f".into()),
+            GitHubError::RateLimited("r".into()),
+            GitHubError::NotFound,
+            GitHubError::Http {
+                status: 500,
+                body: "b".into(),
+            },
+            GitHubError::Transport("t".into()),
+            GitHubError::Parse("p".into()),
+        ] {
+            assert_eq!(e.log_safe(), e.to_string());
+        }
     }
 
     #[test]

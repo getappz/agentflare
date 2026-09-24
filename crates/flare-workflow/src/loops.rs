@@ -54,7 +54,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             if self.state_store.is_cancelled(run_id).await? {
                 return Err(WorkflowError::Cancelled(run_id));
             }
-            if self.state_store.is_paused(run_id).await? {
+            if self.should_stop(run_id).await? {
                 return Err(WorkflowError::Paused(run_id));
             }
 
@@ -125,7 +125,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 };
                 if !retryable
                     || retry_attempt >= max_retry_attempts
-                    || self.state_store.is_paused(run_id).await?
+                    || self.should_stop(run_id).await?
                 {
                     break attempt_result;
                 }
@@ -140,6 +140,11 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 retry_attempt += 1;
             };
             let duration_ms = step_start.elapsed().as_millis() as u64;
+            // Superseded mid-iteration (see `execute_step_with_retry`):
+            // record nothing, the new lease holder re-runs this iteration.
+            if self.is_superseded(run_id) {
+                return Err(WorkflowError::Paused(run_id));
+            }
 
             match result {
                 Ok(Ok(StepResult::Success)) => {

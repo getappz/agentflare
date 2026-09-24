@@ -24,7 +24,7 @@ pub(crate) enum StopOnRequest {
 
 /// Classifies a pipeline error as a deliberate stop. `run_cancelled` is
 /// whether the item's workflow run is in `Cancelled` state (see
-/// [`workflow_run_cancelled`]) -- a cancelled run otherwise surfaces only as
+/// [`run_cancelled_by_this_dispatch`]) -- a cancelled run otherwise surfaces only as
 /// its (possibly empty) error text, indistinguishable from a failure.
 pub(crate) fn stop_on_request(msg: &str, run_cancelled: bool) -> Option<StopOnRequest> {
     if msg.contains(PAUSED_MESSAGE) {
@@ -38,30 +38,38 @@ pub(crate) fn stop_on_request(msg: &str, run_cancelled: bool) -> Option<StopOnRe
     }
 }
 
-/// Whether the workflow run recorded on `item_id`'s `workflow_run_id`
-/// metadata is `Cancelled`. False on any lookup failure.
-fn workflow_run_cancelled(mcp: &AgentflareMcp, item_id: &str) -> bool {
-    let run_id = mcp
+/// The workflow run recorded on `item_id`'s `workflow_run_id` metadata, if
+/// that run is `Cancelled`. `None` on any lookup failure.
+fn cancelled_workflow_run(mcp: &AgentflareMcp, item_id: &str) -> Option<String> {
+    let stored = mcp
         .with_backend_db(|conn| {
             let item = agentflare_backend::item::get(conn, item_id).ok()?;
             let meta: serde_json::Value = serde_json::from_str(&item.metadata).ok()?;
             meta["workflow_run_id"].as_str().map(str::to_string)
         })
         .ok()
-        .flatten()
-        .and_then(|s| <flare_workflow::WorkflowRunId as std::str::FromStr>::from_str(&s).ok());
-    let Some(run_id) = run_id else {
-        return false;
-    };
+        .flatten()?;
+    let run_id = <flare_workflow::WorkflowRunId as std::str::FromStr>::from_str(&stored).ok()?;
     // On a fresh thread: blocking on the workflow runtime from a thread
     // that is itself inside an async context would panic.
-    std::thread::spawn(move || {
+    let cancelled = std::thread::spawn(move || {
         crate::workflow::blocking_runtime()
             .block_on(crate::work_item_pipeline::engine().get_status(run_id))
             .is_ok_and(|state| state.status == flare_workflow::WorkflowStatus::Cancelled)
     })
     .join()
-    .unwrap_or(false)
+    .unwrap_or(false);
+    cancelled.then_some(stored)
+}
+
+/// Whether *this* dispatch's run was cancelled: the item's stored run is
+/// `Cancelled` now (`after`) and it isn't the same run that was already
+/// `Cancelled` before the dispatch started (`before`). A dispatch that finds
+/// a cancelled run starts a fresh one but only persists the new id once
+/// `start_workflow` returns -- so a setup error before that leaves the stale
+/// cancelled id in place, which must not read as a cancel-on-request.
+pub(crate) fn run_cancelled_by_this_dispatch(before: Option<&str>, after: Option<&str>) -> bool {
+    after.is_some() && after != before
 }
 
 /// Ends a run cancelled or paused on request: drops this job's own lease
@@ -146,7 +154,23 @@ fn handle_agent_exhaustion(
     let wait = crate::quota::failover::mark_unavailable(agent.as_str(), &failure, now)
         .unwrap_or(crate::auth_runner::DEFAULT_RATE_LIMIT_SECS);
     if !failure.warrants_failover(now) {
-        release_and_comment(mcp, &item.id, msg, notify_recipient);
+        // A deliberate retry, not a failure: the neutral
+        // `AGENT_UNAVAILABLE_MARKER` comment (not `release_and_comment`'s
+        // "failed" one) keeps it out of the dispatch-failure ceiling.
+        if release_claim(mcp, &item.id) {
+            claim_guard.disarm();
+        }
+        let body = format!(
+            "{}\n\n{} is {} -- retrying the same agent in {wait}s.\n\n{}",
+            crate::dispatch_failure_ceiling::AGENT_UNAVAILABLE_MARKER,
+            agent.as_str(),
+            failure.describe(),
+            tail_str(msg, DIAGNOSTIC_TAIL_CHARS)
+        );
+        mcp.post_item_comment(&item.id, &body);
+        if let Some(recipient) = notify_recipient {
+            notify(recipient, &body, &item.id);
+        }
         let _ = writeln!(
             log,
             "{}: {} -- retrying the same agent in {wait}s",
@@ -162,13 +186,7 @@ fn handle_agent_exhaustion(
 
     let until = crate::quota::failover::format_unix(now + wait as i64);
     let reason = format!("{} -- unavailable until {until}", failure.describe());
-    let released = mcp
-        .item_release(ItemRequest {
-            action: "release".into(),
-            id: Some(item.id.clone()),
-            ..Default::default()
-        })
-        .is_ok();
+    let released = release_claim(mcp, &item.id);
     if released {
         claim_guard.disarm();
     }
@@ -219,6 +237,29 @@ fn handle_agent_exhaustion(
         retry_after_secs: Some(wait),
         fatal: false,
     })
+}
+
+/// Releases `item_id`'s claim; whether the claim was actually released.
+/// `item_release` answers `Ok({"released": false, ..})` when the release
+/// was a no-op (no row affected), so an `Ok` alone is not proof -- the
+/// caller disarms its `ClaimGuard` on this, and a false positive would
+/// leave the claim held with nothing left to release it.
+fn release_claim(mcp: &AgentflareMcp, item_id: &str) -> bool {
+    mcp.item_release(ItemRequest {
+        action: "release".into(),
+        id: Some(item_id.to_string()),
+        ..Default::default()
+    })
+    .is_ok_and(|resp| release_response_released(&resp))
+}
+
+/// Whether an `item_release` response reports `"released": true`. Anything
+/// else (`false`, missing, unparseable) counts as not released.
+fn release_response_released(resp: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(resp)
+        .ok()
+        .and_then(|v| v.get("released").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
 }
 
 /// Before a daemon job claims anything: if the agent it would run is

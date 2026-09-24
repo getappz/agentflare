@@ -184,6 +184,14 @@ pub enum WorkflowStatus {
     Cancelled,
 }
 
+impl WorkflowStatus {
+    /// Whether the run has settled (`Completed`, `Failed` or `Cancelled`)
+    /// and must never change status again.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
 /// Step execution status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

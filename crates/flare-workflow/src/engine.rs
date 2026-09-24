@@ -153,17 +153,22 @@ impl StepTracker {
 type DataPatch<D> = Arc<dyn Fn(&mut D) + Send + Sync>;
 type DataPatches<D> = Arc<parking_lot::Mutex<HashMap<WorkflowRunId, DataPatch<D>>>>;
 
-/// Removes a run from its engine's `driving` set (and drops any data patch
-/// registered for it) when the task driving it ends, however it ends.
+type RunIdSet = Arc<parking_lot::Mutex<HashSet<WorkflowRunId>>>;
+
+/// Removes a run from its engine's `driving` set (and drops any data patch or
+/// superseded mark registered for it) when dropped: by the task driving it
+/// when that ends, or by a start/resume path that errors out before spawning.
 struct DrivingGuard<D: WorkflowData> {
     run_id: WorkflowRunId,
-    driving: Arc<parking_lot::Mutex<HashSet<WorkflowRunId>>>,
+    driving: RunIdSet,
+    superseded: RunIdSet,
     data_patches: DataPatches<D>,
 }
 
 impl<D: WorkflowData> Drop for DrivingGuard<D> {
     fn drop(&mut self) {
         self.driving.lock().remove(&self.run_id);
+        self.superseded.lock().remove(&self.run_id);
         self.data_patches.lock().remove(&self.run_id);
     }
 }
@@ -211,7 +216,11 @@ pub struct WorkflowEngine<D: WorkflowData, S: StateStore<D> = InMemoryStore<D>> 
     /// Runs this engine instance is executing right now. Guards against
     /// driving the same run twice in one process (e.g. `resume_run` racing
     /// the boot-time `recover()`).
-    driving: Arc<parking_lot::Mutex<HashSet<WorkflowRunId>>>,
+    driving: RunIdSet,
+    /// Driven runs whose lease another executor took over: their driver
+    /// stops at the next check without settling the run (see
+    /// `renew_lease_loop`).
+    superseded: RunIdSet,
     /// See [`patch_run_data`](Self::patch_run_data).
     data_patches: DataPatches<D>,
 }
@@ -237,6 +246,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             executor_id: process_executor_id(),
             lease_ttl: DEFAULT_LEASE_TTL,
             driving: Arc::new(parking_lot::Mutex::new(HashSet::new())),
+            superseded: Arc::new(parking_lot::Mutex::new(HashSet::new())),
             data_patches: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }
     }
@@ -426,6 +436,16 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 .insert(step.id.clone(), StepState::default());
         }
 
+        // Claim `driving` before the run becomes visible to `list_active`: a
+        // concurrent `recover()` would otherwise see our own (fresh) lease,
+        // claim it, and drive it alongside the driver spawned below. Dropping
+        // the claim on any early return below releases it again.
+        let driving = self
+            .claim_driving(run_id)
+            .ok_or(WorkflowError::InvalidStateTransition {
+                from: WorkflowStatus::Running,
+                to: WorkflowStatus::Running,
+            })?;
         self.state_store.save(state).await?;
         let journaled_input = JournaledInput { input, params };
         let value = serde_json::to_vec(&journaled_input)
@@ -445,11 +465,11 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
 
         guard.commit();
 
-        self.driving.lock().insert(run_id);
         self.spawn_driven(
             run_id,
             Arc::clone(&definition),
             self.active_workflow_guard(),
+            driving,
         );
 
         Ok(run_id)
@@ -578,18 +598,22 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         }
 
         loop {
+            // `cancel_workflow_impl` announced the cancel when it set the
+            // status (the one publication site, which also covers a run with
+            // no live driver); the driver just stops.
             if self.state_store.is_cancelled(run_id).await? {
-                self.event_bus
-                    .publish(WorkflowEvent::WorkflowCancelled { run_id })
-                    .await;
                 return Ok(());
             }
-            // Paused (`pause_workflow`): stop driving at this step boundary
-            // without settling the run. Whatever a step in flight left behind
-            // stays unjournaled, so `resume_workflow`/`resume_run` re-drives
-            // from exactly the persisted step.
-            if self.state_store.is_paused(run_id).await? {
-                tracing::info!(run_id = %run_id, "Workflow paused; stopping at step boundary");
+            // Paused (`pause_workflow`) or taken over by another executor:
+            // stop driving at this step boundary without settling the run.
+            // Whatever a step in flight left behind stays unjournaled, so
+            // `resume_workflow`/`resume_run` re-drives from exactly the
+            // persisted step. Parallel siblings still running are awaited
+            // first, so the run is not reported as undriven (and relaunched)
+            // while they are.
+            if self.should_stop(run_id).await? {
+                tracing::info!(run_id = %run_id, "Workflow paused or superseded; stopping at step boundary");
+                Self::drain_running(&tracker, &mut rx).await;
                 return Ok(());
             }
 
@@ -1008,6 +1032,9 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             self.finish_workflow_failed(run_id, &definition, Some(step), error_message)
                 .await?;
         } else {
+            if self.is_superseded(run_id) {
+                return Ok(());
+            }
             let output = self
                 .state_store
                 .load(run_id)
@@ -1023,16 +1050,24 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                     },
                 )
                 .await?;
+            let mut settled = false;
             self.state_store
                 .update(run_id, |s| {
-                    s.status = WorkflowStatus::Completed;
+                    // Fence: never settle a run another executor now holds,
+                    // nor overwrite one already settled (a concurrent cancel).
+                    settled = !self.is_leased_elsewhere(s) && !s.status.is_terminal();
+                    if settled {
+                        s.status = WorkflowStatus::Completed;
+                    }
                 })
                 .await?;
 
-            let duration = start_time.elapsed();
-            self.event_bus
-                .publish(WorkflowEvent::WorkflowCompleted { run_id, duration })
-                .await;
+            if settled {
+                let duration = start_time.elapsed();
+                self.event_bus
+                    .publish(WorkflowEvent::WorkflowCompleted { run_id, duration })
+                    .await;
+            }
         }
 
         Ok(())
@@ -1052,6 +1087,9 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         failed_step: Option<StepId>,
         error_message: String,
     ) -> WorkflowResult<()> {
+        if self.is_superseded(run_id) {
+            return Ok(());
+        }
         if definition.steps.iter().any(|s| s.rollback.is_some()) {
             self.run_rollback_phase(run_id, definition, failed_step.as_ref())
                 .await?;
@@ -1061,8 +1099,15 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         // `recover()` (which only resumes `Running`/`Pending` runs) picks it
         // back up and `run_rollback_phase` resumes from whatever `Rollback`
         // entries already exist.
+        let mut settled = false;
         self.state_store
             .update(run_id, |s| {
+                // Fence: never settle a run another executor now holds, nor
+                // overwrite one already settled (a concurrent cancel).
+                settled = !self.is_leased_elsewhere(s) && !s.status.is_terminal();
+                if !settled {
+                    return;
+                }
                 s.status = WorkflowStatus::Failed;
                 // `run_rollback_phase` may have already folded a
                 // compensation-failure note into `s.error` above; append the
@@ -1073,6 +1118,9 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 });
             })
             .await?;
+        if !settled {
+            return Ok(());
+        }
         self.event_bus
             .publish(WorkflowEvent::WorkflowFailed {
                 run_id,
@@ -1105,7 +1153,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             if self.state_store.is_cancelled(run_id).await? {
                 return Err(WorkflowError::Cancelled(run_id));
             }
-            if self.state_store.is_paused(run_id).await? {
+            if self.should_stop(run_id).await? {
                 return Err(WorkflowError::Paused(run_id));
             }
 
@@ -1149,6 +1197,11 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             let step_start = std::time::Instant::now();
             let result = timeout(step_timeout, step.executor.execute(&mut context)).await;
             let step_duration = step_start.elapsed();
+            // Superseded mid-step: the new holder owns the run now, so record
+            // nothing (the step re-runs there) and stop as for a pause.
+            if self.is_superseded(run_id) {
+                return Err(WorkflowError::Paused(run_id));
+            }
 
             if !matches!(result, Ok(Ok(StepResult::Skip))) {
                 self.state_store
@@ -1404,6 +1457,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             executor_id: Arc::clone(&self.executor_id),
             lease_ttl: self.lease_ttl,
             driving: Arc::clone(&self.driving),
+            superseded: Arc::clone(&self.superseded),
             data_patches: Arc::clone(&self.data_patches),
         }
     }
