@@ -1837,7 +1837,9 @@ impl AgentflareMcp {
             Ok::<_, ErrorData>((item_id, item, in_review))
         })??;
         if !in_review && req.force == Some(true) {
-            return self.force_complete_merged(&item_id, &item, forced);
+            // `force_if_requested` above already rejected a missing/blank reason.
+            let reason = req.force_reason.as_deref().unwrap_or_default().trim();
+            return self.force_complete_merged(&item_id, &item, forced, reason);
         }
         if !in_review {
             return Ok(serde_json::json!({

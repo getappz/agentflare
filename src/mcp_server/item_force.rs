@@ -88,16 +88,40 @@ fn terminal_failure_since(conn: &rusqlite::Connection, item_id: &str, since: i64
     })
 }
 
-/// The item's own PR is pushed and verified (CI passing, or already merged).
-fn branch_verified(
-    item: &agentflare_backend::item::Item,
-    repo_root: &std::path::Path,
+/// The caller's own checkout (`caller_root`) is on `branch` and its HEAD is
+/// exactly what's pushed to `origin/<branch>` -- i.e. the caller is the
+/// session whose commits the PR carries, not a bystander.
+pub(super) fn caller_on_pushed_branch(caller_root: &std::path::Path, branch: &str) -> bool {
+    use flare_git_core::shell::run_in_opt;
+    flare_git_core::branch::current_branch(caller_root).as_deref() == Some(branch)
+        && run_in_opt(caller_root, &["rev-parse", "HEAD"]).is_some_and(|head| {
+            run_in_opt(
+                caller_root,
+                &["rev-parse", &format!("refs/remotes/origin/{branch}")],
+            )
+            .is_some_and(|pushed| pushed == head)
+        })
+}
+
+/// Gate condition 3: the item's PR is verified (CI passing, or merged) AND
+/// the caller is the live session on that branch with its HEAD pushed. A
+/// green PR alone is not enough -- that's the normal moment just before a
+/// live owner calls `done`.
+pub(super) fn branch_gate(
+    caller_on_branch: bool,
+    status: crate::worktree::PrCiStatus,
 ) -> Option<String> {
-    match crate::worktree::pr_ci_status(item, repo_root) {
-        crate::worktree::PrCiStatus::Passing { number, .. } => {
-            Some(format!("PR #{number} is pushed with passing CI"))
-        }
-        crate::worktree::PrCiStatus::Merged => Some("the item's PR is merged".to_string()),
+    if !caller_on_branch {
+        return None;
+    }
+    match status {
+        crate::worktree::PrCiStatus::Passing { number, .. } => Some(format!(
+            "caller is on the item's branch with HEAD pushed, and PR #{number} has passing CI"
+        )),
+        crate::worktree::PrCiStatus::Merged => Some(
+            "caller is on the item's branch with HEAD pushed, and the item's PR is merged"
+                .to_string(),
+        ),
         _ => None,
     }
 }
@@ -163,21 +187,31 @@ impl AgentflareMcp {
                         .to_string()
                 })
             })
-            .or_else(|| branch_verified(&item, &self.worktree_repo_root()))
+            .or_else(|| {
+                let root = self.worktree_repo_root();
+                let branch = flare_git_core::worktree::resolve_item_task_branch(&item, &root);
+                // Local check first: no PR round trip unless the caller is
+                // actually on the claim's branch.
+                caller_on_pushed_branch(&Self::repo_root(), &branch)
+                    .then(|| branch_gate(true, crate::worktree::pr_ci_status(&item, &root)))
+                    .flatten()
+            })
             .ok_or_else(|| {
                 ErrorData::invalid_params(
                     format!(
                         "force refused: item {item_id} is claimed by '{holder}' and no override \
                          condition holds (owner job confirmed dead, terminal failure comment \
-                         posted since the claim was taken, or the item's PR pushed with \
-                         passing/merged CI) -- wait out the TTL or have the owner release"
+                         posted since the claim was taken, or the caller on the item's branch \
+                         with HEAD pushed and its PR passing/merged) -- wait out the TTL or have \
+                         the owner release"
                     ),
                     None,
                 )
             })?;
         let body = format!(
             "{FORCE_OVERRIDE_MARKER}\n\n- action: `{action}`\n- prior owner: `{holder}`\n- new \
-             owner: `{owner}`\n- evidence: {evidence}\n- reason: {reason}"
+             owner: `{owner}`\n- evidence: {evidence}\n- reason: {reason}\n\nThe claim moved \
+             before `{action}` ran and stays moved even if `{action}` itself then fails."
         );
         self.with_backend_db(|conn| {
             // Owner-scoped: only ever drops `holder`'s own row.
@@ -212,6 +246,7 @@ impl AgentflareMcp {
         item_id: &str,
         item: &agentflare_backend::item::Item,
         forced: Option<String>,
+        reason: &str,
     ) -> Result<String, ErrorData> {
         let owner = &crate::claims::owner_id();
         let repo_root = self.worktree_repo_root();
@@ -223,26 +258,75 @@ impl AgentflareMcp {
             })
             .to_string());
         }
-        let now = crate::claims::now();
-        let promoted = self.with_backend_db(|conn| {
-            // `force_takeover` already moved any live foreign claim to us;
-            // this covers an item with no live claim at all.
-            agentflare_backend::claim::acquire(conn, item_id, owner, now, backend_claim_ttl_secs())
-                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-            let promoted = agentflare_backend::item::mark_completed(conn, item_id, owner)
-                .map_err(map_backend_err)?;
-            if promoted {
-                let _ = agentflare_backend::claim::done(conn, item_id, owner, now);
-                crate::supervisor::cascade_unblock_dependents(conn, item_id);
-            }
-            Ok::<_, ErrorData>(promoted)
-        })??;
+        let promoted = self.promote_forced(
+            item_id,
+            owner,
+            crate::claims::now(),
+            reason,
+            forced.is_some(),
+        )?;
         if promoted {
             crate::worktree::cleanup_worktree(item, &repo_root);
             crate::worktree::relabel_pr_completed(item, &repo_root);
         }
         let resp = serde_json::json!({"item_id": item_id, "promoted": promoted});
         Ok(with_forced(resp, forced))
+    }
+
+    /// The DB half of `force_complete_merged` once the PR is confirmed
+    /// merged: takes the claim, promotes to completed, and -- unless
+    /// `force_takeover` already audited this call (`already_audited`) --
+    /// posts the audit comment, so no forced promotion is silent.
+    pub(super) fn promote_forced(
+        &self,
+        item_id: &str,
+        owner: &str,
+        now: i64,
+        reason: &str,
+        already_audited: bool,
+    ) -> Result<bool, ErrorData> {
+        self.with_backend_db(|conn| {
+            // `force_takeover` already moved any live foreign claim to us;
+            // this covers an item with no live claim at all.
+            if let agentflare_backend::claim::Acquire::Held { owner: other, .. } =
+                agentflare_backend::claim::acquire(
+                    conn,
+                    item_id,
+                    owner,
+                    now,
+                    backend_claim_ttl_secs(),
+                )
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+            {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "item {item_id} was claimed by '{other}' during the forced check_merge"
+                    ),
+                    None,
+                ));
+            }
+            let promoted = agentflare_backend::item::mark_completed(conn, item_id, owner)
+                .map_err(map_backend_err)?;
+            if promoted {
+                if !already_audited {
+                    let body = format!(
+                        "{FORCE_OVERRIDE_MARKER}\n\n- action: `check_merge`\n- prior owner: \
+                         (none)\n- new owner: `{owner}`\n- evidence: the item's PR is merged \
+                         (promoted from a non-in_review state)\n- reason: {reason}"
+                    );
+                    agentflare_backend::comment::create(
+                        conn,
+                        item_id,
+                        crate::claims::agent_of(owner),
+                        &body,
+                    )
+                    .map_err(map_backend_err)?;
+                }
+                let _ = agentflare_backend::claim::done(conn, item_id, owner, now);
+                crate::supervisor::cascade_unblock_dependents(conn, item_id);
+            }
+            Ok::<_, ErrorData>(promoted)
+        })?
     }
 }
 

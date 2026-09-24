@@ -1,7 +1,8 @@
 //! Item #639: gated `force` override + dead-claim auto-release.
 use super::*;
 use crate::mcp_server::item_force::{
-    AUTO_RELEASE_MARKER, FORCE_OVERRIDE_MARKER, auto_release_dead_claims,
+    AUTO_RELEASE_MARKER, FORCE_OVERRIDE_MARKER, auto_release_dead_claims, branch_gate,
+    caller_on_pushed_branch,
 };
 
 const RESCUER: &str = "claude-code:rescuer";
@@ -230,6 +231,135 @@ fn auto_release_needs_both_a_dead_job_and_a_terminal_failure() {
     let queue = s.job_queue_override.clone().unwrap();
     assert_eq!(auto_release_dead_claims(&s, &queue), 0);
     assert_eq!(
+        holder_of(&tmp, &item_id),
+        Some(format!("claude-code:{job_id}"))
+    );
+}
+
+#[test]
+fn a_passing_pr_is_not_evidence_unless_the_caller_is_on_its_pushed_branch() {
+    use crate::worktree::PrCiStatus;
+    let passing = || PrCiStatus::Passing {
+        number: 7,
+        labels: vec![],
+    };
+    // A live owner's PR going green must not let a bystander take over.
+    assert_eq!(branch_gate(false, passing()), None);
+    assert_eq!(branch_gate(false, PrCiStatus::Merged), None);
+    assert!(branch_gate(true, passing()).unwrap().contains("PR #7"));
+    assert!(branch_gate(true, PrCiStatus::Merged).is_some());
+    assert_eq!(branch_gate(true, PrCiStatus::Pending), None);
+}
+
+#[test]
+fn caller_on_pushed_branch_requires_the_branch_and_a_pushed_head() {
+    let tmp = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    };
+    git(&["init", "-q", "-b", "task/1-x"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "one"]);
+    // Not pushed yet.
+    assert!(!caller_on_pushed_branch(tmp.path(), "task/1-x"));
+    git(&["update-ref", "refs/remotes/origin/task/1-x", "HEAD"]);
+    assert!(caller_on_pushed_branch(tmp.path(), "task/1-x"));
+    // Caller on a different branch than the claim's.
+    assert!(!caller_on_pushed_branch(tmp.path(), "task/2-y"));
+    // Local commits ahead of what's pushed.
+    git(&["commit", "-q", "--allow-empty", "-m", "two"]);
+    assert!(!caller_on_pushed_branch(tmp.path(), "task/1-x"));
+}
+
+#[test]
+fn forced_merged_promotion_of_an_unclaimed_item_is_audited() {
+    // image-qc #299 shape: `done` never ran, so the item isn't in_review;
+    // its PR is merged (checked by the caller) and nobody holds a live claim.
+    let (tmp, s) = harness();
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+    let promoted = s
+        .promote_forced(
+            &item_id,
+            RESCUER,
+            crate::claims::now(),
+            "finish #299",
+            false,
+        )
+        .unwrap();
+    assert!(promoted);
+    let audit = comments(&tmp, &item_id);
+    assert_eq!(audit.len(), 1, "{audit:?}");
+    assert!(audit[0].starts_with(FORCE_OVERRIDE_MARKER));
+    assert!(audit[0].contains("finish #299"), "{}", audit[0]);
+
+    // Already audited by `force_takeover`: no second comment.
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Other"))).unwrap()).unwrap();
+    let other = created["id"].as_str().unwrap().to_string();
+    assert!(
+        s.promote_forced(&other, RESCUER, crate::claims::now(), "r", true)
+            .unwrap()
+    );
+    assert!(comments(&tmp, &other).is_empty());
+}
+
+#[test]
+fn forced_merged_promotion_refuses_when_someone_else_holds_the_claim() {
+    let (tmp, s, item_id, job_id) = foreign_claim_harness();
+    let err = s
+        .promote_forced(&item_id, RESCUER, crate::claims::now(), "race", true)
+        .unwrap_err();
+    assert!(err.message.contains("was claimed by"), "{err:?}");
+    assert_eq!(
+        holder_of(&tmp, &item_id),
+        Some(format!("claude-code:{job_id}"))
+    );
+    assert!(comments(&tmp, &item_id).is_empty());
+}
+
+#[test]
+fn force_done_on_a_dead_jobs_claim_moves_the_claim_with_an_audit() {
+    let (tmp, s, item_id, job_id) = foreign_claim_harness();
+    kill_job(&s, &job_id);
+    let result = crate::claims::with_owner_override(RESCUER, || {
+        s.item(Parameters(force_req(
+            "done",
+            &item_id,
+            Some("job vanished"),
+        )))
+    });
+    // No worktree/remote in this harness, so `done` itself is a no-op --
+    // but the override (and its audit) happened first, as documented.
+    let result: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
+    assert!(
+        result["forced_override"]
+            .as_str()
+            .unwrap()
+            .contains(&job_id),
+        "{result}"
+    );
+    assert!(
+        comments(&tmp, &item_id)
+            .iter()
+            .any(|c| c.starts_with(FORCE_OVERRIDE_MARKER) && c.contains("`done`")),
+        "{:?}",
+        comments(&tmp, &item_id)
+    );
+    assert_ne!(
         holder_of(&tmp, &item_id),
         Some(format!("claude-code:{job_id}"))
     );
