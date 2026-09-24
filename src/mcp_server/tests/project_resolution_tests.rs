@@ -215,6 +215,54 @@ fn find_root_from_never_resolves_to_home_itself() {
     assert_eq!(AgentflareMcp::find_root_from(&start, home.path()), start);
 }
 
+/// Regression for item #303: a second, unrelated project resolved from the
+/// same on-disk folder (e.g. a stray CLI/MCP call made with cwd pointed at
+/// someone else's repo) must never silently steal that folder's
+/// `project_dirs` row -- the daemon's cwd-less supervisor sweep enumerates
+/// `project_dirs` to find each project's folder, so a stolen row makes it
+/// operate against the wrong project entirely (live-diagnosed: PR discovery
+/// items created under `image-qc` for a folder that was actually
+/// `getappz/agentflare`).
+#[test]
+fn register_project_dir_refuses_to_steal_a_folder_path_claimed_by_another_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("backend.db");
+    let shared_root = tmp.path().join("shared-repo");
+    std::fs::create_dir_all(&shared_root).unwrap();
+    let shared_root = dunce::canonicalize(&shared_root).unwrap();
+
+    let first = AgentflareMcp {
+        backend_db_override: Some(db_path.clone()),
+        backend_project_link_override: Some(tmp.path().join("link1.json")),
+        backend_repo_key_override: Some("path:/repo/first".to_string()),
+        worktree_repo_root_override: Some(shared_root.clone()),
+        ..Default::default()
+    };
+    let second = AgentflareMcp {
+        backend_db_override: Some(db_path.clone()),
+        backend_project_link_override: Some(tmp.path().join("link2.json")),
+        backend_repo_key_override: Some("path:/repo/second".to_string()),
+        worktree_repo_root_override: Some(shared_root.clone()),
+        ..Default::default()
+    };
+    let conn = agentflare_backend::db::open_db(&db_path).unwrap();
+
+    let p1 = first.resolve_project(&conn).unwrap();
+    let p2 = second.resolve_project(&conn).unwrap();
+    assert_ne!(p1.id, p2.id, "each repo key must still get its own project");
+
+    let dirs = agentflare_backend::project_dir::list(&conn).unwrap();
+    assert_eq!(
+        dirs.len(),
+        1,
+        "the second project's registration must be refused, not create/steal a row: {dirs:?}"
+    );
+    assert_eq!(
+        dirs[0].project_id, p1.id,
+        "first registrant keeps the folder"
+    );
+}
+
 // No test for the "nothing found anywhere above" fallback: `find_root_from`
 // walks all the way to the filesystem root, so a tempdir-based test would
 // depend on what markers happen to exist above the OS temp directory on

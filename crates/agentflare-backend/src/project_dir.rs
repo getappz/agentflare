@@ -1,5 +1,5 @@
-use crate::error::Result;
-use rusqlite::{Connection, params};
+use crate::error::{Error, Result};
+use rusqlite::{Connection, OptionalExtension, params};
 
 /// One project's on-disk repo root — the reverse of `.agentflare/project.json`
 /// (folder → project), indexed by project instead so a process with no
@@ -23,7 +23,28 @@ fn from_row(row: &rusqlite::Row) -> rusqlite::Result<ProjectDir> {
     })
 }
 
+/// Refuses to associate `folder_path` with `project_id` when it's already
+/// registered to a DIFFERENT project (item #303: a stray project-override
+/// run from the wrong cwd once silently overwrote another project's row,
+/// producing an N:1 folder→project mapping that then pointed the daemon's
+/// cwd-less sweep at the wrong project entirely). First registration wins;
+/// re-registering the SAME project's row still updates in place.
 pub fn upsert(conn: &Connection, project_id: &str, folder_path: &str, now: i64) -> Result<()> {
+    let existing_owner: Option<String> = conn
+        .query_row(
+            "SELECT project_id FROM project_dirs WHERE folder_path = ?1",
+            params![folder_path],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(owner) = existing_owner
+        && owner != project_id
+    {
+        return Err(Error::Duplicate(format!(
+            "folder_path {folder_path} is already registered to project {owner}, \
+             refusing to also register it to {project_id}"
+        )));
+    }
     conn.execute(
         "INSERT INTO project_dirs (project_id, folder_path, updated_at)
          VALUES (?1, ?2, ?3)
@@ -96,6 +117,25 @@ mod tests {
         assert_eq!(rows.len(), 1, "same project must not create a second row");
         assert_eq!(rows[0].folder_path, "/new/path");
         assert_eq!(rows[0].updated_at, 200);
+    }
+
+    #[test]
+    fn upsert_refuses_a_folder_path_already_claimed_by_another_project() {
+        let conn = crate::db::open_in_memory().unwrap();
+        let p1 = seed_project(&conn, "one");
+        let p2 = seed_project(&conn, "two");
+        upsert(&conn, &p1, "/shared/path", 100).unwrap();
+
+        let err = upsert(&conn, &p2, "/shared/path", 200).unwrap_err();
+        assert!(matches!(err, crate::error::Error::Duplicate(_)));
+
+        let rows = list(&conn).unwrap();
+        assert_eq!(rows.len(), 1, "second project must not steal the row");
+        assert_eq!(rows[0].project_id, p1, "original owner keeps the folder");
+        assert_eq!(
+            rows[0].updated_at, 100,
+            "refused write must not touch the row"
+        );
     }
 
     #[test]
