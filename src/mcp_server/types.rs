@@ -881,10 +881,15 @@ pub(crate) struct ItemRequest {
     #[serde(default)]
     pub(crate) reclaim: Option<bool>,
     #[schemars(
-        description = "doctor only: with reclaim=true, also delete lanes flagged dirty (uncommitted changes). Default false. Refused when `worktree` is omitted (an unscoped force-reclaim force-deletes EVERY dirty lane in the repo, including other agents' uncommitted work) unless `repo_wide=true` explicitly confirms repo-wide intent."
+        description = "doctor: with reclaim=true, also delete lanes flagged dirty (uncommitted changes). Default false. Refused when `worktree` is omitted (an unscoped force-reclaim force-deletes EVERY dirty lane in the repo, including other agents' uncommitted work) unless `repo_wide=true` explicitly confirms repo-wide intent. release|done|check_merge: override another owner's live (unexpired) claim — requires `force_reason`, and is refused unless the owner's job is confirmed dead, a terminal `agentflare work — failed` comment was posted since the claim was taken, or this item's PR is pushed with passing/merged CI. check_merge additionally promotes a not-in_review item whose PR is merged. Every override is logged as an audit comment."
     )]
     #[serde(default)]
     pub(crate) force: Option<bool>,
+    #[schemars(
+        description = "release|done|check_merge: why the claim is being force-overridden — required whenever force=true; recorded in the audit comment alongside the prior owner."
+    )]
+    #[serde(default)]
+    pub(crate) force_reason: Option<String>,
     #[schemars(
         description = "doctor only: with reclaim=true, scope reclaim to a single lane by name (e.g. \"task/110\") or its worktree path. Always pass this alongside `force=true` to fix ONE broken worktree; omit only for a genuine repo-wide sweep."
     )]
