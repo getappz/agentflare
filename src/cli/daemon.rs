@@ -36,6 +36,46 @@ pub enum DaemonSubcommand {
     /// hand.
     #[command(hide = true, name = "workflow-store-smoke-test")]
     WorkflowStoreSmokeTest,
+    /// Host resource dispatch gate controls (item #643). A gate stuck
+    /// paused (e.g. a stray `AGENTFLARE_DISPATCH_GATE_MODE=off` baked into
+    /// the daemon's environment) had no reset path short of env-var
+    /// archaeology, and `daemon restart` alone doesn't clear it -- restart
+    /// just re-reads the same stuck env var.
+    Gate {
+        #[command(subcommand)]
+        command: GateSubcommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum GateSubcommand {
+    /// Show the resource gate's current policy and pause reason.
+    Status(GateArgs),
+    /// Force-unpause a gate stuck on `AGENTFLARE_DISPATCH_GATE_MODE=off`.
+    /// Does not override a gate paused for genuine CPU pressure -- that
+    /// reason self-clears once CPU drops, and isn't what this targets.
+    Reset(GateArgs),
+}
+
+#[derive(Args)]
+pub struct GateArgs {
+    /// Dashboard host to reach. The gate's state lives in the running
+    /// daemon process, so this talks to it over HTTP rather than reading
+    /// local state -- the daemon must already be running.
+    #[arg(long, default_value = "127.0.0.1")]
+    pub host: String,
+    /// Dashboard port, matching `agentflare serve`'s own default.
+    #[arg(long, default_value = "35273")]
+    pub port: u16,
+}
+
+impl GateSubcommand {
+    fn run(self) {
+        match self {
+            GateSubcommand::Status(args) => cmd_gate_status(args),
+            GateSubcommand::Reset(args) => cmd_gate_reset(args),
+        }
+    }
 }
 
 impl DaemonArgs {
@@ -49,6 +89,7 @@ impl DaemonArgs {
             DaemonSubcommand::Disable => cmd_disable(),
             DaemonSubcommand::Logs { follow } => cmd_logs(follow),
             DaemonSubcommand::WorkflowStoreSmokeTest => cmd_workflow_store_smoke_test(),
+            DaemonSubcommand::Gate { command } => command.run(),
         }
     }
 }
@@ -144,6 +185,47 @@ fn cmd_disable() {
             std::process::exit(1);
         }
     }
+}
+
+fn cmd_gate_status(args: GateArgs) {
+    match ureq::get(&format!("http://{}:{}/api/gate", args.host, args.port)).call() {
+        Ok(resp) => print_gate_response(resp),
+        Err(e) => gate_request_error(&e),
+    }
+}
+
+fn cmd_gate_reset(args: GateArgs) {
+    match ureq::post(&format!(
+        "http://{}:{}/api/gate/reset",
+        args.host, args.port
+    ))
+    .call()
+    {
+        Ok(resp) => {
+            print_gate_response(resp);
+            crate::ui::success(
+                "gate force-resumed; a stuck `AGENTFLARE_DISPATCH_GATE_MODE=off` no longer blocks dispatch (genuine CPU pressure still will)",
+            );
+        }
+        Err(e) => gate_request_error(&e),
+    }
+}
+
+fn print_gate_response(resp: ureq::Response) {
+    match resp.into_string() {
+        Ok(body) => crate::ui::info(&body),
+        Err(e) => {
+            crate::ui::error(&format!("failed to read dashboard response: {e}"));
+            std::process::exit(1);
+        }
+    }
+}
+
+fn gate_request_error(e: &ureq::Error) {
+    crate::ui::error(&format!(
+        "failed to reach dashboard ({e}); is the daemon running? (`agentflare daemon start` / `agentflare daemon status`)"
+    ));
+    std::process::exit(1);
 }
 
 fn cmd_workflow_store_smoke_test() {

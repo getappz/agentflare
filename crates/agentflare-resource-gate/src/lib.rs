@@ -18,6 +18,8 @@ pub mod pool_size;
 pub mod signals;
 
 pub use config::{GateConfig, GateMode};
-pub use gate::{current_policy, init_global};
+pub use gate::{
+    clear_force_resume, current_policy, force_resume, force_resume_active, init_global,
+};
 pub use policy::{PauseReason, Policy};
 pub use signals::Signals;
