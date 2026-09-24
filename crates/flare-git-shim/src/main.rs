@@ -63,10 +63,12 @@ const BYPASS_UNTIL_ENV: &str = "AGENTFLARE_GIT_BYPASS_UNTIL"; // bypass iff now 
 /// default for a shim installed directly on someone's daily-driver PATH.
 const SNAPSHOTS_ENV: &str = "AGENTFLARE_GIT_SNAPSHOTS";
 
-/// Escape hatch for the canonical-repo HEAD-detach guard (see
-/// `deny_canonical_detach_reason`) -- set to allow an agent-invoked
-/// checkout/switch that would detach HEAD in the canonical (non-worktree)
-/// checkout.
+/// Escape hatch for human/interactive canonical-checkout mutation and for
+/// the stranded-checkout `checkout`/`switch` recovery path (see `main`,
+/// below) -- NOT honored for an agent-invoked call to
+/// `deny_canonical_detach_reason`, which exempts non-agent-invoked calls
+/// before this override is even consulted. An agent cannot clear its own
+/// worktree-mandatory guard by setting this itself.
 const ALLOW_CANONICAL_MUTATE_ENV: &str = "AGENTFLARE_GIT_ALLOW_CANONICAL_MUTATE";
 
 /// Global flags that redirect git to operate on a different repo than the
@@ -170,9 +172,9 @@ fn deny_canonical_detach_reason(
     subcommand: &str,
     args: &[String],
 ) -> Option<String> {
-    if agentflare_shim::is_set(ALLOW_CANONICAL_MUTATE_ENV) {
-        return None;
-    }
+    // Human/interactive use is completely unaffected, override or not --
+    // and checked first, so an agent-invoked call can never reach (and
+    // therefore never self-clear via) the override below.
     if !classify::agent_invocation_detected() {
         return None;
     }
@@ -183,16 +185,16 @@ fn deny_canonical_detach_reason(
         return None; // agent worktrees are exactly where this is expected
     }
     if classify::is_branch_create(subcommand, args) {
-        return Some(format!(
-            "this would create a new branch in the canonical checkout (not an isolated worktree) while agent-invoked -- feature work belongs in a worktree. Call `item(action=\"claim\", id=<item>)` to provision one, or set {ALLOW_CANONICAL_MUTATE_ENV}=1 to override."
-        ));
+        return Some(
+            "this would create a new branch in the canonical checkout (not an isolated worktree) while agent-invoked -- feature work belongs in a worktree. Call `item(action=\"claim\", id=<item>)` to provision one.".to_string()
+        );
     }
     if !classify::would_detach_head(repo_root, subcommand, args) {
         return None;
     }
-    Some(format!(
-        "this would detach HEAD in the canonical checkout (not an isolated worktree) while agent-invoked -- set {ALLOW_CANONICAL_MUTATE_ENV}=1 to override, or work in an isolated worktree instead."
-    ))
+    Some(
+        "this would detach HEAD in the canonical checkout (not an isolated worktree) while agent-invoked -- work in an isolated worktree instead.".to_string()
+    )
 }
 
 #[derive(serde::Deserialize)]

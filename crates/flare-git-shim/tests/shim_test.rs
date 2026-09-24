@@ -93,16 +93,18 @@ const AGENT_DETECTOR_ENV_VARS: &[&str] = &[
 ];
 
 /// Same as `shim`, but for tests exercising *human* (non-agent) behavior:
-/// strips every `AGENT_DETECTOR_ENV_VARS` entry plus `AGENTFLARE_AGENT`
-/// (agentflare's own marker, which `agent-detector` doesn't know about) from
-/// the inherited environment, rather than relying on ambient absence of
-/// whichever one happens not to be set. Also sets
-/// `AGENTFLARE_GIT_ASSUME_HUMAN=1` to short-circuit `agent-detector`'s
-/// `process-tree` feature, which walks ancestor processes for agent markers
-/// -- a signal that survives env-var stripping when this test suite itself
-/// runs under an agent-driven session (opencode/claude/cursor/...), and
-/// would otherwise make these "human" assertions fail for real agent
-/// sessions even though the code path being exercised is correct.
+/// strips every `AGENT_DETECTOR_ENV_VARS` entry plus `AGENTFLARE_AGENT` and
+/// `LEAN_CTX_AGENT` (agentflare's own markers, which `agent-detector` doesn't
+/// know about) from the inherited environment, rather than relying on
+/// ambient absence of whichever one happens not to be set -- `LEAN_CTX_AGENT`
+/// in particular IS ambient here, since this whole suite runs under lean-ctx.
+/// Also sets `AGENTFLARE_GIT_ASSUME_HUMAN=1` to short-circuit
+/// `agent-detector`'s `process-tree` feature, which walks ancestor processes
+/// for agent markers -- a signal that survives env-var stripping when this
+/// test suite itself runs under an agent-driven session
+/// (opencode/claude/cursor/...), and would otherwise make these "human"
+/// assertions fail for real agent sessions even though the code path being
+/// exercised is correct.
 fn human_shim(repo: &Path, home: &Path, args: &[&str]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_git"));
     cmd.args(args)
@@ -113,6 +115,7 @@ fn human_shim(repo: &Path, home: &Path, args: &[&str]) -> Output {
         cmd.env_remove(var);
     }
     cmd.env_remove("AGENTFLARE_AGENT");
+    cmd.env_remove("LEAN_CTX_AGENT");
     cmd.output().unwrap()
 }
 
@@ -467,7 +470,8 @@ fn canonical_repo_branch_create_is_denied_with_accurate_message() {
     assert!(stderr.contains("create a new branch"), "{stderr}");
     assert!(!stderr.contains("detach HEAD"), "{stderr}");
 
-    // Escape hatch still lifts it.
+    // Item #637: an agent-invoked caller cannot self-clear this by setting
+    // the override itself -- still denied, same message, even with it set.
     let out = Command::new(env!("CARGO_BIN_EXE_git"))
         .args(["checkout", "-b", "feature/x"])
         .current_dir(repo.path())
@@ -476,7 +480,9 @@ fn canonical_repo_branch_create_is_denied_with_accurate_message() {
         .env("AGENTFLARE_GIT_ALLOW_CANONICAL_MUTATE", "1")
         .output()
         .unwrap();
-    assert!(out.status.success(), "{out:?}");
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("create a new branch"), "{stderr}");
 }
 
 #[test]
@@ -517,7 +523,10 @@ fn canonical_repo_default_branch_return_is_allowed_with_escape_hatch() {
 }
 
 #[test]
-fn canonical_repo_detach_allowed_with_escape_hatch() {
+fn canonical_repo_detach_still_denied_for_agent_even_with_escape_hatch() {
+    // Item #637: `deny_canonical_detach_reason` checks agent-invocation
+    // before honoring `AGENTFLARE_GIT_ALLOW_CANONICAL_MUTATE`, so an
+    // agent-invoked caller can no longer clear this guard on itself.
     let repo = init_repo();
     let home = tempfile::TempDir::new().unwrap();
     let sha = flare_git_core::shell::run_in(repo.path(), &["rev-parse", "HEAD"]).unwrap();
@@ -530,6 +539,63 @@ fn canonical_repo_detach_allowed_with_escape_hatch() {
         .env("AGENTFLARE_GIT_ALLOW_CANONICAL_MUTATE", "1")
         .output()
         .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("detach HEAD"), "{stderr}");
+}
+
+#[test]
+fn canonical_repo_guard_denies_the_lean_ctx_agent_marker_even_with_escape_hatch() {
+    // Item #637 follow-up (CodeRabbit on #803): `LEAN_CTX_AGENT` is the
+    // marker `agentflare-shim`'s PATH dispatcher sets before routing a call
+    // through `lean-ctx -c git` -- it is NOT part of `agent-detector`
+    // 0.2.1's catalog (`AGENT_DETECTOR_ENV_VARS` above) and isn't
+    // `AGENTFLARE_AGENT` either, so `agent_invocation_detected()` needs its
+    // own explicit check for it (see `classify.rs`), or a caller reaching
+    // this shim through that dispatcher would misclassify as human and
+    // bypass the guard entirely. Covers both guarded operations, same as
+    // the CLAUDECODE-marker tests above.
+    let repo = init_repo();
+    let home = tempfile::TempDir::new().unwrap();
+    let sha = flare_git_core::shell::run_in(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+
+    // Branch-create: denied, escape hatch does not lift it.
+    let out = Command::new(env!("CARGO_BIN_EXE_git"))
+        .args(["checkout", "-b", "feature/x"])
+        .current_dir(repo.path())
+        .env("AGENTFLARE_HOME_OVERRIDE", home.path())
+        .env("LEAN_CTX_AGENT", "1")
+        .env("AGENTFLARE_GIT_ALLOW_CANONICAL_MUTATE", "1")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("create a new branch"), "{stderr}");
+
+    // HEAD-detach: denied, escape hatch does not lift it.
+    let out = Command::new(env!("CARGO_BIN_EXE_git"))
+        .args(["checkout", &sha])
+        .current_dir(repo.path())
+        .env("AGENTFLARE_HOME_OVERRIDE", home.path())
+        .env("LEAN_CTX_AGENT", "1")
+        .env("AGENTFLARE_GIT_ALLOW_CANONICAL_MUTATE", "1")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("detach HEAD"), "{stderr}");
+}
+
+#[test]
+fn canonical_repo_detach_allowed_for_human_without_escape_hatch() {
+    // The override was never needed for human/interactive use -- this guard
+    // exempts non-agent-invoked calls before the override is even
+    // consulted, override set or not.
+    let repo = init_repo();
+    let home = tempfile::TempDir::new().unwrap();
+    let sha = flare_git_core::shell::run_in(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+
+    let out = human_shim(repo.path(), home.path(), &["checkout", &sha]);
     assert!(out.status.success(), "{out:?}");
 }
 
