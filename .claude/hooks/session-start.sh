@@ -54,16 +54,18 @@ install_lean_ctx_prebuilt() {
   trap 'rm -rf "$tmp"' RETURN
 
   log "downloading ${base}/${asset}"
+  # `set -e` is suppressed inside `if ! install_lean_ctx_prebuilt`, so
+  # every step returns explicitly to let the cargo fallback run.
   curl -fsSL --retry 3 --retry-delay 2 -A "agentflare-session-start" \
-    -o "${tmp}/${asset}" "${base}/${asset}"
+    -o "${tmp}/${asset}" "${base}/${asset}" || return 1
   curl -fsSL --retry 3 --retry-delay 2 -A "agentflare-session-start" \
-    -o "${tmp}/SHA256SUMS" "${base}/SHA256SUMS"
+    -o "${tmp}/SHA256SUMS" "${base}/SHA256SUMS" || return 1
   (cd "$tmp" && grep -F " ${asset}" SHA256SUMS | sha256sum -c --quiet -) \
     || { log "checksum mismatch for ${asset}"; return 1; }
 
-  tar -xzf "${tmp}/${asset}" -C "$tmp" lean-ctx
-  mkdir -p "$BIN_DIR"
-  install -m 0755 "${tmp}/lean-ctx" "${BIN_DIR}/lean-ctx"
+  tar -xzf "${tmp}/${asset}" -C "$tmp" lean-ctx || { log "failed to extract ${asset}"; return 1; }
+  mkdir -p "$BIN_DIR" || return 1
+  install -m 0755 "${tmp}/lean-ctx" "${BIN_DIR}/lean-ctx" || { log "failed to install to ${BIN_DIR}"; return 1; }
   log "installed $("${BIN_DIR}/lean-ctx" --version 2>/dev/null | head -1) to ${BIN_DIR}"
 }
 

@@ -58,8 +58,8 @@ only when those agents call agentflare's MCP tools.
 | 2 | **Headless workers are launched bare.** No `--append-system-prompt(-file)`, `--allowedTools`/`--disallowedTools`, `--permission-mode`, `--mcp-config`/`--strict-mcp-config`, `--settings`/`--setting-sources`, `--agent`/`--agents`, `--add-dir`, `--json-schema`, `--effort`, `--name`, `--fork-session`. Role prompts, tool policy and MCP wiring for workers are done by text in the user prompt or by mutating the user's global `~/.claude` state, and verdicts are regex-matched on marker strings. | P0 |
 | 3 | **`--dangerously-skip-permissions` is the only permission posture.** `--permission-mode` (`plan`, `acceptEdits`, `dontAsk`, `auto`), `permissions.deny`, `permissions.disableBypassPermissionsMode`, `autoMode` rules and `sandbox.*` are unused; agentflare relies solely on its own bwrap sandbox and PreToolUse branch guard. | P0 |
 | 4 | **Personas are subagent files that are never invoked as subagents.** Apps project `personas/*.md` into `.claude/agents/` (`crates/agentflare-apps/src/project.rs:4-26`), but `apps/auto-company/workflow.json` prompts say "Read `.claude/agents/<persona>.md` and answer in that voice". `--agent <name>`, `--agents`, `@agent-name`, `SubagentStart`/`SubagentStop` (beyond `optimize code`), and agent frontmatter (`tools`, `model`, `permissionMode`, `maxTurns`, `skills`, `memory`, `hooks`, `mcpServers`, `isolation: worktree`) are unused. | P0 |
-| 5 | **`PreCompact` is wired but a documented no-op** (`src/hook.rs:593-608`) while README and AGENTS.md still advertise `optimize context` as PreCompact compaction. `PostCompact` exists and is the event that can re-inject survival context. `SessionStart` ignores `source` (`startup|resume|clear|compact`), so the full briefing is re-injected after every compaction. | P1 |
-| 6 | **Hook system used at 2 of 5 types and 2 of 9 output verbs.** Unused: `mcp_tool` hooks (call agentflare's own MCP server per event instead of spawning a process), `http` hooks (post to the daemon), `prompt`/`agent` hooks (the judge role), `permissionDecision: allow|ask|defer`, `updatedInput`, `PermissionRequest`, `PermissionDenied`+`retry`, `StopFailure` (API-error failover trigger), `Notification`, `TaskCreated`/`TaskCompleted`, `PreModelSwitch`/`PostModelSwitch`, `WorktreeCreate`/`WorktreeRemove`, `Setup`, the `if` field. | P1 |
+| 5 | **`PreCompact` is wired but a documented no-op** (`src/hook.rs:593-608`) while README and AGENTS.md still advertise `optimize context` as PreCompact compaction. `PostCompact` exists and is the event that can re-inject survival context. `SessionStart` ignores `source` (`startup\|resume\|clear\|compact`), so the full briefing is re-injected after every compaction. | P1 |
+| 6 | **Hook system used at 2 of 5 types and 2 of 9 output verbs.** Unused: `mcp_tool` hooks (call agentflare's own MCP server per event instead of spawning a process), `http` hooks (post to the daemon), `prompt`/`agent` hooks (the judge role), `permissionDecision: allow\|ask\|defer`, `updatedInput`, `PermissionRequest`, `PermissionDenied`+`retry`, `StopFailure` (API-error failover trigger), `Notification`, `TaskCreated`/`TaskCompleted`, `PreModelSwitch`/`PostModelSwitch`, `WorktreeCreate`/`WorktreeRemove`, `Setup`, the `if` field. | P1 |
 | 7 | **Interactive `agentflare run claude-code --mode X` passes `--mode`** (`src/agent_launch.rs:101-103`), which is not a Claude Code flag; the real one is `--permission-mode`. | P1 bug |
 | 8 | **Config-dir and uninstall hygiene.** `~/.claude` is hard-coded (`src/paths.rs:36-60`; only `crates/flare-code/src/config.rs:58-80` honours `CLAUDE_CONFIG_DIR`); auth-profile isolation overrides `HOME` (`src/auth.rs:952`), relocating hooks, memory and plugins too; `wire_optimize_claude_code` overwrites any existing `statusLine` (`src/init.rs:665`); `uninstall` leaves `PreCompact`, `PostToolUse`, `PostToolUseFailure`, `SubagentStart`, `statusLine`, `permissions.allow`, `env.BASH_ENV` and rule files behind (`src/uninstall.rs:55-110`). | P1 |
 | 9 | **Distribution and interop.** No Claude plugin (`.claude-plugin/plugin.json`), only Codex and Cline plugins; no `claude mcp serve` adapter; no `--channels` push messaging; no Agent SDK; no GitHub Action or Routines recipe; `~/.claude/.credentials.json` is read directly for usage polling (`src/claude_usage.rs:23-64`). | P2 |
@@ -76,7 +76,7 @@ only when those agents call agentflare's MCP tools.
 | `UserPromptSubmit` (5s) | `/agentflare …` and `/pm …` toggles, turn count, router and hygiene nudges, `@mention` expansion, coaching auto-match, intent classification → top-3 skill injection, message delivery. `additionalContext` only. | `src/init.rs:291-298`, `src/hook.rs:635-847`, `src/skill_detect.rs:190-459` |
 | `PreToolUse`, no matcher (5s) | In order: branch guard on `MUTATING_TOOLS` resolved against the target file's repo, `TodoWrite` → `item` redirect, spec-path → `asset` redirect, destructive `rm` of agentflare DBs; enforced coaching rules; completion gate (`item done`/`check_merge` need fresh verification + review + diagnosis); then nudges and messages. Emits `permissionDecision: deny` + reason. 2s fail-open budget. | `src/init.rs:299-306`, `src/hook.rs:409-548`, `src/hook_redirect.rs:26-39, 313-346, 408-442` |
 | `PostToolUse`, matcher = Bash family ∪ `mcp__flare__tool` ∪ `mcp__flare__item` ∪ `ReportFindings` ∪ mutating tools (5s) | Records verification evidence, invalidates it on edits, records review evidence, shows the finishing-branch menu after `item done`. | `src/init.rs:263-271, 355-362`, `src/hook_completion_gate.rs:228-330` |
-| `PostToolUseFailure`, matcher `Bash|Edit|Write` (5s) | Deterministic failure coaching via `additionalContext`; a retired `prompt`-type judge hook is removed on upgrade. | `src/init.rs:334-346`, `src/hook.rs:331-368` |
+| `PostToolUseFailure`, matcher `Bash\|Edit\|Write` (5s) | Deterministic failure coaching via `additionalContext`; a retired `prompt`-type judge hook is removed on upgrade. | `src/init.rs:334-346`, `src/hook.rs:331-368` |
 | `Stop` (5s) | `{"decision":"block","reason":<messages>}` to deliver inter-agent messages to an about-to-idle agent. | `src/init.rs:318-325`, `src/hook_messages.rs:123-141` |
 | `SessionEnd` (5s) | Marks the session ended in the registry. | `src/init.rs:326-333`, `src/hook.rs:613-617` |
 | `PreCompact` (5s) | Wired; handler is an intentional no-op. | `src/init.rs:307-314`, `src/hook.rs:593-608` |
@@ -168,7 +168,7 @@ Legend: **Used** = built on; **Partial** = touched but not leveraged;
 | `--max-turns`, `--max-budget-usd` | Used | Handle `subtype` explicitly. |
 | `--model`, `--fallback-model` | Partial | `--fallback-model` gives in-process failover before agentflare's cross-agent failover. |
 | `--effort` | Unused | `TaskModelTier` picks a model per task; effort is the cheaper second axis. |
-| `--resume <id|name|path>`, `--continue` | Used / Unused | Resume by name or transcript path also works. |
+| `--resume <id\|name\|path>`, `--continue` | Used / Unused | Resume by name or transcript path also works. |
 | `-n/--name`, `--fork-session`, `--session-id`, `--from-pr` | Unused | Name sessions after `<item>:<role>:<round>` so they are addressable from the item record; fork one implementer session into parallel reviewers; `--from-pr` links sessions to PRs for `check_merge`. |
 | `--mcp-config`, `--strict-mcp-config` | Unused | Per-job MCP wiring (flare, lean-ctx, GitHub) without mutating `~/.claude.json`. Apps already write a project `.mcp.json`; jobs should too. |
 | `--settings`, `--setting-sources` | Unused | Job-scoped settings (hooks, permissions, `env`, `model`, `statusLine` off, `attribution.commit=false`). |
@@ -179,7 +179,7 @@ Legend: **Used** = built on; **Partial** = touched but not leveraged;
 | `--plugin-dir`, `--plugin-url` | Unused | Load agentflare as a plugin per job without installing it. |
 | `--worktree`, `--cloud`, `--remote-control`, `--channels`, `--chrome`, `--tmux`, `--teammate-mode` | Unused | `--channels` matters: an MCP server with the `claude/channel` capability can push messages into a live session, replacing the `Stop`-block delivery hack. |
 | `--init-only` / `Setup` hook | Unused | The supported way to run one-time setup (agentflare's install steps) inside Claude's own lifecycle. |
-| `claude mcp add|remove|list|get|serve`, `claude plugin …`, `claude doctor`, `claude setup-token`, `claude project purge` | Partial | `mcp add/remove` used. `setup-token` is the supported way to mint long-lived tokens instead of reading `.credentials.json`. |
+| `claude mcp add\|remove\|list\|get\|serve`, `claude plugin …`, `claude doctor`, `claude setup-token`, `claude project purge` | Partial | `mcp add/remove` used. `setup-token` is the supported way to mint long-lived tokens instead of reading `.credentials.json`. |
 
 ### 3.2 Settings
 
@@ -280,7 +280,7 @@ on `Stop` and `systemMessage` on `SessionStart`.
 | Scopes: user (`claude mcp add -s user`), project `.mcp.json` (Apps only) | Partial | A checked-in `.mcp.json` for the repo makes agentflare available to any collaborator without `init`. |
 | Resources | Partial | `agentflare://sessions`, `agentflare://nudges`. Items, artifacts, memory facts and docs are natural resources (`@flare:item/123`). |
 | Prompts | Used | |
-| Tool search / deferred tools | Partial | agentflare's `tool(search|execute)` gateway is its own deferral layer and has fought Claude's native `ToolSearch` before (`fix: stop usetsearch blocking every native ToolSearch call`). Consider `alwaysLoad` and `_meta["anthropic/maxResultSizeChars"]` annotations instead. |
+| Tool search / deferred tools | Partial | agentflare's `tool(search\|execute)` gateway is its own deferral layer and has fought Claude's native `ToolSearch` before (`fix: stop usetsearch blocking every native ToolSearch call`). Consider `alwaysLoad` and `_meta["anthropic/maxResultSizeChars"]` annotations instead. |
 | `claude/channel` push messages (`--channels`, `channelsEnabled`) | Unused | Push inter-agent messages into a live session; retire the `Stop`-block path where available. |
 | `claude mcp serve` | Unused | Turns Claude Code into a tool server any other agent can call: the cleanest way to give non-Claude agents a Claude worker. |
 | `headersHelper`, OAuth, `ws` transport | Unused | Needed for the daemon to serve remote sessions. |
@@ -292,7 +292,7 @@ on `Stop` and `systemMessage` on `SessionStart`.
 |---|---|---|
 | `.claude-plugin/plugin.json`, marketplace | Unused | agentflare ships `.codex-plugin/plugin.json` and a Cline plugin but no Claude plugin, so hooks, rules, skills, agents and MCP are installed by editing user files. A plugin bundles them, versions them, `enabledPlugins` toggles them, and it is the only path under `strictPluginOnlyCustomization`. |
 | Components: `skills/`, `agents/`, `hooks/hooks.json`, `.mcp.json`, `.lsp.json`, `monitors/monitors.json`, `bin/`, `settings.json` | Unused | `monitors` and `bin/` (PATH shims) map onto agentflare's dashboard signals and its PATH shim. |
-| `claude plugin validate|eval` | Unused | |
+| `claude plugin validate\|eval` | Unused | |
 
 ### 3.9 Sessions, context and cost
 
