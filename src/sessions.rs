@@ -221,14 +221,24 @@ pub fn resolve(conn: &Connection, address: &str, now: i64) -> rusqlite::Result<O
         .flatten())
 }
 
+/// Whether [`this_host`] carries the OS machine id. Without it the host is a
+/// bare hostname that another machine can share, so a matching `host` does
+/// not prove the pid is ours.
+fn host_is_machine_unique(host: &str) -> bool {
+    host.contains('@') || host.starts_with("machine-id:")
+}
+
 /// Judges one session: an ended row is dead; a row on this host with a pid is
 /// judged by whether that pid exists (exact, and works for a session idle
-/// for hours); otherwise by `last_seen_at` against [`STALE_AFTER_SECS`].
+/// for hours) -- only when the host identity includes the machine id;
+/// otherwise by `last_seen_at` against [`STALE_AFTER_SECS`].
 pub fn liveness_of(s: &Session, now: i64) -> Liveness {
     if s.ended_at.is_some() {
         return Liveness::Dead;
     }
-    if s.host == this_host()
+    let host = this_host();
+    if host_is_machine_unique(&host)
+        && s.host == host
         && let Some(pid) = s.pid
     {
         return if crate::ipc::process::is_alive(pid) {
@@ -350,6 +360,14 @@ mod tests {
         let b = resolve_host(Some("ci-runner".into()), || None, || Some("bbbb".into()));
         assert_eq!(a, "ci-runner@aaaa");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn only_a_machine_id_qualified_host_trusts_local_pids() {
+        assert!(host_is_machine_unique("ci-runner@aaaa"));
+        assert!(host_is_machine_unique("machine-id:aaaa"));
+        assert!(!host_is_machine_unique("ci-runner"));
+        assert!(!host_is_machine_unique("localhost"));
     }
 
     #[test]
