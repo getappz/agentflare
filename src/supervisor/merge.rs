@@ -8,16 +8,57 @@
 
 use super::*;
 
-/// Whether a CI-green PR may be merged this tick, and at which head.
+/// Whether a CI-green PR may be merged this tick, and at which head. Both
+/// arms carry the head the green verdict was made on and the PR's
+/// auto-merge handle (`worktree::AutoMergeRef`): once approved, either arm
+/// arms GitHub's native auto-merge when the repo allows it, and only
+/// `Allowed` falls back to a direct merge.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum CiGreenMerge<'a> {
     /// Merge once approved, pinned to `head_sha` -- the commit the green
     /// verdict was made on.
-    Allowed { head_sha: Option<&'a str> },
-    /// GitHub is blocking the merge until a human review lands; don't try.
-    /// `changes_requested` tells the approval card whether a reviewer asked
-    /// for changes or nobody has approved yet.
-    BlockedOnReview { changes_requested: bool },
+    Allowed {
+        head_sha: Option<&'a str>,
+        auto_merge: &'a crate::worktree::AutoMergeRef,
+    },
+    /// GitHub is blocking the merge until a human review lands; a direct
+    /// merge would be refused, so only auto-merge is armed. `changes_requested`
+    /// tells the approval card whether a reviewer asked for changes or nobody
+    /// has approved yet.
+    BlockedOnReview {
+        changes_requested: bool,
+        head_sha: Option<&'a str>,
+        auto_merge: &'a crate::worktree::AutoMergeRef,
+    },
+}
+
+impl<'a> CiGreenMerge<'a> {
+    pub(super) fn head_sha(self) -> Option<&'a str> {
+        match self {
+            CiGreenMerge::Allowed { head_sha, .. }
+            | CiGreenMerge::BlockedOnReview { head_sha, .. } => head_sha,
+        }
+    }
+
+    pub(super) fn auto_merge(self) -> &'a crate::worktree::AutoMergeRef {
+        match self {
+            CiGreenMerge::Allowed { auto_merge, .. }
+            | CiGreenMerge::BlockedOnReview { auto_merge, .. } => auto_merge,
+        }
+    }
+}
+
+/// What one tick's merge path did for an approved, CI-green PR.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MergeAttempt {
+    /// Merged just now, by the direct call; the item can be promoted.
+    Merged,
+    /// GitHub's auto-merge is armed (this tick or earlier): GitHub merges
+    /// the PR itself, or takes it through the merge queue, once every
+    /// requirement holds, and the next sweep sees it as `Merged`.
+    AutoMergeArmed,
+    /// Neither happened this tick; the next sweep looks again.
+    NotMerged,
 }
 
 /// `handle_pr_status`'s CI-green path, shared by `Passing` and
@@ -107,7 +148,9 @@ pub(super) fn handle_ci_green(
                 );
             }
         }
-        CiGreenMerge::BlockedOnReview { changes_requested } => {
+        CiGreenMerge::BlockedOnReview {
+            changes_requested, ..
+        } => {
             if first_time_gated(&format!("pr-review:{}", item.id)) {
                 notify_pr_approval_gate(
                     item,
@@ -363,6 +406,10 @@ pub(super) fn merge_or_repair_findings(
     merge: CiGreenMerge<'_>,
 ) -> PassingPrOutcome {
     if !findings.is_empty() {
+        // Auto-merge armed on an earlier, findings-free tick would let the
+        // next approving review merge these findings untouched -- the exact
+        // thing item #628 forbids. Disarm it before routing to repair.
+        disarm_auto_merge_if_armed(repo_root, number, merge.auto_merge());
         return PassingPrOutcome::Repair(coderabbit_repair_or_gate(
             mcp,
             queue,
@@ -387,32 +434,37 @@ pub(super) fn merge_or_repair_findings(
         CODERABBIT_REPAIR_COMPLETED_KEY,
     );
     clear_stale_coderabbit_repair_label(folder_path, number, labels, summary.as_deref());
-    let CiGreenMerge::Allowed { head_sha } = merge else {
-        return PassingPrOutcome::NotMerged;
-    };
-    if merge_if_approved(mcp, item, repo_root, number, labels, head_sha) {
+    if merge_if_approved(mcp, item, repo_root, number, labels, merge) {
         PassingPrOutcome::Merged
     } else {
         PassingPrOutcome::NotMerged
     }
 }
 
-/// Auto-merges a CI-green PR and promotes its item, but only once a human
-/// has attached `PR_APPROVAL_LABEL` to the PR itself -- checked first and
+/// Merges a CI-green PR (directly, or by arming GitHub's auto-merge) and
+/// promotes its item once it has actually merged, but only once a human has
+/// attached `PR_APPROVAL_LABEL` to the PR itself -- checked first and
 /// short-circuits before any GitHub call so an unapproved item never touches
 /// the network here. Only ever called from `merge_or_repair_findings`, once
 /// it has confirmed there are no unresolved CodeRabbit findings, so CI green
 /// is structurally required and findings are structurally clean: the label
-/// can add a gate on top of both, never bypass either.
+/// can add a gate on top of both, never bypass either. Returns whether the
+/// item was promoted this tick; an armed auto-merge is promoted by a later
+/// sweep, when the PR reads `Merged`.
+///
+/// The one network call made without the label is disarming an auto-merge
+/// that was armed while the label was still attached: a human who removes
+/// the label has withdrawn the approval it stood for.
 pub(super) fn merge_if_approved(
     mcp: &AgentflareMcp,
     item: &agentflare_backend::item::Item,
     repo_root: &std::path::Path,
     number: u64,
     labels: &[String],
-    head_sha: Option<&str>,
+    merge: CiGreenMerge<'_>,
 ) -> bool {
     if !labels.iter().any(|l| l == PR_APPROVAL_LABEL) {
+        disarm_auto_merge_if_armed(repo_root, number, merge.auto_merge());
         return false;
     }
     let Some(repo) = crate::github::RepoId::resolve_from_remote(repo_root) else {
@@ -421,39 +473,132 @@ pub(super) fn merge_if_approved(
     let Ok(client) = crate::github::Client::new() else {
         return false;
     };
-    merge_approved_pr(&client, &repo, number, head_sha) && promote_merged_item(mcp, item, repo_root)
+    match merge_approved_pr(&client, &repo, number, merge) {
+        MergeAttempt::Merged => promote_merged_item(mcp, item, repo_root),
+        MergeAttempt::AutoMergeArmed | MergeAttempt::NotMerged => false,
+    }
 }
 
-/// The actual GitHub merge call for an approved, CI-green PR. Split out from
+/// Disarms GitHub's auto-merge on PR `number` when the sweep's snapshot says
+/// it is armed -- no network call otherwise, so the label-absent path of
+/// `merge_if_approved` stays offline for the common case.
+fn disarm_auto_merge_if_armed(
+    repo_root: &std::path::Path,
+    number: u64,
+    auto_merge: &crate::worktree::AutoMergeRef,
+) {
+    let (true, Some(node_id)) = (auto_merge.enabled, auto_merge.node_id.as_deref()) else {
+        return;
+    };
+    let Some(repo) = crate::github::RepoId::resolve_from_remote(repo_root) else {
+        return;
+    };
+    let Ok(client) = crate::github::Client::new() else {
+        return;
+    };
+    disarm_auto_merge_with(&client, &repo, number, node_id);
+}
+
+/// `disarm_auto_merge_if_armed`'s GitHub half, split out for mock-server
+/// tests the same way `merge_approved_pr` is.
+pub(super) fn disarm_auto_merge_with(
+    client: &crate::github::Client,
+    repo: &crate::github::RepoId,
+    number: u64,
+    node_id: &str,
+) {
+    match crate::github::graphql::disable_auto_merge(client, node_id) {
+        Ok(()) => eprintln!(
+            "agentflare-supervisor: disarmed GitHub auto-merge on PR #{number} in {repo}: its \
+             merge conditions no longer hold"
+        ),
+        Err(e) => eprintln!(
+            "agentflare-supervisor: could not disarm GitHub auto-merge on PR #{number} in \
+             {repo}: {e}"
+        ),
+    }
+}
+
+/// The actual GitHub merge for an approved, CI-green PR. Split out from
 /// `merge_if_approved` so tests can drive it against a mock server instead
 /// of `Client::new()`'s real credentials/host, mirroring `github::pulls`'
-/// own test style. Squash matches this repo's existing single-commit-per-item
-/// convention. Logs and falls through (never retries in-line) on failure --
-/// branch protection or a merge conflict just means the item sits until the
-/// next sweep tick, same as any other `skipped` outcome.
+/// own test style.
 ///
-/// Pinned to `head_sha`, the commit the sweep's snapshot judged CI-green: the
-/// sweep acts on a snapshot, and an agent may push between the fetch and
-/// this call. GitHub then answers 409 instead of merging unchecked code,
-/// which is an ordinary skip -- the next tick judges the new head.
+/// Prefers GitHub's native auto-merge when the repo allows it: armed once
+/// (`autoMergeRequest` already set means nothing to do), pinned to the head
+/// the sweep judged, with the merge method the repo's settings allow
+/// (`repos::settings`, read once per process: squash first, matching the
+/// single-commit-per-item convention). Auto-merge is what lets a review-
+/// blocked PR merge the moment the review lands, and the only way onto a
+/// merge queue. GitHub refuses to arm it on a PR it could merge right now,
+/// so a `CiGreenMerge::Allowed` PR falls back to the direct merge call when
+/// arming fails or the repo has auto-merge off; a review-blocked PR never
+/// does, since a direct merge would only be refused too.
+///
+/// Logs and falls through (never retries in-line) on failure -- branch
+/// protection or a merge conflict just means the item sits until the next
+/// sweep tick, same as any other `skipped` outcome. The direct merge is
+/// pinned to `head_sha`, the commit the sweep's snapshot judged CI-green: an
+/// agent may push between the fetch and this call, and GitHub then answers
+/// 409 instead of merging unchecked code, which is an ordinary skip -- the
+/// next tick judges the new head.
 pub(super) fn merge_approved_pr(
     client: &crate::github::Client,
     repo: &crate::github::RepoId,
     number: u64,
-    head_sha: Option<&str>,
-) -> bool {
-    match crate::github::pulls::merge_at_head(client, repo, number, "squash", head_sha) {
-        Ok(()) => true,
+    merge: CiGreenMerge<'_>,
+) -> MergeAttempt {
+    let settings = crate::github::repos::settings(client, repo).unwrap_or_else(|e| {
+        eprintln!(
+            "agentflare-supervisor: could not read {repo}'s merge settings ({e}); assuming \
+             squash and no auto-merge"
+        );
+        crate::github::repos::RepoSettings::unknown("")
+    });
+    let method = settings.merge_method();
+    let head_sha = merge.head_sha();
+    let auto = merge.auto_merge();
+    if settings.allow_auto_merge {
+        if auto.enabled {
+            return MergeAttempt::AutoMergeArmed;
+        }
+        if let Some(node_id) = auto.node_id.as_deref() {
+            match crate::github::graphql::enable_auto_merge(
+                client,
+                node_id,
+                method.graphql(),
+                head_sha,
+            ) {
+                Ok(()) => {
+                    eprintln!(
+                        "agentflare-supervisor: armed GitHub auto-merge ({}) on PR #{number} in \
+                         {repo}; GitHub merges it once every requirement holds",
+                        method.rest()
+                    );
+                    return MergeAttempt::AutoMergeArmed;
+                }
+                Err(e) => eprintln!(
+                    "agentflare-supervisor: could not arm GitHub auto-merge on PR #{number} in \
+                     {repo}: {e}"
+                ),
+            }
+        }
+    }
+    if matches!(merge, CiGreenMerge::BlockedOnReview { .. }) {
+        return MergeAttempt::NotMerged;
+    }
+    match crate::github::pulls::merge_at_head(client, repo, number, method.rest(), head_sha) {
+        Ok(()) => MergeAttempt::Merged,
         Err(e) if crate::github::pulls::is_head_moved(&e) => {
             eprintln!(
                 "agentflare-supervisor: PR #{number} in {repo} got new commits since CI was \
                  checked; not merging this tick"
             );
-            false
+            MergeAttempt::NotMerged
         }
         Err(e) => {
             eprintln!("agentflare-supervisor: auto-merge failed for PR #{number} in {repo}: {e}");
-            false
+            MergeAttempt::NotMerged
         }
     }
 }

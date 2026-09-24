@@ -56,6 +56,17 @@ pub struct BatchPrData {
     /// every context on the head commit -- consulted when the context list
     /// itself came back empty.
     pub rollup_state: Option<String>,
+    /// The PR's GraphQL node id: what the `enablePullRequestAutoMerge` and
+    /// `markPullRequestReadyForReview` mutations take as `pullRequestId`.
+    pub node_id: Option<String>,
+    /// `autoMergeRequest` is non-null while GitHub's native auto-merge is
+    /// armed on the PR.
+    pub auto_merge_enabled: bool,
+    /// `isMergeQueueEnabled`: the base branch merges through a merge queue,
+    /// so a direct merge is refused and auto-merge is the way to enqueue.
+    pub merge_queue_enabled: bool,
+    /// `isInMergeQueue`: already enqueued; the queue's own CI decides now.
+    pub in_merge_queue: bool,
 }
 
 /// One aliased sub-query for PR `number` -- `pr<number>` is a valid GraphQL
@@ -68,8 +79,9 @@ fn pr_alias(number: u64) -> String {
 
 fn pr_subquery(number: u64) -> String {
     format!(
-        "{}: pullRequest(number: {number}) {{ state merged mergeable mergeStateStatus \
+        "{}: pullRequest(number: {number}) {{ id state merged mergeable mergeStateStatus \
          reviewDecision headRefOid \
+         isMergeQueueEnabled isInMergeQueue autoMergeRequest {{ enabledAt }} \
          labels(first: 20) {{ nodes {{ name }} }} \
          commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state contexts(first: 100) {{ \
          nodes {{ __typename \
@@ -197,7 +209,69 @@ fn parse_batch_pr(node: &serde_json::Value) -> BatchPrData {
         head_sha: string(&node["headRefOid"]),
         review_decision: string(&node["reviewDecision"]),
         rollup_state: string(&rollup["state"]),
+        node_id: string(&node["id"]),
+        auto_merge_enabled: node["autoMergeRequest"].is_object(),
+        merge_queue_enabled: node["isMergeQueueEnabled"].as_bool().unwrap_or(false),
+        in_merge_queue: node["isInMergeQueue"].as_bool().unwrap_or(false),
     }
+}
+
+/// Runs one GraphQL mutation and returns its `data`, mapping a top-level
+/// `errors` array to `GitHubError` the same way `batch_pr_status` does.
+fn mutate(
+    client: &Client,
+    query: &str,
+    variables: serde_json::Value,
+) -> Result<serde_json::Value, GitHubError> {
+    let body = serde_json::json!({ "query": query, "variables": variables });
+    let json = client.request("POST", "/graphql", Some(body))?;
+    if let Some(errors) = json.get("errors") {
+        return Err(graphql_error(errors));
+    }
+    Ok(json.get("data").cloned().unwrap_or(serde_json::Value::Null))
+}
+
+/// Arms GitHub's native auto-merge on the PR with node id `pr_node_id`:
+/// GitHub then merges it itself (or adds it to the merge queue, on a base
+/// branch that has one) the moment every requirement -- required checks,
+/// required reviews -- is satisfied. `merge_method` is GraphQL's enum
+/// spelling (`SQUASH`/`MERGE`/`REBASE`); `expected_head_oid` pins the request
+/// to the head the caller judged, so GitHub refuses it if the PR moved. GitHub
+/// reports a PR that could be merged right now (`CLEAN`, no merge queue) as an
+/// error rather than arming it, and a repository with auto-merge switched off
+/// likewise -- both come back as `Err`, and the caller falls back to a direct
+/// merge.
+pub fn enable_auto_merge(
+    client: &Client,
+    pr_node_id: &str,
+    merge_method: &str,
+    expected_head_oid: Option<&str>,
+) -> Result<(), GitHubError> {
+    let mut input = serde_json::json!({ "pullRequestId": pr_node_id, "mergeMethod": merge_method });
+    if let Some(oid) = expected_head_oid {
+        input["expectedHeadOid"] = serde_json::Value::String(oid.to_string());
+    }
+    mutate(
+        client,
+        "mutation($input: EnablePullRequestAutoMergeInput!) { \
+         enablePullRequestAutoMerge(input: $input) { \
+         pullRequest { autoMergeRequest { enabledAt } } } }",
+        serde_json::json!({ "input": input }),
+    )?;
+    Ok(())
+}
+
+/// Disarms a previously enabled auto-merge -- used when a condition that
+/// gated arming it (no unresolved CodeRabbit findings, the approval label)
+/// stops holding, so GitHub can't merge on the next approving review.
+pub fn disable_auto_merge(client: &Client, pr_node_id: &str) -> Result<(), GitHubError> {
+    mutate(
+        client,
+        "mutation($input: DisablePullRequestAutoMergeInput!) { \
+         disablePullRequestAutoMerge(input: $input) { pullRequest { number } } }",
+        serde_json::json!({ "input": { "pullRequestId": pr_node_id } }),
+    )?;
+    Ok(())
 }
 
 /// One `statusCheckRollup` context: a Checks-API `CheckRun`, or a legacy
@@ -335,12 +409,97 @@ mod tests {
         for field in [
             "headRefOid",
             "reviewDecision",
+            "isMergeQueueEnabled isInMergeQueue autoMergeRequest { enabledAt }",
             "statusCheckRollup { state",
             "... on StatusContext { context state isRequired(pullRequestNumber: 8) }",
             "isRequired(pullRequestNumber: 8)",
         ] {
             assert!(query.contains(field), "query must request {field}: {query}");
         }
+    }
+
+    #[test]
+    fn batch_pr_status_reads_node_id_auto_merge_and_merge_queue_flags() {
+        let server = MockServer::start(vec![MockResponse::json(
+            200,
+            r#"{"data":{"repository":{
+                "pr8":{"id":"PR_kwDOAbc","merged":false,"mergeable":"MERGEABLE","mergeStateStatus":"BLOCKED",
+                       "isMergeQueueEnabled":true,"isInMergeQueue":false,
+                       "autoMergeRequest":{"enabledAt":"2026-09-24T00:00:00Z"},
+                       "labels":{"nodes":[]},"commits":{"nodes":[]}},
+                "pr9":{"id":"PR_kwDOAbd","merged":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN",
+                       "autoMergeRequest":null,
+                       "labels":{"nodes":[]},"commits":{"nodes":[]}}
+            }}}"#,
+        )]);
+        let client = server.client(Some("tok"));
+        let out = batch_pr_status(&client, &repo(), &[8, 9]).unwrap();
+        assert_eq!(out[&8].node_id.as_deref(), Some("PR_kwDOAbc"));
+        assert!(out[&8].auto_merge_enabled);
+        assert!(out[&8].merge_queue_enabled);
+        assert!(!out[&8].in_merge_queue);
+        assert!(!out[&9].auto_merge_enabled);
+        assert!(!out[&9].merge_queue_enabled);
+        let sent: serde_json::Value = serde_json::from_str(&server.requests()[0].body).unwrap();
+        assert!(
+            sent["query"]
+                .as_str()
+                .unwrap()
+                .contains("pullRequest(number: 8) { id ")
+        );
+    }
+
+    #[test]
+    fn enable_auto_merge_sends_the_mutation_pinned_to_the_expected_head() {
+        let server = MockServer::start(vec![MockResponse::json(
+            200,
+            r#"{"data":{"enablePullRequestAutoMerge":{"pullRequest":{"autoMergeRequest":{"enabledAt":"x"}}}}}"#,
+        )]);
+        let client = server.client(Some("tok"));
+        enable_auto_merge(&client, "PR_1", "SQUASH", Some("abc123")).unwrap();
+        let reqs = server.requests();
+        assert_eq!(reqs[0].path, "/graphql");
+        let sent: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
+        assert!(
+            sent["query"]
+                .as_str()
+                .unwrap()
+                .contains("enablePullRequestAutoMerge(input: $input)")
+        );
+        assert_eq!(sent["variables"]["input"]["pullRequestId"], "PR_1");
+        assert_eq!(sent["variables"]["input"]["mergeMethod"], "SQUASH");
+        assert_eq!(sent["variables"]["input"]["expectedHeadOid"], "abc123");
+    }
+
+    #[test]
+    fn enable_auto_merge_surfaces_a_clean_status_refusal_as_an_error() {
+        // GitHub refuses to arm auto-merge on a PR it could merge right now;
+        // the caller falls back to a direct merge on this error.
+        let server = MockServer::start(vec![MockResponse::json(
+            200,
+            r#"{"data":{"enablePullRequestAutoMerge":null},"errors":[{"message":"Pull request is in clean status"}]}"#,
+        )]);
+        let client = server.client(Some("tok"));
+        let err = enable_auto_merge(&client, "PR_1", "SQUASH", None).unwrap_err();
+        assert!(err.to_string().contains("clean status"), "{err}");
+    }
+
+    #[test]
+    fn disable_auto_merge_sends_the_mutation() {
+        let server = MockServer::start(vec![MockResponse::json(
+            200,
+            r#"{"data":{"disablePullRequestAutoMerge":{"pullRequest":{"number":1}}}}"#,
+        )]);
+        let client = server.client(Some("tok"));
+        disable_auto_merge(&client, "PR_1").unwrap();
+        let sent: serde_json::Value = serde_json::from_str(&server.requests()[0].body).unwrap();
+        assert!(
+            sent["query"]
+                .as_str()
+                .unwrap()
+                .contains("disablePullRequestAutoMerge")
+        );
+        assert_eq!(sent["variables"]["input"]["pullRequestId"], "PR_1");
     }
 
     #[test]

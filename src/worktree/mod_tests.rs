@@ -423,6 +423,10 @@
             head_sha: Some("head-sha".to_string()),
             review_decision: None,
             rollup_state: None,
+            node_id: Some("PR_node".to_string()),
+            auto_merge_enabled: false,
+            merge_queue_enabled: false,
+            in_merge_queue: false,
         }
     }
 
@@ -467,12 +471,72 @@
                 number,
                 labels,
                 head_sha,
+                auto_merge,
             } => {
                 assert_eq!(number, 101);
                 assert_eq!(labels, vec!["status:pr:approved".to_string()]);
                 assert_eq!(head_sha.as_deref(), Some("head-sha"));
+                assert_eq!(auto_merge.node_id.as_deref(), Some("PR_node"));
+                assert!(!auto_merge.enabled);
             }
             other => panic!("expected Passing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_ci_status_from_batch_reports_passing_when_only_a_merge_queue_blocks_green_checks() {
+        // On a merge-queue base branch GitHub never says "clean"; with every
+        // required check green and no review due, "blocked" is the queue's
+        // cue, not an incomplete snapshot.
+        let mut data = batch_data(
+            false,
+            Some(true),
+            Some("blocked"),
+            vec![required(check("build", "completed", Some("success")))],
+            vec![],
+        );
+        data.merge_queue_enabled = true;
+        assert!(matches!(
+            pr_ci_status_from_batch(101, &data),
+            PrCiStatus::Passing { number: 101, .. }
+        ));
+        // Already enqueued: the queue's own CI decides; nothing to do here.
+        data.in_merge_queue = true;
+        assert!(matches!(
+            pr_ci_status_from_batch(101, &data),
+            PrCiStatus::Pending
+        ));
+        // A review still due wins over the queue.
+        data.in_merge_queue = false;
+        data.review_decision = Some("REVIEW_REQUIRED".to_string());
+        assert!(matches!(
+            pr_ci_status_from_batch(101, &data),
+            PrCiStatus::AwaitingReview { .. }
+        ));
+    }
+
+    #[test]
+    fn pr_ci_status_from_batch_awaiting_review_carries_the_auto_merge_handle() {
+        let mut data = batch_data(
+            false,
+            Some(true),
+            Some("blocked"),
+            vec![required(check("build", "completed", Some("success")))],
+            vec![],
+        );
+        data.review_decision = Some("REVIEW_REQUIRED".to_string());
+        data.auto_merge_enabled = true;
+        match pr_ci_status_from_batch(101, &data) {
+            PrCiStatus::AwaitingReview {
+                head_sha,
+                auto_merge,
+                ..
+            } => {
+                assert_eq!(head_sha.as_deref(), Some("head-sha"));
+                assert_eq!(auto_merge.node_id.as_deref(), Some("PR_node"));
+                assert!(auto_merge.enabled);
+            }
+            other => panic!("expected AwaitingReview, got {other:?}"),
         }
     }
 

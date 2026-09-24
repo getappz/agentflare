@@ -1568,6 +1568,7 @@ fn handle_pr_status(
             number,
             labels,
             head_sha,
+            auto_merge,
         } => handle_ci_green(
             mcp,
             queue,
@@ -1578,6 +1579,7 @@ fn handle_pr_status(
             &labels,
             CiGreenMerge::Allowed {
                 head_sha: head_sha.as_deref(),
+                auto_merge: &auto_merge,
             },
             label_id_by_name,
             folder_path,
@@ -1593,6 +1595,8 @@ fn handle_pr_status(
             number,
             labels,
             changes_requested,
+            head_sha,
+            auto_merge,
         } => handle_ci_green(
             mcp,
             queue,
@@ -1601,7 +1605,11 @@ fn handle_pr_status(
             item,
             number,
             &labels,
-            CiGreenMerge::BlockedOnReview { changes_requested },
+            CiGreenMerge::BlockedOnReview {
+                changes_requested,
+                head_sha: head_sha.as_deref(),
+                auto_merge: &auto_merge,
+            },
             label_id_by_name,
             folder_path,
             repo_root,

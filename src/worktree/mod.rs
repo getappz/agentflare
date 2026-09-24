@@ -262,6 +262,18 @@ fn find_own_pr_by_branch(
 /// `is_pr_merged` above also treats as "not merged yet" -- no credentials,
 /// no resolvable remote, no PR found, or a lookup error -- since the
 /// caller's fallback is simply to poll again next tick.
+/// What GitHub's native auto-merge needs beyond a PR number: the PR's
+/// GraphQL node id (the `enablePullRequestAutoMerge` mutation's
+/// `pullRequestId`) and whether auto-merge is already armed on it, so the
+/// sweep neither re-arms it every tick nor arms it blind. Both come from the
+/// same fetch as the CI verdict (GraphQL `id`/`autoMergeRequest`, REST
+/// `node_id`/`auto_merge`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AutoMergeRef {
+    pub node_id: Option<String>,
+    pub enabled: bool,
+}
+
 #[derive(Debug)]
 pub enum PrCiStatus {
     Merged,
@@ -289,6 +301,7 @@ pub enum PrCiStatus {
         number: u64,
         labels: Vec<String>,
         head_sha: Option<String>,
+        auto_merge: AutoMergeRef,
     },
     /// Required CI is green but GitHub's `mergeStateStatus` is `BLOCKED` on
     /// review: branch protection wants an approving review
@@ -304,6 +317,12 @@ pub enum PrCiStatus {
         /// changes) as opposed to `REVIEW_REQUIRED` (nobody has approved
         /// yet) -- the approval card tells the human which it is.
         changes_requested: bool,
+        /// The head the green verdict was made on, and the auto-merge
+        /// handle: with the approval label attached and no findings, the
+        /// sweep arms GitHub's auto-merge here so the review landing is
+        /// all it takes to merge.
+        head_sha: Option<String>,
+        auto_merge: AutoMergeRef,
     },
     /// GitHub's own `mergeable_state == "behind"` -- mergeable, no conflict,
     /// just missing commits the base branch has gained since this PR was
@@ -453,6 +472,14 @@ fn pr_ci_status_impl(
             review_decision: None,
             rollup_state: None,
             head_sha: Some(&sha),
+            auto_merge: AutoMergeRef {
+                node_id: pr.node_id.clone(),
+                enabled: pr.auto_merge.is_some(),
+            },
+            // REST doesn't say; a merge-queue repo's PR stays `Pending`
+            // on this path, as it did before.
+            merge_queue_enabled: false,
+            in_merge_queue: false,
         },
     )
 }
@@ -468,6 +495,11 @@ struct MergeSignals<'a> {
     /// Upper-case GraphQL `statusCheckRollup.state`; always `None` on REST.
     rollup_state: Option<&'a str>,
     head_sha: Option<&'a str>,
+    auto_merge: AutoMergeRef,
+    /// The base branch merges through a merge queue (GraphQL only).
+    merge_queue_enabled: bool,
+    /// The PR is already in that queue (GraphQL only).
+    in_merge_queue: bool,
 }
 
 /// The part of the CI-status decision tree that only needs check-run data
@@ -499,6 +531,7 @@ fn decide_from_checks(
         number,
         labels,
         head_sha: signals.head_sha.map(str::to_string),
+        auto_merge: signals.auto_merge.clone(),
     };
     let awaiting_review = signals.mergeable_state == Some("blocked")
         && matches!(
@@ -509,7 +542,14 @@ fn decide_from_checks(
         number,
         labels,
         changes_requested: signals.review_decision == Some("CHANGES_REQUESTED"),
+        head_sha: signals.head_sha.map(str::to_string),
+        auto_merge: signals.auto_merge.clone(),
     };
+    // Enqueued: the merge queue's own CI run on the merge group decides
+    // now, and GitHub merges (or kicks it back out) by itself.
+    if signals.in_merge_queue {
+        return PrCiStatus::Pending;
+    }
     let relevant: Vec<crate::github::models::CheckRun> = if checks.iter().any(|c| c.required) {
         checks.iter().filter(|c| c.required).cloned().collect()
     } else {
@@ -577,6 +617,16 @@ fn decide_from_checks(
     // that's the exact same incomplete-snapshot window, just caught one tick
     // earlier, so it gets the same treatment.
     if matches!(signals.mergeable_state, Some("blocked") | Some("unknown")) {
+        // A base branch with a merge queue never reports "clean": a direct
+        // merge is refused there by design, and the PR reads "blocked"
+        // until it goes through the queue. With every required context
+        // green and no review outstanding, that is the queue's cue -- the
+        // sweep's merge path arms auto-merge, which is how a PR enters the
+        // queue, and the queue's own CI run on the merge group is the real
+        // gate for whatever a still-missing gated job would have covered.
+        if signals.merge_queue_enabled && signals.mergeable_state == Some("blocked") {
+            return passing(labels);
+        }
         return PrCiStatus::Pending;
     }
     passing(labels)
@@ -619,6 +669,12 @@ pub(crate) fn pr_ci_status_from_batch(
             review_decision: data.review_decision.as_deref(),
             rollup_state: data.rollup_state.as_deref(),
             head_sha: data.head_sha.as_deref(),
+            auto_merge: AutoMergeRef {
+                node_id: data.node_id.clone(),
+                enabled: data.auto_merge_enabled,
+            },
+            merge_queue_enabled: data.merge_queue_enabled,
+            in_merge_queue: data.in_merge_queue,
         },
     )
 }

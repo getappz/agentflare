@@ -5,13 +5,78 @@ use crate::github::{Client, GitHubError, RepoId};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-/// The slice of `GET /repos/{owner}/{repo}` post-merge cleanup consults.
+/// The slice of `GET /repos/{owner}/{repo}` the merge path and post-merge
+/// cleanup consult.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoSettings {
     pub default_branch: String,
     /// GitHub's own "Automatically delete head branches" setting -- when on,
     /// GitHub already deleted the branch at merge time.
     pub delete_branch_on_merge: bool,
+    /// "Allow auto-merge" in the repo's settings: whether
+    /// `enablePullRequestAutoMerge` can be used at all.
+    pub allow_auto_merge: bool,
+    pub allow_squash_merge: bool,
+    pub allow_merge_commit: bool,
+    pub allow_rebase_merge: bool,
+}
+
+/// A PR merge method in both spellings GitHub uses: REST's `merge_method`
+/// (`squash`) and GraphQL's `PullRequestMergeMethod` enum (`SQUASH`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeMethod {
+    Squash,
+    Merge,
+    Rebase,
+}
+
+impl MergeMethod {
+    pub fn rest(self) -> &'static str {
+        match self {
+            MergeMethod::Squash => "squash",
+            MergeMethod::Merge => "merge",
+            MergeMethod::Rebase => "rebase",
+        }
+    }
+
+    pub fn graphql(self) -> &'static str {
+        match self {
+            MergeMethod::Squash => "SQUASH",
+            MergeMethod::Merge => "MERGE",
+            MergeMethod::Rebase => "REBASE",
+        }
+    }
+}
+
+impl RepoSettings {
+    /// What GitHub falls back to when it can't read a repo's settings: every
+    /// merge method allowed (GitHub's defaults), auto-merge off. Used when
+    /// the settings fetch itself fails, so a merge can still be attempted.
+    pub fn unknown(default_branch: &str) -> RepoSettings {
+        RepoSettings {
+            default_branch: default_branch.to_string(),
+            delete_branch_on_merge: false,
+            allow_auto_merge: false,
+            allow_squash_merge: true,
+            allow_merge_commit: true,
+            allow_rebase_merge: true,
+        }
+    }
+
+    /// The merge method the supervisor uses for this repo: squash when the
+    /// repo allows it (one commit per item, matching agentflare's own
+    /// convention), else a merge commit, else rebase. A repo that allows
+    /// none -- possible when the fetched flags are all false -- still gets
+    /// squash, so the attempt is made and GitHub says why it can't.
+    pub fn merge_method(&self) -> MergeMethod {
+        if self.allow_squash_merge || (!self.allow_merge_commit && !self.allow_rebase_merge) {
+            MergeMethod::Squash
+        } else if self.allow_merge_commit {
+            MergeMethod::Merge
+        } else {
+            MergeMethod::Rebase
+        }
+    }
 }
 
 /// `repo`'s settings, fetched once per process per host+repo: they change
@@ -31,12 +96,20 @@ pub fn settings(client: &Client, repo: &RepoId) -> Result<RepoSettings, GitHubEr
         return Ok(hit);
     }
     let json = client.request("GET", &format!("/repos/{}/{}", repo.owner, repo.repo), None)?;
+    // The `allow_*` flags default to GitHub's own defaults when the response
+    // omits them (a token without admin scope still sees them; a truncated
+    // test fixture may not).
+    let flag = |name: &str, default: bool| json[name].as_bool().unwrap_or(default);
     let fetched = RepoSettings {
         default_branch: json["default_branch"]
             .as_str()
             .ok_or_else(|| GitHubError::Parse("missing default_branch".to_string()))?
             .to_string(),
-        delete_branch_on_merge: json["delete_branch_on_merge"].as_bool().unwrap_or(false),
+        delete_branch_on_merge: flag("delete_branch_on_merge", false),
+        allow_auto_merge: flag("allow_auto_merge", false),
+        allow_squash_merge: flag("allow_squash_merge", true),
+        allow_merge_commit: flag("allow_merge_commit", true),
+        allow_rebase_merge: flag("allow_rebase_merge", true),
     };
     cache
         .lock()
@@ -148,6 +221,41 @@ mod tests {
         let client = server.client(None);
         assert_eq!(get_default_branch(&client, &repo()).unwrap(), "main");
         assert_eq!(server.requests()[0].path, "/repos/o/r");
+    }
+
+    #[test]
+    fn settings_reads_merge_flags_and_defaults_the_missing_ones() {
+        let server = MockServer::start(vec![MockResponse::json(
+            200,
+            r#"{"default_branch":"main","allow_auto_merge":true,"allow_squash_merge":false}"#,
+        )]);
+        let client = server.client(None);
+        let s = settings(&client, &repo()).unwrap();
+        assert!(s.allow_auto_merge);
+        assert!(!s.allow_squash_merge);
+        assert!(s.allow_merge_commit, "GitHub's default when omitted");
+        assert!(s.allow_rebase_merge);
+        assert!(!s.delete_branch_on_merge);
+        assert_eq!(s.merge_method(), MergeMethod::Merge);
+        let _ = server.requests();
+    }
+
+    #[test]
+    fn merge_method_prefers_squash_then_merge_then_rebase() {
+        let mut s = RepoSettings::unknown("main");
+        assert_eq!(s.merge_method(), MergeMethod::Squash);
+        s.allow_squash_merge = false;
+        assert_eq!(s.merge_method(), MergeMethod::Merge);
+        s.allow_merge_commit = false;
+        assert_eq!(s.merge_method(), MergeMethod::Rebase);
+        s.allow_rebase_merge = false;
+        assert_eq!(
+            s.merge_method(),
+            MergeMethod::Squash,
+            "nothing allowed: still try"
+        );
+        assert_eq!(MergeMethod::Squash.rest(), "squash");
+        assert_eq!(MergeMethod::Rebase.graphql(), "REBASE");
     }
 
     #[test]

@@ -36,6 +36,14 @@ pub struct PullRequest {
     pub body: Option<String>,
     #[serde(default)]
     pub draft: bool,
+    // The GraphQL node id, what the auto-merge and ready-for-review
+    // mutations address the PR by; REST returns it on every PR object.
+    #[serde(default)]
+    pub node_id: Option<String>,
+    // Non-null while GitHub's native auto-merge is armed on the PR (an
+    // object naming who enabled it and with which method).
+    #[serde(default)]
+    pub auto_merge: Option<serde_json::Value>,
     // Present (non-null) on both the list and single-PR endpoints, unlike
     // `merged: bool` which the GitHub API only returns from the single-PR
     // endpoint — using this instead lets `check_merge` (item #420) read

@@ -82,6 +82,15 @@ fn is_mutating(method: &str) -> bool {
     matches!(method, "POST" | "PATCH" | "PUT" | "DELETE")
 }
 
+/// Whether a `/graphql` request body carries a mutation (as opposed to a
+/// query): GraphQL documents start with their operation type, and every
+/// mutation agentflare sends spells it out.
+fn is_graphql_mutation(body: &Option<serde_json::Value>) -> bool {
+    body.as_ref()
+        .and_then(|b| b["query"].as_str())
+        .is_some_and(|q| q.trim_start().starts_with("mutation"))
+}
+
 /// GitHub's secondary ("abuse") limits come back as a 403 or 429 carrying
 /// either a `retry-after` header or a message naming the limit, and --
 /// unlike the primary limit -- usually with `x-ratelimit-remaining` well
@@ -261,9 +270,12 @@ impl Client {
             ));
         }
         // Mutating requests go out one at a time per host, spaced apart,
-        // per GitHub's guidance for staying under secondary limits. GraphQL
-        // is exempt: every `/graphql` POST agentflare sends is a query.
-        let mut mutation_slot = (is_mutating(method) && path != "/graphql").then(|| {
+        // per GitHub's guidance for staying under secondary limits. A
+        // GraphQL POST counts only when its document is a mutation -- the
+        // batched status lookups are queries, and spacing those out would
+        // slow every sweep for nothing.
+        let mutating = is_mutating(method) && (path != "/graphql" || is_graphql_mutation(&body));
+        let mut mutation_slot = mutating.then(|| {
             let slot = self
                 .throttle
                 .last_mutation
@@ -479,6 +491,17 @@ mod tests {
         // A plain permission 403 and non-limit statuses arm no backoff.
         assert_eq!(backoff_for(403, &remaining("5"), "", 1000), None);
         assert_eq!(backoff_for(500, &RateHeaders::default(), "", 1000), None);
+    }
+
+    #[test]
+    fn is_graphql_mutation_tells_mutations_from_queries() {
+        let q = |s: &str| Some(serde_json::json!({ "query": s }));
+        assert!(is_graphql_mutation(&q(
+            "mutation($input: X!) { enablePullRequestAutoMerge(input: $input) { x } }"
+        )));
+        assert!(is_graphql_mutation(&q("  mutation { x }")));
+        assert!(!is_graphql_mutation(&q("query($owner:String!){ x }")));
+        assert!(!is_graphql_mutation(&None));
     }
 
     #[test]
