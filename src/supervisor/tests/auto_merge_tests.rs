@@ -208,7 +208,9 @@ fn merge_or_repair_findings_never_attempts_a_merge_while_github_awaits_review() 
         &[PR_APPROVAL_LABEL.to_string()],
         &label_id_by_name,
         "/repo",
-        CiGreenMerge::BlockedOnReview,
+        CiGreenMerge::BlockedOnReview {
+            changes_requested: false,
+        },
     );
 
     assert!(matches!(outcome, PassingPrOutcome::NotMerged));

@@ -125,7 +125,7 @@ pub(crate) fn notify_human_gate(item: &agentflare_backend::item::Item, reason: &
 /// `notify_human_gate`: no-ops without a configured chat id, and a send
 /// failure only logs -- a notification failure must never block the gate
 /// itself.
-fn request_channel_approval(card_text: &str, approve_label: &str, callback_data: &str) {
+fn request_channel_approval(card_text: &str, button: Option<(&str, &str)>) {
     if test_notify_disabled() {
         return;
     }
@@ -140,47 +140,114 @@ fn request_channel_approval(card_text: &str, approve_label: &str, callback_data:
     let _turn_guard = turn_lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Err(e) =
-        crate::channels::send_telegram_card(&chat_id, card_text, &[(approve_label, callback_data)])
-    {
+    let buttons: Vec<(&str, &str)> = button.into_iter().collect();
+    if let Err(e) = crate::channels::send_telegram_card(&chat_id, card_text, &buttons) {
         eprintln!("agentflare-supervisor: telegram card notify failed: {e}");
     }
 }
 
-/// Telegram-only rich variant of [`notify_human_gate`] for the one gate a
-/// human can resolve with a single tap: CI is green and the only thing
-/// missing is `PR_APPROVAL_LABEL`. Unlike the plain-text pings, this carries
-/// an inline "Approve" button whose `callback_data` embeds the repo and PR
-/// number directly (`approve:{owner}/{repo}#{number}`) -- self-contained,
-/// so [`poll_telegram_approvals`] never needs to re-resolve a worktree path
-/// to act on a click. Same fail-open contract as `notify_human_gate`: no-ops
-/// without a configured chat id or a resolvable repo, and a send failure
-/// only logs.
+/// What is holding a CI-green PR back from merging -- decides the wording of
+/// [`notify_pr_approval_gate`]'s card, so a human reading it knows which
+/// action actually unblocks the PR instead of being told to attach a label
+/// that GitHub would still ignore.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PrApprovalBlocker {
+    /// GitHub would merge it; only agentflare's own `PR_APPROVAL_LABEL` is
+    /// missing. One tap on the card's button attaches it.
+    ApprovalLabel,
+    /// Branch protection is holding it for a human review
+    /// (`PrCiStatus::AwaitingReview`): an approving review is required, or
+    /// a reviewer requested changes. The label alone can't merge this.
+    GitHubReview {
+        changes_requested: bool,
+        /// Whether `PR_APPROVAL_LABEL` is still missing too, so the card can
+        /// say the review is the first of two steps and keep its button.
+        label_missing: bool,
+    },
+}
+
+/// The HTML card body for [`notify_pr_approval_gate`], split out so its
+/// wording is testable without a Telegram chat.
+fn pr_approval_card_text(
+    item: &agentflare_backend::item::Item,
+    repo: &crate::github::RepoId,
+    number: u64,
+    blocker: PrApprovalBlocker,
+) -> String {
+    let excerpt: String = item.description.chars().take(200).collect();
+    let pr_link = format!("PR <a href=\"https://github.com/{repo}/pull/{number}\">#{number}</a>");
+    let status = match blocker {
+        PrApprovalBlocker::ApprovalLabel => format!(
+            "{pr_link} is CI-green and mergeable, awaiting <code>{PR_APPROVAL_LABEL}</code>."
+        ),
+        PrApprovalBlocker::GitHubReview {
+            changes_requested,
+            label_missing,
+        } => {
+            let why = if changes_requested {
+                "a reviewer requested changes"
+            } else {
+                "branch protection requires an approving review"
+            };
+            let then = if label_missing {
+                format!(" It also still needs <code>{PR_APPROVAL_LABEL}</code> to auto-merge.")
+            } else {
+                String::new()
+            };
+            format!(
+                "{pr_link} is CI-green, but GitHub is blocking the merge until a human review \
+                 lands: {why}. \
+                 <a href=\"https://github.com/{repo}/pull/{number}/files\">Review it here</a>.{then}"
+            )
+        }
+    };
+    format!(
+        "\u{1F514} <b>agentflare</b> needs a human\n\
+         <b>Repo:</b> {repo}\n\
+         <b>Item:</b> #{} \u{2014} {}\n\
+         {}\n\n\
+         {status}",
+        item.sequence_id,
+        html_escape(&item.name),
+        html_escape(&excerpt),
+    )
+}
+
+/// Telegram-only rich variant of [`notify_human_gate`] for a CI-green PR
+/// waiting on a human. When `PR_APPROVAL_LABEL` is all that is missing
+/// (`PrApprovalBlocker::ApprovalLabel`) the human can resolve it with a
+/// single tap: the card carries an inline "Approve" button whose
+/// `callback_data` embeds the repo and PR number directly
+/// (`approve:{owner}/{repo}#{number}`) -- self-contained, so
+/// [`poll_telegram_approvals`] never needs to re-resolve a worktree path to
+/// act on a click. When GitHub itself is holding the PR for a review
+/// (`PrApprovalBlocker::GitHubReview`) the card says so and links the
+/// review instead of asking for a label that can't merge it; the button is
+/// kept only while the label is missing as well. Same fail-open contract as
+/// `notify_human_gate`: no-ops without a configured chat id or a resolvable
+/// repo, and a send failure only logs.
 pub(crate) fn notify_pr_approval_gate(
     item: &agentflare_backend::item::Item,
     folder_path: &str,
     number: u64,
+    blocker: PrApprovalBlocker,
 ) {
     let Some(repo) = crate::github::RepoId::resolve_from_remote(std::path::Path::new(folder_path))
     else {
         return;
     };
-    let excerpt: String = item.description.chars().take(200).collect();
-    let text = format!(
-        "\u{1F514} <b>agentflare</b> needs a human\n\
-         <b>Repo:</b> {repo}\n\
-         <b>Item:</b> #{} \u{2014} {}\n\
-         {}\n\n\
-         PR <a href=\"https://github.com/{repo}/pull/{number}\">#{number}</a> is CI-green and \
-         mergeable, awaiting <code>{PR_APPROVAL_LABEL}</code>.",
-        item.sequence_id,
-        html_escape(&item.name),
-        html_escape(&excerpt),
+    let text = pr_approval_card_text(item, &repo, number, blocker);
+    let wants_label = !matches!(
+        blocker,
+        PrApprovalBlocker::GitHubReview {
+            label_missing: false,
+            ..
+        }
     );
+    let callback = format!("approve:{repo}#{number}");
     request_channel_approval(
         &text,
-        "\u{2705} Approve",
-        &format!("approve:{repo}#{number}"),
+        wants_label.then_some(("\u{2705} Approve", callback.as_str())),
     );
 }
 
@@ -202,11 +269,8 @@ pub(crate) fn notify_plan_approval_gate(
         html_escape(&item.name),
         html_escape(plan_asset_id),
     );
-    request_channel_approval(
-        &text,
-        "\u{2705} Approve",
-        &format!("approve_plan:{}", item.id),
-    );
+    let callback = format!("approve_plan:{}", item.id);
+    request_channel_approval(&text, Some(("\u{2705} Approve", callback.as_str())));
 }
 
 /// Parse an "Approve" button's `callback_data` (`approve_plan:{item_id}`)
@@ -233,6 +297,102 @@ pub(crate) fn first_time_gated(item_id: &str) -> bool {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(item_id.to_string())
+}
+
+#[cfg(test)]
+mod pr_approval_card_tests {
+    use super::*;
+
+    fn item() -> agentflare_backend::item::Item {
+        agentflare_backend::item::Item {
+            id: "item-12".into(),
+            project_id: "p".into(),
+            state_id: "s".into(),
+            name: "Widen the <gate>".into(),
+            description: "desc".into(),
+            priority: "none".into(),
+            parent_id: None,
+            assignee_agent: None,
+            sequence_id: 12,
+            sort_order: 0.0,
+            started_at: None,
+            completed_at: None,
+            archived_at: None,
+            external_source: None,
+            external_id: None,
+            metadata: "{}".into(),
+            created_at: 0,
+            updated_at: 0,
+            deleted_at: None,
+            start_date: None,
+            due_date: None,
+        }
+    }
+
+    fn repo() -> crate::github::RepoId {
+        crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        }
+    }
+
+    #[test]
+    fn label_blocker_asks_for_the_approval_label() {
+        let text = pr_approval_card_text(&item(), &repo(), 7, PrApprovalBlocker::ApprovalLabel);
+        assert!(
+            text.contains("awaiting <code>status:pr:approved</code>"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Widen the &lt;gate&gt;"),
+            "escaped title: {text}"
+        );
+        assert!(!text.contains("Review it here"), "{text}");
+    }
+
+    #[test]
+    fn review_blocker_names_the_github_review_and_links_it() {
+        let text = pr_approval_card_text(
+            &item(),
+            &repo(),
+            7,
+            PrApprovalBlocker::GitHubReview {
+                changes_requested: false,
+                label_missing: false,
+            },
+        );
+        assert!(
+            text.contains("branch protection requires an approving review"),
+            "{text}"
+        );
+        assert!(
+            text.contains("href=\"https://github.com/o/r/pull/7/files\">Review it here</a>"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("awaiting <code>status:pr:approved</code>"),
+            "a review-blocked PR must not be described as waiting on the label: {text}"
+        );
+        assert!(!text.contains("also still needs"), "{text}");
+    }
+
+    #[test]
+    fn review_blocker_says_changes_were_requested_and_mentions_a_missing_label() {
+        let text = pr_approval_card_text(
+            &item(),
+            &repo(),
+            7,
+            PrApprovalBlocker::GitHubReview {
+                changes_requested: true,
+                label_missing: true,
+            },
+        );
+        assert!(text.contains("a reviewer requested changes"), "{text}");
+        assert!(
+            text.contains("also still needs <code>status:pr:approved</code>"),
+            "{text}"
+        );
+    }
 }
 
 #[cfg(test)]

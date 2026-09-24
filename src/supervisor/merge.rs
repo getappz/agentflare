@@ -15,7 +15,9 @@ pub(super) enum CiGreenMerge<'a> {
     /// verdict was made on.
     Allowed { head_sha: Option<&'a str> },
     /// GitHub is blocking the merge until a human review lands; don't try.
-    BlockedOnReview,
+    /// `changes_requested` tells the approval card whether a reviewer asked
+    /// for changes or nobody has approved yet.
+    BlockedOnReview { changes_requested: bool },
 }
 
 /// `handle_pr_status`'s CI-green path, shared by `Passing` and
@@ -87,10 +89,37 @@ pub(super) fn handle_ci_green(
     // unrelated reason earlier in its life (e.g. the go/no-go
     // decision gate below, or `skip_item`), since that gate's call
     // already consumed the bare-id token (item #587).
-    if !labels.iter().any(|l| l == PR_APPROVAL_LABEL)
-        && first_time_gated(&format!("pr-approval:{}", item.id))
-    {
-        notify_pr_approval_gate(item, folder_path, number);
+    //
+    // A GitHub-review block gets its own card (and its own once-per-item
+    // key): telling the human to attach the approval label there would
+    // be wrong -- the label can't merge a review-blocked PR -- and when
+    // the review later lands with the label still missing, the plain
+    // label card is still owed.
+    let label_missing = !labels.iter().any(|l| l == PR_APPROVAL_LABEL);
+    match merge {
+        CiGreenMerge::Allowed { .. } => {
+            if label_missing && first_time_gated(&format!("pr-approval:{}", item.id)) {
+                notify_pr_approval_gate(
+                    item,
+                    folder_path,
+                    number,
+                    PrApprovalBlocker::ApprovalLabel,
+                );
+            }
+        }
+        CiGreenMerge::BlockedOnReview { changes_requested } => {
+            if first_time_gated(&format!("pr-review:{}", item.id)) {
+                notify_pr_approval_gate(
+                    item,
+                    folder_path,
+                    number,
+                    PrApprovalBlocker::GitHubReview {
+                        changes_requested,
+                        label_missing,
+                    },
+                );
+            }
+        }
     }
     // CI being green and a human's approval label being attached
     // don't mean the PR is actually done if CodeRabbit's own review
@@ -127,7 +156,7 @@ pub(super) fn handle_ci_green(
             PassingPrOutcome::Merged => result.promoted += 1,
             PassingPrOutcome::NotMerged => match merge {
                 CiGreenMerge::Allowed { .. } => result.skipped += 1,
-                CiGreenMerge::BlockedOnReview => result.waiting += 1,
+                CiGreenMerge::BlockedOnReview { .. } => result.waiting += 1,
             },
             PassingPrOutcome::Repair(SelfRepairOutcome::Dispatched) => result.review_repaired += 1,
             PassingPrOutcome::Repair(SelfRepairOutcome::Deferred) => result.waiting += 1,

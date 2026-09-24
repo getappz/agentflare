@@ -300,6 +300,10 @@ pub enum PrCiStatus {
     AwaitingReview {
         number: u64,
         labels: Vec<String>,
+        /// `reviewDecision == CHANGES_REQUESTED` (a reviewer asked for
+        /// changes) as opposed to `REVIEW_REQUIRED` (nobody has approved
+        /// yet) -- the approval card tells the human which it is.
+        changes_requested: bool,
     },
     /// GitHub's own `mergeable_state == "behind"` -- mergeable, no conflict,
     /// just missing commits the base branch has gained since this PR was
@@ -501,6 +505,11 @@ fn decide_from_checks(
             signals.review_decision,
             Some("REVIEW_REQUIRED") | Some("CHANGES_REQUESTED")
         );
+    let awaiting = |labels: Vec<String>| PrCiStatus::AwaitingReview {
+        number,
+        labels,
+        changes_requested: signals.review_decision == Some("CHANGES_REQUESTED"),
+    };
     let relevant: Vec<crate::github::models::CheckRun> = if checks.iter().any(|c| c.required) {
         checks.iter().filter(|c| c.required).cloned().collect()
     } else {
@@ -524,7 +533,7 @@ fn decide_from_checks(
                 return passing(labels);
             }
             if awaiting_review {
-                return PrCiStatus::AwaitingReview { number, labels };
+                return awaiting(labels);
             }
         }
         return PrCiStatus::Pending;
@@ -552,7 +561,7 @@ fn decide_from_checks(
     // purely on review: hand it to the approval gate rather than polling a
     // PR that only a human can unblock.
     if awaiting_review {
-        return PrCiStatus::AwaitingReview { number, labels };
+        return awaiting(labels);
     }
     // The check-run list above only reflects what GitHub has created so far --
     // gated jobs (e.g. a `build` matrix behind a `changes` job) may not exist

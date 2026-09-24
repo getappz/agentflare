@@ -42,7 +42,7 @@ fn pr_status_summary(
         crate::worktree::PrCiStatus::Passing { number, labels, .. } => {
             ("passing", Some(number), vec![], labels)
         }
-        crate::worktree::PrCiStatus::AwaitingReview { number, labels } => {
+        crate::worktree::PrCiStatus::AwaitingReview { number, labels, .. } => {
             ("awaiting_review", Some(number), vec![], labels)
         }
         crate::worktree::PrCiStatus::Behind { number, .. } => {

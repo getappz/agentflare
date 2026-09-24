@@ -253,6 +253,7 @@ fn a_passing_pr_is_not_evidence_unless_the_caller_is_on_its_pushed_branch() {
     let awaiting_review = PrCiStatus::AwaitingReview {
         number: 8,
         labels: vec![],
+        changes_requested: false,
     };
     assert!(
         branch_gate(true, awaiting_review)

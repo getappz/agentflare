@@ -580,13 +580,18 @@
                 vec![],
             );
             data.review_decision = Some(decision.to_string());
-            assert!(
-                matches!(
-                    pr_ci_status_from_batch(101, &data),
-                    PrCiStatus::AwaitingReview { number: 101, .. }
+            match pr_ci_status_from_batch(101, &data) {
+                PrCiStatus::AwaitingReview {
+                    number: 101,
+                    changes_requested,
+                    ..
+                } => assert_eq!(
+                    changes_requested,
+                    decision == "CHANGES_REQUESTED",
+                    "{decision}"
                 ),
-                "{decision}"
-            );
+                other => panic!("{decision}: expected AwaitingReview, got {other:?}"),
+            }
         }
     }
 

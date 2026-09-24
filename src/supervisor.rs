@@ -1589,7 +1589,11 @@ fn handle_pr_status(
         // repair labels cleared, the approval gate surfaced (the whole point:
         // this used to read as `Pending` and never reached the gate), and
         // CodeRabbit findings still repaired while it waits.
-        crate::worktree::PrCiStatus::AwaitingReview { number, labels } => handle_ci_green(
+        crate::worktree::PrCiStatus::AwaitingReview {
+            number,
+            labels,
+            changes_requested,
+        } => handle_ci_green(
             mcp,
             queue,
             auth_conn,
@@ -1597,7 +1601,7 @@ fn handle_pr_status(
             item,
             number,
             &labels,
-            CiGreenMerge::BlockedOnReview,
+            CiGreenMerge::BlockedOnReview { changes_requested },
             label_id_by_name,
             folder_path,
             repo_root,
