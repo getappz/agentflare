@@ -260,12 +260,16 @@ impl AgentflareMcp {
             })
             .to_string());
         }
+        // Compare-and-set on the PR just verified merged (same fence as
+        // `item_check_merge`): a redispatch + new PR landing during that
+        // network check must not complete the item off the old one.
         let promoted = self.promote_forced(
             item_id,
             owner,
             crate::claims::now(),
             reason,
             forced.is_some(),
+            crate::worktree::pr_number_from_metadata(item),
         )?;
         if promoted {
             crate::worktree::cleanup_worktree(item, &repo_root);
@@ -279,6 +283,9 @@ impl AgentflareMcp {
     /// merged: takes the claim, promotes to completed, and -- unless
     /// `force_takeover` already audited this call (`already_audited`) --
     /// posts the audit comment, so no forced promotion is silent.
+    /// `expected_pr` is the PR number (from the item the merge check read)
+    /// that was confirmed merged; the promotion is a no-op unless the item
+    /// still tracks that same PR.
     pub(super) fn promote_forced(
         &self,
         item_id: &str,
@@ -286,8 +293,11 @@ impl AgentflareMcp {
         now: i64,
         reason: &str,
         already_audited: bool,
+        expected_pr: Option<u64>,
     ) -> Result<bool, ErrorData> {
         self.with_backend_db(|conn| {
+            let held_before = agentflare_backend::claim::is_owner(conn, item_id, owner)
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
             // `force_takeover` already moved any live foreign claim to us;
             // this covers an item with no live claim at all.
             if let agentflare_backend::claim::Acquire::Held { owner: other, .. } =
@@ -307,8 +317,18 @@ impl AgentflareMcp {
                     None,
                 ));
             }
-            let promoted = agentflare_backend::item::mark_completed_forced(conn, item_id, owner)
-                .map_err(map_backend_err)?;
+            let promoted = agentflare_backend::item::mark_completed_forced_if_pr(
+                conn,
+                item_id,
+                owner,
+                expected_pr,
+            )
+            .map_err(map_backend_err)?;
+            if !promoted && !held_before {
+                // Don't strand the lease this call just took on an item it
+                // declined to complete (e.g. the PR changed under us).
+                let _ = agentflare_backend::claim::release(conn, item_id, owner);
+            }
             if promoted {
                 if !already_audited {
                     let body = format!(

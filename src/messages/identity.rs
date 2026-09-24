@@ -194,17 +194,9 @@ pub fn mcp_key(conn: &Connection, now: i64) -> String {
     if let Some(pid) = agent_pid()
         && let Ok(Some(key)) = live_session_by_pid(conn, pid, &provisional)
     {
-        if sessions::get(conn, &provisional)
-            .ok()
-            .flatten()
-            .is_some_and(|s| s.ended_at.is_none())
-        {
-            let _ = crate::messages::reroute_undelivered(conn, &provisional, &key);
-            // Forget, don't `end`: the provisional key is also this live
-            // MCP server's claim owner, and an ended row reads as
-            // `Liveness::Dead` -- claim liveness would release its claims.
-            let _ = sessions::forget(conn, &provisional);
-        }
+        // Best effort: on failure the provisional row survives, so the next
+        // `mcp_key` call retries the adoption.
+        let _ = adopt_provisional(conn, &provisional, &key);
         return key;
     }
     let cwd = std::env::current_dir()
@@ -212,6 +204,26 @@ pub fn mcp_key(conn: &Connection, now: i64) -> String {
         .map(|p| p.to_string_lossy().into_owned());
     let _ = touch_hook_session(conn, &provisional, cwd.as_deref(), false, now);
     provisional
+}
+
+/// Moves a still-live provisional session's undelivered mail to `key` and
+/// forgets the provisional row, atomically (one IMMEDIATE transaction).
+/// Separately, a failed reroute followed by a successful forget stranded
+/// the mail in a mailbox nobody reads, with no row left to retry from; now
+/// any failure rolls both back, keeping the provisional row so a later
+/// `mcp_key` retries. Returns whether a provisional row was adopted.
+fn adopt_provisional(conn: &Connection, provisional: &str, key: &str) -> rusqlite::Result<bool> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    if !sessions::get(&tx, provisional)?.is_some_and(|s| s.ended_at.is_none()) {
+        return Ok(false);
+    }
+    crate::messages::reroute_undelivered(&tx, provisional, key)?;
+    // Forget, don't `end`: the provisional key is also this live MCP
+    // server's claim owner, and an ended row reads as `Liveness::Dead` --
+    // claim liveness would release its claims.
+    sessions::forget(&tx, provisional)?;
+    tx.commit()?;
+    Ok(true)
 }
 
 /// The sender key for a CLI invocation: the agent session it runs inside
@@ -267,6 +279,63 @@ mod tests {
     fn this_process_has_a_parent_on_linux() {
         #[cfg(target_os = "linux")]
         assert!(parent_of(std::process::id()).is_some());
+    }
+
+    #[test]
+    fn adopt_provisional_rolls_back_when_the_reroute_fails() {
+        let c = Connection::open_in_memory().unwrap();
+        sessions::migrate(&c).unwrap();
+        crate::messages::migrate(&c).unwrap();
+        let touch = |key| {
+            sessions::touch(
+                &c,
+                &Touch {
+                    key,
+                    pid: Some(std::process::id()),
+                    ..Default::default()
+                },
+                100,
+            )
+            .unwrap();
+        };
+        touch("agent:provisional");
+        touch("claude-code:sess-1");
+        c.execute(
+            "INSERT INTO agent_messages (from_key, to_key, to_address, body, created_at)
+             VALUES ('x:1', 'agent:provisional', 'agent:provisional', 'early', 100)",
+            [],
+        )
+        .unwrap();
+
+        // Make the reroute UPDATE fail.
+        c.execute_batch(
+            "CREATE TRIGGER fail_reroute BEFORE UPDATE ON agent_messages
+             BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+        )
+        .unwrap();
+        assert!(adopt_provisional(&c, "agent:provisional", "claude-code:sess-1").is_err());
+        assert!(
+            sessions::get(&c, "agent:provisional").unwrap().is_some(),
+            "provisional row kept so a later mcp_key retries"
+        );
+        assert_eq!(
+            crate::messages::inbox(&c, "agent:provisional", true, 10)
+                .unwrap()
+                .len(),
+            1,
+            "mail stays where the retry can find it"
+        );
+
+        // The retry succeeds once the reroute can.
+        c.execute_batch("DROP TRIGGER fail_reroute;").unwrap();
+        assert!(adopt_provisional(&c, "agent:provisional", "claude-code:sess-1").unwrap());
+        assert!(sessions::get(&c, "agent:provisional").unwrap().is_none());
+        assert_eq!(
+            crate::messages::inbox(&c, "claude-code:sess-1", true, 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

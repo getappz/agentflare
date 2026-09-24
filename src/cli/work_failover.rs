@@ -239,14 +239,27 @@ fn handle_agent_exhaustion(
     })
 }
 
-/// Releases `item_id`'s claim; whether that succeeded.
+/// Releases `item_id`'s claim; whether the claim was actually released.
+/// `item_release` answers `Ok({"released": false, ..})` when the release
+/// was a no-op (no row affected), so an `Ok` alone is not proof -- the
+/// caller disarms its `ClaimGuard` on this, and a false positive would
+/// leave the claim held with nothing left to release it.
 fn release_claim(mcp: &AgentflareMcp, item_id: &str) -> bool {
     mcp.item_release(ItemRequest {
         action: "release".into(),
         id: Some(item_id.to_string()),
         ..Default::default()
     })
-    .is_ok()
+    .is_ok_and(|resp| release_response_released(&resp))
+}
+
+/// Whether an `item_release` response reports `"released": true`. Anything
+/// else (`false`, missing, unparseable) counts as not released.
+fn release_response_released(resp: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(resp)
+        .ok()
+        .and_then(|v| v.get("released").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
 }
 
 /// Before a daemon job claims anything: if the agent it would run is
