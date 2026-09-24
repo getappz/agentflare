@@ -18,10 +18,6 @@ pub use db_kit::claim::Acquire;
 use db_kit::claim::ClaimLedger;
 use rusqlite::{Connection, OptionalExtension, params};
 
-/// Default lease: a claim whose owner hasn't heartbeat within this window is
-/// stealable, so a crashed/hung agent can't wedge a target forever.
-const DEFAULT_TTL_SECS: u64 = 1800; // 30 min
-
 const LEDGER: ClaimLedger = ClaimLedger::new("claims", &["repo", "target"]);
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
@@ -424,11 +420,12 @@ pub fn agent_of(owner_id: &str) -> &str {
     owner_id.split(':').next().unwrap_or(owner_id)
 }
 
+/// Default lease (30 min, `AGENTFLARE_CLAIM_TTL_SECS` overrides): a claim
+/// whose owner hasn't heartbeat within this window is stealable, so a
+/// crashed/hung agent can't wedge a target forever. Same value the backend
+/// crate applies to item claims.
 pub fn ttl_secs() -> i64 {
-    std::env::var("AGENTFLARE_CLAIM_TTL_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_TTL_SECS) as i64
+    agentflare_backend::claim::default_ttl_secs()
 }
 
 /// When an item's `assignee_agent` is updated to a different agent, release
@@ -516,75 +513,6 @@ mod tests {
     }
 
     const TTL: i64 = 1800;
-
-    #[test]
-    fn acquire_free_target_then_held_by_other() {
-        let c = mem();
-        assert_eq!(
-            acquire(&c, "o/r", "issue#1", "a:1", None, None, 1000, TTL).unwrap(),
-            Acquire::Acquired
-        );
-        match acquire(&c, "o/r", "issue#1", "b:2", None, None, 1001, TTL).unwrap() {
-            Acquire::Held { owner, .. } => assert_eq!(owner, "a:1"),
-            other => panic!("expected Held, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn reacquiring_own_live_claim_is_idempotent_and_refreshes_heartbeat() {
-        let c = mem();
-        acquire(&c, "o/r", "issue#1", "a:1", None, None, 1000, TTL).unwrap();
-        assert_eq!(
-            acquire(&c, "o/r", "issue#1", "a:1", None, None, 1500, TTL).unwrap(),
-            Acquire::Acquired
-        );
-        let hb: i64 = c
-            .query_row("SELECT heartbeat_at FROM claims", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(hb, 1500, "own re-acquire should refresh heartbeat");
-    }
-
-    #[test]
-    fn stale_claim_is_stealable_but_fresh_one_is_not() {
-        let c = mem();
-        acquire(&c, "o/r", "issue#1", "a:1", None, None, 1000, TTL).unwrap();
-        // Well within TTL — cannot steal.
-        assert!(matches!(
-            acquire(&c, "o/r", "issue#1", "b:2", None, None, 1000 + 100, TTL).unwrap(),
-            Acquire::Held { .. }
-        ));
-        // Past the TTL — steal succeeds and ownership transfers.
-        assert_eq!(
-            acquire(&c, "o/r", "issue#1", "b:2", None, None, 1000 + TTL + 1, TTL).unwrap(),
-            Acquire::Acquired
-        );
-        let owner: String = c
-            .query_row("SELECT owner FROM claims", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(owner, "b:2");
-    }
-
-    #[test]
-    fn done_target_is_reacquirable_by_anyone() {
-        let c = mem();
-        acquire(&c, "o/r", "issue#1", "a:1", None, None, 1000, TTL).unwrap();
-        assert!(done(&c, "o/r", "issue#1", "a:1", 1100).unwrap());
-        assert_eq!(
-            acquire(&c, "o/r", "issue#1", "b:2", None, None, 1200, TTL).unwrap(),
-            Acquire::Acquired
-        );
-    }
-
-    #[test]
-    fn heartbeat_release_done_are_owner_scoped() {
-        let c = mem();
-        acquire(&c, "o/r", "issue#1", "a:1", None, None, 1000, TTL).unwrap();
-        assert!(!heartbeat(&c, "o/r", "issue#1", "b:2", 1100).unwrap());
-        assert!(!release(&c, "o/r", "issue#1", "b:2").unwrap());
-        assert!(!done(&c, "o/r", "issue#1", "b:2", 1100).unwrap());
-        assert!(heartbeat(&c, "o/r", "issue#1", "a:1", 1100).unwrap());
-        assert!(release(&c, "o/r", "issue#1", "a:1").unwrap());
-    }
 
     #[test]
     fn list_hides_stale_and_done_unless_requested() {

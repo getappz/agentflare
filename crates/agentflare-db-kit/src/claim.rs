@@ -356,7 +356,8 @@ mod tests {
         (conn, ClaimLedger::new("test_single", &["id"]))
     }
 
-    // --- ported verbatim (behaviorally) from src/claims.rs's composite-key tests ---
+    // --- ported (behaviorally) from src/claims.rs's composite-key tests, which now
+    // rely on these instead of keeping their own copies ---
 
     #[test]
     fn acquire_free_target_then_held_by_other() {

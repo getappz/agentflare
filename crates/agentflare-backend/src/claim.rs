@@ -57,9 +57,8 @@ pub fn is_owner(conn: &Connection, item_id: &str, owner: &str) -> rusqlite::Resu
     LEDGER.is_owner(conn, &[item_id], owner)
 }
 
-/// Default claim TTL, mirrored from the main binary's `claims::ttl_secs()`
-/// (this lower-level crate can't depend on it) — override via
-/// AGENTFLARE_CLAIM_TTL_SECS so the two stay in sync.
+/// Default claim TTL (override via AGENTFLARE_CLAIM_TTL_SECS) -- the single
+/// source of truth; the main binary's `claims::ttl_secs()` delegates here.
 pub fn default_ttl_secs() -> i64 {
     std::env::var("AGENTFLARE_CLAIM_TTL_SECS")
         .ok()

@@ -33,23 +33,18 @@ fn handoff_depth(existing: &str) -> u64 {
 
 /// Merges `handoff_depth` into existing metadata JSON, preserving other keys.
 fn merge_handoff_depth(existing: &str, depth: u64) -> String {
-    let mut merged = serde_json::from_str::<serde_json::Value>(existing)
-        .ok()
-        .and_then(|v| v.as_object().cloned())
-        .map(serde_json::Value::Object)
-        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
-    merged[HANDOFF_DEPTH_KEY] = serde_json::Value::from(depth);
-    merged.to_string()
+    let mut merged = crate::mcp_server::metadata_object(existing);
+    merged.insert(HANDOFF_DEPTH_KEY.into(), serde_json::Value::from(depth));
+    serde_json::Value::Object(merged).to_string()
 }
 
 fn merge_task_type(existing: &str, task_type: &str) -> String {
-    let mut merged = serde_json::from_str::<serde_json::Value>(existing)
-        .ok()
-        .and_then(|v| v.as_object().cloned())
-        .map(serde_json::Value::Object)
-        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
-    merged["task_type"] = serde_json::Value::String(task_type.to_string());
-    merged.to_string()
+    let mut merged = crate::mcp_server::metadata_object(existing);
+    merged.insert(
+        "task_type".into(),
+        serde_json::Value::String(task_type.to_string()),
+    );
+    serde_json::Value::Object(merged).to_string()
 }
 
 impl AgentflareMcp {
@@ -428,18 +423,9 @@ impl AgentflareMcp {
                         if let Some(t) = &thread_id
                             && !metadata_str.contains("\"thread\"")
                         {
-                            metadata_str = {
-                                let mut v =
-                                    serde_json::from_str::<serde_json::Value>(&metadata_str)
-                                        .ok()
-                                        .and_then(|v| v.as_object().cloned())
-                                        .map(serde_json::Value::Object)
-                                        .unwrap_or_else(|| {
-                                            serde_json::Value::Object(Default::default())
-                                        });
-                                v["thread"] = serde_json::Value::String(t.clone());
-                                v.to_string()
-                            };
+                            let mut v = crate::mcp_server::metadata_object(&metadata_str);
+                            v.insert("thread".into(), serde_json::Value::String(t.clone()));
+                            metadata_str = serde_json::Value::Object(v).to_string();
                         }
                         agentflare_backend::item::update(
                             conn,

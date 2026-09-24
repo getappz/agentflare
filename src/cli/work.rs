@@ -519,12 +519,7 @@ pub(crate) fn release_and_comment(
         ..Default::default()
     });
     let comment_body = format!("## agentflare work — failed\n\n{reason}");
-    let _ = mcp.comment_impl(CommentRequest {
-        action: "create".into(),
-        item_id: Some(item_id.into()),
-        body: Some(comment_body.clone()),
-        ..Default::default()
-    });
+    mcp.post_item_comment(item_id, &comment_body);
     if let Some(recipient) = notify_recipient {
         notify(recipient, &comment_body, item_id);
     }

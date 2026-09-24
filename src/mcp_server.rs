@@ -14,6 +14,7 @@ mod flare_git;
 mod handoff;
 pub(crate) mod item;
 mod item_doctor;
+mod item_reports;
 mod item_status;
 mod memory_tool;
 mod message;
@@ -67,10 +68,7 @@ pub(crate) fn merge_item_metadata(
 ) -> agentflare_backend::error::Result<agentflare_backend::item::Item> {
     in_immediate_tx(conn, agentflare_backend::error::Error::from, || {
         let current = agentflare_backend::item::get(conn, item_id)?;
-        let mut map = serde_json::from_str::<serde_json::Value>(&current.metadata)
-            .ok()
-            .and_then(|v| v.as_object().cloned())
-            .unwrap_or_default();
+        let mut map = metadata_object(&current.metadata);
         merge(&mut map);
         agentflare_backend::item::update(
             conn,
@@ -81,6 +79,15 @@ pub(crate) fn merge_item_metadata(
             },
         )
     })
+}
+
+/// Parses an item's metadata JSON string as an object map. Non-object (or
+/// unparseable) metadata is treated as `{}`, same as `merge_item_metadata`.
+pub(crate) fn metadata_object(metadata: &str) -> serde_json::Map<String, serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(metadata)
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
 }
 
 /// Runs `f` inside a `BEGIN IMMEDIATE` transaction on `conn`, committing on
@@ -890,6 +897,18 @@ impl AgentflareMcp {
         }
     }
 
+    /// Posts `body` as a comment on `item_id`, best-effort: a failed write is
+    /// dropped, same as the `let _ = comment_impl(..)` it replaces -- used for
+    /// status notes where the caller's own outcome must not hinge on it.
+    pub(crate) fn post_item_comment(&self, item_id: &str, body: impl Into<String>) {
+        let _ = self.comment_impl(CommentRequest {
+            action: "create".into(),
+            item_id: Some(item_id.to_string()),
+            body: Some(body.into()),
+            ..Default::default()
+        });
+    }
+
     /// Records why a completed item with real commits has no PR (a repo with
     /// no origin, a non-GitHub remote, or no GitHub credentials): a
     /// `metadata.no_pr` entry plus one comment, so the completion is never
@@ -916,15 +935,13 @@ impl AgentflareMcp {
         } else {
             "The commits stay on the item's local branch"
         };
-        let _ = self.comment_impl(CommentRequest {
-            action: "create".into(),
-            item_id: Some(item_id.to_string()),
-            body: Some(format!(
+        self.post_item_comment(
+            item_id,
+            format!(
                 "## agentflare work — completed without a PR\n\nNo pull request can be opened \
                  for this repository ({reason}). {where_}; marked completed without review."
-            )),
-            ..Default::default()
-        });
+            ),
+        );
     }
 
     /// A view of this instance pinned to one already-known project and its

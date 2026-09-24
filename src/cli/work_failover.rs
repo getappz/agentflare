@@ -92,12 +92,7 @@ fn end_stopped_run(
         "{}\n\nworkflow run {what} on request -- not retrying. {how}.",
         crate::dispatch_failure_ceiling::STOPPED_ON_REQUEST_MARKER
     );
-    let _ = mcp.comment_impl(CommentRequest {
-        action: "create".into(),
-        item_id: Some(item_id.into()),
-        body: Some(body),
-        ..Default::default()
-    });
+    mcp.post_item_comment(item_id, body);
     let _ = writeln!(log, "{what}: {item_id}");
     WorkOutcome {
         exit_code: 1,
@@ -214,12 +209,7 @@ fn handle_agent_exhaustion(
         agent.as_str(),
         tail_str(msg, DIAGNOSTIC_TAIL_CHARS)
     );
-    let _ = mcp.comment_impl(CommentRequest {
-        action: "create".into(),
-        item_id: Some(item.id.clone()),
-        body: Some(body.clone()),
-        ..Default::default()
-    });
+    mcp.post_item_comment(&item.id, &body);
     if let Some(recipient) = notify_recipient {
         notify(recipient, &body, &item.id);
     }
