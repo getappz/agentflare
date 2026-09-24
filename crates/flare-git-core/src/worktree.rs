@@ -41,6 +41,7 @@ static WORKTREE_ADD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub fn is_retryable_worktree_race(err: &str) -> bool {
     let e = err.to_lowercase();
     e.contains("missing but already registered")
+        || e.contains("missing but locked")
         || e.contains("already registered")
         || e.contains("could not lock")
         || e.contains("unable to lock")
@@ -237,6 +238,36 @@ fn adopt_existing_checkout(worktree_path: &Path, branch: &str, label: &str) -> R
     })
 }
 
+/// Reason recorded by [`lock_item_worktree`]; registrations locked with it
+/// are ours to clean up, any other lock is someone's deliberate pin.
+const AGENTFLARE_LOCK_REASON: &str = "agentflare: in use by work item";
+
+/// `git worktree lock`s a claimed item's worktree so nothing outside this
+/// process (a human's `git worktree prune`, `gc`'s own pruning, another
+/// tool) drops its registration while an agent works in it. Idempotent.
+fn lock_item_worktree(repo_root: &Path, worktree_path: &Path) {
+    let path = worktree_path.to_string_lossy().to_string();
+    let _ = run_git_in(
+        repo_root,
+        &[
+            "worktree",
+            "lock",
+            "--reason",
+            AGENTFLARE_LOCK_REASON,
+            &path,
+        ],
+    );
+}
+
+/// Whether a registration's `locked` file is absent or was written by
+/// [`lock_item_worktree`] -- i.e. whether our own cleanup may remove it.
+fn lock_is_ours_or_absent(admin: &Path) -> bool {
+    match std::fs::read_to_string(admin.join("locked")) {
+        Ok(reason) => reason.trim() == AGENTFLARE_LOCK_REASON,
+        Err(_) => true,
+    }
+}
+
 /// `true` when `worktree_path`'s registration still carries the
 /// "initializing" lock `git worktree add` holds while it populates a new
 /// checkout, and is old enough that no add can still be in flight -- the
@@ -282,8 +313,13 @@ fn resolve_gitdir_pointer(base_dir: &Path, raw: &str) -> PathBuf {
 }
 
 pub fn resolve_target_branch(conn: &rusqlite::Connection, item: &Item, repo_root: &Path) -> String {
+    // A finished parent's branch has landed (or been abandoned): basing new
+    // work on it would carry its pre-squash commits into this item's PR and
+    // conflict on every later rebase onto the default branch.
     if let Some(ref parent_id) = item.parent_id
         && let Ok(parent) = agentflare_backend::item::get(conn, parent_id)
+        && !agentflare_backend::state::get(conn, &parent.state_id)
+            .is_ok_and(|st| matches!(st.group_name.as_str(), "completed" | "cancelled"))
         && let Ok(meta) = serde_json::from_str::<serde_json::Value>(&parent.metadata)
         && let Some(branch) = meta.get("branch").and_then(|v| v.as_str())
     {
@@ -660,6 +696,7 @@ pub fn create_worktree(
         // and re-warn since the ambient env can still be shadowing it.
         warn_if_ambient_target_dir();
         isolate_worktree_target_dir(&worktree_path);
+        lock_item_worktree(repo_root, &worktree_path);
         return Ok(worktree_path);
     }
     // Never silently proceed over an existing checkout holding uncommitted
@@ -698,6 +735,7 @@ pub fn create_worktree(
             })?;
             warn_if_ambient_target_dir();
             isolate_worktree_target_dir(&worktree_path);
+            lock_item_worktree(repo_root, &worktree_path);
             return Ok(worktree_path);
         }
     }
@@ -881,6 +919,7 @@ pub fn create_worktree(
                     p.send(1.0, Some(1.0), Some("Worktree created".into()));
                 }
                 isolate_worktree_target_dir(&worktree_path);
+                lock_item_worktree(repo_root, &worktree_path);
                 return Ok(worktree_path);
             }
             Err(e) => {
@@ -932,7 +971,7 @@ fn remove_stale_registration_for(repo_root: &Path, branch: &str) -> bool {
         }
         // Does this registration claim our branch?
         let head = std::fs::read_to_string(admin.join("HEAD")).unwrap_or_default();
-        if head.trim() != wanted_head || admin.join("locked").exists() {
+        if head.trim() != wanted_head || !lock_is_ours_or_absent(&admin) {
             continue;
         }
         // `gitdir` holds "<checkout>/.git" -- its parent is the checkout.
@@ -983,7 +1022,7 @@ fn remove_stale_registration_for_path(repo_root: &Path, worktree_path: &Path) ->
         }
         // Never touch a locked registration (`git worktree lock` pins the
         // entry on purpose — e.g. portable/network paths).
-        if admin.join("locked").exists() {
+        if !lock_is_ours_or_absent(&admin) {
             continue;
         }
         let gitdir = std::fs::read_to_string(admin.join("gitdir")).unwrap_or_default();
@@ -1012,7 +1051,7 @@ fn remove_stale_registration_for_path(repo_root: &Path, worktree_path: &Path) ->
             .map(std::path::Path::to_path_buf)
             .as_deref()
             == Some(worktree_path);
-        if !still_ours || admin.join("locked").exists() {
+        if !still_ours || !lock_is_ours_or_absent(&admin) {
             continue;
         }
         if std::fs::remove_dir_all(&admin).is_ok() {
@@ -1574,6 +1613,8 @@ pub fn gc_orphans(repo_root: &Path, names: &[String]) -> Vec<String> {
             );
             continue;
         }
+        let path = worktree_path.to_string_lossy().to_string();
+        let _ = run_git_in(repo_root, &["worktree", "unlock", &path]);
         if remove_worktree_dir(&worktree_path, name) {
             // Scoped to this path, never a repo-wide `worktree prune`: prune
             // also drops registrations of other worktrees whose gitdir merely

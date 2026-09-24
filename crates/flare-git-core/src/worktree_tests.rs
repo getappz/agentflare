@@ -1598,7 +1598,9 @@ fn create_worktree_recreates_a_half_created_checkout() {
 
     create_worktree(&item, &repo.path, "master", None).unwrap();
     assert!(
-        !locked.exists(),
+        !std::fs::read_to_string(&locked)
+            .unwrap_or_default()
+            .contains("initializing"),
         "the half-created registration must be replaced"
     );
     let status = run_git_in(&wt, &["status", "--porcelain"]).unwrap();
@@ -1777,4 +1779,61 @@ fn retryable_worktree_race_matches_real_git_lock_messages() {
     assert!(is_retryable_worktree_race(
         "fatal: Unable to create '/r/.git/index.lock': File exists."
     ));
+}
+
+#[test]
+fn create_worktree_locks_the_worktree_and_cleanup_still_removes_it() {
+    let repo = init_repo();
+    let item = test_item(1);
+    let wt = create_worktree(&item, &repo.path, "master", None).unwrap();
+    let locked = worktree_git_path(&wt, "locked").unwrap();
+    assert!(
+        locked.exists(),
+        "a claimed worktree must be locked against outside prunes"
+    );
+    run_git_in(&repo.path, &["worktree", "prune"]).unwrap();
+    assert!(cleanup_item_worktree(&item, &repo.path));
+    let list = run_git_in(&repo.path, &["worktree", "list", "--porcelain"]).unwrap();
+    assert!(
+        !list.contains(".worktrees/task/1"),
+        "registration must be gone too: {list}"
+    );
+    // And the item can be claimed again afterwards.
+    create_worktree(&item, &repo.path, "master", None).unwrap();
+}
+
+#[test]
+fn create_worktree_recovers_when_its_own_locked_worktree_dir_vanished() {
+    let repo = init_repo();
+    let item = test_item(1);
+    let wt = create_worktree(&item, &repo.path, "master", None).unwrap();
+    std::fs::remove_dir_all(&wt).unwrap();
+    create_worktree(&item, &repo.path, "master", None)
+        .expect("our own lock must not wedge a re-claim after the directory was removed");
+}
+
+#[test]
+fn git_children_get_english_non_interactive_env() {
+    let mut cmd = std::process::Command::new("true");
+    crate::shell::apply_filtered_path(&mut cmd);
+    let envs: std::collections::HashMap<_, _> = cmd
+        .get_envs()
+        .map(|(k, v)| {
+            (
+                k.to_string_lossy().to_string(),
+                v.map(|v| v.to_string_lossy().to_string()),
+            )
+        })
+        .collect();
+    assert_eq!(envs.get("LC_MESSAGES"), Some(&Some("C".to_string())));
+    assert_eq!(
+        envs.get("LC_ALL"),
+        Some(&None),
+        "LC_ALL must be removed so LC_MESSAGES applies"
+    );
+    assert_eq!(
+        envs.get("GIT_TERMINAL_PROMPT"),
+        Some(&Some("0".to_string()))
+    );
+    assert_eq!(envs.get("GIT_OPTIONAL_LOCKS"), Some(&Some("0".to_string())));
 }
