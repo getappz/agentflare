@@ -669,7 +669,9 @@ fn update_with_unrelated_metadata_does_not_erase_an_existing_approval() {
     // Mirrors `persist_run_id`'s own shape: read-current, patch in one
     // unrelated key, write the whole object back.
     let conn = backend_conn(&tmp);
-    let current = agentflare_backend::item::get(&conn, &item_id).unwrap().metadata;
+    let current = agentflare_backend::item::get(&conn, &item_id)
+        .unwrap()
+        .metadata;
     drop(conn);
     let mut merged: serde_json::Value = serde_json::from_str(&current).unwrap();
     merged["workflow_run_id"] = serde_json::json!("01a0b3ad-test-run");
@@ -790,7 +792,9 @@ fn update_attaching_a_new_plan_asset_id_after_rejection_clears_the_stale_reason(
     assert_eq!(metadata["plan_status"], "pending");
     assert_eq!(metadata["plan_asset_id"], "asset-2-revised");
     assert!(
-        metadata.get("plan_rejection_reason").is_none_or(|v| v.is_null()),
+        metadata
+            .get("plan_rejection_reason")
+            .is_none_or(|v| v.is_null()),
         "a resubmission must clear the previous rejection reason: {metadata}"
     );
 }

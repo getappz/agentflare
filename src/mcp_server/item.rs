@@ -261,8 +261,8 @@ fn merge_submitted_plan(
         None => base,
     };
     let gate = agentflare_backend::item::plan_gate::read_plan_gate(&with_field);
-    let current_asset_id = agentflare_backend::item::plan_gate::read_plan_gate(current_metadata)
-        .plan_asset_id;
+    let current_asset_id =
+        agentflare_backend::item::plan_gate::read_plan_gate(current_metadata).plan_asset_id;
     let is_new_submission = gate.plan_asset_id.is_some() && gate.plan_asset_id != current_asset_id;
     Some(
         if gate.plan_asset_id.is_some() && (gate.plan_status.is_none() || is_new_submission) {
