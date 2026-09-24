@@ -281,11 +281,17 @@ impl AgentflareMcp {
         // `worktree::create_worktree`, which is what actually spawns that
         // command).
         let folder_path = dunce::canonicalize(&repo_root).unwrap_or(repo_root);
-        let _ = agentflare_backend::project_dir::upsert(
+        if let Err(e) = agentflare_backend::project_dir::upsert(
             conn,
             project_id,
             &folder_path.to_string_lossy(),
             crate::claims::now(),
-        );
+        ) {
+            eprintln!(
+                "agentflare: refusing to register project_dir for project {project_id} at \
+                 {} -- {e}",
+                folder_path.display()
+            );
+        }
     }
 }

@@ -235,7 +235,7 @@ fn item_comment_edit_succeeds_across_sessions_of_same_agent() {
 }
 
 #[test]
-fn item_comment_edit_uses_id_tiebreak_when_timestamps_collide() {
+fn item_comment_edit_uses_insertion_order_tiebreak_when_timestamps_collide() {
     let (_tmp, s) = harness();
     let created: serde_json::Value =
         serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
@@ -265,14 +265,10 @@ fn item_comment_edit_uses_id_tiebreak_when_timestamps_collide() {
     .unwrap();
     let second_id = second["id"].as_str().unwrap().to_string();
 
-    // ID tiebreak: nanoid is random, so determine "latest" at runtime.
-    let (lower_id, higher_id) = if first_id > second_id {
-        (second_id, first_id)
-    } else {
-        (first_id, second_id)
-    };
-
-    // Force both comments onto the same second-resolution timestamp.
+    // Force both comments onto the same second-resolution timestamp -- the
+    // tiebreak must still resolve to true insertion order (SQLite's implicit
+    // `rowid`), not the comments' own random nanoid `id`s, which carry no
+    // ordering information at all.
     s.with_backend_db(|conn| {
         conn.execute(
             "UPDATE item_comments SET created_at = 1000, updated_at = 1000",
@@ -285,7 +281,7 @@ fn item_comment_edit_uses_id_tiebreak_when_timestamps_collide() {
     let err = s
         .comment(Parameters(CommentRequest {
             action: "edit".into(),
-            id: Some(lower_id),
+            id: Some(first_id),
             body: Some("edited".into()),
             ..Default::default()
         }))
@@ -295,7 +291,7 @@ fn item_comment_edit_uses_id_tiebreak_when_timestamps_collide() {
     let updated: serde_json::Value = serde_json::from_str(
         &s.comment(Parameters(CommentRequest {
             action: "edit".into(),
-            id: Some(higher_id),
+            id: Some(second_id),
             body: Some("edited".into()),
             ..Default::default()
         }))
