@@ -1115,13 +1115,7 @@ fn run_or_resume_with_sender_discards_a_workflow_run_id_that_belongs_to_a_differ
 
     // Simulate the bug: item A's metadata carries item B's run id (a stale
     // copy, or a race in `persist_run_id` -- either way, not item A's own).
-    persist_run_id(
-        &mcp,
-        &item_a.id,
-        &serde_json::Value::Object(Default::default()),
-        foreign_run_id,
-    )
-    .unwrap();
+    persist_run_id(&mcp, &item_a.id, foreign_run_id).unwrap();
 
     let seen_cwds: Arc<std::sync::Mutex<Vec<Option<std::path::PathBuf>>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1275,9 +1269,22 @@ fn persist_run_id_recovers_from_non_object_existing_metadata() {
     let mcp = Arc::new(mcp);
 
     let double_encoded = serde_json::Value::String(r#"{"size": "M"}"#.to_string());
+    mcp.with_backend_db(|conn| {
+        agentflare_backend::item::update(
+            conn,
+            &item_id,
+            agentflare_backend::item::UpdateItem {
+                metadata: Some(double_encoded.to_string()),
+                ..Default::default()
+            },
+        )
+    })
+    .unwrap()
+    .unwrap();
+
     let run_id = flare_workflow::WorkflowRunId::new();
 
-    let result = persist_run_id(&mcp, &item_id, &double_encoded, run_id);
+    let result = persist_run_id(&mcp, &item_id, run_id);
     assert!(result.is_ok(), "{result:?}");
 
     let updated = mcp
