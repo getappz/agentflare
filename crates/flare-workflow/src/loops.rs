@@ -57,6 +57,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
 
             let state = self.state_store.load(run_id).await?;
             let mut context = state.context.clone();
+            self.apply_data_patch(run_id, &mut context.data);
             context.input = state.input.clone();
             context.variables = state.variables.clone();
             context.output.clear();
@@ -141,6 +142,9 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                     self.state_store
                         .update(run_id, |s| {
                             s.context = context.clone();
+                            // See the matching write-back in
+                            // `execute_step_with_retry`.
+                            self.apply_data_patch(run_id, &mut s.context.data);
                             s.input = out.clone();
                             s.output = Some(out.clone());
                             if let Some(var) = step.output_var.as_deref() {

@@ -235,7 +235,17 @@ pub fn run_captured_for_job(
     // native `.exe` hides cleanly. The decision is per-agent, made by
     // `run_headless` (the only production caller) from the resolved binary's
     // extension — see its `#[cfg(windows)] creation_flags` block.
+    let record_dir = cmd
+        .get_current_dir()
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok());
     let mut child = cmd.spawn()?;
+    // Removed again when this function returns (child reaped); left behind
+    // only if this whole process dies first -- exactly the case
+    // `orphan_reconcile` needs it for.
+    let _pid_record = record_dir
+        .as_deref()
+        .and_then(|dir| AgentPidRecord::write(dir, child.id()));
 
     if let Some(text) = stdin {
         let mut pipe = child.stdin.take().expect("stdin piped above");
@@ -352,6 +362,129 @@ pub fn run_captured(
     stdin: Option<&str>,
 ) -> std::io::Result<Captured> {
     run_captured_for_job(cmd, hard_cap, idle_timeout, stdin, None)
+}
+
+/// Where agent CLIs launched with `worktree` as their cwd record their pid
+/// (one file per live child, named by pid). Lets the next daemon find and
+/// kill a child that outlived a daemon crash: outside the Linux bwrap path
+/// the worktree appears nowhere in the child's argv (its prompt is on stdin
+/// and the path is only its cwd), so a command-line match can't see it.
+/// Keyed by a stable hash of the canonical path, not std's `DefaultHasher`,
+/// so a different (upgraded) binary computes the same directory.
+pub(crate) fn agent_pid_dir(worktree: &Path) -> std::path::PathBuf {
+    let canonical = std::fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in canonical.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    crate::state::state_dir()
+        .join("agent-pids")
+        .join(format!("{hash:016x}"))
+}
+
+/// One launched agent child's pid record (see `agent_pid_dir`), removed on
+/// drop.
+struct AgentPidRecord {
+    path: std::path::PathBuf,
+}
+
+impl AgentPidRecord {
+    /// Best-effort: failing to record only costs the orphan sweep its
+    /// fallback, never the launch itself.
+    fn write(worktree: &Path, pid: u32) -> Option<Self> {
+        let dir = agent_pid_dir(worktree);
+        std::fs::create_dir_all(&dir).ok()?;
+        let path = dir.join(pid.to_string());
+        let start = process_start_token(pid).unwrap_or_default();
+        std::fs::write(&path, format!("{pid}\n{start}\n")).ok()?;
+        Some(Self { path })
+    }
+}
+
+impl Drop for AgentPidRecord {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// A launched agent child recorded under `agent_pid_dir(worktree)`: its pid
+/// (also its process-group id on Unix, see `process_group(0)` in
+/// `run_captured_for_job`) and the start-time token captured at launch, if
+/// one could be read.
+pub(crate) struct RecordedAgentPid {
+    pub pid: u32,
+    pub start_token: Option<String>,
+    pub record_path: std::path::PathBuf,
+}
+
+pub(crate) fn recorded_agent_pids(worktree: &Path) -> Vec<RecordedAgentPid> {
+    let Ok(entries) = std::fs::read_dir(agent_pid_dir(worktree)) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let record_path = entry.path();
+            let content = std::fs::read_to_string(&record_path).ok()?;
+            let mut lines = content.lines();
+            let pid = lines.next()?.trim().parse::<u32>().ok()?;
+            let start_token = lines
+                .next()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string);
+            Some(RecordedAgentPid {
+                pid,
+                start_token,
+                record_path,
+            })
+        })
+        .collect()
+}
+
+/// An opaque token identifying *this incarnation* of `pid` -- its start
+/// time -- so a recorded pid the OS has since handed to an unrelated process
+/// can be told apart from the original. `None` if it can't be read (process
+/// gone, or no cheap source on this platform).
+pub(crate) fn process_start_token(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        // Field 22 (starttime); split after the parenthesised comm, which
+        // may itself contain spaces.
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let after_comm = stat.rsplit_once(')')?.1;
+        after_comm.split_whitespace().nth(19).map(str::to_string)
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "lstart=", "-p", &pid.to_string()])
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!token.is_empty()).then_some(token)
+    }
+    #[cfg(windows)]
+    {
+        let out = flare_process::command("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!("(Get-Process -Id {pid}).StartTime.ToFileTimeUtc()"),
+            ])
+            .output()
+            .ok()?;
+        let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!token.is_empty()).then_some(token)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
 /// The queue job id inside an in-process work job's claim owner

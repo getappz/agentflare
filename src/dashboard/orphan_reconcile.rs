@@ -89,8 +89,17 @@ pub(super) fn reconcile_orphaned_jobs(queue: &Queue) {
 /// (see the call site for why) -- matched by substring on the full command
 /// line, not a tracked PID, so it catches the whole process tree
 /// (bwrap layers, grandchildren). Best-effort: a failing lookup is swallowed.
+///
+/// The command-line match only works where the path is in argv (the Linux
+/// bwrap wrapper); an unsandboxed agent CLI has it only as its cwd, with the
+/// prompt on stdin. So this also kills the process groups `agent_launch`
+/// recorded for the worktree at spawn time, and on Linux any process whose
+/// cwd is inside it.
 #[cfg(unix)]
 fn kill_processes_touching_worktree(worktree_path: &std::path::Path) {
+    kill_recorded_agent_processes(worktree_path);
+    #[cfg(target_os = "linux")]
+    kill_processes_with_cwd_under(worktree_path);
     let pattern = worktree_path.to_string_lossy().into_owned();
     let Ok(output) = std::process::Command::new("pgrep")
         .args(["-f", &pattern])
@@ -107,8 +116,10 @@ fn kill_processes_touching_worktree(worktree_path: &std::path::Path) {
 
 /// Windows has no `pgrep`; `Get-CimInstance Win32_Process` exposes each
 /// process's `CommandLine` for the same match. `''`-escapes a stray quote.
+/// Recorded agent pids are killed first, same as the Unix variant.
 #[cfg(windows)]
 fn kill_processes_touching_worktree(worktree_path: &std::path::Path) {
+    kill_recorded_agent_processes(worktree_path);
     let pattern = worktree_path
         .to_string_lossy()
         .into_owned()
@@ -129,6 +140,126 @@ fn kill_processes_touching_worktree(worktree_path: &std::path::Path) {
             let _ = crate::ipc::process::force_kill(pid);
         }
     }
+}
+
+/// Kills (and forgets) every agent CLI `agent_launch::run_captured_for_job`
+/// recorded as launched in `worktree_path` -- see `agent_launch::agent_pid_dir`.
+/// A record whose pid is alive but now belongs to a different process (its
+/// start time no longer matches, or on Unix it's no longer the leader of its
+/// own process group) is dropped without killing anything.
+fn kill_recorded_agent_processes(worktree_path: &std::path::Path) {
+    for record in crate::agent_launch::recorded_agent_pids(worktree_path) {
+        let pid = record.pid;
+        if pid != std::process::id() {
+            let alive = crate::ipc::process::is_alive(pid);
+            let reused = alive
+                && match (
+                    record.start_token.as_deref(),
+                    crate::agent_launch::process_start_token(pid).as_deref(),
+                ) {
+                    (Some(recorded), Some(current)) => recorded != current,
+                    _ => !is_own_group_leader(pid),
+                };
+            if !reused {
+                kill_recorded_agent_group(pid, alive);
+            }
+        }
+        let _ = std::fs::remove_file(&record.record_path);
+    }
+}
+
+/// Whether `pid` still leads the process group it was launched as the
+/// leader of (`process_group(0)`) -- a cheap plausibility check for a reused
+/// pid when no start time is available.
+#[cfg(unix)]
+fn is_own_group_leader(pid: u32) -> bool {
+    #[allow(unsafe_code)]
+    // SAFETY: `getpgid` has no memory-safety preconditions.
+    let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
+    pgid == pid as libc::pid_t
+}
+
+#[cfg(windows)]
+fn is_own_group_leader(_pid: u32) -> bool {
+    // No process groups; without a start time there's nothing to confirm
+    // the pid is still ours, so don't kill it.
+    false
+}
+
+/// Kills the whole process group the agent was launched as the leader of.
+/// Signalled even when the leader itself is gone: its descendants keep the
+/// group alive, and while any member exists the OS won't hand that id to a
+/// new process, so the group can only still be ours.
+#[cfg(unix)]
+fn kill_recorded_agent_group(pgid: u32, _leader_alive: bool) {
+    #[allow(unsafe_code)]
+    // SAFETY: `kill` has no memory-safety preconditions; a negative pid
+    // targets the process group.
+    let _ = unsafe { libc::kill(-(pgid as libc::pid_t), libc::SIGKILL) };
+}
+
+/// No process groups on Windows: kill the recorded process's tree, which
+/// needs the root alive to find its descendants.
+#[cfg(windows)]
+fn kill_recorded_agent_group(pid: u32, leader_alive: bool) {
+    if leader_alive {
+        let _ = flare_process::command("taskkill")
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .status();
+    }
+}
+
+/// Force-kills every process whose working directory is inside
+/// `worktree_path` (component-wise, so `task/1` never matches `task/10`),
+/// other than this process itself.
+#[cfg(target_os = "linux")]
+fn kill_processes_with_cwd_under(worktree_path: &std::path::Path) {
+    let Ok(root) = std::fs::canonicalize(worktree_path) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    let me = std::process::id();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        if std::fs::read_link(entry.path().join("cwd")).is_ok_and(|cwd| cwd.starts_with(&root))
+            && !has_controlling_tty(&entry.path())
+        {
+            let _ = crate::ipc::process::force_kill(pid);
+        }
+    }
+}
+
+/// Whether `/proc/<pid>` has a controlling terminal (`tty_nr`, field 7 of
+/// `stat`). Agents the daemon launched never do; a human's shell or editor
+/// `cd`'d into the worktree does, and must not be killed by the sweep.
+/// Unreadable counts as having one -- fail toward not killing.
+#[cfg(target_os = "linux")]
+fn has_controlling_tty(proc_dir: &std::path::Path) -> bool {
+    std::fs::read_to_string(proc_dir.join("stat"))
+        .ok()
+        .and_then(|stat| stat_tty_nr(&stat))
+        .is_none_or(|tty| tty != 0)
+}
+
+/// `tty_nr` from a `/proc/<pid>/stat` line. `comm` (field 2) may contain
+/// spaces and parens, so fields are counted from after the last `)`:
+/// state, ppid, pgrp, session, tty_nr.
+#[cfg(target_os = "linux")]
+fn stat_tty_nr(stat: &str) -> Option<i64> {
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().nth(4))
+        .and_then(|t| t.parse().ok())
 }
 
 /// Swaps `dispatched` back to `ready-for-work` on an item whose in-process
@@ -201,7 +332,7 @@ fn restore_ready_for_work(
         // `dispatched` still attached (item #99) -- `with_backend_db` gives
         // no rollback of its own, so this crate does it explicitly instead
         // of discarding a mid-sequence error via `.ok()?` and continuing.
-        conn.execute_batch("BEGIN").ok()?;
+        conn.execute_batch("BEGIN IMMEDIATE").ok()?;
         let result: agentflare_backend::error::Result<()> = (|| {
             // Defense in depth: `reconcile_orphaned_jobs` already tries to
             // release this claim via `release_and_comment` under a
@@ -301,6 +432,110 @@ fn post_any_reason_cap_comment(mcp: &crate::mcp_server::AgentflareMcp, item_id: 
     });
 }
 
+const TERMINAL_FAILURE_RESTORE_ATTEMPTS: usize = 3;
+
+/// `handle_terminal_job_failure`'s label restore, as one `BEGIN IMMEDIATE`
+/// transaction: committed only when every step succeeds, rolled back (item
+/// untouched, still `dispatched`) on any error. `Ok(None)` means nothing to
+/// do (item done/cancelled, project unresolvable, or no label to restore
+/// onto); `Ok(Some(at_cap))` otherwise.
+fn restore_after_terminal_failure(
+    mcp: &crate::mcp_server::AgentflareMcp,
+    conn: &rusqlite::Connection,
+    item_id: &str,
+    agent: &str,
+) -> Result<Option<bool>, String> {
+    // Resolved before BEGIN, like `restore_ready_for_work`: project
+    // resolution may refresh its own link/`project_dirs` bookkeeping, which
+    // has no business running inside this transaction.
+    let Ok(project) = mcp.resolve_project(conn) else {
+        return Ok(None);
+    };
+    let labels =
+        agentflare_backend::label::list_by_project(conn, &project.id).map_err(|e| e.to_string())?;
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|e| e.to_string())?;
+    let result = (|| -> Result<Option<bool>, String> {
+        let item = agentflare_backend::item::get(conn, item_id).map_err(|e| e.to_string())?;
+        let state =
+            agentflare_backend::state::get(conn, &item.state_id).map_err(|e| e.to_string())?;
+        if matches!(state.group_name.as_str(), "completed" | "cancelled") {
+            return Ok(None);
+        }
+        let comments =
+            agentflare_backend::comment::list_by_item(conn, item_id).map_err(|e| e.to_string())?;
+        let identical_count =
+            crate::dispatch_failure_ceiling::consecutive_identical_failure_count(&comments);
+        let any_reason_count =
+            crate::dispatch_failure_ceiling::consecutive_failure_count_any_reason(&comments);
+        let at_cap = identical_count >= crate::dispatch_failure_ceiling::DISPATCH_FAILURE_CAP
+            || any_reason_count >= crate::dispatch_failure_ceiling::DISPATCH_FAILURE_CAP_ANY_REASON;
+        let find = |name: &str| labels.iter().find(|l| l.name == name).map(|l| &l.id);
+        let ready_id = find(crate::supervisor::READY_LABEL);
+        if !at_cap && ready_id.is_none() {
+            // Below cap with no ready-for-work label to restore onto: the
+            // only thing left is the removal, same as before.
+            if let Some(dispatched_id) = find(crate::supervisor::DISPATCHED_LABEL) {
+                agentflare_backend::item::remove_label(conn, item_id, dispatched_id)
+                    .map_err(|e| e.to_string())?;
+            }
+            return Ok(None);
+        }
+
+        if let Some(dispatched_id) = find(crate::supervisor::DISPATCHED_LABEL) {
+            agentflare_backend::item::remove_label(conn, item_id, dispatched_id)
+                .map_err(|e| e.to_string())?;
+        }
+        // `release_and_comment` already cleared `assignee_agent` via
+        // `item_release`. Restore it in both branches: below cap, the next
+        // discovery tick would otherwise hit `skip_item` (item #150); at
+        // cap, the cap comment's own `item action=redispatch` instruction
+        // needs an existing `assignee_agent` unless one is passed
+        // explicitly. Prefer the item's own current assignee over this
+        // dead job's frozen payload agent (item #230) -- see the matching
+        // comment in `restore_ready_for_work` above.
+        agentflare_backend::item::update(
+            conn,
+            item_id,
+            agentflare_backend::item::UpdateItem {
+                assignee_agent: Some(
+                    item.assignee_agent
+                        .clone()
+                        .unwrap_or_else(|| agent.to_string()),
+                ),
+                ..Default::default()
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        if at_cap {
+            // No `needs-manual-dispatch` label on the project: leave the
+            // item off `ready-for-work` -- the cap comment posted by the
+            // caller is what a human/PM acts on.
+            if let Some(manual_id) = find(crate::supervisor::NEEDS_MANUAL_LABEL) {
+                agentflare_backend::item::add_label(conn, item_id, manual_id)
+                    .map_err(|e| e.to_string())?;
+            }
+        } else if let Some(ready_id) = ready_id {
+            agentflare_backend::item::add_label(conn, item_id, ready_id)
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(Some(at_cap))
+    })();
+    match result {
+        Ok(outcome) => match conn.execute_batch("COMMIT") {
+            Ok(()) => Ok(outcome),
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e.to_string())
+            }
+        },
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
 /// Registered as the daemon's `WorkerPool::with_terminal_failure_hook` (see
 /// `dashboard::server::run`) -- fires when an `in_process` job reaches
 /// terminal `state = 'failed'` after exhausting its retries, the clean-
@@ -341,84 +576,30 @@ pub(super) fn handle_terminal_job_failure(job: &agentflare_jobs::AgentJob) {
         }
         None => crate::mcp_server::AgentflareMcp::default(),
     };
+    // One IMMEDIATE transaction around the whole label swap, same reasoning
+    // as `restore_ready_for_work` above: `dispatched` coming off and
+    // `ready-for-work`/`needs-manual-dispatch` going on must land together.
+    // Done piecemeal (as this used to be), a failure after the removal --
+    // most often a busy database -- left the item with neither label,
+    // invisible to `run_discovery_tick` forever. A failed attempt rolls
+    // back to the untouched `dispatched` state and is retried a couple of
+    // times, since this hook fires exactly once per terminal job.
     let cap_reached = mcp.with_backend_db(|conn| -> Option<bool> {
-        let item = agentflare_backend::item::get(conn, item_id).ok()?;
-        let state = agentflare_backend::state::get(conn, &item.state_id).ok()?;
-        if matches!(state.group_name.as_str(), "completed" | "cancelled") {
-            return None;
-        }
-        let project = mcp.resolve_project(conn).ok()?;
-        let labels = agentflare_backend::label::list_by_project(conn, &project.id).ok()?;
-        if let Some(dispatched_id) = labels
-            .iter()
-            .find(|l| l.name == crate::supervisor::DISPATCHED_LABEL)
-        {
-            let _ = agentflare_backend::item::remove_label(conn, item_id, &dispatched_id.id);
-        }
-
-        let comments = agentflare_backend::comment::list_by_item(conn, item_id).ok()?;
-        let identical_count =
-            crate::dispatch_failure_ceiling::consecutive_identical_failure_count(&comments);
-        let any_reason_count =
-            crate::dispatch_failure_ceiling::consecutive_failure_count_any_reason(&comments);
-        let at_cap = identical_count >= crate::dispatch_failure_ceiling::DISPATCH_FAILURE_CAP
-            || any_reason_count >= crate::dispatch_failure_ceiling::DISPATCH_FAILURE_CAP_ANY_REASON;
-
-        if at_cap {
-            // Same restoration as the below-cap branch: `release_and_comment`
-            // already cleared `assignee_agent` via `item_release`. The cap
-            // comment tells a human to run `item action=redispatch`, which
-            // requires an existing `assignee_agent` unless one is passed
-            // explicitly — leaving it cleared here would make that
-            // instruction fail.
-            agentflare_backend::item::update(
-                conn,
-                item_id,
-                agentflare_backend::item::UpdateItem {
-                    // Prefer the item's own current assignee over this dead
-                    // job's frozen payload agent (item #230) -- see the
-                    // matching comment in `restore_ready_for_work` above.
-                    assignee_agent: Some(
-                        item.assignee_agent.clone().unwrap_or_else(|| agent.clone()),
-                    ),
-                    ..Default::default()
-                },
-            )
-            .ok();
-            if let Some(manual_id) = labels
-                .iter()
-                .find(|l| l.name == crate::supervisor::NEEDS_MANUAL_LABEL)
-            {
-                agentflare_backend::item::add_label(conn, item_id, &manual_id.id).ok();
+        let mut last_err = None;
+        for _ in 0..TERMINAL_FAILURE_RESTORE_ATTEMPTS {
+            match restore_after_terminal_failure(&mcp, conn, item_id, agent) {
+                Ok(outcome) => return outcome,
+                Err(e) => last_err = Some(e),
             }
-            Some(true)
-        } else if let Some(ready_id) = labels
-            .iter()
-            .find(|l| l.name == crate::supervisor::READY_LABEL)
-        {
-            // `release_and_comment` clears assignee via `item_release`; without
-            // restoring it the next discovery tick hits `skip_item` (item
-            // #150). Restore it before adding the label so a mid-failure here
-            // never leaves the item labeled ready-for-work with no assignee.
-            agentflare_backend::item::update(
-                conn,
-                item_id,
-                agentflare_backend::item::UpdateItem {
-                    // Prefer the item's own current assignee over this dead
-                    // job's frozen payload agent (item #230) -- see the
-                    // matching comment in `restore_ready_for_work` above.
-                    assignee_agent: Some(
-                        item.assignee_agent.clone().unwrap_or_else(|| agent.clone()),
-                    ),
-                    ..Default::default()
-                },
-            )
-            .ok()?;
-            agentflare_backend::item::add_label(conn, item_id, &ready_id.id).ok();
-            Some(false)
-        } else {
-            None
         }
+        if let Some(e) = last_err {
+            eprintln!(
+                "agentflare-supervisor: restoring item {item_id} after terminal job failure \
+                 failed and was rolled back (still labeled {}): {e}",
+                crate::supervisor::DISPATCHED_LABEL
+            );
+        }
+        None
     });
 
     let Ok(Some(true)) = cap_reached else {
@@ -477,6 +658,83 @@ pub(super) fn handle_terminal_job_failure(job: &agentflare_jobs::AgentJob) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stat_tty_nr_parses_past_a_comm_with_spaces_and_parens() {
+        let detached = "4242 (claude (x) y) S 1 4242 4242 0 -1 4194560 0";
+        let interactive = "77 (bash) S 70 77 77 34816 77 4194560 0";
+        assert_eq!(super::stat_tty_nr(detached), Some(0));
+        assert_eq!(super::stat_tty_nr(interactive), Some(34816));
+    }
+
     include!("orphan_reconcile_tests.rs");
     include!("orphan_reconcile_assignee_tests.rs");
+
+    /// A failure partway through the terminal-failure label swap must roll
+    /// the whole swap back, never strand the item with neither `dispatched`
+    /// nor `ready-for-work` (invisible to discovery forever) -- and once the
+    /// fault clears, the next run must complete the swap.
+    #[test]
+    fn handle_terminal_job_failure_is_all_or_nothing_when_a_step_fails() {
+        crate::paths::test_support::with_temp_home(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo_root).unwrap();
+            init_test_repo(&repo_root);
+
+            let mcp = crate::mcp_server::AgentflareMcp::for_project_dir(repo_root.clone());
+            let label_ids = seed_labels(
+                &mcp,
+                &[
+                    crate::supervisor::READY_LABEL,
+                    crate::supervisor::DISPATCHED_LABEL,
+                ],
+            );
+            let dispatched_id = &label_ids[crate::supervisor::DISPATCHED_LABEL];
+            let ready_id = &label_ids[crate::supervisor::READY_LABEL];
+            let item_id = create_dispatched_item(&mcp, dispatched_id);
+
+            // Fault injection: the final `ready-for-work` add fails, after
+            // `dispatched` has already been removed within the same run.
+            mcp.with_backend_db(|conn| {
+                conn.execute_batch(&format!(
+                    "CREATE TRIGGER fail_ready_add BEFORE INSERT ON item_labels \
+                     WHEN NEW.label_id = '{ready_id}' \
+                     BEGIN SELECT RAISE(ABORT, 'injected failure'); END;"
+                ))
+                .unwrap();
+            })
+            .unwrap();
+
+            let job = agentflare_jobs::AgentJob::new("agentflare-work")
+                .args([
+                    item_id.clone(),
+                    "claude-code".to_string(),
+                    repo_root.to_string_lossy().to_string(),
+                ])
+                .in_process();
+            handle_terminal_job_failure(&job);
+
+            let labels = mcp
+                .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id))
+                .unwrap()
+                .unwrap();
+            assert!(
+                labels.contains(dispatched_id),
+                "a failed swap must roll back to `dispatched`, not drop both labels: {labels:?}"
+            );
+            assert!(!labels.contains(ready_id));
+
+            mcp.with_backend_db(|conn| conn.execute_batch("DROP TRIGGER fail_ready_add").unwrap())
+                .unwrap();
+            handle_terminal_job_failure(&job);
+
+            let labels = mcp
+                .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id))
+                .unwrap()
+                .unwrap();
+            assert!(labels.contains(ready_id), "{labels:?}");
+            assert!(!labels.contains(dispatched_id), "{labels:?}");
+        });
+    }
 }

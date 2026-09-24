@@ -843,3 +843,61 @@
             other => panic!("expected Ok, got {other:?}"),
         }
     }
+
+    // Item H4: a headless agent child records its pid under its cwd's
+    // `agent_pid_dir` for exactly as long as `run_captured` is waiting on
+    // it, so a daemon that dies mid-turn leaves the record behind for the
+    // next daemon's orphan sweep to find.
+    #[cfg(unix)]
+    #[test]
+    fn run_captured_records_the_childs_pid_under_its_cwd_while_it_runs() {
+        let worktree = tempfile::tempdir().unwrap();
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("sleep 1").current_dir(worktree.path());
+        let watched = worktree.path().to_path_buf();
+        let watcher = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while std::time::Instant::now() < deadline {
+                let recorded = recorded_agent_pids(&watched);
+                if let Some(record) = recorded.first() {
+                    return Some((record.pid, record.start_token.clone()));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            None
+        });
+        let out = run_captured(
+            cmd,
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(5),
+            None,
+        )
+        .unwrap();
+        assert!(out.success);
+        let (pid, start_token) = watcher
+            .join()
+            .unwrap()
+            .expect("the running child's pid must be recorded");
+        assert!(pid > 0);
+        #[cfg(target_os = "linux")]
+        assert!(start_token.is_some(), "linux records the start time");
+        #[cfg(not(target_os = "linux"))]
+        let _ = start_token;
+        assert!(
+            recorded_agent_pids(worktree.path()).is_empty(),
+            "the record is removed once the child is reaped"
+        );
+        let _ = std::fs::remove_dir(agent_pid_dir(worktree.path()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_start_token_identifies_a_live_process_and_not_a_dead_one() {
+        let me = std::process::id();
+        let token = process_start_token(me).expect("own start time is readable");
+        assert_eq!(process_start_token(me), Some(token), "stable per process");
+        let mut child = Command::new("true").spawn().unwrap();
+        let child_pid = child.id();
+        child.wait().unwrap();
+        assert_eq!(process_start_token(child_pid), None);
+    }
