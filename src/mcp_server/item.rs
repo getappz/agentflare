@@ -851,16 +851,32 @@ impl AgentflareMcp {
             // allowed. Falls back to no filter only when identity is undetected.
             let assignee = req.assignee_agent.clone().or_else(|| self.agent.clone());
             if let Some(agent) = &assignee {
+                // A claimed item stores the claim owner's raw id
+                // (`<agent>:<instance>`, see `item::claim`), while `self.agent`
+                // and an explicit `assignee_agent` filter are the canonical
+                // agent name. Compare canonical agent parts, not exact strings,
+                // or a claimed item drops out of its own agent's inbox the
+                // moment the claim is filed — item #66 was invisible to
+                // `list(state_group="in_review")` while its (stale) claim held,
+                // and only "reappeared" once the claim was released. Unassigned
+                // items are always kept.
+                let wanted = agentflare_backend::item::agent_part(agent);
                 items.retain(|i| {
-                    i.assignee_agent.as_deref() == Some(agent.as_str())
-                        || i.assignee_agent.is_none()
+                    i.assignee_agent
+                        .as_deref()
+                        .map(|a| agentflare_backend::item::agent_part(a) == wanted)
+                        .unwrap_or(true)
                 });
                 items.sort_by_key(|i| {
                     let is_open = state_by_id
                         .get(i.state_id.as_str())
                         .map(|s| !matches!(s.group_name.as_str(), "completed" | "cancelled"))
                         .unwrap_or(true);
-                    let is_mine = i.assignee_agent.as_deref() == Some(agent.as_str());
+                    let is_mine = i
+                        .assignee_agent
+                        .as_deref()
+                        .map(|a| agentflare_backend::item::agent_part(a) == wanted)
+                        .unwrap_or(false);
                     (!is_open, !is_mine)
                 });
             }
