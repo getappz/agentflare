@@ -136,6 +136,29 @@ pub enum HandoffCommands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Suggest (or execute) failover to the next agent when one is exhausted.
+    Route {
+        /// Exhausted agent (aliases cc/claude/oc accepted).
+        from: String,
+        /// Log excerpt / error text to classify.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Explicit target, skips auto-selection.
+        #[arg(long)]
+        to: Option<String>,
+        /// Current chain depth (refuses at 5).
+        #[arg(long, default_value = "0")]
+        depth: u32,
+        /// Perform the send, not just suggest (needs --session).
+        #[arg(long)]
+        execute: bool,
+        /// Foreign session id (for --execute).
+        #[arg(long)]
+        session: Option<String>,
+        /// minimal|standard|verbose|full (for --execute).
+        #[arg(long, default_value = "standard")]
+        verbosity: String,
+    },
 }
 
 #[derive(Debug)]
@@ -318,6 +341,42 @@ fn run_continuity(cmd: HandoffCommands) {
                 }
             })
         }
+        HandoffCommands::Route {
+            from,
+            reason,
+            to,
+            depth,
+            execute,
+            session,
+            verbosity,
+        } => crate::handoff::route::route(crate::handoff::route::RouteRequest {
+            from,
+            reason,
+            to,
+            depth,
+            execute,
+            session_id: session,
+            verbosity,
+        })
+        .map(|out| {
+            let mut text = format!(
+                "from: {} (signal: {})\nrecommended: {}\nalternatives: {}\ndepth: {}",
+                out.from,
+                out.signal.as_deref().unwrap_or("unrecognized"),
+                out.recommended.as_deref().unwrap_or("none"),
+                out.alternatives.join(", "),
+                out.depth,
+            );
+            if let Some(sent) = out.sent {
+                text.push_str(&format!(
+                    "\nsent artifact {} (v{}) to {} (thread {})",
+                    sent.id, sent.version, sent.recipient, sent.thread_id
+                ));
+            } else {
+                text.push_str("\nsuggestion only — re-run with --execute --session <id> to send");
+            }
+            text
+        }),
     };
     match out {
         Ok(text) => println!("{text}"),

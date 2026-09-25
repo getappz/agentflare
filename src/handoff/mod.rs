@@ -9,6 +9,7 @@
 
 pub mod apply;
 pub mod body;
+pub mod route;
 pub mod sources;
 
 use body::{HandoffBodyV1, build, git_context, render_markdown};
@@ -185,6 +186,7 @@ pub struct SendRequest {
     pub artifact_dir: Option<PathBuf>,
 }
 
+#[derive(Debug)]
 pub struct SendOutcome {
     pub id: String,
     pub version: u32,

@@ -61,13 +61,13 @@ fn scan_source(
 pub fn load_session(source: &str, session_id: &str) -> Result<SessionBundle, String> {
     let source = normalize_source(source)?;
     let config = flare_insights::config::InsightsConfig::default();
-    let order: Vec<&str> = if source == "auto" {
-        SUPPORTED.to_vec()
+    let order: Vec<String> = if source == "auto" {
+        SUPPORTED.iter().map(|s| s.to_string()).collect()
     } else {
-        vec![source.as_str()]
+        vec![source.clone()]
     };
     let mut scanned = 0usize;
-    for name in order {
+    for name in &order {
         let bundle = scan_source(name, &config)?;
         scanned += bundle.sessions.len();
         if let Some(session) = bundle.sessions.into_iter().find(|s| s.id == session_id) {
