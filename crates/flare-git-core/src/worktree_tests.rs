@@ -1,8 +1,11 @@
 use super::*;
 use crate::shell::test_support::{Repo, init_repo_with_branch};
+#[cfg(windows)]
+use std::process::Command;
+use std::time::Duration;
 use tempfile::TempDir;
 
-fn init_repo() -> Repo {
+pub(super) fn init_repo() -> Repo {
     init_repo_with_branch("master")
 }
 
@@ -116,7 +119,7 @@ fn remove_worktree_dir_retries_past_a_transient_lock() {
     releaser.join().unwrap();
 }
 
-fn test_item(sequence_id: i64) -> Item {
+pub(super) fn test_item(sequence_id: i64) -> Item {
     Item {
         id: "test-id".into(),
         project_id: "proj".into(),
@@ -142,14 +145,14 @@ fn test_item(sequence_id: i64) -> Item {
     }
 }
 
-fn test_item_named(sequence_id: i64, name: &str) -> Item {
+pub(super) fn test_item_named(sequence_id: i64, name: &str) -> Item {
     Item {
         name: name.into(),
         ..test_item(sequence_id)
     }
 }
 
-fn test_item_with_pr_branch(sequence_id: i64, branch: &str) -> Item {
+pub(super) fn test_item_with_pr_branch(sequence_id: i64, branch: &str) -> Item {
     Item {
         metadata: format!(r#"{{"pr":{{"number":1,"branch":"{branch}"}}}}"#),
         ..test_item(sequence_id)
@@ -454,6 +457,31 @@ fn audit_orphans_preserves_a_dirty_worktree_stranded_on_the_default_branch() {
         orphans.is_empty(),
         "dirty stranded worktree must not be listed as prunable: {} found",
         orphans.len()
+    );
+}
+
+#[test]
+fn audit_orphans_skips_a_task_dir_that_is_not_its_own_checkout() {
+    // No `.git` of its own: git commands run "in" it fall through to the
+    // enclosing main repo, which is clean and on the default branch -- that
+    // must not make the directory read as a clean stranded orphan.
+    let repo = init_repo();
+    let item = test_item(1);
+    let target = resolve_default_branch(&repo.path);
+    create_worktree(&item, &repo.path, &target, None).unwrap();
+    let bare_dir = repo.path.join(".worktrees").join("task").join("42");
+    std::fs::create_dir_all(&bare_dir).unwrap();
+    std::fs::write(bare_dir.join("work.txt"), "unsaved work").unwrap();
+    assert_eq!(
+        crate::branch::current_branch(&bare_dir).unwrap_or_default(),
+        target,
+        "precondition: git in the dir resolves to the main repo"
+    );
+
+    let orphans = audit_orphans(&repo.path, Some(&std::collections::HashSet::new()));
+    assert!(
+        orphans.iter().all(|o| o.name != "42"),
+        "a dir that isn't its own checkout must not be gc-able"
     );
 }
 
@@ -1215,7 +1243,7 @@ fn fetch_with_retry_returns_the_final_failure_when_every_attempt_fails() {
 /// needs to make the remote's default branch diverge independently of the
 /// local clone (item #161's "other agents merge PRs while we're mid-session"
 /// scenario).
-fn init_remote_and_local_clone() -> (Repo, TempDir, PathBuf) {
+pub(super) fn init_remote_and_local_clone() -> (Repo, TempDir, PathBuf) {
     let remote = init_repo();
     let local_container = TempDir::new().unwrap();
     let local_path = local_container.path().join("local");

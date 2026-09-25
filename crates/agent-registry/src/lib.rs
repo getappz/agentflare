@@ -1,13 +1,19 @@
 pub mod detect;
+pub mod failover;
 pub mod registry;
+pub mod role;
 pub mod router;
 pub use detect::{
     DetectedAgent, RealVersionRunner, VersionCacheEntry, VersionRunner, detect_all,
     detect_all_with, detect_present, find_binary, resolve_version, resolve_version_with,
 };
+pub use failover::{FailoverConfig, failover_candidates, parse_failover_config};
 pub use registry::{
     Agent, AgentSpec, REGISTRY, Tier, agent_by_name, autonomous_args, canonicalize,
-    clinepass_model_for_claude, headless_args, json_output_args, resume_arg, spec,
+    clinepass_model_for_claude, headless_args, json_output_args, mode_flag, resume_arg, spec,
+};
+pub use role::{
+    CompiledRole, Effort, PermissionMode, RoleSpec, compile_role, prompt_with_system_fallback,
 };
 pub use router::{
     RouteDecision, RouterConfig, RouterRule, RuleMatch, TaskContext, model_for_task,

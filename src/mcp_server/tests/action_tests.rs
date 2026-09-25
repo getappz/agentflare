@@ -449,12 +449,16 @@ fn item_done_leaves_a_dirty_worktree_in_place_when_auto_commit_cannot_run() {
     // specific git author-identity fallbacks.
     std::fs::write(worktree_path.join(".git"), "gitdir: /nonexistent").unwrap();
 
-    s.item(Parameters(ItemRequest {
-        action: "done".into(),
-        id: Some(item_id),
-        ..Default::default()
-    }))
-    .unwrap();
+    // Real edits that can't be committed must fail `done` loudly (item
+    // #92), not read as "nothing to commit".
+    let err = s
+        .item(Parameters(ItemRequest {
+            action: "done".into(),
+            id: Some(item_id),
+            ..Default::default()
+        }))
+        .unwrap_err();
+    assert!(err.message.contains("auto-commit"), "{}", err.message);
 
     assert!(
         worktree_path.join("uncommitted.txt").exists(),

@@ -30,6 +30,14 @@ pub enum Error {
     DbKit(#[from] db_kit::open::Error),
     #[error("job not found: {0}")]
     NotFound(String),
+    /// `request_cancel` on a running subprocess job: only in-process
+    /// executors observe `cancel_requested`, so flagging it would claim a
+    /// cancel that never takes effect.
+    #[error(
+        "job {0} is a running subprocess job, which cannot be cancelled once started; \
+         it will run to completion (or its timeout)"
+    )]
+    NotCancellable(String),
     #[error("serialization: {0}")]
     Serialize(#[from] serde_json::Error),
 }
@@ -174,13 +182,21 @@ impl Queue {
         Ok(Some((id, job)))
     }
 
+    /// Records a finished attempt's outcome. A job an operator cancelled
+    /// while it ran (`cancel_requested`, via `request_cancel`/
+    /// `cancel_for_item`) finishes as `killed` whatever the attempt returned
+    /// -- an executor that finished its work anyway (never polled the flag,
+    /// or returned `Ok` during the abandon grace) must not flip a deliberate
+    /// cancel into `exited`. The check is part of the same UPDATE, so it can't
+    /// race a concurrent cancel request from another connection.
     pub fn complete(&self, id: &str, output: &JobOutput, success: bool) -> Result<(), Error> {
         let now = db_kit::ids::now();
         let state = if success { "exited" } else { "failed" };
         let conn = self.conn.lock();
         conn.execute(
             "UPDATE agent_jobs
-             SET state = ?1,
+             SET state = CASE WHEN cancel_requested != 0 THEN 'killed' ELSE ?1 END,
+                 error = CASE WHEN cancel_requested != 0 THEN ?10 ELSE error END,
                  exit_code = ?2,
                  timed_out = ?3,
                  stdout_log_path = ?4,
@@ -198,7 +214,8 @@ impl Queue {
                 output.stdout_total_bytes as i64,
                 output.stderr_total_bytes as i64,
                 now,
-                id
+                id,
+                crate::cancel::CANCELLED_MESSAGE
             ],
         )?;
         Ok(())
@@ -413,6 +430,35 @@ impl Queue {
         Ok(jobs)
     }
 
+    /// Number of queued or running jobs whose `args` carry `value` -- at
+    /// position `index` when given, anywhere in `args` otherwise. Unlike
+    /// `list`, which only returns the 100 newest rows, this counts every
+    /// active row, so an old but still-queued job is never missed by a
+    /// single-flight or per-project fairness check built on it.
+    pub fn count_active_with_arg(&self, value: &str, index: Option<usize>) -> Result<u64, Error> {
+        let conn = self.conn.lock();
+        let count: i64 = match index {
+            Some(index) => conn.query_row(
+                "SELECT COUNT(*) FROM agent_jobs
+                 WHERE state IN ('queued', 'running')
+                   AND json_extract(payload, '$.args[' || ?2 || ']') = ?1",
+                params![value, index as i64],
+                |r| r.get(0),
+            )?,
+            None => conn.query_row(
+                "SELECT COUNT(*) FROM agent_jobs
+                 WHERE state IN ('queued', 'running')
+                   AND EXISTS (
+                       SELECT 1 FROM json_each(agent_jobs.payload, '$.args') a
+                       WHERE a.value = ?1
+                   )",
+                params![value],
+                |r| r.get(0),
+            )?,
+        };
+        Ok(count.max(0) as u64)
+    }
+
     pub fn get(&self, id: &str) -> Result<JobInfo, Error> {
         let conn = self.conn.lock();
         let row = conn.query_row(
@@ -438,6 +484,56 @@ impl Queue {
             return Err(Error::NotFound(id.to_string()));
         }
         Ok(())
+    }
+
+    /// Operator cancel of one job by id, whatever its state: a queued (or
+    /// retry-pending) job is `killed` at once; a running one only gets
+    /// `cancel_requested`, which its executor observes (`is_cancelled`) to
+    /// stop its agent, after which `fail` finishes the row as `killed` --
+    /// never re-queued, so the cancel is terminal. Only in-process executors
+    /// observe that flag, so a *running subprocess* job is refused with
+    /// `NotCancellable` (and left untouched) rather than reported as
+    /// cancelled while it runs to completion. Returns false when the job had
+    /// already finished (nothing to cancel); `NotFound` for an unknown id.
+    pub fn request_cancel(&self, id: &str) -> Result<bool, Error> {
+        let now = db_kit::ids::now();
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let row: Option<(String, String)> = tx
+            .query_row(
+                "SELECT state, payload FROM agent_jobs WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(e),
+            })?;
+        let Some((state, payload)) = row else {
+            return Err(Error::NotFound(id.to_string()));
+        };
+        // An unparsable payload can't be proven in-process: treat it as a
+        // subprocess job, whose cancel flag nothing would observe.
+        let in_process = serde_json::from_str::<crate::types::AgentJob>(&payload)
+            .is_ok_and(|job| job.in_process);
+        if state == "running" && !in_process {
+            return Err(Error::NotCancellable(id.to_string()));
+        }
+        let killed = state == "queued"
+            && tx.execute(
+                "UPDATE agent_jobs SET state = 'killed', finished_at = ?1, error = ?2
+                 WHERE id = ?3 AND state = 'queued'",
+                params![now, crate::cancel::CANCELLED_MESSAGE, id],
+            )? > 0;
+        let flagged = !killed
+            && tx.execute(
+                "UPDATE agent_jobs SET cancel_requested = 1
+                 WHERE id = ?1 AND state IN ('queued', 'running')",
+                params![id],
+            )? > 0;
+        tx.commit()?;
+        Ok(killed || flagged)
     }
 
     /// Whether the job was cancelled (`cancel`/`cancel_for_item`). A running
@@ -893,5 +989,61 @@ mod tests {
             stored.retries, 0,
             "retries must not be incremented on a fatal failure"
         );
+    }
+    // Operator cancel (`agentflare job cancel`) must be terminal for both a
+    // queued and a running job: the running one's retry budget is never
+    // spent, it finishes as `killed` rather than going back to `queued`.
+    #[test]
+    fn request_cancel_is_terminal_for_queued_and_running_jobs() {
+        let (queue, _dir) = test_queue();
+        let queued = queue
+            .enqueue(&AgentJob::new("true").max_retries(3))
+            .unwrap();
+        assert!(queue.request_cancel(&queued.id).unwrap());
+        assert_eq!(queue.get(&queued.id).unwrap().state, JobState::Killed);
+
+        let running = queue
+            .enqueue(&AgentJob::new("true").max_retries(3).in_process())
+            .unwrap();
+        let (id, _) = queue.dequeue().unwrap().expect("dequeue running job");
+        assert_eq!(id, running.id);
+        assert!(queue.request_cancel(&running.id).unwrap());
+        assert!(queue.is_cancelled(&running.id));
+        assert!(
+            !queue.fail(&running.id, "stopped", None, false).unwrap(),
+            "a cancelled job's failure is not a terminal failure"
+        );
+        assert_eq!(queue.get(&running.id).unwrap().state, JobState::Killed);
+        assert!(queue.dequeue().unwrap().is_none(), "never re-queued");
+
+        assert!(
+            !queue.request_cancel(&running.id).unwrap(),
+            "already finished"
+        );
+        assert!(matches!(
+            queue.request_cancel("no-such-job"),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    // A running subprocess job never polls `cancel_requested`, so claiming to
+    // have cancelled it would be a lie: it is refused and left untouched.
+    // Queued subprocess jobs are still killed outright.
+    #[test]
+    fn request_cancel_refuses_a_running_subprocess_job() {
+        let (queue, _dir) = test_queue();
+        let running = queue.enqueue(&AgentJob::new("true")).unwrap();
+        let (id, _) = queue.dequeue().unwrap().expect("dequeue running job");
+        assert_eq!(id, running.id);
+        assert!(matches!(
+            queue.request_cancel(&running.id),
+            Err(Error::NotCancellable(_))
+        ));
+        assert!(!queue.is_cancelled(&running.id), "not flagged");
+        assert_eq!(queue.get(&running.id).unwrap().state, JobState::Running);
+
+        let queued = queue.enqueue(&AgentJob::new("true")).unwrap();
+        assert!(queue.request_cancel(&queued.id).unwrap());
+        assert_eq!(queue.get(&queued.id).unwrap().state, JobState::Killed);
     }
 }

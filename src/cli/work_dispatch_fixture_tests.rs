@@ -84,26 +84,19 @@ fn run_dispatch_fixture(
 }
 
 #[test]
-fn execute_work_runs_through_the_pipeline_but_hard_errors_without_a_github_remote() {
+fn execute_work_runs_through_the_pipeline_and_completes_without_a_github_remote() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_root = tmp.path().join("repo");
     std::fs::create_dir_all(&repo_root).unwrap();
-    // A local bare "origin" so `git push` itself succeeds -- same
-    // fixture shape as item_pr_failure_tests.rs. It's still not a
-    // GitHub remote, so `push_and_open_pr` can't resolve a repo to
-    // open a PR against; that's the known, deliberately-tested
-    // soft-fail path (item #109 / PR #482), not this test's concern.
+    // A local bare "origin" so `git push` itself succeeds -- same fixture
+    // shape as item_pr_failure_tests.rs. It is not a GitHub remote, so no
+    // PR can ever be opened for it: `item_done` completes the item once the
+    // branch is pushed, rather than erroring on every retry forever.
     init_test_repo_with_origin(&repo_root);
 
     crate::paths::test_support::with_temp_home(|| {
         let (seed_mcp, item, outcome) = run_dispatch_fixture(&repo_root);
-        // The pipeline itself (coder -> review -> finalize) ran through
-        // successfully and a real commit landed -- but `origin` here is
-        // a local bare repo, not a real GitHub remote, so finalize's
-        // push/PR step correctly soft-fails to open a PR and reports a
-        // hard error (item #109 / PR #482) rather than false-completing
-        // a claim whose work was never actually published.
-        assert_eq!(outcome.exit_code, 1);
+        assert_eq!(outcome.exit_code, 0);
 
         let comments = seed_mcp
             .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &item.id))
@@ -112,8 +105,8 @@ fn execute_work_runs_through_the_pipeline_but_hard_errors_without_a_github_remot
         assert!(
             comments
                 .iter()
-                .any(|c| c.body.contains("PR creation failed")),
-            "expected a PR-creation-failed comment, got: {comments:?}"
+                .any(|c| c.body.contains("completed without a PR")),
+            "expected a completed-without-PR comment, got: {comments:?}"
         );
     });
 }
@@ -125,10 +118,9 @@ include!("work_cwd_race_tests.rs");
 /// for completion (see `work_item_pipeline::persist_run_id`) — exercises
 /// that persistence through the real `execute_work_impl` call site with
 /// the new `item_description`/`plan_doc` params. `persist_run_id` runs
-/// at dispatch time, well before `finalize`'s push/PR step, so the
-/// metadata write survives even though this fixture's `origin` (a local
-/// bare repo, not a real GitHub remote) makes `finalize` hard-error the
-/// same way the sibling test above does (item #109 / PR #482).
+/// at dispatch time, well before `finalize`'s push/PR step, and must
+/// survive `finalize`'s own metadata writes (`metadata.no_pr` here, since
+/// this fixture's `origin` is a local bare repo, not GitHub).
 #[test]
 fn execute_work_persists_workflow_run_id_on_dispatch() {
     let tmp = tempfile::tempdir().unwrap();
@@ -138,7 +130,7 @@ fn execute_work_persists_workflow_run_id_on_dispatch() {
 
     crate::paths::test_support::with_temp_home(|| {
         let (seed_mcp, item, outcome) = run_dispatch_fixture(&repo_root);
-        assert_eq!(outcome.exit_code, 1);
+        assert_eq!(outcome.exit_code, 0);
 
         let updated_item = seed_mcp
             .with_backend_db(|conn| agentflare_backend::item::get(conn, &item.id).ok())

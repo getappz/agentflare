@@ -164,11 +164,10 @@ use flare_workflow::store::InMemoryStore;
 use flare_workflow::{WorkflowDefinition, WorkflowEngine, WorkflowId};
 use std::sync::Arc;
 
+// The fixture's `origin` is a local bare repo -- not GitHub, so no PR can
+// ever result. `item_done` now completes such items once the branch is
+// pushed (recording `metadata.no_pr`) instead of erroring on every retry.
 #[tokio::test]
-#[ignore = "item_done hard-fails (#482) unless push succeeds AND a PR is \
-            created; push_and_open_pr can't recognize a local bare repo \
-            as GitHub, and this codebase has no mock GitHub client — \
-            needs a real GitHub remote + credentials to reach Completed"]
 async fn finalize_step_calls_item_done_on_success() {
     let (mcp, _backend_tmp, _repo_tmp, item_id, project_id, worktree_path) =
         crate::mcp_server::tests::mcp_with_claimed_item("Finalize test item");
@@ -219,6 +218,56 @@ async fn finalize_step_calls_item_done_on_success() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     panic!("finalize step did not complete");
+}
+
+/// Nothing was ever committed: `item_done` answers "unchanged", releasing the
+/// claim and leaving the item in "started". Finalize used to report that as
+/// success, parking the item with no claim, no label and no job forever. It
+/// must fail the run instead, so the terminal-failure hook re-arms the item.
+#[tokio::test]
+async fn finalize_step_fails_when_item_done_reports_nothing_committed() {
+    let (mcp, _backend_tmp, _repo_tmp, item_id, _project_id, _worktree_path) =
+        crate::mcp_server::tests::mcp_with_claimed_item("Nothing-committed finalize item");
+    let mcp = Arc::new(mcp);
+
+    let data = WorkItemData {
+        item_id: item_id.clone(),
+        owner: crate::claims::owner_id(),
+        reply_text: "did nothing".into(),
+        ..Default::default()
+    };
+    let step = build_finalize_step(mcp.clone());
+    let wf = WorkflowDefinition::new(WORKFLOW_ID, "work item").add_step(step);
+    let engine = WorkflowEngine::<WorkItemData, InMemoryStore<WorkItemData>>::new();
+    engine.register_workflow(wf).unwrap();
+    let run_id = engine
+        .start_workflow(WorkflowId::new(WORKFLOW_ID), data, String::new())
+        .await
+        .unwrap();
+
+    for _ in 0..200 {
+        let state = engine.get_status(run_id).await.unwrap();
+        match state.status {
+            flare_workflow::WorkflowStatus::Failed => {
+                let comments = mcp
+                    .with_backend_db(|conn| {
+                        agentflare_backend::comment::list_by_item(conn, &item_id).unwrap()
+                    })
+                    .unwrap();
+                assert!(
+                    !comments.iter().any(|c| c.body.contains("did nothing")),
+                    "no success comment may be posted for a run that published nothing"
+                );
+                return;
+            }
+            flare_workflow::WorkflowStatus::Completed => {
+                panic!("an \"unchanged\" item_done must not complete the run")
+            }
+            _ => {}
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("finalize step did not finish");
 }
 
 /// Item #507: a review-only run must never reach `item_done`/PR flow —
@@ -595,16 +644,10 @@ async fn finalize_step_releases_claim_after_review_only_success() {
 /// findings-comment-only short-circuit for it, even though it would for a
 /// plain review-only task (see
 /// `finalize_step_posts_review_findings_comment_and_skips_item_done_when_review_only`
-/// above). Proven the same way `finalize_step_calls_item_done_on_success` is
-/// (but without its `#[ignore]`): `item_done` hard-fails in this sandbox
-/// (#482 — no real GitHub remote to open a PR against), so reaching it
-/// deterministically fails the step. If this branch fell through to the
-/// review-only short-circuit instead, the step would succeed with exactly
-/// one findings comment, like the plain review-only test above. Since
-/// `item_done` posts its own "PR creation failed" comment before erroring
-/// (see `finalize_step_fails_when_branch_slug_mismatch_hides_divergence`),
-/// the absence of the review-only "review findings" wording — not an empty
-/// comment list — is what proves the short-circuit was skipped.
+/// above). The fixture's `origin` is a local bare repo, so `item_done`
+/// pushes the spec and completes the item without a PR; the short-circuit
+/// never touches item state. So the item reaching "completed", with no
+/// review-only "review findings" comment, is what proves `item_done` ran.
 #[tokio::test]
 async fn finalize_step_attempts_item_done_for_design_spec_instead_of_findings_comment() {
     let (mcp, _backend_tmp, _repo_tmp, item_id, _project_id, worktree_path) =
@@ -635,7 +678,7 @@ async fn finalize_step_attempts_item_done_for_design_spec_instead_of_findings_co
     for _ in 0..200 {
         let state = engine.get_status(run_id).await.unwrap();
         match state.status {
-            flare_workflow::WorkflowStatus::Failed => {
+            flare_workflow::WorkflowStatus::Completed => {
                 let comments: serde_json::Value = serde_json::from_str(
                     &mcp.comment_impl(CommentRequest {
                         action: "list".into(),
@@ -653,14 +696,19 @@ async fn finalize_step_attempts_item_done_for_design_spec_instead_of_findings_co
                         .contains("review findings")),
                     "design-spec finalize must not post the review-only findings comment: {arr:?}"
                 );
+                let group = mcp
+                    .with_backend_db(|conn| {
+                        let item = agentflare_backend::item::get(conn, &item_id).unwrap();
+                        agentflare_backend::state::get(conn, &item.state_id)
+                            .unwrap()
+                            .group_name
+                    })
+                    .unwrap();
+                assert_eq!(group, "completed", "item_done must have run");
                 return;
             }
-            flare_workflow::WorkflowStatus::Completed => {
-                panic!(
-                    "design-spec finalize unexpectedly succeeded without a real GitHub \
-                     remote -- it must have taken the review-only short-circuit instead \
-                     of attempting item_done/PR flow"
-                );
+            flare_workflow::WorkflowStatus::Failed => {
+                panic!("design-spec finalize failed: {:?}", state.error);
             }
             _ => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
         }
@@ -722,10 +770,8 @@ fn run_or_resume_persists_run_id_and_resume_skips_completed_coder_step() {
 /// `run_or_resume_with_sender` with a mock `SendMessage` that answers
 /// `sdd_loop`'s implementer and judge roles (distinguished by prompt
 /// content, same as `sdd_test_support::mock_send`'s callers), so it runs
-/// unconditionally in CI. Unlike `finalize_step_calls_item_done_on_success`
-/// this doesn't need a real GitHub PR to assert anything -- it only
-/// checks that `workflow_run_id` was persisted before `finalize`'s
-/// `item_done` call hard-fails on the missing PR (#482).
+/// unconditionally in CI. It checks that `workflow_run_id` was persisted
+/// and survives `finalize`'s own metadata writes.
 #[test]
 fn run_or_resume_with_sender_persists_run_id_on_success() {
     let (mcp, _backend_tmp, _repo_tmp, item_id, _project_id, worktree_path) =
@@ -776,15 +822,9 @@ fn run_or_resume_with_sender_persists_run_id_on_success() {
             send,
         )
     });
-    // `mcp_with_claimed_item` wires a local bare `origin`, so `git push`
-    // succeeds but not a real GitHub remote — `finalize`'s `item_done` call
-    // hard-fails on the missing PR (item #109 / PR #482) -- same
-    // reasoning as `finalize_step_calls_item_done_on_success` right
-    // above, which needs `#[ignore]` for the same root cause since it
-    // asserts completion rather than just metadata persistence. This
-    // test only cares that `workflow_run_id` was persisted before that
-    // failure, which happens well before `finalize` runs.
-    assert!(result.is_err(), "{result:?}");
+    // `mcp_with_claimed_item` wires a local bare `origin` -- not GitHub, so
+    // `finalize`'s `item_done` pushes and completes the item without a PR.
+    assert!(result.is_ok(), "{result:?}");
 
     let updated = mcp
         .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).ok())
@@ -1179,9 +1219,12 @@ fn run_or_resume_with_sender_discards_a_workflow_run_id_that_belongs_to_a_differ
 }
 
 // Item #512: bare `task/<N>` checkout + renamed slug hid divergence from
-// `item_done`; finalize must surface workflow failure (not silent success).
+// `item_done`, so finalize reported success with nothing published. The
+// divergence must be seen: the real branch is pushed and the item completes
+// (the fixture's origin isn't GitHub, so without a PR) -- never a silent
+// no-op success.
 #[tokio::test]
-async fn finalize_step_fails_when_branch_slug_mismatch_hides_divergence() {
+async fn finalize_step_publishes_when_branch_slug_mismatch_hides_divergence() {
     let (mcp, _backend_tmp, _repo_tmp, item_id, _project_id, worktree_path) =
         crate::mcp_server::tests::mcp_with_claimed_item("!!!");
     mcp.with_backend_db(|conn| {
@@ -1218,14 +1261,16 @@ async fn finalize_step_fails_when_branch_slug_mismatch_hides_divergence() {
     for _ in 0..200 {
         let state = engine.get_status(run_id).await.unwrap();
         match state.status {
-            flare_workflow::WorkflowStatus::Failed => {
-                let err = state.error.unwrap_or_default();
-                assert!(
-                    err.contains("no PR resulted")
-                        || err.contains("not marking completed")
-                        || err.contains("One or more steps failed"),
-                    "finalize must fail when item_done hard-errors: {err}"
-                );
+            flare_workflow::WorkflowStatus::Completed => {
+                let group = mcp
+                    .with_backend_db(|conn| {
+                        let item = agentflare_backend::item::get(conn, &item_id).unwrap();
+                        agentflare_backend::state::get(conn, &item.state_id)
+                            .unwrap()
+                            .group_name
+                    })
+                    .unwrap();
+                assert_eq!(group, "completed", "the diverged branch must be published");
                 let comments: serde_json::Value = serde_json::from_str(
                     &mcp.comment_impl(CommentRequest {
                         action: "list".into(),
@@ -1240,21 +1285,18 @@ async fn finalize_step_fails_when_branch_slug_mismatch_hides_divergence() {
                     arr.iter().any(|c| c["body"]
                         .as_str()
                         .unwrap_or_default()
-                        .contains("PR creation failed")),
-                    "finalize failure path must post PR-failure comment: {arr:?}"
+                        .contains("completed without a PR")),
+                    "the no-PR completion must be recorded on the item: {arr:?}"
                 );
                 return;
             }
-            flare_workflow::WorkflowStatus::Completed => {
-                panic!(
-                    "finalize must not succeed when item_done errors on slug mismatch: {:?}",
-                    state
-                );
+            flare_workflow::WorkflowStatus::Failed => {
+                panic!("finalize failed on slug mismatch: {:?}", state.error);
             }
             _ => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
         }
     }
-    panic!("finalize step did not fail");
+    panic!("finalize step did not finish");
 }
 
 // Item #331's live failure: a double-JSON-encoded metadata field parses to

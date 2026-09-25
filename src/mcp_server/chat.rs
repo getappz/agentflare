@@ -15,6 +15,23 @@ pub(crate) const CHAT_COMMAND_SPECS: &[(&str, &str, &str)] = &[
     ("status", "", "project standup (done / in progress / stuck)"),
     ("project", "", "the project this chat is linked to"),
     ("new", " <title>", "create a work item"),
+    (
+        "msg",
+        " <to> <text>",
+        "message a live agent session (key, name, item:<id>, agent:<name>, *); /msg alone lists sessions",
+    ),
+    (
+        "cancel",
+        " <item> [reason]",
+        "cancel an item and stop its agent",
+    ),
+    ("pause", " <item>", "pause an item's run (resume later)"),
+    ("resume", " <item>", "resume a paused item"),
+    (
+        "redispatch",
+        " <item> [agent]",
+        "re-queue an item, optionally to another agent",
+    ),
     ("help", "", "this message"),
 ];
 
@@ -28,6 +45,8 @@ impl AgentflareMcp {
             "status" => self.chat_status(),
             "project" => self.chat_project(),
             "new" => self.chat_new(args),
+            "msg" => self.chat_msg(args),
+            "cancel" | "pause" | "resume" | "redispatch" => self.chat_control(command, args),
             "help" => Self::chat_help(),
             other => format!("Unknown command /{other}.\n\n{}", Self::chat_help()),
         }
@@ -92,6 +111,115 @@ impl AgentflareMcp {
                     .unwrap_or(name),
             ),
             Err(e) => format!("create failed: {}", e.message),
+        }
+    }
+
+    /// `/cancel|/pause|/resume|/redispatch <item> [rest]` -- the same
+    /// operator controls as `agentflare item ...` and the dashboard. `rest`
+    /// is the cancel/pause reason, or the agent to redispatch to.
+    fn chat_control(&self, command: &str, args: &str) -> String {
+        let mut parts = args.trim().splitn(2, char::is_whitespace);
+        let Some(item) = parts.next().filter(|s| !s.is_empty()) else {
+            let usage = CHAT_COMMAND_SPECS
+                .iter()
+                .find(|(name, _, _)| *name == command)
+                .map_or("", |(_, usage, _)| usage);
+            return format!("usage: /{command}{usage}");
+        };
+        let rest = parts
+            .next()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let (reason, agent) = match command {
+            "redispatch" => (None, rest),
+            "resume" => (None, None),
+            _ => (rest, None),
+        };
+        let req = ItemRequest {
+            action: command.into(),
+            id: Some(item.to_string()),
+            reason,
+            assignee_agent: agent,
+            ..Default::default()
+        };
+        match self.item_control(req) {
+            Ok(_) => {
+                let done = match command {
+                    "cancel" => "cancelled",
+                    "pause" => "paused",
+                    "resume" => "resumed",
+                    _ => "re-queued",
+                };
+                format!("{item} {done}.")
+            }
+            Err(e) => format!("{command} failed: {}", e.message),
+        }
+    }
+
+    /// `/msg <to> <text>` sends as the local human; bare `/msg` lists who's
+    /// live to message.
+    fn chat_msg(&self, args: &str) -> String {
+        let args = args.trim();
+        if args.is_empty() {
+            return match crate::db::open().map_err(|e| e.to_string()).and_then(|c| {
+                crate::sessions::list_live(&c, crate::claims::now()).map_err(|e| e.to_string())
+            }) {
+                Ok(live) if live.is_empty() => "No live agent sessions.".to_string(),
+                Ok(live) => {
+                    let mut out = String::from("Live sessions:");
+                    for s in live.iter().take(20) {
+                        out.push_str(&format!("\n{}", s.key));
+                        if let Some(name) = &s.name {
+                            out.push_str(&format!(" ({name})"));
+                        }
+                        if let Some(item) = &s.item_id {
+                            out.push_str(&format!(" item {item}"));
+                        }
+                    }
+                    out
+                }
+                Err(e) => format!("listing sessions failed: {e}"),
+            };
+        }
+        let Some((to, text)) = args
+            .split_once(char::is_whitespace)
+            .map(|(to, text)| (to, text.trim()))
+            .filter(|(_, text)| !text.is_empty())
+        else {
+            return "usage: /msg <to> <text>".to_string();
+        };
+        let sent = crate::db::open()
+            .map_err(|e| e.to_string())
+            .and_then(|conn| {
+                self.message_as(
+                    &conn,
+                    &crate::messages::identity::human_key(),
+                    MessageRequest {
+                        action: "send".into(),
+                        to: Some(to.to_string()),
+                        body: Some(text.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .map_err(|e| e.message.to_string())
+            })
+            .and_then(|json| {
+                serde_json::from_str::<serde_json::Value>(&json).map_err(|e| e.to_string())
+            });
+        match sent {
+            Ok(v) => {
+                let recipients: Vec<&str> = v["recipients"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(serde_json::Value::as_str).collect())
+                    .unwrap_or_default();
+                if recipients.is_empty() {
+                    "Nobody is working that item right now; left it as an item comment.".to_string()
+                } else {
+                    format!("Sent to {}", recipients.join(", "))
+                }
+            }
+            Err(e) => format!("send failed: {e}"),
         }
     }
 
@@ -170,7 +298,7 @@ mod tests {
     fn handle_chat_command_help_lists_every_command() {
         let mcp = AgentflareMcp::default();
         let text = mcp.handle_chat_command("help", "");
-        for cmd in ["/status", "/project", "/new", "/help"] {
+        for cmd in ["/status", "/project", "/new", "/msg", "/help"] {
             assert!(text.contains(cmd), "help text missing {cmd}");
         }
     }
@@ -204,6 +332,15 @@ mod tests {
         let text = mcp.handle_chat_command("bogus", "");
         assert!(text.starts_with("Unknown command /bogus."));
         assert!(text.contains("/help"));
+    }
+
+    #[test]
+    fn handle_chat_command_msg_without_text_shows_usage() {
+        let mcp = AgentflareMcp::default();
+        assert_eq!(
+            mcp.handle_chat_command("msg", "codex:abc   "),
+            "usage: /msg <to> <text>"
+        );
     }
 
     #[test]

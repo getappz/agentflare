@@ -58,7 +58,7 @@ impl RuleMatch {
         self.labels.is_empty() && self.kind.is_none() && self.size.is_none() && self.role.is_none()
     }
 
-    fn matches(&self, task: &TaskContext) -> bool {
+    pub(crate) fn matches(&self, task: &TaskContext) -> bool {
         if self.is_empty() {
             return false;
         }

@@ -14,17 +14,52 @@ impl AgentflareMcp {
     /// Derives a project name from the git remote (`getappz/agentflare` →
     /// `agentflare`) or, outside a repo, the directory basename.
     pub(crate) fn resolve_project_name() -> String {
-        if let Some(repo) = Self::run_git(&["remote", "get-url", "origin"]) {
+        Self::project_name_from(
+            Self::run_git(&["remote", "get-url", "origin"]),
+            std::env::current_dir().ok(),
+        )
+    }
+
+    fn project_name_from(origin: Option<String>, dir: Option<std::path::PathBuf>) -> String {
+        if let Some(repo) = origin {
             let normalized = crate::claims::normalize_repo(&repo);
             if let Some(name) = normalized.rsplit('/').next().filter(|s| !s.is_empty()) {
                 return name.to_string();
             }
         }
-        std::env::current_dir()
-            .ok()
-            .and_then(|d| d.file_name().map(|n| n.to_string_lossy().to_string()))
+        dir.and_then(|d| d.file_name().map(|n| n.to_string_lossy().to_string()))
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "default".to_string())
+    }
+
+    /// The directory project resolution derives identity from: the pinned
+    /// `worktree_repo_root_override` when this instance was scoped to a
+    /// project folder (`for_project_dir`/`scoped_to_project`), else this
+    /// process's cwd-derived repo root. Every fallback below reads from
+    /// here, never from the process cwd directly, so an instance scoped to
+    /// repo B can never resolve (and then write into B's link file) the
+    /// project of whatever repo A the daemon happened to start in.
+    fn resolution_root(&self) -> std::path::PathBuf {
+        self.worktree_repo_root_override
+            .clone()
+            .unwrap_or_else(Self::repo_root)
+    }
+
+    /// `git remote get-url origin` for `resolution_root`. Unscoped
+    /// instances keep running it in the raw cwd, exactly as before.
+    fn resolution_origin(&self) -> Option<String> {
+        match &self.worktree_repo_root_override {
+            Some(root) => flare_git_core::shell::run_in_opt(root, &["remote", "get-url", "origin"]),
+            None => Self::run_git(&["remote", "get-url", "origin"]),
+        }
+    }
+
+    /// `resolve_project_name`, scoped the same way as `resolution_root`.
+    fn resolve_project_name_scoped(&self) -> String {
+        match &self.worktree_repo_root_override {
+            Some(root) => Self::project_name_from(self.resolution_origin(), Some(root.clone())),
+            None => Self::resolve_project_name(),
+        }
     }
 
     /// Short uppercase alnum identifier for a project (used for issue-key
@@ -84,10 +119,10 @@ impl AgentflareMcp {
         if let Some(key) = self.backend_repo_key_override.clone() {
             return key;
         }
-        if let Some(remote) = Self::run_git(&["remote", "get-url", "origin"]) {
+        if let Some(remote) = self.resolution_origin() {
             return format!("git:{}", crate::claims::normalize_repo(&remote));
         }
-        let root = Self::repo_root();
+        let root = self.resolution_root();
         // `dunce`, not `std::fs::canonicalize` directly: on Windows std adds
         // a `\\?\` UNC prefix that Git for Windows' MSYS layer can't handle
         // when this path is later fed to `git worktree add` (folder_path
@@ -108,10 +143,10 @@ impl AgentflareMcp {
         if self.backend_repo_key_override.is_some() {
             return None;
         }
-        if Self::run_git(&["remote", "get-url", "origin"]).is_some() {
+        if self.resolution_origin().is_some() {
             return None;
         }
-        let root = Self::repo_root();
+        let root = self.resolution_root();
         let canonical = std::fs::canonicalize(&root).unwrap_or(root);
         Some(format!("path:{}", canonical.to_string_lossy()))
     }
@@ -129,6 +164,9 @@ impl AgentflareMcp {
         &self,
         conn: &rusqlite::Connection,
     ) -> Result<agentflare_backend::project::Project, ErrorData> {
+        if let Some(project_id) = &self.project_id_override {
+            return agentflare_backend::project::get(conn, project_id).map_err(map_backend_err);
+        }
         let link_path = self.project_link_path();
         if let Ok(bytes) = std::fs::read(&link_path)
             && let Ok(link) = serde_json::from_slice::<ProjectLink>(&bytes)
@@ -145,7 +183,7 @@ impl AgentflareMcp {
         }
 
         let workspace_id = Self::resolve_workspace_id(conn)?;
-        let name = Self::resolve_project_name();
+        let name = self.resolve_project_name_scoped();
         let identifier = Self::derive_project_identifier(&name);
         let repo_key = self.resolve_repo_key();
         let legacy_repo_key = self.legacy_repo_key();

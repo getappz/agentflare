@@ -28,6 +28,12 @@ pub(crate) const DISPATCHED_LABEL: &str = "dispatched";
 /// on `READY_LABEL`, so it doesn't retry-loop against the same broken agent
 /// or a persistently orphaning job (items #463/#506/#164).
 pub(crate) const NEEDS_MANUAL_LABEL: &str = "needs-manual-dispatch";
+/// Set by an operator pause (`item(action="pause")`, `agentflare item
+/// pause`): the item's run is parked with its worktree and run state kept,
+/// and its claim released. Discovery never dispatches an item carrying it,
+/// even if `ready-for-work` is added back by hand -- only a resume (which
+/// removes it) re-arms the item.
+pub(crate) const PAUSED_LABEL: &str = "paused";
 const NEEDS_HUMAN_GATE_LABEL: &str = "needs-human-gate";
 /// Blocks auto-dispatch even while `READY_LABEL` is also present -- for a
 /// go/no-go candidate item whose description says "not dispatched, awaiting
@@ -83,19 +89,28 @@ fn update_pr_stage(folder_path: &str, number: u64, from: Option<&str>, to: &str,
         return;
     };
     if let Err(e) = crate::github::issues::add_labels(&client, &repo, number, &[to.to_string()]) {
-        eprintln!("agentflare-supervisor: could not add {to} to PR #{number}: {e}");
+        eprintln!(
+            "agentflare-supervisor: could not add {to} to PR #{number}: {}",
+            e.log_safe()
+        );
     }
     if let Some(from) = from
         && let Err(e) = crate::github::issues::remove_label(&client, &repo, number, from)
     {
-        eprintln!("agentflare-supervisor: could not remove {from} from PR #{number}: {e}");
+        eprintln!(
+            "agentflare-supervisor: could not remove {from} from PR #{number}: {}",
+            e.log_safe()
+        );
     }
     // Empty comment = label bookkeeping only (a silent re-dispatch whose
     // announcement already went out) — never post a blank comment to the PR.
     if !comment.is_empty()
         && let Err(e) = crate::github::issues::comment(&client, &repo, number, comment)
     {
-        eprintln!("agentflare-supervisor: could not comment on PR #{number}: {e}");
+        eprintln!(
+            "agentflare-supervisor: could not comment on PR #{number}: {}",
+            e.log_safe()
+        );
     }
 }
 
@@ -261,6 +276,32 @@ struct ProjectBatch {
     ready_id: String,
 }
 
+/// Most work jobs one project may have queued or running at once while
+/// other projects also have ready-for-work items waiting, so one project's
+/// backlog can't take every worker. `AGENTFLARE_WORK_MAX_PER_PROJECT`
+/// overrides it; otherwise half the worker pool (the same
+/// `AGENTFLARE_WORK_MAX_CONCURRENCY` / resource-gate sizing the daemon's
+/// `WorkerPool` starts with), never less than one.
+fn per_project_work_cap() -> u64 {
+    let parse = |var: &str| {
+        std::env::var(var)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|n| *n > 0)
+    };
+    if let Some(cap) = parse("AGENTFLARE_WORK_MAX_PER_PROJECT") {
+        return cap;
+    }
+    let workers = parse("AGENTFLARE_WORK_MAX_CONCURRENCY").unwrap_or_else(|| {
+        let available_parallelism = std::thread::available_parallelism().map_or(1, |n| n.get());
+        agentflare_resource_gate::pool_size::resolve_pool_size(
+            available_parallelism,
+            agentflare_resource_gate::pool_size::memory_budget_bytes(),
+        ) as u64
+    });
+    (workers / 2).max(1)
+}
+
 /// One pass: across every project registered in `project_dirs` (see
 /// `AgentflareMcp::register_project_dir`, called wherever an agentflare
 /// CLI/MCP call runs inside a linked repo) — not just whichever project
@@ -285,7 +326,29 @@ pub(crate) fn run_discovery_tick(
         let dirs = agentflare_backend::project_dir::list(conn).ok()?;
         let mut batches = Vec::new();
         for dir in dirs {
-            let labels = agentflare_backend::label::list_by_project(conn, &dir.project_id).ok()?;
+            // One project's broken or vanished folder (repo deleted/moved,
+            // unmounted drive) must not stall dispatch for every other
+            // project -- skip just this one, loudly, and look again next tick.
+            if !std::path::Path::new(&dir.folder_path).is_dir() {
+                eprintln!(
+                    "agentflare-supervisor: project {} is registered at {} but that folder does \
+                     not exist -- skipping its ready-for-work items this tick",
+                    dir.project_id, dir.folder_path
+                );
+                continue;
+            }
+            // Same isolation for a per-project DB read failure: `?` here
+            // used to abort the whole tick, for every project.
+            let labels = match agentflare_backend::label::list_by_project(conn, &dir.project_id) {
+                Ok(labels) => labels,
+                Err(e) => {
+                    eprintln!(
+                        "agentflare-supervisor: could not list labels for project {}: {e}",
+                        dir.project_id
+                    );
+                    continue;
+                }
+            };
             let mut label_id_by_name = std::collections::HashMap::new();
             for l in &labels {
                 label_id_by_name.insert(l.name.clone(), l.id.clone());
@@ -296,7 +359,17 @@ pub(crate) fn run_discovery_tick(
                 continue;
             };
             let items =
-                agentflare_backend::item::list_by_label(conn, &dir.project_id, &ready_id).ok()?;
+                match agentflare_backend::item::list_by_label(conn, &dir.project_id, &ready_id) {
+                    Ok(items) => items,
+                    Err(e) => {
+                        eprintln!(
+                            "agentflare-supervisor: could not list ready-for-work items for \
+                             project {}: {e}",
+                            dir.project_id
+                        );
+                        continue;
+                    }
+                };
             batches.push(ProjectBatch {
                 folder_path: dir.folder_path,
                 items,
@@ -311,6 +384,11 @@ pub(crate) fn run_discovery_tick(
         return result;
     };
 
+    // Per-project fairness: only once more than one project is competing
+    // for workers this tick -- a lone project may use the whole pool.
+    let contended = batches.iter().filter(|b| !b.items.is_empty()).count() > 1;
+    let project_cap = per_project_work_cap();
+
     for batch in batches {
         let ProjectBatch {
             folder_path,
@@ -318,7 +396,25 @@ pub(crate) fn run_discovery_tick(
             label_id_by_name,
             ready_id,
         } = batch;
+        let mut project_in_flight = if contended {
+            queue
+                .count_active_with_arg(&folder_path, Some(2))
+                .unwrap_or(0)
+        } else {
+            0
+        };
         for item in items {
+            if let Some(paused_id) = label_id_by_name.get(PAUSED_LABEL) {
+                let paused = mcp
+                    .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item.id))
+                    .ok()
+                    .and_then(Result::ok)
+                    .is_some_and(|ids| ids.contains(paused_id));
+                if paused {
+                    result.waiting += 1;
+                    continue;
+                }
+            }
             if let Some(gate_id) = label_id_by_name.get(NEEDS_DECISION_LABEL) {
                 let gated = mcp
                     .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item.id))
@@ -381,6 +477,18 @@ pub(crate) fn run_discovery_tick(
                         result.waiting += 1;
                         continue;
                     }
+                    if contended && project_in_flight >= project_cap {
+                        // Leave ready-for-work in place, same as the other
+                        // Wait paths: the next tick re-checks the cap.
+                        eprintln!(
+                            "agentflare-supervisor: item #{} ({}) is ready-for-work but its \
+                             project already has {project_in_flight} work job(s) queued or \
+                             running (per-project cap {project_cap})",
+                            item.sequence_id, item.id
+                        );
+                        result.waiting += 1;
+                        continue;
+                    }
                     match dispatch_item(
                         mcp,
                         queue,
@@ -390,7 +498,10 @@ pub(crate) fn run_discovery_tick(
                         &label_id_by_name,
                         &ready_id,
                     ) {
-                        DispatchOutcome::Dispatched => result.dispatched += 1,
+                        DispatchOutcome::Dispatched => {
+                            result.dispatched += 1;
+                            project_in_flight += 1;
+                        }
                         DispatchOutcome::WaitingOnPlan => result.waiting += 1,
                         DispatchOutcome::NotDispatched => {}
                     }
@@ -1085,6 +1196,9 @@ pub(crate) struct ReviewSweepResult {
     /// item is picked up by the *next* tick's normal per-item loop, not this
     /// one.
     pub discovered: usize,
+    /// Items whose PR was closed without merging, sent back to the backlog
+    /// for a fresh attempt instead of sitting in "in_review" forever.
+    pub requeued: usize,
 }
 
 /// Why `self_repair_or_gate` did or didn't dispatch. A plain `bool` can't
@@ -1157,6 +1271,7 @@ pub(crate) fn run_review_sweep(
         waiting: 0,
         updated: 0,
         discovered: 0,
+        requeued: 0,
     };
     // Computed once, not per-project/per-PR: identifies this workstation to
     // `claim_pr_for_discovery`'s marker comment so two workstations racing to
@@ -1281,6 +1396,15 @@ pub(crate) fn run_review_sweep(
             stray_candidates,
         } = batch;
         let repo_root = std::path::PathBuf::from(&folder_path);
+        // Every per-item call below (`item_check_merge`, `comment_impl`,
+        // `item_add_label`, ...) resolves ids through `resolve_item_id`,
+        // which only accepts items of the instance's own project. The
+        // daemon's `mcp` is linked to whatever repo it was started in, so
+        // with it an in_review item from any other registered project could
+        // never be promoted, relabeled or cleaned up and sat in_review
+        // forever. Pin a view of it to this batch's project and folder.
+        let scoped = mcp.scoped_to_project(project_id.clone(), repo_root.clone());
+        let mcp = &scoped;
         // Resolved once per project and reused for discovery, the batched
         // GraphQL fetch below, and (implicitly, inside `pr_ci_status`) the
         // per-item REST fallback -- rather than every one of those re-doing
@@ -1421,7 +1545,7 @@ fn handle_pr_status(
 ) {
     match status {
         crate::worktree::PrCiStatus::Merged => {
-            if promote_merged_item(mcp, item) {
+            if promote_merged_item(mcp, item, repo_root) {
                 result.promoted += 1;
             } else {
                 result.skipped += 1;
@@ -1449,107 +1573,47 @@ fn handle_pr_status(
                 SelfRepairOutcome::Skipped => result.skipped += 1,
             }
         }
-        crate::worktree::PrCiStatus::Passing { number, labels } => {
-            // CI just went green -- if the PR was still carrying a
-            // self-repair/needs-human stage label from before, swap it back
-            // to plain in-review rather than leaving a stale "under repair"
-            // label on a now-passing PR. `labels` is already in hand from
-            // the batched/single fetch above, so this only touches GitHub
-            // when there's actually something to revert.
-            if let Some(stale) = [SELF_REPAIR_PR_LABEL, NEEDS_HUMAN_PR_LABEL]
-                .into_iter()
-                .find(|l| labels.iter().any(|have| have == l))
-            {
-                update_pr_stage(
-                    folder_path,
-                    number,
-                    Some(stale),
-                    IN_REVIEW_PR_LABEL,
-                    "## supervisor — CI green\n\nChecks are passing again.",
-                );
-            }
-            // Item #303: post the one-time completion summary for whichever
-            // `self_repair_or_gate` trigger(s) were previously announced on
-            // this item -- each call is a no-op unless that trigger actually
-            // has an unresolved announcement recorded, so it's safe to check
-            // both unconditionally rather than trying to infer from the PR
-            // label above which trigger (if either) was in play.
-            maybe_post_repair_complete_summary(
-                mcp,
-                item,
-                CI_SELF_REPAIR_MARKER,
-                CI_SELF_REPAIR_COMPLETE_MARKER,
-                "CI checks are passing again",
-                CI_SELF_REPAIR_ANNOUNCED_KEY,
-                CI_SELF_REPAIR_SILENT_KEY,
-                CI_SELF_REPAIR_COMPLETED_KEY,
-            );
-            maybe_post_repair_complete_summary(
-                mcp,
-                item,
-                CONFLICT_REPAIR_MARKER,
-                CONFLICT_REPAIR_COMPLETE_MARKER,
-                "The merge conflict is resolved",
-                CONFLICT_REPAIR_ANNOUNCED_KEY,
-                CONFLICT_REPAIR_SILENT_KEY,
-                CONFLICT_REPAIR_COMPLETED_KEY,
-            );
-            // Namespaced ("pr-approval:<id>", not the bare item id): the
-            // underlying set is keyed globally across every gate type in
-            // this file (see `dispatch_item`'s "plan:" comment) -- an
-            // unnamespaced key here silently starves this card of its
-            // once-per-gate notify if the item was already gated for an
-            // unrelated reason earlier in its life (e.g. the go/no-go
-            // decision gate below, or `skip_item`), since that gate's call
-            // already consumed the bare-id token (item #587).
-            if !labels.iter().any(|l| l == PR_APPROVAL_LABEL)
-                && first_time_gated(&format!("pr-approval:{}", item.id))
-            {
-                notify_pr_approval_gate(item, folder_path, number);
-            }
-            // CI being green and a human's approval label being attached
-            // don't mean the PR is actually done if CodeRabbit's own review
-            // still has unresolved findings sitting on it untouched (item
-            // #273) -- so the findings check must run, and gate the merge,
-            // *before* `merge_if_approved` is ever called, not only in the
-            // branch where it happened not to merge (item #628: an approved,
-            // CI-green PR with real findings on it got merged untouched
-            // because the two were checked in the wrong order -- see GitHub
-            // PR 791). Skip the two live GitHub calls this fetch costs
-            // entirely once the item is already gated or a repair job is
-            // already in flight -- `coderabbit_repair_or_gate` would just
-            // discard the findings and return `Skipped` anyway, but not
-            // before paying for the fetch on every single tick for as long
-            // as the PR sits gated or in-flight.
-            if already_gated_or_in_flight(mcp, queue, item, label_id_by_name) {
-                result.skipped += 1;
-            } else {
-                let findings = fetch_unresolved_coderabbit_comments(repo_root, number);
-                match merge_or_repair_findings(
-                    mcp,
-                    queue,
-                    auth_conn,
-                    host_policy,
-                    item,
-                    repo_root,
-                    number,
-                    &findings,
-                    &labels,
-                    label_id_by_name,
-                    folder_path,
-                ) {
-                    PassingPrOutcome::Merged => result.promoted += 1,
-                    PassingPrOutcome::NotMerged => result.skipped += 1,
-                    PassingPrOutcome::Repair(SelfRepairOutcome::Dispatched) => {
-                        result.review_repaired += 1
-                    }
-                    PassingPrOutcome::Repair(SelfRepairOutcome::Deferred) => result.waiting += 1,
-                    PassingPrOutcome::Repair(SelfRepairOutcome::Skipped) => result.skipped += 1,
-                }
-            }
-        }
-        crate::worktree::PrCiStatus::Behind { number } => {
-            if crate::worktree::update_stale_branch(repo_root, number) {
+        crate::worktree::PrCiStatus::Passing {
+            number,
+            labels,
+            head_sha,
+        } => handle_ci_green(
+            mcp,
+            queue,
+            auth_conn,
+            host_policy,
+            item,
+            number,
+            &labels,
+            CiGreenMerge::Allowed {
+                head_sha: head_sha.as_deref(),
+            },
+            label_id_by_name,
+            folder_path,
+            repo_root,
+            result,
+        ),
+        // Branch protection is holding a CI-green PR for a human review:
+        // everything `Passing` does short of the merge attempt -- stale
+        // repair labels cleared, the approval gate surfaced (the whole point:
+        // this used to read as `Pending` and never reached the gate), and
+        // CodeRabbit findings still repaired while it waits.
+        crate::worktree::PrCiStatus::AwaitingReview { number, labels } => handle_ci_green(
+            mcp,
+            queue,
+            auth_conn,
+            host_policy,
+            item,
+            number,
+            &labels,
+            CiGreenMerge::BlockedOnReview,
+            label_id_by_name,
+            folder_path,
+            repo_root,
+            result,
+        ),
+        crate::worktree::PrCiStatus::Behind { number, head_sha } => {
+            if crate::worktree::update_stale_branch(repo_root, number, head_sha.as_deref()) {
                 result.updated += 1;
             } else {
                 result.skipped += 1;
@@ -1587,151 +1651,21 @@ fn handle_pr_status(
                 result.skipped += 1;
             }
         }
+        crate::worktree::PrCiStatus::Closed { number } => {
+            if requeue_closed_pr_item(mcp, item, number) {
+                result.requeued += 1;
+            } else {
+                result.skipped += 1;
+            }
+        }
         crate::worktree::PrCiStatus::Pending | crate::worktree::PrCiStatus::Unknown => {
             result.skipped += 1;
         }
     }
 }
 
-/// Item #234's self-heal (`run_review_sweep`'s `stray_candidates` handling):
-/// confirms a stray item's tracked PR hasn't simply been closed without
-/// merging before restoring the item to "in_review" -- an abandoned PR is
-/// the one case metadata presence and claim liveness alone can't rule out.
-/// Split out from the sweep's loop, mirroring `merge_approved_pr`'s own
-/// test seam, so tests can drive it against a mock server instead of
-/// `Client::new()`'s real credentials/host -- `run_review_sweep`'s own
-/// integration tests never touch the network at all (see
-/// `throwaway_repo`'s doc comment), so this is the only way to pin the
-/// actual open/merged/closed decision.
-fn stray_pr_is_still_relevant(
-    client: &crate::github::Client,
-    repo: &crate::github::RepoId,
-    number: u64,
-) -> bool {
-    match crate::github::pulls::get(client, repo, number) {
-        Ok(pr) => pr.state != "closed" || pr.merged_at.is_some(),
-        Err(_) => false,
-    }
-}
-
-fn promote_merged_item(mcp: &AgentflareMcp, item: &agentflare_backend::item::Item) -> bool {
-    let Ok(json) = mcp.item_check_merge(ItemRequest {
-        action: "check_merge".into(),
-        id: Some(item.id.clone()),
-        ..Default::default()
-    }) else {
-        return false;
-    };
-    serde_json::from_str::<serde_json::Value>(&json)
-        .ok()
-        .and_then(|v| v["promoted"].as_bool())
-        .unwrap_or(false)
-}
-
-/// Routes a CI-green PR to either a CodeRabbit review-repair dispatch or an
-/// approval-gated merge attempt -- `findings` (pre-fetched by the caller,
-/// same convention as `self_repair_or_gate`'s `failed_checks`) is checked
-/// FIRST, so a PR with unresolved CodeRabbit findings can never reach
-/// `merge_if_approved`, regardless of its approval label or CI status (item
-/// #628: the two were previously checked in the wrong order -- `merge_if_approved`
-/// ran first and findings were only checked in the branch where it did NOT
-/// merge -- so an approved, CI-green PR with real findings still sitting on
-/// it got merged untouched; see GitHub PR 791).
-#[allow(clippy::too_many_arguments)]
-fn merge_or_repair_findings(
-    mcp: &AgentflareMcp,
-    queue: &agentflare_jobs::Queue,
-    auth_conn: &rusqlite::Connection,
-    host_policy: agentflare_resource_gate::Policy,
-    item: &agentflare_backend::item::Item,
-    repo_root: &std::path::Path,
-    number: u64,
-    findings: &[crate::github::models::ReviewComment],
-    labels: &[String],
-    label_id_by_name: &std::collections::HashMap<String, String>,
-    folder_path: &str,
-) -> PassingPrOutcome {
-    if !findings.is_empty() {
-        return PassingPrOutcome::Repair(coderabbit_repair_or_gate(
-            mcp,
-            queue,
-            auth_conn,
-            host_policy,
-            item,
-            number,
-            findings,
-            labels,
-            label_id_by_name,
-            folder_path,
-        ));
-    }
-    let summary = maybe_post_repair_complete_summary(
-        mcp,
-        item,
-        CODERABBIT_REPAIR_MARKER,
-        CODERABBIT_REPAIR_COMPLETE_MARKER,
-        "All CodeRabbit findings are resolved",
-        CODERABBIT_REPAIR_ANNOUNCED_KEY,
-        CODERABBIT_REPAIR_SILENT_KEY,
-        CODERABBIT_REPAIR_COMPLETED_KEY,
-    );
-    clear_stale_coderabbit_repair_label(folder_path, number, labels, summary.as_deref());
-    if merge_if_approved(mcp, item, repo_root, number, labels) {
-        PassingPrOutcome::Merged
-    } else {
-        PassingPrOutcome::NotMerged
-    }
-}
-
-/// Auto-merges a CI-green PR and promotes its item, but only once a human
-/// has attached `PR_APPROVAL_LABEL` to the PR itself -- checked first and
-/// short-circuits before any GitHub call so an unapproved item never touches
-/// the network here. Only ever called from `merge_or_repair_findings`, once
-/// it has confirmed there are no unresolved CodeRabbit findings, so CI green
-/// is structurally required and findings are structurally clean: the label
-/// can add a gate on top of both, never bypass either.
-fn merge_if_approved(
-    mcp: &AgentflareMcp,
-    item: &agentflare_backend::item::Item,
-    repo_root: &std::path::Path,
-    number: u64,
-    labels: &[String],
-) -> bool {
-    if !labels.iter().any(|l| l == PR_APPROVAL_LABEL) {
-        return false;
-    }
-    let Some(repo) = crate::github::RepoId::resolve_from_remote(repo_root) else {
-        return false;
-    };
-    let Ok(client) = crate::github::Client::new() else {
-        return false;
-    };
-    merge_approved_pr(&client, &repo, number) && promote_merged_item(mcp, item)
-}
-
-/// The actual GitHub merge call for an approved, CI-green PR. Split out from
-/// `merge_if_approved` so tests can drive it against a mock server instead
-/// of `Client::new()`'s real credentials/host, mirroring `github::pulls`'
-/// own test style. Squash matches this repo's existing single-commit-per-item
-/// convention. Logs and falls through (never retries in-line) on failure --
-/// branch protection or a merge conflict just means the item sits until the
-/// next sweep tick, same as any other `skipped` outcome.
-fn merge_approved_pr(
-    client: &crate::github::Client,
-    repo: &crate::github::RepoId,
-    number: u64,
-) -> bool {
-    match crate::github::pulls::merge(client, repo, number, "squash") {
-        Ok(()) => true,
-        Err(e) => {
-            eprintln!("agentflare-supervisor: auto-merge failed for PR #{number} in {repo}: {e}");
-            false
-        }
-    }
-}
-
 /// Called from `item_check_merge` right after `item_id` is promoted to
-/// `completed` (both the automatic path via `promote_merged_item` above and
+/// `completed` (both the automatic path via `merge::promote_merged_item` and
 /// manual/reconciliation calls funnel through that one function) -- for
 /// every item that declared a dependency on `item_id`, once *all* of its
 /// dependencies are completed, apply `READY_LABEL` so `run_discovery_tick`
@@ -1828,15 +1762,14 @@ pub(crate) fn cascade_unblock_dependents(conn: &rusqlite::Connection, item_id: &
 /// returning and the job actually reaching `item_claim`, during which the
 /// item's state group hasn't flipped out of "in_review" yet and a second
 /// sweep tick could otherwise dispatch a duplicate.
+///
+/// A targeted count over every active row, not `Queue::list` -- that only
+/// returns the 100 newest jobs, so an older still-queued job for this item
+/// was invisible to this guard once enough other work piled up behind it.
 fn job_in_flight(queue: &agentflare_jobs::Queue, item_id: &str) -> bool {
-    [
-        agentflare_jobs::JobState::Queued,
-        agentflare_jobs::JobState::Running,
-    ]
-    .into_iter()
-    .filter_map(|state| queue.list(Some(state)).ok())
-    .flatten()
-    .any(|job| job.args.contains(&item_id.to_string()))
+    queue
+        .count_active_with_arg(item_id, None)
+        .is_ok_and(|n| n > 0)
 }
 
 /// Telegram notifications and the inbound channel-approval poll. Split out
@@ -1846,6 +1779,8 @@ fn job_in_flight(queue: &agentflare_jobs::Queue, item_id: &str) -> bool {
 /// keeps working unchanged.
 pub(crate) mod notify;
 pub(crate) use notify::*;
+mod merge;
+use merge::*;
 
 /// Whether `item` is already gated for a human (`NEEDS_HUMAN_GATE_LABEL`) or
 /// has an `agentflare-work` job already queued/running -- the short-circuit

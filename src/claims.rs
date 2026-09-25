@@ -18,10 +18,6 @@ pub use db_kit::claim::Acquire;
 use db_kit::claim::ClaimLedger;
 use rusqlite::{Connection, OptionalExtension, params};
 
-/// Default lease: a claim whose owner hasn't heartbeat within this window is
-/// stealable, so a crashed/hung agent can't wedge a target forever.
-const DEFAULT_TTL_SECS: u64 = 1800; // 30 min
-
 const LEDGER: ClaimLedger = ClaimLedger::new("claims", &["repo", "target"]);
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
@@ -365,8 +361,9 @@ pub fn has_owner_override() -> bool {
 /// `<agent>:<instance>` — same agent chain as handoff, plus an instance
 /// discriminator so two parallel sessions of one agent are distinct owners.
 ///
-/// Instance is `AGENTFLARE_SESSION` if set, else the process pid. A long-lived
-/// MCP server has a stable pid, so all its `claim_*` calls share one owner —
+/// Instance is `AGENTFLARE_SESSION` if set, else a per-process id
+/// (`process_instance_id`: pid plus a random suffix). A long-lived MCP
+/// server computes it once, so all its `claim_*` calls share one owner —
 /// the common case. The CLI, however, is a fresh process per command, so
 /// `AGENTFLARE_SESSION` must be set to keep ownership continuous across
 /// separate `agentflare claim` invocations (acquire in one, release in
@@ -398,8 +395,20 @@ pub fn owner_id() -> String {
     let instance = std::env::var("AGENTFLARE_SESSION")
         .ok()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| std::process::id().to_string());
+        .unwrap_or_else(|| process_instance_id().to_string());
     format!("{agent}:{instance}")
+}
+
+/// This process's owner-instance discriminator: `<pid>-<random>`, computed
+/// once. A bare pid is not unique enough — every sandboxed job run under
+/// bwrap's `--unshare-pid` sees itself as a tiny pid (often the same one),
+/// and pids repeat across machines sharing a synced db — and `acquire`
+/// treats an identical owner string as "already ours", so two such
+/// processes would silently share one claim. The pid stays as a prefix for
+/// readability; no `:` so `agent_of`/`agent_part` still split correctly.
+fn process_instance_id() -> &'static str {
+    static INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    INSTANCE.get_or_init(|| format!("{}-{:016x}", std::process::id(), rand::random::<u64>()))
 }
 
 /// Strips the `:<instance>` suffix off an owner id, leaving the stable agent
@@ -411,11 +420,12 @@ pub fn agent_of(owner_id: &str) -> &str {
     owner_id.split(':').next().unwrap_or(owner_id)
 }
 
+/// Default lease (30 min, `AGENTFLARE_CLAIM_TTL_SECS` overrides): a claim
+/// whose owner hasn't heartbeat within this window is stealable, so a
+/// crashed/hung agent can't wedge a target forever. Same value the backend
+/// crate applies to item claims.
 pub fn ttl_secs() -> i64 {
-    std::env::var("AGENTFLARE_CLAIM_TTL_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_TTL_SECS) as i64
+    agentflare_backend::claim::default_ttl_secs()
 }
 
 /// When an item's `assignee_agent` is updated to a different agent, release
@@ -503,75 +513,6 @@ mod tests {
     }
 
     const TTL: i64 = 1800;
-
-    #[test]
-    fn acquire_free_target_then_held_by_other() {
-        let c = mem();
-        assert_eq!(
-            acquire(&c, "o/r", "issue#1", "a:1", None, None, 1000, TTL).unwrap(),
-            Acquire::Acquired
-        );
-        match acquire(&c, "o/r", "issue#1", "b:2", None, None, 1001, TTL).unwrap() {
-            Acquire::Held { owner, .. } => assert_eq!(owner, "a:1"),
-            other => panic!("expected Held, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn reacquiring_own_live_claim_is_idempotent_and_refreshes_heartbeat() {
-        let c = mem();
-        acquire(&c, "o/r", "issue#1", "a:1", None, None, 1000, TTL).unwrap();
-        assert_eq!(
-            acquire(&c, "o/r", "issue#1", "a:1", None, None, 1500, TTL).unwrap(),
-            Acquire::Acquired
-        );
-        let hb: i64 = c
-            .query_row("SELECT heartbeat_at FROM claims", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(hb, 1500, "own re-acquire should refresh heartbeat");
-    }
-
-    #[test]
-    fn stale_claim_is_stealable_but_fresh_one_is_not() {
-        let c = mem();
-        acquire(&c, "o/r", "issue#1", "a:1", None, None, 1000, TTL).unwrap();
-        // Well within TTL — cannot steal.
-        assert!(matches!(
-            acquire(&c, "o/r", "issue#1", "b:2", None, None, 1000 + 100, TTL).unwrap(),
-            Acquire::Held { .. }
-        ));
-        // Past the TTL — steal succeeds and ownership transfers.
-        assert_eq!(
-            acquire(&c, "o/r", "issue#1", "b:2", None, None, 1000 + TTL + 1, TTL).unwrap(),
-            Acquire::Acquired
-        );
-        let owner: String = c
-            .query_row("SELECT owner FROM claims", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(owner, "b:2");
-    }
-
-    #[test]
-    fn done_target_is_reacquirable_by_anyone() {
-        let c = mem();
-        acquire(&c, "o/r", "issue#1", "a:1", None, None, 1000, TTL).unwrap();
-        assert!(done(&c, "o/r", "issue#1", "a:1", 1100).unwrap());
-        assert_eq!(
-            acquire(&c, "o/r", "issue#1", "b:2", None, None, 1200, TTL).unwrap(),
-            Acquire::Acquired
-        );
-    }
-
-    #[test]
-    fn heartbeat_release_done_are_owner_scoped() {
-        let c = mem();
-        acquire(&c, "o/r", "issue#1", "a:1", None, None, 1000, TTL).unwrap();
-        assert!(!heartbeat(&c, "o/r", "issue#1", "b:2", 1100).unwrap());
-        assert!(!release(&c, "o/r", "issue#1", "b:2").unwrap());
-        assert!(!done(&c, "o/r", "issue#1", "b:2", 1100).unwrap());
-        assert!(heartbeat(&c, "o/r", "issue#1", "a:1", 1100).unwrap());
-        assert!(release(&c, "o/r", "issue#1", "a:1").unwrap());
-    }
 
     #[test]
     fn list_hides_stale_and_done_unless_requested() {
@@ -781,6 +722,21 @@ mod tests {
         let after = owner_id();
         assert_eq!(overridden, "claude-code:job-123");
         assert_ne!(after, "claude-code:job-123");
+    }
+
+    #[test]
+    fn process_instance_id_is_stable_pid_prefixed_and_colon_free() {
+        let id = process_instance_id();
+        assert_eq!(
+            id,
+            process_instance_id(),
+            "must be computed once per process"
+        );
+        assert!(id.starts_with(&format!("{}-", std::process::id())), "{id}");
+        assert!(!id.contains(':'), "{id}");
+        // Longer than the bare pid: carries the random disambiguator.
+        assert!(id.len() > std::process::id().to_string().len() + 1, "{id}");
+        assert_eq!(agent_of(&format!("claude-code:{id}")), "claude-code");
     }
 
     #[test]

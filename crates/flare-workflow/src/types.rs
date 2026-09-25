@@ -184,6 +184,14 @@ pub enum WorkflowStatus {
     Cancelled,
 }
 
+impl WorkflowStatus {
+    /// Whether the run has settled (`Completed`, `Failed` or `Cancelled`)
+    /// and must never change status again.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
 /// Step execution status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -437,6 +445,35 @@ pub struct WorkflowState<D: WorkflowData> {
     pub variables: HashMap<String, String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Which live engine process is currently driving this run, if any —
+    /// see [`ExecutorLease`]. `#[serde(default)]`: rows persisted before this
+    /// field existed (or by an older binary) load as `None`, i.e. "nobody
+    /// holds it", which is exactly what an un-leased legacy run means.
+    #[serde(default)]
+    pub lease: Option<ExecutorLease>,
+}
+
+/// Executor liveness for a run: the engine driving it stamps its own
+/// process-unique `owner` token here and re-stamps `renewed_at` on a fixed
+/// cadence for as long as it keeps driving. A lease whose `renewed_at` is
+/// older than the engine's lease TTL means its holder died (crash, kill -9,
+/// upgrade) without finishing the run, so another process may take it over;
+/// a fresh one means someone else is still actively executing it and it must
+/// not be resumed a second time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutorLease {
+    /// `host:pid:nonce` of the holding process (see
+    /// `WorkflowEngine::executor_id`).
+    pub owner: String,
+    pub renewed_at: DateTime<Utc>,
+}
+
+impl ExecutorLease {
+    /// Whether this lease was renewed within `ttl` of `now`.
+    pub fn is_fresh(&self, now: DateTime<Utc>, ttl: std::time::Duration) -> bool {
+        let ttl = chrono::Duration::from_std(ttl).unwrap_or(chrono::Duration::MAX);
+        now.signed_duration_since(self.renewed_at) < ttl
+    }
 }
 
 impl<D: WorkflowData> WorkflowState<D> {
@@ -455,6 +492,7 @@ impl<D: WorkflowData> WorkflowState<D> {
             variables: HashMap::new(),
             created_at: now,
             updated_at: now,
+            lease: None,
         }
     }
 }
@@ -491,6 +529,11 @@ pub enum WorkflowError {
 
     #[error("workflow cancelled: {0}")]
     Cancelled(WorkflowRunId),
+
+    /// A step stopped because an operator paused the run; nothing about the
+    /// step is recorded as failed, so a resume re-runs it.
+    #[error("workflow paused: {0}")]
+    Paused(WorkflowRunId),
 
     #[error("invalid state transition: {from:?} -> {to:?}")]
     InvalidStateTransition {

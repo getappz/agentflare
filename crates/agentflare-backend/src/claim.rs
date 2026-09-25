@@ -19,6 +19,23 @@ pub fn acquire(
     LEDGER.acquire(conn, &[item_id], owner, now, ttl_secs)
 }
 
+/// Steal-only acquire: takes over an existing done, stale, or already-ours
+/// lease on `item_id` exactly like `acquire`, but returns `Ok(None)`
+/// instead of creating one when no row exists. For callers finishing work
+/// they believe they already hold (`item_done`'s/`item_release`'s
+/// abandoned-claim steal): no row means the lease was released since —
+/// e.g. the item was reassigned and its new owner released it — and a plain
+/// `acquire` would re-mint the claim for a job that has already lost it.
+pub fn acquire_if_stale_only(
+    conn: &Connection,
+    item_id: &str,
+    owner: &str,
+    now: i64,
+    ttl_secs: i64,
+) -> rusqlite::Result<Option<Acquire>> {
+    LEDGER.acquire_existing(conn, &[item_id], owner, now, ttl_secs)
+}
+
 pub fn heartbeat(
     conn: &Connection,
     item_id: &str,
@@ -40,9 +57,8 @@ pub fn is_owner(conn: &Connection, item_id: &str, owner: &str) -> rusqlite::Resu
     LEDGER.is_owner(conn, &[item_id], owner)
 }
 
-/// Default claim TTL, mirrored from the main binary's `claims::ttl_secs()`
-/// (this lower-level crate can't depend on it) — override via
-/// AGENTFLARE_CLAIM_TTL_SECS so the two stay in sync.
+/// Default claim TTL (override via AGENTFLARE_CLAIM_TTL_SECS) -- the single
+/// source of truth; the main binary's `claims::ttl_secs()` delegates here.
 pub fn default_ttl_secs() -> i64 {
     std::env::var("AGENTFLARE_CLAIM_TTL_SECS")
         .ok()
@@ -230,5 +246,39 @@ mod tests {
         let stale = claims.iter().find(|c| c.key == [stale_id.clone()]).unwrap();
         assert!(!fresh.stale);
         assert!(stale.stale);
+    }
+
+    #[test]
+    fn acquire_if_stale_only_refuses_a_released_claim_but_steals_a_stale_one() {
+        let conn = db::open_in_memory().unwrap();
+        let item_id = seed_item(&conn, "StealOnly");
+
+        // Claimed by the old job, then reassigned + released by the new
+        // owner: the row is gone, and the old job must not get it back.
+        acquire(&conn, &item_id, "claude-code:old-job", 1_000, TTL).unwrap();
+        assert!(release(&conn, &item_id, "claude-code:old-job").unwrap());
+        assert_eq!(
+            acquire_if_stale_only(&conn, &item_id, "claude-code:old-job", 1_100, TTL).unwrap(),
+            None
+        );
+        assert!(current_owner(&conn, &item_id).is_none());
+
+        // A live claim by someone else is still Held.
+        acquire(&conn, &item_id, "codex:new", 1_200, TTL).unwrap();
+        assert!(matches!(
+            acquire_if_stale_only(&conn, &item_id, "claude-code:old-job", 1_300, TTL).unwrap(),
+            Some(Acquire::Held { ref owner, .. }) if owner == "codex:new"
+        ));
+
+        // Abandoned past the TTL — stealable, same as `acquire`.
+        assert_eq!(
+            acquire_if_stale_only(&conn, &item_id, "claude-code:old-job", 1_200 + TTL + 1, TTL)
+                .unwrap(),
+            Some(Acquire::Acquired)
+        );
+        assert_eq!(
+            current_owner(&conn, &item_id).as_deref(),
+            Some("claude-code:old-job")
+        );
     }
 }

@@ -161,8 +161,11 @@ fn worker_loop(
 /// in-process job has no OS-level SIGKILL backstop the way a subprocess does
 /// (a stuck claim/worktree/done step can't be force-killed), so without this
 /// a hang there would wedge one of the pool's worker threads forever. On
-/// timeout the job is marked failed and this worker moves on to the next
-/// queued job; the stuck thread itself is abandoned (there is no safe way to
+/// timeout the attempt is flagged cancelled (`cancel::job_cancelled` reads
+/// true for it, so cooperative cancel checks inside the job stop it), given
+/// a bounded grace period to wind down, then the job is marked failed and
+/// this worker moves on to the next queued job; a thread that ignores the
+/// cancellation is abandoned (there is no safe way to
 /// force-kill a thread in Rust) rather than actually terminated — a real,
 /// deliberate trade-off against the OS-level guarantee a subprocess gets,
 /// not a bug. The one genuinely open-ended part of a work item -- the agent
@@ -226,37 +229,64 @@ fn run_in_process(
     // a retry's and replace it. The guard moves into the thread and is held
     // until the executor returns, so `cancel::job_cancelled(job_id)` is live
     // exactly while this job's work is.
-    let cancel_registration =
-        crate::cancel::register(&job_id, move || cancel_queue.is_cancelled(&cancel_id));
+    //
+    // `abandoned` is this attempt's own watchdog flag (see the timeout arm
+    // below): once set, the job reads as cancelled to everything inside this
+    // attempt, so its run winds down instead of running on unobserved.
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let abandoned_check = abandoned.clone();
+    let cancel_registration = crate::cancel::register(&job_id, move || {
+        abandoned_check.load(Ordering::SeqCst) || cancel_queue.is_cancelled(&cancel_id)
+    });
     std::thread::spawn(move || {
         let _cancel = cancel_registration;
         let result = executor.execute(&job_id, &args, &mut log_file);
         let _ = tx.send(result);
     });
 
+    // Records a successful attempt, whether it finished within the timeout
+    // or only during the abandon grace period below. An attempt an operator
+    // cancelled mid-run is finished as `killed` by `Queue::complete` itself
+    // (atomically against the cancel request), not as `exited`.
+    let record_success = |stdout_path: std::path::PathBuf, stderr_path: std::path::PathBuf| {
+        let stdout_total_bytes = std::fs::metadata(&stdout_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let output = JobOutput {
+            exit_code: Some(0),
+            timed_out: false,
+            stdout_path,
+            stderr_path,
+            stdout_total_bytes,
+            stderr_total_bytes: 0,
+        };
+        if let Err(e) = queue.complete(id, &output, true) {
+            eprintln!("agentflare-jobs: failed to complete job {id}: {e}");
+        }
+    };
+
     let outcome = rx.recv_timeout(Duration::from_secs(job.timeout_secs.max(1)));
     match outcome {
-        Ok(Ok(())) => {
-            let stdout_total_bytes = std::fs::metadata(&stdout_path)
-                .map(|m| m.len())
-                .unwrap_or(0);
-            let output = JobOutput {
-                exit_code: Some(0),
-                timed_out: false,
-                stdout_path,
-                stderr_path,
-                stdout_total_bytes,
-                stderr_total_bytes: 0,
-            };
-            if let Err(e) = queue.complete(id, &output, true) {
-                eprintln!("agentflare-jobs: failed to complete job {id}: {e}");
-            }
-        }
+        Ok(Ok(())) => record_success(stdout_path, stderr_path),
         Ok(Err(failure)) => {
             record_output_best_effort(queue, id, &stdout_path, &stderr_path);
             record_fail(&failure.message, failure.retry_after_secs, failure.fatal);
         }
         Err(_) => {
+            // Silently abandoning the thread here used to leave its whole
+            // pipeline running (agent turns, claim heartbeats) while the
+            // retry below started a second attempt at the same item. Flag
+            // the attempt cancelled first so its cancel checks stop it, and
+            // give it a bounded grace period to actually wind down before
+            // the retry can be dequeued.
+            abandoned.store(true, Ordering::SeqCst);
+            if let Ok(Ok(())) = rx.recv_timeout(abandon_grace(job.timeout_secs)) {
+                // The attempt finished its work during the grace period:
+                // record it done rather than failing (and possibly
+                // retrying, i.e. redoing) work that already succeeded.
+                record_success(stdout_path, stderr_path);
+                return;
+            }
             let msg = format!(
                 "in-process job exceeded its {}s timeout and was abandoned \
                  (a coordination step may be stuck — the agent CLI subprocess \
@@ -270,6 +300,15 @@ fn run_in_process(
     }
 }
 
+/// How long a timed-out attempt gets to observe its cancellation and stop
+/// before its job is recorded as failed (and possibly retried) anyway.
+/// Capped by the job's own timeout so a short-timeout job's watchdog still
+/// fires promptly.
+fn abandon_grace(timeout_secs: u64) -> Duration {
+    const MAX_ABANDON_GRACE: Duration = Duration::from_secs(30);
+    Duration::from_secs(timeout_secs.max(1)).min(MAX_ABANDON_GRACE)
+}
+
 /// The log file at `stdout_path` was already written by the executor
 /// before it failed or timed out (see `run_in_process`'s call sites) — this
 /// persists that path/size the same way the success branch does, so a
@@ -281,5 +320,206 @@ fn record_output_best_effort(queue: &Queue, id: &str, stdout_path: &Path, stderr
     let stdout_total_bytes = std::fs::metadata(stdout_path).map(|m| m.len()).unwrap_or(0);
     if let Err(e) = queue.record_output(id, stdout_path, stderr_path, stdout_total_bytes, 0) {
         eprintln!("agentflare-jobs: failed to record output for {id}: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{AgentJob, JobState};
+
+    /// Runs past its own watchdog unless it cooperatively polls the cancel
+    /// registry -- the shape of the work-item pipeline's wait loop. Reports
+    /// whether it saw the cancellation.
+    struct CooperativeSlowExecutor {
+        saw_cancel: std::sync::mpsc::SyncSender<bool>,
+    }
+
+    impl InProcessExecutor for CooperativeSlowExecutor {
+        fn execute(
+            &self,
+            job_id: &str,
+            _args: &[String],
+            _log: &mut dyn std::io::Write,
+        ) -> Result<(), JobFailure> {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                if crate::cancel::job_cancelled(job_id) {
+                    let _ = self.saw_cancel.send(true);
+                    return Err(crate::cancel::CANCELLED_MESSAGE.into());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let _ = self.saw_cancel.send(false);
+            Ok(())
+        }
+    }
+
+    // The watchdog must not just walk away from a timed-out attempt: the
+    // attempt keeps running its pipeline (agent turns, claim heartbeats) next
+    // to the retry. Flagging it cancelled lets its own cancel checks stop it.
+    #[test]
+    fn timed_out_in_process_job_is_flagged_cancelled_so_the_attempt_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::open_memory(dir.path().join("logs")).unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut pool = WorkerPool::new(q.clone())
+            .with_executor(Arc::new(CooperativeSlowExecutor { saw_cancel: tx }));
+        pool.start(1);
+
+        let info = q
+            .enqueue(
+                &AgentJob::new("label-only")
+                    .in_process()
+                    .timeout(1)
+                    .max_retries(0),
+            )
+            .unwrap();
+
+        let saw_cancel = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the executor must stop well before its own 10s deadline");
+        assert!(saw_cancel, "the timed-out attempt must read as cancelled");
+        let mut final_info = q.get(&info.id).unwrap();
+        for _ in 0..400 {
+            if final_info.state == JobState::Failed {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            final_info = q.get(&info.id).unwrap();
+        }
+        pool.shutdown();
+        assert_eq!(final_info.state, JobState::Failed);
+        assert!(
+            final_info
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("abandoned"),
+            "the watchdog's own reason is what gets recorded, got: {:?}",
+            final_info.error
+        );
+    }
+
+    /// Ignores cancellation and finishes successfully a little after its
+    /// job's 1s watchdog fires -- inside the abandon grace period.
+    struct FinishesDuringGraceExecutor {
+        runs: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl InProcessExecutor for FinishesDuringGraceExecutor {
+        fn execute(
+            &self,
+            _job_id: &str,
+            _args: &[String],
+            _log: &mut dyn std::io::Write,
+        ) -> Result<(), JobFailure> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(1300));
+            Ok(())
+        }
+    }
+
+    // An attempt that completes its work during the grace period succeeded:
+    // recording it as a timeout failure would retry (redo) finished work.
+    #[test]
+    fn attempt_finishing_during_the_abandon_grace_is_recorded_as_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::open_memory(dir.path().join("logs")).unwrap();
+        let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut pool = WorkerPool::new(q.clone())
+            .with_executor(Arc::new(FinishesDuringGraceExecutor { runs: runs.clone() }));
+        pool.start(1);
+
+        let info = q
+            .enqueue(
+                &AgentJob::new("label-only")
+                    .in_process()
+                    .timeout(1)
+                    .max_retries(3),
+            )
+            .unwrap();
+        let mut final_info = q.get(&info.id).unwrap();
+        for _ in 0..500 {
+            if final_info.state.is_terminal() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            final_info = q.get(&info.id).unwrap();
+        }
+        // Give a (wrong) retry the chance to be dequeued before asserting.
+        std::thread::sleep(Duration::from_millis(200));
+        pool.shutdown();
+        assert_eq!(final_info.state, JobState::Exited, "{:?}", final_info.error);
+        assert_eq!(q.get(&info.id).unwrap().retries, 0, "never retried");
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "work done exactly once");
+    }
+
+    /// Signals once it's running, then waits for the test's go-ahead and
+    /// returns `Ok` without ever polling the cancel registry.
+    struct IgnoresCancelExecutor {
+        started: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl InProcessExecutor for IgnoresCancelExecutor {
+        fn execute(
+            &self,
+            _job_id: &str,
+            _args: &[String],
+            _log: &mut dyn std::io::Write,
+        ) -> Result<(), JobFailure> {
+            let _ = self.started.send(());
+            let _ = self
+                .release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5));
+            Ok(())
+        }
+    }
+
+    // An operator cancel of a running job is deliberate: an executor that
+    // finishes its work anyway must not turn it into `exited`.
+    #[test]
+    fn cancelled_running_job_whose_executor_returns_ok_finishes_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::open_memory(dir.path().join("logs")).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut pool = WorkerPool::new(q.clone()).with_executor(Arc::new(IgnoresCancelExecutor {
+            started: started_tx,
+            release: std::sync::Mutex::new(release_rx),
+        }));
+        pool.start(1);
+
+        let info = q
+            .enqueue(
+                &AgentJob::new("label-only")
+                    .in_process()
+                    .timeout(30)
+                    .max_retries(0),
+            )
+            .unwrap();
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("executor must start");
+        assert!(q.request_cancel(&info.id).unwrap(), "running job flagged");
+        release_tx.send(()).unwrap();
+
+        let mut final_info = q.get(&info.id).unwrap();
+        for _ in 0..500 {
+            if final_info.state.is_terminal() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            final_info = q.get(&info.id).unwrap();
+        }
+        pool.shutdown();
+        assert_eq!(final_info.state, JobState::Killed);
+        assert_eq!(
+            final_info.error.as_deref(),
+            Some(crate::cancel::CANCELLED_MESSAGE)
+        );
     }
 }

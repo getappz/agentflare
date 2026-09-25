@@ -1,7 +1,9 @@
 mod artifacts;
 mod chat;
+mod controls;
 mod data;
 mod gate;
+mod messages;
 mod orphan_reconcile;
 mod server;
 

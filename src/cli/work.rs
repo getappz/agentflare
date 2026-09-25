@@ -519,12 +519,7 @@ pub(crate) fn release_and_comment(
         ..Default::default()
     });
     let comment_body = format!("## agentflare work — failed\n\n{reason}");
-    let _ = mcp.comment_impl(CommentRequest {
-        action: "create".into(),
-        item_id: Some(item_id.into()),
-        body: Some(comment_body.clone()),
-        ..Default::default()
-    });
+    mcp.post_item_comment(item_id, &comment_body);
     if let Some(recipient) = notify_recipient {
         notify(recipient, &comment_body, item_id);
     }
@@ -610,44 +605,7 @@ fn job_failure_for(outcome: &WorkOutcome) -> agentflare_jobs::JobFailure {
     }
 }
 
-/// Cooldown-table key used when there's no active vault rotation profile for
-/// `agent` — keeps `auth_db`'s `(agent, profile)`-keyed cooldown table as the
-/// single source of truth for both the interactive (`auth_runner`) and
-/// autonomous (this file) dispatch paths, even for the common single-
-/// credential setup that never configured vault profiles.
-const DEFAULT_COOLDOWN_PROFILE: &str = "__default__";
-/// Matches the cooldown length `auth_runner::run` already uses for the
-/// interactive path's rate-limit rotation.
-const RATE_LIMIT_COOLDOWN_MINUTES: u32 = 30;
-
-/// Classifies a headless failure the same way `auth_runner::is_rate_limited`
-/// does for the interactive path and, if rate-limit shaped, records a
-/// cooldown so `auth_db::is_cooling_down` (discovery tick, `auth rotate`)
-/// sees it too. Returns seconds until clear, as the job queue's retry delay.
-///
-/// Only ever called once `handle_auth_expired` (see call site below) has
-/// already ruled out an auth-expiry failure -- unlike rate-limiting,
-/// retrying an auth-expired dispatch against the same expired credential is
-/// guaranteed-useless, so that case is routed to `fatal: true` instead of a
-/// cooldown-and-retry (item #164's incident: 15h of exactly that).
-fn classify_and_cooldown(agent: &str, failure_message: &str) -> Option<u64> {
-    if !crate::auth_runner::is_rate_limited(failure_message) {
-        return None;
-    }
-    let conn = crate::auth_db::open_or_rebuild();
-    let profile = crate::auth_db::get_rotation_last(&conn, agent)
-        .map(|(profile, _)| profile)
-        .unwrap_or_else(|| DEFAULT_COOLDOWN_PROFILE.to_string());
-    crate::auth_db::set_cooldown(
-        &conn,
-        agent,
-        &profile,
-        RATE_LIMIT_COOLDOWN_MINUTES,
-        "rate limit",
-    );
-    Some(RATE_LIMIT_COOLDOWN_MINUTES as u64 * 60)
-}
-
+include!("work_failover.rs");
 include!("work_auth_expiry.rs");
 
 /// Claims `args.target`, runs the resolved agent on it, and reports the
@@ -971,6 +929,9 @@ fn execute_work_impl(
     // `run_in_worktree` just validates `wpath` is enterable -- the pipeline
     // itself takes `wpath` explicitly rather than relying on process cwd,
     // so concurrent dispatches (item #205) don't need to serialize here. ---
+    // A run already `Cancelled` before this dispatch is not this dispatch's
+    // cancellation (see `run_cancelled_by_this_dispatch`).
+    let cancelled_before = cancelled_workflow_run(&mcp, item_id);
     let result = match run_in_worktree(wpath, || {
         run_pipeline(
             mcp.clone(),
@@ -1038,16 +999,42 @@ fn execute_work_impl(
             }
         }
         Err(msg) => {
-            release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
+            // A workflow run cancelled (or paused) on request is terminal, not
+            // a failure to retry. A run the waiter cancelled itself after
+            // losing its claim is not a request -- it keeps the failure path.
+            let run_cancelled = !msg.contains("is no longer held by")
+                && run_cancelled_by_this_dispatch(
+                    cancelled_before.as_deref(),
+                    cancelled_workflow_run(&mcp, item_id).as_deref(),
+                );
+            if let Some(stop) = stop_on_request(&msg, run_cancelled) {
+                return end_stopped_run(&mcp, item_id, stop, &mut claim_guard, log);
+            }
             crate::ui::error(&msg);
             let _ = writeln!(log, "failed: {msg}");
+            // Out of credit / quota / rate limited: cool the agent down and
+            // (daemon dispatch only) move the item to an available agent.
+            if let Some(outcome) = handle_agent_exhaustion(
+                &mcp,
+                &item_detail,
+                &labels,
+                implementer_agent,
+                &msg,
+                crate::claims::has_owner_override(),
+                &mut claim_guard,
+                args.notify.as_deref(),
+                log,
+                crate::quota::failover::find_alternative,
+            ) {
+                return outcome;
+            }
+            release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
             if let Some(outcome) = handle_auth_expired(&mcp, &item_detail, &msg, log) {
                 return outcome;
             }
-            let retry_after_secs = classify_and_cooldown(implementer_agent.as_str(), &msg);
             WorkOutcome {
                 exit_code: 1,
-                retry_after_secs,
+                retry_after_secs: None,
                 fatal: false,
             }
         }
@@ -1164,6 +1151,14 @@ impl agentflare_jobs::InProcessExecutor for WorkItemExecutor {
                 fatal: true,
             });
         }
+        // Assignee already known to be out (cooling down after an
+        // exhaustion, or over its usage threshold): run an available agent
+        // instead. The item's model pin was for the old agent, so it's
+        // dropped along with it.
+        let (agent, model) = match prelaunch_failover(item_id, &agent, repo_root.as_deref(), log) {
+            Some(to) => (to, None),
+            None => (agent, model),
+        };
         let work_args = WorkArgs {
             target: item_id.clone(),
             agent: Some(agent.clone()),
@@ -1799,6 +1794,18 @@ rotate = true
         assert_eq!(cap_reply_for_comment(&mcp, "item-1", reply), reply);
     }
 
+    /// Test-side stand-in for the old `classify_and_cooldown`: classify the
+    /// failure text and record the agent's unavailability, as
+    /// `handle_agent_exhaustion` does.
+    fn classify_and_cooldown(agent: &str, msg: &str) -> Option<u64> {
+        crate::quota::failover::mark_unavailable(
+            agent,
+            &crate::auth_runner::classify_failure(msg),
+            chrono::Utc::now().timestamp(),
+        )
+    }
+    const RATE_LIMIT_COOLDOWN_MINUTES: u32 = 30;
+
     #[test]
     fn classify_and_cooldown_ignores_non_rate_limit_failures() {
         crate::paths::test_support::with_temp_home(|| {
@@ -1820,6 +1827,7 @@ rotate = true
     }
 
     include!("work_auth_expiry_tests.rs");
+    include!("work_failover_tests.rs");
 
     /// The workflow engine's failure message is the generic placeholder
     /// folded with the failing step's real `last_error` (see
@@ -1858,7 +1866,9 @@ rotate = true
         crate::paths::test_support::with_temp_home(|| {
             let msg = "Workflow failed due to step dependency failure: cursor exited non-zero — last stderr before kill:\nActionRequiredError: You've hit your usage limit You've saved $51 on API model usage this month with Start. Switch to a different model or set a Spend Limit to continue with this model.";
             let retry = classify_and_cooldown("cursor", msg);
-            assert_eq!(retry, Some(RATE_LIMIT_COOLDOWN_MINUTES as u64 * 60));
+            // "set a Spend Limit" is billing exhaustion: cooled down for the
+            // credit-exhaustion window, not the 30-minute rate-limit one.
+            assert_eq!(retry, Some(crate::auth_runner::CREDIT_EXHAUSTED_SECS));
             let conn = crate::auth_db::open_or_rebuild();
             assert!(crate::auth_db::is_cooling_down(&conn, "cursor"));
         });

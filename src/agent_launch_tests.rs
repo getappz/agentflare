@@ -629,6 +629,8 @@
             timed_out: true,
             idle_killed: false,
             cancelled: false,
+            stalled: false,
+            exhausted: None,
         };
         assert_eq!(diagnostic_suffix(&c, None), " (no output captured)");
     }
@@ -648,6 +650,8 @@
             timed_out: true,
             idle_killed: false,
             cancelled: false,
+            stalled: false,
+            exhausted: None,
         };
         let suffix = diagnostic_suffix(&c, None);
         assert!(suffix.contains("last stdout before kill"));
@@ -666,6 +670,8 @@
             timed_out: true,
             idle_killed: false,
             cancelled: false,
+            stalled: false,
+            exhausted: None,
         };
         let suffix = diagnostic_suffix(&c, None);
         assert!(suffix.contains("last stderr before kill"));
@@ -685,6 +691,8 @@
             timed_out: true,
             idle_killed: true,
             cancelled: false,
+            stalled: false,
+            exhausted: None,
         };
         let suffix = diagnostic_suffix(&c, Some("level=INFO message=\"tool call\" tool=lean_ctx"));
         assert!(suffix.contains("sandbox-side agent log tail"));
@@ -700,6 +708,8 @@
             timed_out: false,
             idle_killed: false,
             cancelled: false,
+            stalled: false,
+            exhausted: None,
         };
         let msg = match Ok::<_, std::io::Error>(captured) {
             Ok(c) if c.success => unreachable!(),
@@ -786,6 +796,156 @@
         assert_eq!(reply.cost_usd, None);
     }
 
+    #[test]
+    fn parse_json_reply_reads_the_final_line_of_a_stream_json_transcript() {
+        // What `agentflare work` actually captures: `build_extra_args` pins
+        // `--output-format stream-json`, so stdout is one JSON object per
+        // event and only the last line carries the result fields. Before
+        // the fix this parse failed and the whole transcript came back as
+        // `text` with no session id -- so `--resume` never fired.
+        let raw = concat!(
+            r#"{"type":"system","subtype":"init","session_id":"sess-123"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"working..."}]}}"#,
+            "\n",
+            r#"{"type":"result","result":"Fixed it.","session_id":"sess-123","total_cost_usd":0.0842}"#,
+        );
+        let reply = parse_json_reply(raw);
+        assert_eq!(reply.text, "Fixed it.");
+        assert_eq!(reply.session_id.as_deref(), Some("sess-123"));
+        assert_eq!(reply.cost_usd, Some(0.0842));
+    }
+
+    #[test]
+    fn headless_full_args_prepends_json_output_when_caller_pins_no_output_format() {
+        let extra = vec!["--model".to_string(), "sonnet".to_string()];
+        let args = headless_full_args(Agent::ClaudeCode, true, &extra);
+        assert_eq!(args, vec!["--output-format", "json", "--model", "sonnet"]);
+    }
+
+    #[test]
+    fn headless_full_args_keeps_a_caller_pinned_output_format_and_emits_it_once() {
+        // The exact argv `cli::work::build_extra_args` produces for Claude
+        // Code. Prepending `--output-format json` in front of it is the
+        // collision the audit found: two `--output-format` flags, last wins.
+        let extra: Vec<String> = [
+            "--dangerously-skip-permissions",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        let args = headless_full_args(Agent::ClaudeCode, true, &extra);
+        assert_eq!(args, extra);
+        assert_eq!(
+            args.iter().filter(|a| *a == "--output-format").count(),
+            1,
+            "exactly one --output-format must reach the CLI"
+        );
+    }
+
+    #[test]
+    fn headless_full_args_respects_the_equals_and_alias_spellings() {
+        for pinned in ["--output-format=stream-json", "--stream-json"] {
+            let extra = vec![pinned.to_string()];
+            let args = headless_full_args(Agent::ClaudeCode, true, &extra);
+            assert_eq!(args, extra, "{pinned}");
+        }
+    }
+
+    #[test]
+    fn parse_json_reply_reads_usage_turns_subtype_and_structured_output() {
+        let raw = r#"{"type":"result","subtype":"success","is_error":false,"num_turns":7,"result":"done","session_id":"s-1","total_cost_usd":0.5,"usage":{"input_tokens":100,"cache_creation_input_tokens":20,"cache_read_input_tokens":30,"output_tokens":40},"structured_output":{"action":"advance_task"}}"#;
+        let reply = parse_json_reply(raw);
+        assert_eq!(reply.subtype.as_deref(), Some("success"));
+        assert!(!reply.is_error);
+        assert_eq!(reply.num_turns, Some(7));
+        assert_eq!(reply.input_tokens, Some(150), "fresh + cache-creation + cache-read");
+        assert_eq!(reply.output_tokens, Some(40));
+        assert_eq!(
+            reply.structured_output,
+            Some(serde_json::json!({"action":"advance_task"}))
+        );
+        let (text, in_tok, out_tok) = reply_payload(reply);
+        assert_eq!(text, r#"{"action":"advance_task"}"#, "structured output wins");
+        assert_eq!((in_tok, out_tok), (150, 40));
+    }
+
+    #[test]
+    fn parse_json_reply_result_event_without_result_text_yields_empty_text_not_the_transcript() {
+        let raw = concat!(
+            r#"{"type":"system","subtype":"init","session_id":"s-2"}"#,
+            "\n",
+            r#"{"type":"result","subtype":"error_max_turns","is_error":true,"session_id":"s-2","num_turns":5}"#,
+        );
+        let reply = parse_json_reply(raw);
+        assert_eq!(reply.text, "");
+        assert_eq!(reply.session_id.as_deref(), Some("s-2"));
+        assert_eq!(reply.subtype.as_deref(), Some("error_max_turns"));
+        assert!(reply.is_error);
+        assert_eq!(reply.input_tokens, None, "no usage block, no fabricated count");
+    }
+
+    #[test]
+    fn reply_payload_reports_zero_tokens_when_the_agent_gave_none() {
+        let reply = parse_json_reply("plain text reply");
+        assert_eq!(reply_payload(reply), ("plain text reply".to_string(), 0, 0));
+    }
+
+    #[test]
+    fn classify_result_reply_keeps_a_cap_hit_usable_with_its_session() {
+        let reply = parse_json_reply(
+            r#"{"type":"result","subtype":"error_max_turns","is_error":true,"result":"halfway there","session_id":"s-3"}"#,
+        );
+        match classify_result_reply("Claude Code", reply) {
+            HeadlessOutcome::Ok(reply) => {
+                assert!(reply.text.starts_with("[agentflare] Claude Code stopped early: error_max_turns"));
+                assert!(reply.text.ends_with("halfway there"));
+                assert_eq!(reply.session_id.as_deref(), Some("s-3"), "resume stays possible");
+            }
+            other => panic!("a cap hit must stay Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_result_reply_fails_on_other_error_subtypes_naming_them() {
+        let reply = parse_json_reply(
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"boom","session_id":"s-4"}"#,
+        );
+        match classify_result_reply("Claude Code", reply) {
+            HeadlessOutcome::Failed(msg) => {
+                assert!(msg.contains("error_during_execution"), "{msg}");
+                assert!(msg.contains("boom"), "{msg}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_result_reply_passes_a_success_through() {
+        let reply = parse_json_reply(r#"{"type":"result","subtype":"success","result":"ok","session_id":"s-5"}"#);
+        assert!(matches!(
+            classify_result_reply("Claude Code", reply),
+            HeadlessOutcome::Ok(r) if r.text == "ok"
+        ));
+    }
+
+    #[test]
+    fn result_subtype_note_names_the_reason_when_stdout_ends_in_a_result_event() {
+        let stdout = "{\"type\":\"system\"}\n{\"type\":\"result\",\"subtype\":\"error_during_execution\"}";
+        assert_eq!(result_subtype_note(stdout), " (error_during_execution)");
+        assert_eq!(result_subtype_note("nothing structured"), "");
+    }
+
+    #[test]
+    fn headless_full_args_adds_nothing_when_json_is_not_requested_or_unsupported() {
+        let extra = vec!["--full-auto".to_string()];
+        assert_eq!(headless_full_args(Agent::ClaudeCode, false, &extra), extra);
+        assert_eq!(headless_full_args(Agent::Codex, true, &extra), extra);
+    }
+
     #[cfg(unix)]
     #[test]
     fn run_headless_with_request_json_parses_a_json_reply_from_the_child() {
@@ -842,4 +1002,237 @@
             }
             other => panic!("expected Ok, got {other:?}"),
         }
+    }
+
+    // Item H4: a headless agent child records its pid under its cwd's
+    // `agent_pid_dir` for exactly as long as `run_captured` is waiting on
+    // it, so a daemon that dies mid-turn leaves the record behind for the
+    // next daemon's orphan sweep to find.
+    #[cfg(unix)]
+    #[test]
+    fn run_captured_records_the_childs_pid_under_its_cwd_while_it_runs() {
+        let worktree = tempfile::tempdir().unwrap();
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("sleep 1").current_dir(worktree.path());
+        let watched = worktree.path().to_path_buf();
+        let watcher = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while std::time::Instant::now() < deadline {
+                let recorded = recorded_agent_pids(&watched);
+                if let Some(record) = recorded.first() {
+                    return Some((record.pid, record.start_token.clone()));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            None
+        });
+        let out = run_captured(
+            cmd,
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(5),
+            None,
+        )
+        .unwrap();
+        assert!(out.success);
+        let (pid, start_token) = watcher
+            .join()
+            .unwrap()
+            .expect("the running child's pid must be recorded");
+        assert!(pid > 0);
+        #[cfg(target_os = "linux")]
+        assert!(start_token.is_some(), "linux records the start time");
+        #[cfg(not(target_os = "linux"))]
+        let _ = start_token;
+        assert!(
+            recorded_agent_pids(worktree.path()).is_empty(),
+            "the record is removed once the child is reaped"
+        );
+        let _ = std::fs::remove_dir(agent_pid_dir(worktree.path()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_start_token_identifies_a_live_process_and_not_a_dead_one() {
+        let me = std::process::id();
+        let token = process_start_token(me).expect("own start time is readable");
+        assert_eq!(process_start_token(me), Some(token), "stable per process");
+        let mut child = Command::new("true").spawn().unwrap();
+        let child_pid = child.id();
+        child.wait().unwrap();
+        assert_eq!(process_start_token(child_pid), None);
+    }
+
+    // --- hung-but-chatty detection (agent_launch_progress.rs) ---
+
+    fn looping_progress(lines: &[&str]) -> OutputProgress {
+        let mut p = OutputProgress::new(std::time::Instant::now());
+        for _ in 0..3 {
+            for line in lines {
+                p.feed(1, &format!("{line}\n"), std::time::Instant::now());
+            }
+        }
+        p
+    }
+
+    #[test]
+    fn normalize_line_folds_counters_but_keeps_names() {
+        assert_eq!(
+            normalize_line("Rate limited, retrying in 5s (attempt 3 of 10) at 12:01:07"),
+            normalize_line("Rate limited, retrying in 7s (attempt 4 of 10) at 12:01:19")
+        );
+        assert_ne!(
+            normalize_line("test case_1 ... ok"),
+            normalize_line("test case_2 ... ok")
+        );
+    }
+
+    #[test]
+    fn a_retry_loop_is_repetitive_but_varied_output_is_not() {
+        let looping = looping_progress(&[
+            "API error (429), retrying in 5s... attempt 1",
+            "API error (429), retrying in 10s... attempt 2",
+            "API error (429), retrying in 20s... attempt 3",
+            "API error (429), retrying in 40s... attempt 4",
+        ]);
+        assert!(looping.is_repetitive());
+
+        let varied = looping_progress(&[
+            "test parser::handles_empty_input ... ok",
+            "test parser::rejects_trailing_comma ... ok",
+            "test lexer::tokenizes_strings ... ok",
+            "test lexer::tokenizes_numbers ... ok",
+            "test eval::adds ... ok",
+        ]);
+        assert!(!varied.is_repetitive());
+    }
+
+    #[test]
+    fn stall_needs_repetition_and_no_worktree_change_for_the_window() {
+        let t0 = std::time::Instant::now();
+        let window = std::time::Duration::from_secs(45 * 60);
+        let later = t0 + window + std::time::Duration::from_secs(1);
+        // Repetitive output, worktree and output both stale: stalled.
+        assert!(is_stalled(later, t0, t0, true, window));
+        // Varied output: never stalled, however long.
+        assert!(!is_stalled(later, t0, t0, false, window));
+        // Worktree changed recently: progress, not stalled.
+        assert!(!is_stalled(later, later, t0, true, window));
+        // A novel output line recently: progress, not stalled.
+        assert!(!is_stalled(later, t0, later, true, window));
+        // Window 0 disables detection.
+        assert!(!is_stalled(later, t0, t0, true, std::time::Duration::ZERO));
+    }
+
+    #[test]
+    fn exhaustion_mid_run_needs_repeated_spaced_sightings() {
+        let t0 = std::time::Instant::now();
+        let line = "Error: Credit balance is too low\n";
+        let mut spread = OutputProgress::new(t0);
+        for i in 0..3 {
+            spread.feed(1, line, t0 + std::time::Duration::from_secs(20 * i));
+        }
+        assert_eq!(spread.exhausted(), Some("Error: Credit balance is too low"));
+
+        // Printed three times at once (e.g. a file dump): not enough.
+        let mut burst = OutputProgress::new(t0);
+        for _ in 0..3 {
+            burst.feed(1, line, t0);
+        }
+        assert_eq!(burst.exhausted(), None);
+
+        // A transcript JSON line that merely contains the phrase isn't the
+        // agent's own error.
+        let mut echoed = OutputProgress::new(t0);
+        for i in 0..3 {
+            echoed.feed(
+                0,
+                "{\"type\":\"user\",\"content\":\"grep: Credit balance is too low\"}\n",
+                t0 + std::time::Duration::from_secs(20 * i),
+            );
+        }
+        assert_eq!(echoed.exhausted(), None);
+    }
+
+    fn fast_stall() -> StallConfig {
+        StallConfig {
+            window: std::time::Duration::from_secs(2),
+            check_every: std::time::Duration::from_secs(1),
+            exhaustion_kill: true,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_captured_kills_a_chatty_loop_that_makes_no_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = std::time::Instant::now();
+        let mut cmd = Command::new("sh");
+        cmd.current_dir(dir.path()).arg("-c").arg(
+            "while true; do echo 'rate limited, retrying in 5s'; sleep 0.05; done",
+        );
+        let out = run_captured_with_stall(
+            cmd,
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+            None,
+            None,
+            fast_stall(),
+        )
+        .unwrap();
+        assert!(out.stalled, "a looping, progress-free child is stalled");
+        assert!(!out.success && !out.timed_out);
+        assert!(start.elapsed() < std::time::Duration::from_secs(20));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_captured_leaves_varied_output_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cmd = Command::new("sh");
+        cmd.current_dir(dir.path()).arg("-c").arg(
+            "for i in $(seq 1 80); do echo \"step $(tr -dc a-z </dev/urandom | head -c 12)\"; sleep 0.05; done",
+        );
+        let out = run_captured_with_stall(
+            cmd,
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+            None,
+            None,
+            fast_stall(),
+        )
+        .unwrap();
+        assert!(!out.stalled, "varied output is progress");
+        assert!(out.success);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_captured_leaves_a_repetitive_child_that_changes_its_worktree_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        let mut cmd = Command::new("sh");
+        cmd.current_dir(dir.path()).arg("-c").arg(
+            "for i in $(seq 1 100); do echo 'building...'; echo $i >> work.txt; sleep 0.05; done",
+        );
+        let out = run_captured_with_stall(
+            cmd,
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+            None,
+            None,
+            StallConfig {
+                window: std::time::Duration::from_secs(3),
+                ..fast_stall()
+            },
+        )
+        .unwrap();
+        assert!(!out.stalled, "worktree changes are progress");
+        assert!(out.success);
     }

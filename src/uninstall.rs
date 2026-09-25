@@ -65,7 +65,13 @@ fn clean_claude_code(dry_run: bool) {
             && let Ok(mut settings) = serde_json::from_str::<Value>(&content)
         {
             if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
-                for key in &["SessionStart", "UserPromptSubmit", "PreToolUse"] {
+                for key in &[
+                    "SessionStart",
+                    "UserPromptSubmit",
+                    "PreToolUse",
+                    "Stop",
+                    "SessionEnd",
+                ] {
                     if let Some(arr) = hooks.get(*key).and_then(|v| v.as_array()) {
                         hooks[*key] = Value::Array(
                             arr.iter()
@@ -88,6 +94,14 @@ fn clean_claude_code(dry_run: bool) {
                     hooks.remove("SessionStart");
                     hooks.remove("UserPromptSubmit");
                     hooks.remove("PreToolUse");
+                }
+                for key in ["Stop", "SessionEnd"] {
+                    if hooks
+                        .get(key)
+                        .is_some_and(|v| v.as_array().is_some_and(|a| a.is_empty()))
+                    {
+                        hooks.remove(key);
+                    }
                 }
                 if hooks.is_empty() {
                     settings.as_object_mut().unwrap().remove("hooks");

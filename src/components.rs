@@ -623,7 +623,7 @@ fn apply_coaching_defaults() -> String {
 /// externally-visible GitHub issue, and an allowlisted tool call skips the
 /// permission prompt that would otherwise let a human catch an unintended
 /// external publish before it happens.
-const GATEWAY_PERMISSIONS_ALLOW: &[&str] = &[
+pub(crate) const GATEWAY_PERMISSIONS_ALLOW: &[&str] = &[
     "mcp__flare__docs",
     "mcp__flare__search",
     "mcp__flare__tool",

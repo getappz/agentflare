@@ -199,6 +199,9 @@ fn spawn_supervisor_discovery(
             let queue = queue.clone();
             let mcp = mcp.clone();
             let result = tokio::task::spawn_blocking(move || {
+                // Release dead owners' claims first, so an item they held is
+                // re-armed and dispatched in this same tick.
+                crate::claim_liveness::run_sweep(&mcp, &queue);
                 let auth_conn = crate::auth_db::open_or_rebuild();
                 let host_policy = agentflare_resource_gate::current_policy();
                 crate::mcp_server::item_force::auto_release_dead_claims(&mcp, &queue);
@@ -251,14 +254,16 @@ fn spawn_supervisor_review_sweep(
                         || s.self_repaired > 0
                         || s.review_repaired > 0
                         || s.waiting > 0
-                        || s.updated > 0 =>
+                        || s.updated > 0
+                        || s.requeued > 0 =>
                 {
                     eprintln!(
-                        "agentflare-supervisor: review sweep promoted {}, self-repaired {}, review-repaired {}, updated {}, skipped {}, waiting {}",
+                        "agentflare-supervisor: review sweep promoted {}, self-repaired {}, review-repaired {}, updated {}, requeued {}, skipped {}, waiting {}",
                         s.promoted,
                         s.self_repaired,
                         s.review_repaired,
                         s.updated,
+                        s.requeued,
                         s.skipped,
                         s.waiting
                     );
@@ -676,46 +681,21 @@ pub fn router(queue: Queue) -> Router {
         .route("/api/cost", get(cost_handler))
         .route("/events", get(events_handler))
         .merge(super::chat::router())
+        .merge(super::messages::router())
         .merge(super::gate::router())
+        .merge(super::controls::router())
         .merge(jobs_router(queue))
         .nest("/artifacts", super::artifacts::router())
         .merge(flare_proxy::router())
         .fallback(static_handler)
 }
 
+#[path = "dispatch_boot.rs"]
+mod dispatch_boot;
+use dispatch_boot::*;
+
 fn is_local_bind(host: &str) -> bool {
     matches!(host, "127.0.0.1" | "localhost" | "::1")
-}
-
-/// Parses `AGENTFLARE_WORK_MAX_CONCURRENCY` into an explicit override, or
-/// `None` when absent, zero, or unparseable — in which case the caller
-/// falls back to `concurrency::resolve_pool_size`'s CPU+memory-aware
-/// default rather than silently starting a `WorkerPool` with no workers
-/// (which would wedge the queue forever with no error). Split into a pure
-/// parse step so the override logic is testable without mutating
-/// process-global env state — env vars are shared across the whole test
-/// binary, unlike this narrow seam.
-fn parse_work_max_concurrency(raw: Option<&str>) -> Option<usize> {
-    raw.and_then(|s| s.parse::<usize>().ok()).filter(|n| *n > 0)
-}
-
-/// Defaults to a CPU+memory-aware pool size (ported from codegraph's
-/// `ResolverPool.resolvePoolSize`, see `agentflare_resource_gate::pool_size`)
-/// instead of a flat hardcoded value, so a resource-starved box and a beefy
-/// dev box no longer run the same fixed concurrency.
-fn work_max_concurrency() -> usize {
-    parse_work_max_concurrency(
-        std::env::var("AGENTFLARE_WORK_MAX_CONCURRENCY")
-            .ok()
-            .as_deref(),
-    )
-    .unwrap_or_else(|| {
-        let available_parallelism = std::thread::available_parallelism().map_or(1, |n| n.get());
-        agentflare_resource_gate::pool_size::resolve_pool_size(
-            available_parallelism,
-            agentflare_resource_gate::pool_size::memory_budget_bytes(),
-        )
-    })
 }
 
 /// Runs for the lifetime of the process: wakes on
@@ -830,46 +810,33 @@ pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {
             // resume state is untrustworthy, so dispatch stays disabled
             // here too -- same "fail closed, dashboard stays up" contract
             // as the smoke-test gate this block is already nested inside.
-            let pipeline_ready =
-                match crate::work_item_pipeline::engine().register_workflow(boot_definition) {
-                    Ok(()) => match crate::work_item_pipeline::engine().recover().await {
-                        Ok(_) => true,
-                        Err(e) => {
-                            crate::ui::error(&format!(
-                                "failed to recover in-flight work-item pipeline runs at boot: {e}"
-                            ));
-                            false
-                        }
-                    },
+            match crate::work_item_pipeline::engine().register_workflow(boot_definition) {
+                Ok(()) => match crate::work_item_pipeline::engine()
+                    .recover_with(crate::work_item_pipeline::should_recover_at_boot)
+                    .await
+                {
+                    Ok(_) => start_work_dispatch(&queue),
                     Err(e) => {
+                        // A recovery failure is often transient (a locked
+                        // store, one bad run the engine can't yet isolate),
+                        // and failing closed forever used to leave the
+                        // daemon with no worker pool and no supervisor at
+                        // all until someone restarted it by hand. Keep the
+                        // "no dispatch until recovery succeeds" contract,
+                        // but keep retrying it in the background.
                         crate::ui::error(&format!(
-                            "failed to register work-item pipeline definition at boot: {e}"
+                            "failed to recover in-flight work-item pipeline runs at boot: {e} \
+                             -- retrying every {}s; work dispatch stays off until it succeeds",
+                            PIPELINE_RECOVERY_RETRY_INTERVAL.as_secs()
                         ));
-                        false
+                        spawn_pipeline_recovery_retry(queue.clone());
                     }
-                };
-
-            if pipeline_ready {
-                let mut worker_pool = agentflare_jobs::WorkerPool::new(queue.clone())
-                    .with_executor(std::sync::Arc::new(crate::cli::work::WorkItemExecutor))
-                    .with_terminal_failure_hook(std::sync::Arc::new(|_job_id, job| {
-                        super::orphan_reconcile::handle_terminal_job_failure(job);
-                    }));
-                worker_pool.start(work_max_concurrency());
-                spawn_supervisor_discovery(
-                    queue.clone(),
-                    std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default()),
-                    SUPERVISOR_DISCOVERY_INTERVAL,
-                );
-                spawn_supervisor_review_sweep(
-                    queue.clone(),
-                    std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default()),
-                    SUPERVISOR_REVIEW_SWEEP_INTERVAL,
-                );
-                spawn_supervisor_telegram_approvals(
-                    std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default()),
-                    SUPERVISOR_TELEGRAM_POLL_INTERVAL,
-                );
+                },
+                Err(e) => {
+                    crate::ui::error(&format!(
+                        "failed to register work-item pipeline definition at boot: {e}"
+                    ));
+                }
             }
         }
         Err(e) => {

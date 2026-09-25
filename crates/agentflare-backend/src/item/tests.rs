@@ -2180,6 +2180,8 @@ fn redispatch_rejects_a_completed_item() {
     );
 }
 
+#[path = "tests_finalize.rs"]
+mod tests_finalize;
 #[path = "tests_labels.rs"]
 mod tests_labels;
 #[path = "tests_relations.rs"]

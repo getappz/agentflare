@@ -146,10 +146,29 @@ pub(crate) fn git_binary() -> PathBuf {
 /// spawn can still hit `E2BIG` even though `git_binary()` already computed a
 /// clean PATH, because that clean PATH was only ever used to *locate* the
 /// binary, never applied to the child's actual env.
+///
+/// Also pins the environment every daemon-side git call needs to be safe
+/// unattended:
+/// - `LC_MESSAGES=C`/`LANGUAGE=` (and no `LC_ALL`, which would override
+///   them): callers classify failures by matching git's English stderr
+///   (lock races, push rejections); a translated message on a non-English
+///   workstation would silently skip every retry/recovery. Messages only --
+///   the character encoding hooks run under is left alone.
+/// - `GIT_TERMINAL_PROMPT=0`/`GCM_INTERACTIVE=never`: a credential prompt
+///   has no one to answer it -- fail fast as an auth error rather than hang
+///   until a timeout (or forever, for calls without one).
+/// - `GIT_OPTIONAL_LOCKS=0`: read-only polling (`status`) must not take
+///   `index.lock` in a worktree an agent is actively committing in.
 pub(crate) fn apply_filtered_path(cmd: &mut Command) {
     if let Some(path) = &resolved_git().filtered_path {
         cmd.env("PATH", path);
     }
+    cmd.env_remove("LC_ALL")
+        .env("LC_MESSAGES", "C")
+        .env("LANGUAGE", "")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "never")
+        .env("GIT_OPTIONAL_LOCKS", "0");
 }
 
 /// This crate's git spawns run inside the agentflare daemon far more than

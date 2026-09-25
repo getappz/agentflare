@@ -20,6 +20,9 @@ use super::*;
 fn dispatch_bookkeeping_lands_on_items_of_projects_other_than_the_daemons_own() {
     let mcp = test_mcp();
     let queue = test_queue();
+    // A real folder: discovery skips a project whose folder doesn't exist.
+    let other_dir = tempfile::tempdir().unwrap();
+    let other_path = other_dir.path().to_string_lossy().to_string();
     let (item_id, ready_id, dispatched_id) = mcp
         .with_backend_db(|conn| {
             let own = mcp.resolve_project(conn).unwrap();
@@ -35,8 +38,7 @@ fn dispatch_bookkeeping_lands_on_items_of_projects_other_than_the_daemons_own() 
             )
             .unwrap();
             assert_ne!(other.id, own.id);
-            agentflare_backend::project_dir::upsert(conn, &other.id, "/elsewhere/other-repo", 0)
-                .unwrap();
+            agentflare_backend::project_dir::upsert(conn, &other.id, &other_path, 0).unwrap();
             let mut label_ids = std::collections::HashMap::new();
             for name in ["ready-for-work", "dispatched"] {
                 let label = agentflare_backend::label::create(

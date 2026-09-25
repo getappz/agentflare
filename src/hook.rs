@@ -10,6 +10,7 @@ use std::io::Read;
 use std::time::Duration;
 
 const STDIN_TIMEOUT_MS: u64 = 1000;
+const SESSION_START_STDIN_TIMEOUT_MS: u64 = 300;
 
 // Brand palette — same codes as `banner::colorize` (magenta wordmark, cyan
 // dividers) so hook output matches the CLI. Gated on `NO_COLOR` only, not
@@ -48,7 +49,25 @@ pub(crate) fn read_stdin_or_skip(label: &str) -> Option<String> {
 }
 
 pub fn session_start(agent: &str) {
-    let msg = session_start_message(agent);
+    let mut msg = session_start_message(agent);
+    // Registers this session for inter-agent messaging (pid, name, cwd) and
+    // picks up anything already waiting for it (a resumed session). Short
+    // stdin wait: hosts that pass no JSON here shouldn't stall startup.
+    let session = crate::hook_messages::parse_session(
+        &read_stdin_timeout(SESSION_START_STDIN_TIMEOUT_MS).unwrap_or_default(),
+    );
+    let pending = crate::hook_messages::sync(agent, &session, true);
+    let context = if pending.is_empty() {
+        msg.clone()
+    } else {
+        format!("{msg}\n\n{}", crate::messages::format_delivery(&pending))
+    };
+    if !pending.is_empty() {
+        msg.push_str(&format!(
+            "\nagentflare: {} agent message(s) delivered",
+            pending.len()
+        ));
+    }
 
     // Flush any vents buffered since the last turn/session (best-effort;
     // never blocks the hook or surfaces errors to the agent). Always report
@@ -70,7 +89,7 @@ pub fn session_start(agent: &str) {
         "systemMessage": msg,
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "additionalContext": msg,
+            "additionalContext": context,
         }
     });
     println!("{out}");
@@ -519,10 +538,11 @@ pub fn pre_tool_use(agent: &str) {
 
     crate::optimize::save_runtime(&runtime);
 
-    if !nudges.is_empty() {
-        let out = json!({
-            "systemMessage": format!("agentflare: {}", nudges.join(" "))
-        });
+    // Inter-agent messages ride along on every tool call, so a peer's
+    // message reaches a working agent within one tool call.
+    let msgs =
+        crate::hook_messages::sync(agent, &crate::hook_messages::parse_session(&input), false);
+    if let Some(out) = crate::hook_messages::pre_tool_use_output(&msgs, &nudges) {
         println!("{out}");
     }
 }
@@ -587,11 +607,14 @@ fn relevance_query<'a>(content: &'a str, session_id: &'a str) -> &'a str {
 /// still used by the coaching-rule digest (`coaching::store`).
 pub fn pre_compact(_agent: &str) {}
 
-/// No-op, kept only so a `settings.json` entry written by an older agentflare
-/// version (which fired an `engram-cli` handoff here — removed along with the
-/// rest of the engram integration) doesn't start erroring on every session
-/// end after an upgrade. New installs never wire this hook (see init.rs).
-pub fn session_end(_agent: &str) {}
+/// Marks the session ended in the live-session registry so it stops being
+/// listed/addressable (see `hook_messages::end`). An older agentflare wired
+/// this hook for an `engram-cli` handoff, since removed.
+pub fn session_end(agent: &str) {
+    if let Some(input) = read_stdin_timeout(SESSION_START_STDIN_TIMEOUT_MS) {
+        crate::hook_messages::end(agent, &crate::hook_messages::parse_session(&input));
+    }
+}
 
 /// Static identity/rules reminder — sent once per session (first turn only,
 /// not every turn) and gated on which components are actually active, so it
@@ -646,8 +669,21 @@ pub fn prompt_submit(agent: &str) {
         s.active = true;
         state::save(&s);
     }
+    // Taken only past the early returns above, which print nothing (or
+    // nothing that carries them): a taken message must reach the output.
+    let agent_msgs =
+        crate::hook_messages::sync(agent, &crate::hook_messages::parse_session(&input), false);
 
     if !s.active {
+        if !agent_msgs.is_empty() {
+            let out = json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": crate::messages::format_delivery(&agent_msgs),
+                }
+            });
+            println!("{out}");
+        }
         return;
     }
 
@@ -796,10 +832,15 @@ pub fn prompt_submit(agent: &str) {
         }
     }
 
+    let mut context = bits.join(" ");
+    if !agent_msgs.is_empty() {
+        context.push_str("\n\n");
+        context.push_str(&crate::messages::format_delivery(&agent_msgs));
+    }
     let out = json!({
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
-            "additionalContext": bits.join(" "),
+            "additionalContext": context,
         }
     });
     println!("{out}");

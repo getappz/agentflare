@@ -242,6 +242,7 @@ fn a_passing_pr_is_not_evidence_unless_the_caller_is_on_its_pushed_branch() {
     let passing = || PrCiStatus::Passing {
         number: 7,
         labels: vec![],
+        head_sha: None,
     };
     // A live owner's PR going green must not let a bystander take over.
     assert_eq!(branch_gate(false, passing()), None);
@@ -249,6 +250,15 @@ fn a_passing_pr_is_not_evidence_unless_the_caller_is_on_its_pushed_branch() {
     assert!(branch_gate(true, passing()).unwrap().contains("PR #7"));
     assert!(branch_gate(true, PrCiStatus::Merged).is_some());
     assert_eq!(branch_gate(true, PrCiStatus::Pending), None);
+    let awaiting_review = PrCiStatus::AwaitingReview {
+        number: 8,
+        labels: vec![],
+    };
+    assert!(
+        branch_gate(true, awaiting_review)
+            .unwrap()
+            .contains("PR #8")
+    );
 }
 
 #[test]
@@ -298,6 +308,7 @@ fn forced_merged_promotion_of_an_unclaimed_item_is_audited() {
             crate::claims::now(),
             "finish #299",
             false,
+            None,
         )
         .unwrap();
     assert!(promoted);
@@ -311,7 +322,7 @@ fn forced_merged_promotion_of_an_unclaimed_item_is_audited() {
         serde_json::from_str(&s.item(Parameters(empty_item_create("Other"))).unwrap()).unwrap();
     let other = created["id"].as_str().unwrap().to_string();
     assert!(
-        s.promote_forced(&other, RESCUER, crate::claims::now(), "r", true)
+        s.promote_forced(&other, RESCUER, crate::claims::now(), "r", true, None)
             .unwrap()
     );
     assert!(comments(&tmp, &other).is_empty());
@@ -321,7 +332,7 @@ fn forced_merged_promotion_of_an_unclaimed_item_is_audited() {
 fn forced_merged_promotion_refuses_when_someone_else_holds_the_claim() {
     let (tmp, s, item_id, job_id) = foreign_claim_harness();
     let err = s
-        .promote_forced(&item_id, RESCUER, crate::claims::now(), "race", true)
+        .promote_forced(&item_id, RESCUER, crate::claims::now(), "race", true, None)
         .unwrap_err();
     assert!(err.message.contains("was claimed by"), "{err:?}");
     assert_eq!(
@@ -362,5 +373,49 @@ fn force_done_on_a_dead_jobs_claim_moves_the_claim_with_an_audit() {
     assert_ne!(
         holder_of(&tmp, &item_id),
         Some(format!("claude-code:{job_id}"))
+    );
+}
+
+#[test]
+fn forced_merged_promotion_refuses_when_the_tracked_pr_changed() {
+    // The merge check confirmed PR #42, but a redispatch + fresh attempt's
+    // PR #43 landed in between: completing off #42 would be wrong.
+    let (tmp, s) = harness();
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+    agentflare_backend::item::update(
+        &backend_conn(&tmp),
+        &item_id,
+        agentflare_backend::item::UpdateItem {
+            metadata: Some(r#"{"pr":{"number":43,"branch":"b"}}"#.into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let promoted = s
+        .promote_forced(
+            &item_id,
+            RESCUER,
+            crate::claims::now(),
+            "r",
+            false,
+            Some(42),
+        )
+        .unwrap();
+    assert!(!promoted);
+    assert!(comments(&tmp, &item_id).is_empty());
+    assert_eq!(holder_of(&tmp, &item_id), None, "lease taken must not leak");
+
+    assert!(
+        s.promote_forced(
+            &item_id,
+            RESCUER,
+            crate::claims::now(),
+            "r",
+            false,
+            Some(43)
+        )
+        .unwrap()
     );
 }

@@ -99,7 +99,7 @@ pub fn run_launch_env(
         cmd.arg("--model").arg(m);
     }
     if let Some(m) = mode {
-        cmd.arg("--mode").arg(m);
+        cmd.arg(agent_registry::mode_flag(spec.id)).arg(m);
     }
     for a in args {
         cmd.arg(a);
@@ -133,7 +133,16 @@ pub struct Captured {
     /// True iff the child was killed because its job was cancelled (see
     /// `agentflare_jobs::cancel`). Never set together with `timed_out`.
     pub cancelled: bool,
+    /// True iff the child was killed as stalled: no worktree change and no
+    /// novel output for the stall window while its output was looping (see
+    /// `agent_launch_progress.rs`).
+    pub stalled: bool,
+    /// The agent's own credit/quota-exhausted error line, when the child
+    /// was killed for printing it repeatedly mid-run.
+    pub exhausted: Option<String>,
 }
+
+include!("agent_launch_progress.rs");
 
 /// Kill `child` and everything it spawned, not just the direct process. A
 /// plain `child.kill()` only signals the direct child; if that child (e.g.
@@ -207,11 +216,31 @@ pub(crate) fn kill_tree(child: &mut std::process::Child) {
 /// works for; the wait loop polls `agentflare_jobs::cancel::job_cancelled` for
 /// it and kills the child once the job is cancelled (see `Captured::cancelled`).
 pub fn run_captured_for_job(
+    cmd: Command,
+    hard_cap: Duration,
+    idle_timeout: Duration,
+    stdin: Option<&str>,
+    cancel_job: Option<&str>,
+) -> std::io::Result<Captured> {
+    run_captured_with_stall(
+        cmd,
+        hard_cap,
+        idle_timeout,
+        stdin,
+        cancel_job,
+        StallConfig::from_env(),
+    )
+}
+
+/// `run_captured_for_job` with an explicit [`StallConfig`] (tests pass
+/// short windows instead of mutating the process env).
+pub(crate) fn run_captured_with_stall(
     mut cmd: Command,
     hard_cap: Duration,
     idle_timeout: Duration,
     stdin: Option<&str>,
     cancel_job: Option<&str>,
+    stall: StallConfig,
 ) -> std::io::Result<Captured> {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -235,7 +264,17 @@ pub fn run_captured_for_job(
     // native `.exe` hides cleanly. The decision is per-agent, made by
     // `run_headless` (the only production caller) from the resolved binary's
     // extension — see its `#[cfg(windows)] creation_flags` block.
+    let record_dir = cmd
+        .get_current_dir()
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok());
     let mut child = cmd.spawn()?;
+    // Removed again when this function returns (child reaped); left behind
+    // only if this whole process dies first -- exactly the case
+    // `orphan_reconcile` needs it for.
+    let _pid_record = record_dir
+        .as_deref()
+        .and_then(|dir| AgentPidRecord::write(dir, child.id()));
 
     if let Some(text) = stdin {
         let mut pipe = child.stdin.take().expect("stdin piped above");
@@ -248,9 +287,11 @@ pub fn run_captured_for_job(
     }
 
     let activity = Arc::new(AtomicU64::new(0));
+    let output_progress = Arc::new(std::sync::Mutex::new(OutputProgress::new(Instant::now())));
 
     let mut pipe = child.stdout.take().expect("stdout piped above");
     let stdout_activity = activity.clone();
+    let stdout_progress = output_progress.clone();
     let reader = std::thread::spawn(move || {
         let mut buf: Vec<u8> = Vec::new();
         let mut chunk = [0u8; 8192];
@@ -264,6 +305,9 @@ pub fn run_captured_for_job(
                 Ok(n) => {
                     buf.extend_from_slice(&chunk[..n]);
                     stdout_activity.fetch_add(n as u64, Ordering::Relaxed);
+                    if let Ok(mut p) = stdout_progress.lock() {
+                        p.feed(0, &String::from_utf8_lossy(&chunk[..n]), Instant::now());
+                    }
                 }
             }
         }
@@ -271,6 +315,7 @@ pub fn run_captured_for_job(
     });
     let mut err_pipe = child.stderr.take().expect("stderr piped above");
     let stderr_activity = activity.clone();
+    let stderr_progress = output_progress.clone();
     let err_reader = std::thread::spawn(move || {
         let mut buf: Vec<u8> = Vec::new();
         let mut chunk = [0u8; 8192];
@@ -280,6 +325,9 @@ pub fn run_captured_for_job(
                 Ok(n) => {
                     buf.extend_from_slice(&chunk[..n]);
                     stderr_activity.fetch_add(n as u64, Ordering::Relaxed);
+                    if let Ok(mut p) = stderr_progress.lock() {
+                        p.feed(1, &String::from_utf8_lossy(&chunk[..n]), Instant::now());
+                    }
                 }
             }
         }
@@ -293,6 +341,12 @@ pub fn run_captured_for_job(
     let mut idle_killed = false;
     let mut cancelled = false;
     let mut last_cancel_poll = Instant::now();
+    let mut stalled = false;
+    let mut exhausted: Option<String> = None;
+    let mut last_progress_poll = Instant::now();
+    // Fingerprinted lazily (first poll), so a short-lived child never pays
+    // for a `git status` at all.
+    let mut worktree: Option<WorktreeProgress> = None;
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
@@ -315,6 +369,44 @@ pub fn run_captured_for_job(
             idle_killed = true;
             break status;
         }
+        // Hung-but-chatty detection (see `agent_launch_progress.rs`),
+        // evaluated ~1/s; the worktree itself is only fingerprinted every
+        // `stall.check_every`.
+        if last_progress_poll.elapsed() >= Duration::from_secs(1) {
+            last_progress_poll = Instant::now();
+            let now = Instant::now();
+            let (repetitive, last_novel, exhaustion_seen, exhausted_line) = {
+                let p = output_progress.lock().unwrap_or_else(|e| e.into_inner());
+                (
+                    p.is_repetitive(),
+                    p.last_novel_at(),
+                    p.exhaustion_first_seen(),
+                    p.exhausted().map(str::to_string),
+                )
+            };
+            let wt =
+                worktree.get_or_insert_with(|| WorktreeProgress::new(record_dir.clone(), start));
+            if !stall.window.is_zero() && start.elapsed() >= stall.check_every {
+                wt.poll(now, stall.check_every);
+            }
+            if stall.exhaustion_kill && exhaustion_seen {
+                wt.note_exhaustion_seen();
+            }
+            let stop = if let Some(line) =
+                exhausted_line.filter(|_| stall.exhaustion_kill && wt.unchanged_since_exhaustion())
+            {
+                exhausted = Some(line);
+                true
+            } else {
+                is_stalled(now, wt.last_change, last_novel, repetitive, stall.window)
+            };
+            if stop {
+                kill_tree(&mut child);
+                let status = child.wait()?;
+                stalled = exhausted.is_none();
+                break status;
+            }
+        }
         // A cancelled job (item reassigned to another agent) must not keep its
         // agent CLI running. Polled ~1/s -- it costs a DB read.
         if let Some(job_id) = cancel_job
@@ -333,13 +425,16 @@ pub fn run_captured_for_job(
 
     let stdout = reader.join().unwrap_or_default();
     let stderr = err_reader.join().unwrap_or_default();
+    let killed_early = stalled || exhausted.is_some();
     Ok(Captured {
-        success: status.success() && !timed_out && !cancelled,
+        success: status.success() && !timed_out && !cancelled && !killed_early,
         stdout,
         stderr,
         timed_out,
         idle_killed,
         cancelled,
+        stalled,
+        exhausted,
     })
 }
 
@@ -352,6 +447,129 @@ pub fn run_captured(
     stdin: Option<&str>,
 ) -> std::io::Result<Captured> {
     run_captured_for_job(cmd, hard_cap, idle_timeout, stdin, None)
+}
+
+/// Where agent CLIs launched with `worktree` as their cwd record their pid
+/// (one file per live child, named by pid). Lets the next daemon find and
+/// kill a child that outlived a daemon crash: outside the Linux bwrap path
+/// the worktree appears nowhere in the child's argv (its prompt is on stdin
+/// and the path is only its cwd), so a command-line match can't see it.
+/// Keyed by a stable hash of the canonical path, not std's `DefaultHasher`,
+/// so a different (upgraded) binary computes the same directory.
+pub(crate) fn agent_pid_dir(worktree: &Path) -> std::path::PathBuf {
+    let canonical = std::fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in canonical.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    crate::state::state_dir()
+        .join("agent-pids")
+        .join(format!("{hash:016x}"))
+}
+
+/// One launched agent child's pid record (see `agent_pid_dir`), removed on
+/// drop.
+struct AgentPidRecord {
+    path: std::path::PathBuf,
+}
+
+impl AgentPidRecord {
+    /// Best-effort: failing to record only costs the orphan sweep its
+    /// fallback, never the launch itself.
+    fn write(worktree: &Path, pid: u32) -> Option<Self> {
+        let dir = agent_pid_dir(worktree);
+        std::fs::create_dir_all(&dir).ok()?;
+        let path = dir.join(pid.to_string());
+        let start = process_start_token(pid).unwrap_or_default();
+        std::fs::write(&path, format!("{pid}\n{start}\n")).ok()?;
+        Some(Self { path })
+    }
+}
+
+impl Drop for AgentPidRecord {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// A launched agent child recorded under `agent_pid_dir(worktree)`: its pid
+/// (also its process-group id on Unix, see `process_group(0)` in
+/// `run_captured_for_job`) and the start-time token captured at launch, if
+/// one could be read.
+pub(crate) struct RecordedAgentPid {
+    pub pid: u32,
+    pub start_token: Option<String>,
+    pub record_path: std::path::PathBuf,
+}
+
+pub(crate) fn recorded_agent_pids(worktree: &Path) -> Vec<RecordedAgentPid> {
+    let Ok(entries) = std::fs::read_dir(agent_pid_dir(worktree)) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let record_path = entry.path();
+            let content = std::fs::read_to_string(&record_path).ok()?;
+            let mut lines = content.lines();
+            let pid = lines.next()?.trim().parse::<u32>().ok()?;
+            let start_token = lines
+                .next()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string);
+            Some(RecordedAgentPid {
+                pid,
+                start_token,
+                record_path,
+            })
+        })
+        .collect()
+}
+
+/// An opaque token identifying *this incarnation* of `pid` -- its start
+/// time -- so a recorded pid the OS has since handed to an unrelated process
+/// can be told apart from the original. `None` if it can't be read (process
+/// gone, or no cheap source on this platform).
+pub(crate) fn process_start_token(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        // Field 22 (starttime); split after the parenthesised comm, which
+        // may itself contain spaces.
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let after_comm = stat.rsplit_once(')')?.1;
+        after_comm.split_whitespace().nth(19).map(str::to_string)
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "lstart=", "-p", &pid.to_string()])
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!token.is_empty()).then_some(token)
+    }
+    #[cfg(windows)]
+    {
+        let out = flare_process::command("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!("(Get-Process -Id {pid}).StartTime.ToFileTimeUtc()"),
+            ])
+            .output()
+            .ok()?;
+        let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!token.is_empty()).then_some(token)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
 /// The queue job id inside an in-process work job's claim owner
@@ -434,12 +652,44 @@ fn launch_command(binary: &Path, args: &[String]) -> (String, Vec<String>, bool)
 }
 
 /// Outcome of a headless (non-interactive, output-captured) agent invocation.
+///
+/// The fields past `cost_usd` come from Claude Code's `result` event
+/// (`--output-format json` / `stream-json`) and stay at their defaults for
+/// agents whose reply is plain text.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct HeadlessReply {
     pub text: String,
     pub session_id: Option<String>,
     pub cost_usd: Option<f64>,
+    /// `success`, `error_max_turns`, `error_max_budget_usd`,
+    /// `error_during_execution`, ... — how the run ended.
+    pub subtype: Option<String>,
+    pub is_error: bool,
+    pub num_turns: Option<u64>,
+    /// Input tokens processed, summed over fresh, cache-creation and
+    /// cache-read input so it is comparable across runs whatever the cache
+    /// hit rate was.
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    /// The typed reply when the run was given a `--json-schema`.
+    pub structured_output: Option<serde_json::Value>,
+}
+
+/// What a `SendMessage` hook hands the workflow engine for an `Ok` reply:
+/// the reply text (the `--json-schema` structured output serialized, when
+/// there is one, so downstream parsers see the typed object rather than
+/// prose around it) and the token counts, `0` when the agent reported none.
+pub(crate) fn reply_payload(reply: HeadlessReply) -> (String, u64, u64) {
+    let text = match reply.structured_output {
+        Some(structured) => structured.to_string(),
+        None => reply.text,
+    };
+    (
+        text,
+        reply.input_tokens.unwrap_or(0),
+        reply.output_tokens.unwrap_or(0),
+    )
 }
 
 #[allow(dead_code)]
@@ -455,28 +705,158 @@ pub enum HeadlessOutcome {
     Failed(String),
 }
 
+/// Print-mode argv tail: the registry's JSON-output flags (when the caller
+/// asked for a structured reply) followed by `extra_args` — unless
+/// `extra_args` already pin `--output-format` themselves, in which case the
+/// caller's choice stands and no second `--output-format` is emitted.
+///
+/// `cli::work::build_extra_args` pins `stream-json` for liveness. Emitting
+/// `--output-format json` ahead of it made the CLI (last flag wins) stream
+/// multi-line output that `parse_json_reply` then failed to parse as one
+/// object, so every `agentflare work` dispatch silently lost its
+/// `session_id` and `total_cost_usd` — the SDD loop's `--resume` between fix
+/// rounds never fired in real dispatch (audit 2026-09-24, finding #1).
+pub(crate) fn headless_full_args(
+    agent: Agent,
+    request_json: bool,
+    extra_args: &[String],
+) -> Vec<String> {
+    let pins_output_format = extra_args.iter().any(|a| {
+        a == "--output-format" || a.starts_with("--output-format=") || a == "--stream-json"
+    });
+    let mut full_args: Vec<String> = Vec::with_capacity(extra_args.len() + 2);
+    if request_json
+        && !pins_output_format
+        && let Some(flags) = json_output_args(agent)
+    {
+        full_args.extend(flags.iter().map(|s| (*s).to_string()));
+    }
+    full_args.extend(extra_args.iter().cloned());
+    full_args
+}
+
+/// Structured reply off a headless run's stdout. Accepts both shapes the
+/// registry's `json_output_args` agents produce: `--output-format json` (the
+/// whole stdout is one object) and `--output-format stream-json` (one object
+/// per line, the final line carrying the same `{"result", "session_id",
+/// "total_cost_usd"}` fields). Anything else comes back as raw text with no
+/// session or cost — never an error.
 fn parse_json_reply(stdout: &str) -> HeadlessReply {
-    match serde_json::from_str::<serde_json::Value>(stdout.trim()) {
-        Ok(value) => HeadlessReply {
-            text: value
-                .get("result")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or(stdout)
-                .to_string(),
-            session_id: value
-                .get("session_id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-            cost_usd: value
-                .get("total_cost_usd")
-                .and_then(serde_json::Value::as_f64),
-        },
-        Err(_) => HeadlessReply {
+    match final_json_object(stdout) {
+        Some(value) => reply_from_result_event(&value, stdout),
+        None => HeadlessReply {
             text: stdout.to_string(),
-            session_id: None,
-            cost_usd: None,
+            ..HeadlessReply::default()
         },
     }
+}
+
+/// The one JSON object a structured reply carries: the whole stdout for
+/// `--output-format json`, the final line for `stream-json`.
+fn final_json_object(stdout: &str) -> Option<serde_json::Value> {
+    let trimmed = stdout.trim();
+    serde_json::from_str::<serde_json::Value>(trimmed)
+        .ok()
+        .or_else(|| {
+            trimmed
+                .lines()
+                .next_back()
+                .and_then(|last| serde_json::from_str::<serde_json::Value>(last).ok())
+        })
+}
+
+/// Reads a Claude Code `result` event (`{"type":"result","subtype":...,
+/// "is_error":...,"num_turns":...,"result":...,"session_id":...,
+/// "total_cost_usd":...,"usage":{...},"structured_output":...}`) into a
+/// reply. Any JSON object is accepted: fields that aren't there stay at
+/// their defaults, and a non-result object (no `type`/`session_id`) with no
+/// `result` text keeps `raw` as the text so nothing is lost.
+fn reply_from_result_event(value: &serde_json::Value, raw: &str) -> HeadlessReply {
+    use serde_json::Value;
+    let is_result_event = value.get("type").and_then(Value::as_str) == Some("result")
+        || value.get("session_id").is_some();
+    let text = match value.get("result").and_then(Value::as_str) {
+        Some(result) => result.to_string(),
+        None if is_result_event => String::new(),
+        None => raw.to_string(),
+    };
+    let usage = value.get("usage");
+    let tokens = |key: &str| usage.and_then(|u| u.get(key)).and_then(Value::as_u64);
+    let input_tokens = match (
+        tokens("input_tokens"),
+        tokens("cache_creation_input_tokens"),
+        tokens("cache_read_input_tokens"),
+    ) {
+        (None, None, None) => None,
+        (fresh, created, read) => {
+            Some(fresh.unwrap_or(0) + created.unwrap_or(0) + read.unwrap_or(0))
+        }
+    };
+    HeadlessReply {
+        text,
+        session_id: value
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        cost_usd: value.get("total_cost_usd").and_then(Value::as_f64),
+        subtype: value
+            .get("subtype")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        is_error: value
+            .get("is_error")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        num_turns: value.get("num_turns").and_then(Value::as_u64),
+        input_tokens,
+        output_tokens: tokens("output_tokens"),
+        structured_output: value
+            .get("structured_output")
+            .filter(|s| !s.is_null())
+            .cloned(),
+    }
+}
+
+/// Turns a parsed structured reply into an outcome. A cap hit
+/// (`error_max_turns`, `error_max_budget_usd`) is still a usable reply — the
+/// session id lets the next round `--resume` where the run stopped — so it
+/// stays `Ok`, with the stop reason spelled out ahead of the text for the
+/// reviewer/judge that reads it. Any other error subtype is a failure that
+/// names itself instead of hiding behind an opaque exit code.
+fn classify_result_reply(display_name: &str, mut reply: HeadlessReply) -> HeadlessOutcome {
+    match reply.subtype.as_deref() {
+        Some(subtype) if subtype.starts_with("error_max_") => {
+            reply.text = format!(
+                "[agentflare] {display_name} stopped early: {subtype}. Its partial reply follows.\n\n{}",
+                reply.text
+            );
+            HeadlessOutcome::Ok(reply)
+        }
+        Some(subtype) if reply.is_error || subtype.starts_with("error") => {
+            HeadlessOutcome::Failed(format!(
+                "{display_name} ended with {subtype}: {}",
+                tail_str(&reply.text, DIAGNOSTIC_TAIL_CHARS)
+            ))
+        }
+        _ if reply.is_error => HeadlessOutcome::Failed(format!(
+            "{display_name} reported an error result: {}",
+            tail_str(&reply.text, DIAGNOSTIC_TAIL_CHARS)
+        )),
+        _ => HeadlessOutcome::Ok(reply),
+    }
+}
+
+/// ` (<subtype>)` when a failed run's stdout still ends in a `result` event
+/// that names why it ended, else empty — so "exited non-zero" carries the
+/// CLI's own reason when it gave one.
+fn result_subtype_note(stdout: &str) -> String {
+    final_json_object(stdout)
+        .and_then(|v| {
+            v.get("subtype")
+                .and_then(serde_json::Value::as_str)
+                .map(|s| format!(" ({s})"))
+        })
+        .unwrap_or_default()
 }
 
 /// Run an agent non-interactively with `prompt` and capture its reply, killing
@@ -625,11 +1005,7 @@ fn run_headless_impl(
             spec.binary_names.join(" / ")
         ));
     };
-    let mut full_args: Vec<String> = Vec::with_capacity(extra_args.len() + 2);
-    if request_json && let Some(flags) = json_output_args(spec.id) {
-        full_args.extend(flags.iter().map(|s| (*s).to_string()));
-    }
-    full_args.extend(extra_args.iter().cloned());
+    let full_args = headless_full_args(spec.id, request_json, extra_args);
     let Some(argv) = headless_argv(spec.id, &binary, &full_args) else {
         return HeadlessOutcome::NotHeadless(format!(
             "{} has no headless print mode",
@@ -762,18 +1138,32 @@ fn run_headless_impl(
     match result {
         Ok(c) if c.success => {
             if request_json && json_output_args(spec.id).is_some() {
-                HeadlessOutcome::Ok(parse_json_reply(&c.stdout))
+                classify_result_reply(spec.display_name, parse_json_reply(&c.stdout))
             } else {
                 HeadlessOutcome::Ok(HeadlessReply {
                     text: c.stdout,
-                    session_id: None,
-                    cost_usd: None,
+                    ..HeadlessReply::default()
                 })
             }
         }
         Ok(c) if c.cancelled => {
             HeadlessOutcome::Failed(agentflare_jobs::cancel::CANCELLED_MESSAGE.to_string())
         }
+        // Killed early for repeatedly printing its own credit/quota error:
+        // the line leads the message so `auth_runner::classify_failure`
+        // routes it to the exhaustion/failover path.
+        Ok(c) if c.exhausted.is_some() => HeadlessOutcome::Failed(format!(
+            "{} stopped mid-run: agent reported {}{}",
+            spec.display_name,
+            c.exhausted.as_deref().unwrap_or_default(),
+            diagnostic_suffix(&c, sandbox_log.as_deref())
+        )),
+        Ok(c) if c.stalled => HeadlessOutcome::Failed(format!(
+            "{} {STALLED_MARKER} for {:?} while its output repeated{}",
+            spec.display_name,
+            StallConfig::from_env().window,
+            diagnostic_suffix(&c, sandbox_log.as_deref())
+        )),
         Ok(c) if c.timed_out => {
             let reason = if c.idle_killed {
                 format!("went idle for {idle_timeout:?} (no new output)")
@@ -787,8 +1177,9 @@ fn run_headless_impl(
             ))
         }
         Ok(c) => HeadlessOutcome::Failed(format!(
-            "{} exited non-zero{}",
+            "{} exited non-zero{}{}",
             spec.display_name,
+            result_subtype_note(&c.stdout),
             diagnostic_suffix(&c, sandbox_log.as_deref())
         )),
         Err(e) => HeadlessOutcome::Failed(format!("failed to run {}: {e}", spec.display_name)),
@@ -828,23 +1219,8 @@ fn take_diagnostic_log(path: Option<&Path>) -> Option<String> {
 /// event, which has no `action` field — instead of the judge's actual
 /// decision on the transcript's last line, hard-failing every judge turn.
 pub(crate) fn parse_claude_reply(raw: &str) -> (String, Option<String>, Option<f64>) {
-    let last_line = raw.trim().lines().next_back().unwrap_or("");
-    match serde_json::from_str::<serde_json::Value>(last_line) {
-        Ok(v) => {
-            let text = v
-                .get("result")
-                .and_then(|r| r.as_str())
-                .map(str::to_string)
-                .unwrap_or_else(|| raw.to_string());
-            let session_id = v
-                .get("session_id")
-                .and_then(|s| s.as_str())
-                .map(str::to_string);
-            let cost = v.get("total_cost_usd").and_then(serde_json::Value::as_f64);
-            (text, session_id, cost)
-        }
-        Err(_) => (raw.to_string(), None, None),
-    }
+    let reply = parse_json_reply(raw);
+    (reply.text, reply.session_id, reply.cost_usd)
 }
 
 /// Every role dispatched through `real_agent_send_hook` (`work_item_pipeline`)

@@ -32,24 +32,29 @@ fn daemon_singleton_lock_path() -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join("agentflare-daemon.singleton.lock"))
 }
 
+/// Held (flock) by the running daemon for its whole lifetime — see
+/// `write_pid_file`. Never deleted, like every lock file here.
+fn daemon_alive_lock_path() -> PathBuf {
+    dirs::runtime_dir()
+        .map(|d| d.join("agentflare").join("daemon.alive.lock"))
+        .unwrap_or_else(|| std::env::temp_dir().join("agentflare-daemon.alive.lock"))
+}
+
+/// Lock files are deliberately left in place: deleting one while another
+/// process is blocked on it (holding the old, now-unlinked inode) lets a
+/// third process create a fresh file at the same path and lock *that* —
+/// both then "hold" the lock and two daemons start.
 pub fn cleanup_daemon_files() {
     let pid_path = daemon_pid_path();
     let _ = std::fs::remove_file(&pid_path);
-    let lock_path = daemon_start_lock_path();
-    let _ = std::fs::remove_file(&lock_path);
     let addr = DaemonAddr::default_for_pid(read_pid_from_file().unwrap_or(0));
     crate::ipc::cleanup(&addr);
 }
 
+/// Releases its flock when dropped (closing the file does that); the file
+/// itself is never removed — see `cleanup_daemon_files`.
 pub struct LockGuard {
     _file: std::fs::File,
-    path: PathBuf,
-}
-
-impl Drop for LockGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
 }
 
 pub fn acquire_start_lock() -> Result<LockGuard, String> {
@@ -84,10 +89,7 @@ fn acquire_lock(lock_path: PathBuf, timeout: Duration) -> Result<LockGuard, Stri
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if file.try_lock_exclusive().is_ok() {
-            return Ok(LockGuard {
-                _file: file,
-                path: lock_path,
-            });
+            return Ok(LockGuard { _file: file });
         }
         if std::time::Instant::now() >= deadline {
             return Err(format!("could not acquire lock within {timeout:?}"));
@@ -98,12 +100,50 @@ fn acquire_lock(lock_path: PathBuf, timeout: Duration) -> Result<LockGuard, Stri
 
 pub fn is_daemon_running() -> Option<u32> {
     let pid = read_pid_from_file()?;
-    if process::is_alive(pid) {
+    // A held lifetime lock is proof of a live daemon, immune to pid reuse.
+    // A free one is not proof of death: a daemon from a build predating the
+    // lock never takes it, so fall back to the pid probe rather than start
+    // a second daemon next to it.
+    if lock_held(&daemon_alive_lock_path()) == Some(true) || process::is_alive(pid) {
         Some(pid)
     } else {
         cleanup_daemon_files();
         None
     }
+}
+
+/// `Some(true)` if another open file description holds an exclusive flock on
+/// `path` (including one in this same process), `Some(false)` if it's free,
+/// `None` if that can't be determined.
+fn lock_held(path: &std::path::Path) -> Option<bool> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .ok()?;
+    match file.try_lock_exclusive() {
+        // Released as `file` drops.
+        Ok(()) => Some(false),
+        Err(e) if e.raw_os_error() == fs2::lock_contended_error().raw_os_error() => Some(true),
+        Err(_) => None,
+    }
+}
+
+/// The running daemon's lifetime lock, held until the process exits.
+static DAEMON_ALIVE_LOCK: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
+
+/// Take the lifetime lock at `path` for this process, waiting up to
+/// `timeout` for a predecessor that is still exiting (`respawn_from_stale`
+/// spawns its replacement just before it exits) to let go.
+fn hold_lifetime_lock(path: PathBuf, timeout: Duration) -> Result<(), String> {
+    if DAEMON_ALIVE_LOCK.get().is_some() {
+        return Ok(());
+    }
+    let guard = acquire_lock(path, timeout)
+        .map_err(|e| format!("another daemon holds the lifetime lock: {e}"))?;
+    let _ = DAEMON_ALIVE_LOCK.set(guard._file);
+    Ok(())
 }
 
 fn read_pid_from_file() -> Option<u32> {
@@ -115,7 +155,12 @@ fn read_pid_from_file() -> Option<u32> {
 /// `is_daemon_running`/`daemon status`/`daemon stop` (possibly from a
 /// different process) can find it. Called by the `serve` foreground process
 /// itself once it starts, not just by `start_daemon`'s spawner.
+///
+/// Also takes the daemon's lifetime lock first (held until this process
+/// exits), which `is_daemon_running` uses as its liveness test; refuses to
+/// record a pid if another live daemon holds it.
 pub fn write_pid_file() -> Result<(), String> {
+    hold_lifetime_lock(daemon_alive_lock_path(), Duration::from_secs(5))?;
     let path = daemon_pid_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create pid dir {parent:?}: {e}"))?;
@@ -308,6 +353,33 @@ pub fn stop_daemon() -> Result<(), String> {
 
     cleanup_daemon_files();
     Ok(())
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+
+    #[test]
+    fn releasing_a_lock_never_deletes_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.lock");
+        let guard = acquire_lock(path.clone(), Duration::from_millis(100)).unwrap();
+        drop(guard);
+        assert!(path.exists(), "a deleted lock file lets two holders in");
+    }
+
+    #[test]
+    fn a_held_lock_excludes_a_second_holder_and_reads_as_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.lock");
+        assert_eq!(lock_held(&path), Some(false));
+        let guard = acquire_lock(path.clone(), Duration::from_millis(100)).unwrap();
+        assert_eq!(lock_held(&path), Some(true));
+        assert!(acquire_lock(path.clone(), Duration::from_millis(100)).is_err());
+        drop(guard);
+        assert_eq!(lock_held(&path), Some(false));
+        assert!(acquire_lock(path, Duration::from_millis(100)).is_ok());
+    }
 }
 
 #[cfg(test)]

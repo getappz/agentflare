@@ -11,6 +11,15 @@ pub struct RefInfo {
     pub git_ref: String,
     #[serde(default)]
     pub sha: String,
+    /// The repository the ref lives in -- for a PR's `head`, a fork's when
+    /// the PR came from one. `null` once that fork has been deleted.
+    #[serde(default)]
+    pub repo: Option<RefRepo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RefRepo {
+    pub full_name: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -136,6 +145,36 @@ pub struct CheckRun {
     pub status: String,
     #[serde(default)]
     pub conclusion: Option<String>,
+    /// Whether branch protection requires this context to pass before the
+    /// PR can merge. Only GraphQL's `isRequired(pullRequestNumber:)` reports
+    /// it; REST check runs and statuses carry no such field, so they default
+    /// to `false` (and every context then counts -- see
+    /// `worktree::decide_from_checks`).
+    #[serde(default)]
+    pub required: bool,
+}
+
+impl CheckRun {
+    /// A legacy commit status (the Statuses API, e.g. a third-party CI or a
+    /// CLA bot) folded into the check-run shape the CI decision reads, so
+    /// both kinds of context count. `state` is lowercased first: GraphQL's
+    /// `StatusState` is upper-case, REST's is lower-case. `error`/`failure`
+    /// are failures, `success` passes, and `pending`/`expected` (a required
+    /// context nothing has reported yet) are still running.
+    pub fn from_status(name: &str, state: &str, required: bool) -> CheckRun {
+        let state = state.to_lowercase();
+        let (status, conclusion) = match state.as_str() {
+            "success" => ("completed", Some("success")),
+            "failure" | "error" => ("completed", Some("failure")),
+            _ => ("pending", None),
+        };
+        CheckRun {
+            name: name.to_string(),
+            status: status.to_string(),
+            conclusion: conclusion.map(str::to_string),
+            required,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

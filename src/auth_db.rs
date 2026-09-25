@@ -87,6 +87,20 @@ pub fn open_or_rebuild() -> Connection {
     conn
 }
 
+/// Like [`open_or_rebuild`], but `None` instead of panicking when the
+/// database can't be opened -- for best-effort readers on hot paths (the
+/// discovery tick's failover probe) where a missing/unwritable home must not
+/// take the caller down.
+pub fn try_open() -> Option<Connection> {
+    let path = db_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    let conn = Connection::open(&path).ok()?;
+    migrate(&conn).ok()?;
+    Some(conn)
+}
+
 fn now_iso() -> String {
     // Use space separator to match SQLite datetime('now') format
     chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()

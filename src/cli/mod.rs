@@ -22,8 +22,10 @@ mod hook;
 mod init;
 mod insights;
 mod item;
+mod job;
 mod mcp;
 mod memory;
+mod message;
 mod optimize;
 mod project;
 mod review;
@@ -140,6 +142,8 @@ pub enum Commands {
     Skill(skill::SkillArgs),
     /// Read and write agentflare's cross-session agent memory.
     Memory(memory::MemoryArgs),
+    /// Message live agent sessions (send, list, inbox, watch).
+    Message(message::MessageArgs),
     /// Serve the read-only agentflare dashboard.
     Serve(serve::ServeArgs),
     /// Vent friction or feedback encountered during an agent session.
@@ -154,8 +158,10 @@ pub enum Commands {
     Insights(insights::InsightsArgs),
     /// Run and manage AgentFlare Apps — self-contained agentic domain modules.
     Apps(apps::AppsArgs),
-    /// Manage work items (list/get)
+    /// Manage work items (list/get/cancel/pause/resume/redispatch)
     Item(item::ItemArgs),
+    /// Control dispatched jobs (cancel/pause/resume)
+    Job(job::JobArgs),
     /// Manage projects
     Project(project::ProjectArgs),
     /// Local store (chunks, vectors, meta, cache) — hybrid search internals.
@@ -194,6 +200,7 @@ impl Commands {
             Self::Review(cmd) => cmd.run(),
             Self::Skill(cmd) => cmd.run(),
             Self::Memory(cmd) => cmd.run(),
+            Self::Message(cmd) => cmd.run(),
             Self::Serve(cmd) => cmd.run(),
             Self::Daemon(cmd) => cmd.run(),
             Self::Vent(cmd) => vent::run(cmd),
@@ -203,6 +210,7 @@ impl Commands {
             Self::Insights(cmd) => cmd.run(),
             Self::Apps(cmd) => cmd.run(),
             Self::Item(cmd) => cmd.run(),
+            Self::Job(cmd) => cmd.run(),
             Self::Project(cmd) => cmd.run(),
             Self::Store(cmd) => cmd.run(),
         }

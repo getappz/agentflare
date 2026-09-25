@@ -49,12 +49,26 @@ pub fn list(client: &Client, repo: &RepoId, state: &str) -> Result<Vec<PullReque
 /// the same branch is perfectly legal to create, which is how `item done`
 /// re-running on an already-merged branch ended up opening a redundant PR
 /// (2026-07-25, PR #328 duplicating already-merged #327).
+///
+/// Asks GitHub for just this branch (`head=<owner>:<branch>`) in a single
+/// request rather than paginating every PR the repo has ever had: that
+/// unbounded walk cost one request per 100 PRs on every call and was the
+/// call most likely to trip the rate limit. The `head.ref` check is kept as
+/// a guard in case the filter is ever ignored.
 pub fn find_existing(
     client: &Client,
     repo: &RepoId,
     branch: &str,
 ) -> Result<Option<PullRequest>, GitHubError> {
-    let prs = list(client, repo, "all")?;
+    let path = format!(
+        "/repos/{}/{}/pulls?state=all&head={}&per_page=100",
+        repo.owner,
+        repo.repo,
+        crate::github::encode_query(&format!("{}:{branch}", repo.owner))
+    );
+    let json = client.request("GET", &path, None)?;
+    let prs: Vec<PullRequest> =
+        serde_json::from_value(json).map_err(|e| GitHubError::Parse(e.to_string()))?;
     Ok(prs
         .into_iter()
         .find(|pr| pr.head.as_ref().is_some_and(|h| h.git_ref == branch)))
@@ -200,13 +214,38 @@ pub fn get(client: &Client, repo: &RepoId, number: u64) -> Result<PullRequest, G
 }
 
 pub fn merge(client: &Client, repo: &RepoId, number: u64, method: &str) -> Result<(), GitHubError> {
+    merge_at_head(client, repo, number, method, None)
+}
+
+/// `merge`, pinned to `head_sha` when given: GitHub then refuses with 409
+/// if the PR's head has moved since -- a commit pushed after the caller
+/// judged CI green must never ride along into the merge unchecked. Callers
+/// treat that 409 as "look again next tick" (see [`is_head_moved`]).
+pub fn merge_at_head(
+    client: &Client,
+    repo: &RepoId,
+    number: u64,
+    method: &str,
+    head_sha: Option<&str>,
+) -> Result<(), GitHubError> {
     let path = format!("/repos/{}/{}/pulls/{number}/merge", repo.owner, repo.repo);
-    client.request(
-        "PUT",
-        &path,
-        Some(serde_json::json!({ "merge_method": method })),
-    )?;
+    let mut body = serde_json::json!({ "merge_method": method });
+    if let Some(sha) = head_sha {
+        body["sha"] = serde_json::Value::String(sha.to_string());
+    }
+    client.request("PUT", &path, Some(body))?;
     Ok(())
+}
+
+/// True when GitHub rejected a head-pinned `merge_at_head` because the PR's
+/// head moved underneath the caller (409 Conflict). `update_branch`'s
+/// equivalent mismatch comes back as a 422 naming the expected SHA.
+pub fn is_head_moved(err: &GitHubError) -> bool {
+    match err {
+        GitHubError::Http { status: 409, .. } => true,
+        GitHubError::Http { status: 422, body } => body.contains("expected head sha"),
+        _ => false,
+    }
 }
 
 /// Same server-side operation as the PR page's own "Update branch" button --
@@ -217,12 +256,22 @@ pub fn merge(client: &Client, repo: &RepoId, number: u64, method: &str) -> Resul
 /// `mergeable_state` is already GitHub's own "behind" (mergeable, no
 /// conflict) -- `worktree::run_review_sweep`'s job, not this function's, to
 /// check that first.
-pub fn update_branch(client: &Client, repo: &RepoId, number: u64) -> Result<(), GitHubError> {
+///
+/// `head_sha`, when given, is sent as GitHub's `expected_head_sha` guard:
+/// the update is refused (422) instead of applied when the branch head is no
+/// longer the one the caller saw, e.g. an agent pushed a fix in the meantime.
+pub fn update_branch(
+    client: &Client,
+    repo: &RepoId,
+    number: u64,
+    head_sha: Option<&str>,
+) -> Result<(), GitHubError> {
     let path = format!(
         "/repos/{}/{}/pulls/{number}/update-branch",
         repo.owner, repo.repo
     );
-    client.request("PUT", &path, None)?;
+    let body = head_sha.map(|sha| serde_json::json!({ "expected_head_sha": sha }));
+    client.request("PUT", &path, body)?;
     Ok(())
 }
 
@@ -304,9 +353,9 @@ pub fn resolved_review_comment_ids(
         "query": QUERY,
         "variables": { "owner": repo.owner, "repo": repo.repo, "number": number }
     });
-    let json = client.request("POST", "/graphql", Some(body))?;
+    let json = client.graphql(body)?;
     if let Some(errors) = json.get("errors") {
-        return Err(GitHubError::Parse(format!("GraphQL error: {errors}")));
+        return Err(crate::github::graphql::graphql_error(client, errors));
     }
     let threads = json["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
         .as_array()
@@ -393,9 +442,11 @@ mod tests {
         let client = server.client(None);
         let found = find_existing(&client, &repo(), "task/348").unwrap();
         assert_eq!(found.unwrap().number, 5);
+        let reqs = server.requests();
+        assert_eq!(reqs.len(), 1, "one head-filtered request, no pagination");
         assert_eq!(
-            server.requests()[0].path,
-            "/repos/o/r/pulls?state=all&per_page=100&page=1"
+            reqs[0].path,
+            "/repos/o/r/pulls?state=all&head=o%3Atask/348&per_page=100"
         );
     }
 
@@ -618,10 +669,44 @@ mod tests {
     }
 
     #[test]
+    fn merge_at_head_pins_the_checked_sha() {
+        let server = MockServer::start(vec![MockResponse::json(200, r#"{"merged":true}"#)]);
+        let client = server.client(Some("tok"));
+        merge_at_head(&client, &repo(), 3, "squash", Some("abc123")).unwrap();
+        let sent: serde_json::Value = serde_json::from_str(&server.requests()[0].body).unwrap();
+        assert_eq!(sent["sha"], "abc123");
+        assert_eq!(sent["merge_method"], "squash");
+    }
+
+    #[test]
+    fn merge_at_head_reports_a_moved_head_as_is_head_moved() {
+        let server = MockServer::start(vec![MockResponse::json(
+            409,
+            r#"{"message":"Head branch was modified. Review and try the merge again."}"#,
+        )]);
+        let client = server.client(Some("tok"));
+        let err = merge_at_head(&client, &repo(), 3, "squash", Some("abc123")).unwrap_err();
+        assert!(is_head_moved(&err));
+        assert!(!is_head_moved(&GitHubError::Http {
+            status: 405,
+            body: "not mergeable".into()
+        }));
+    }
+
+    #[test]
+    fn update_branch_sends_expected_head_sha() {
+        let server = MockServer::start(vec![MockResponse::json(202, r#"{"message":"Updating"}"#)]);
+        let client = server.client(Some("tok"));
+        update_branch(&client, &repo(), 7, Some("def456")).unwrap();
+        let sent: serde_json::Value = serde_json::from_str(&server.requests()[0].body).unwrap();
+        assert_eq!(sent["expected_head_sha"], "def456");
+    }
+
+    #[test]
     fn update_branch_puts_to_the_update_branch_endpoint() {
         let server = MockServer::start(vec![MockResponse::json(202, r#"{"message":"Updating"}"#)]);
         let client = server.client(Some("tok"));
-        update_branch(&client, &repo(), 7).unwrap();
+        update_branch(&client, &repo(), 7, None).unwrap();
         let reqs = server.requests();
         assert_eq!(reqs[0].method, "PUT");
         assert_eq!(reqs[0].path, "/repos/o/r/pulls/7/update-branch");

@@ -399,7 +399,10 @@ async fn journal_records_every_step_result() {
     );
 }
 
-#[tokio::test]
+// Multi-threaded: the step blocks its worker thread, and on a single-threaded
+// runtime the run would complete before `cancel_workflow` ever runs (a
+// cancel no longer overwrites a run that already settled).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancellation_stops_execution() {
     let engine = build_engine();
     let wf = WorkflowDefinition::new("wf", "wf").add_step(step("slow", |_| {

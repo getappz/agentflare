@@ -29,10 +29,15 @@ pub enum HookEvent {
         #[arg(long, value_enum)]
         agent: Option<agent_registry::Agent>,
     },
-    /// No-op — kept only so an old settings.json entry from a prior
-    /// agentflare version doesn't start erroring after an upgrade. New
-    /// installs never wire this (see init.rs).
+    /// Fires when an agent session ends; marks it ended in the live-session
+    /// registry used for inter-agent messaging.
     SessionEnd {
+        #[arg(long, value_enum)]
+        agent: Option<agent_registry::Agent>,
+    },
+    /// Fires when the agent is about to stop; blocks the stop to deliver
+    /// inter-agent messages that arrived during the turn.
+    Stop {
         #[arg(long, value_enum)]
         agent: Option<agent_registry::Agent>,
     },
@@ -74,6 +79,7 @@ impl HookArgs {
             }
             HookEvent::PostToolUse { agent } => crate::hook::post_tool_use(&resolve_agent(agent)),
             HookEvent::SessionEnd { agent } => crate::hook::session_end(&resolve_agent(agent)),
+            HookEvent::Stop { agent } => crate::hook_messages::stop(&resolve_agent(agent)),
             HookEvent::PreCompact { agent } => crate::hook::pre_compact(&resolve_agent(agent)),
         }
     }

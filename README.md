@@ -44,7 +44,7 @@ agent session.
 | **memory** (built-in) | knowledge *across* sessions — decisions, facts, preferences that survive a session ending | ships in the binary, SQLite + FTS5, no separate install |
 | **`agentflare optimize output`** (formerly Caveman, Claude Code only) | conversation verbosity, ~65% | built into the binary |
 | **`agentflare optimize code`** (formerly Ponytail, Claude Code only) | code-writing over-engineering | built into the binary |
-| **`agentflare optimize context`** | session-transcript compaction — BM25/FTS5 relevance scoring on `PreCompact`, so a context compaction keeps what's relevant | built into the binary |
+| **`agentflare optimize context`** | on-demand BM25/FTS5 relevance scoring over a session transcript (`optimize context score`). The `PreCompact` hook is wired for upgrade compatibility but inert: Claude Code's `PreCompact` accepts no injected context, so compaction survival is left to lean-ctx | built into the binary |
 | **`agentflare optimize retrieve`** | reversible-compression retrieve (CCR) — pulls back the original, full-fidelity content that output/context compression replaced, when an agent actually needs it | built into the binary |
 | **runtime layer** (always-on, no CLI surface) | automatic session hygiene and model-routing nudges, surfaced via hooks | built into the binary |
 

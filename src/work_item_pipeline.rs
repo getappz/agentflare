@@ -395,6 +395,16 @@ pub(crate) fn build_sdd_loop_step(
 
                 let task = ctx.data.tasks[ctx.data.current_task_index].clone();
 
+                // The first-pass role for a fresh task or an open fix round:
+                // the analyst on a review-only task, else the implementer.
+                let first_pass_role = if ctx.data.review_only {
+                    SddRole::Analyst {
+                        design_spec: ctx.data.design_spec,
+                    }
+                } else {
+                    SddRole::Implementer
+                };
+
                 // 1. Role dispatch — state read from ctx.data decides which
                 // role plays this turn.
                 // Reviewer branches (task-reviewer, re-reviewer) dispatch on
@@ -403,7 +413,7 @@ pub(crate) fn build_sdd_loop_step(
                 // dispatch further down), so a usage-threshold fallback that
                 // swaps `agent_name` to another CLI still leaves real code
                 // review running on the reserved agent.
-                let (role_agent, role_prompt, is_implementer_turn) = if ctx
+                let (role_agent, role_prompt, is_implementer_turn, role_kind) = if ctx
                     .data
                     .review_issues
                     .is_some()
@@ -417,6 +427,7 @@ pub(crate) fn build_sdd_loop_step(
                             judge_agent_name.clone(),
                             build_re_reviewer_prompt(&task, &findings, &fix_report),
                             false,
+                            SddRole::Reviewer,
                         )
                     } else {
                         // Issues open, no fix attempt yet — dispatch the
@@ -428,7 +439,12 @@ pub(crate) fn build_sdd_loop_step(
                         } else {
                             build_implementer_prompt(&task, fix_context, ctx.data.tdd)
                         };
-                        (agent_name.clone(), prompt, !ctx.data.review_only)
+                        (
+                            agent_name.clone(),
+                            prompt,
+                            !ctx.data.review_only,
+                            first_pass_role,
+                        )
                     }
                 } else if ctx.data.last_report.is_some() {
                     // No open issues; a report is pending review.
@@ -438,7 +454,7 @@ pub(crate) fn build_sdd_loop_step(
                     } else {
                         build_task_reviewer_prompt(&task, &report, ctx.data.tdd)
                     };
-                    (judge_agent_name.clone(), prompt, false)
+                    (judge_agent_name.clone(), prompt, false, SddRole::Reviewer)
                 } else {
                     // Fresh task, nothing dispatched yet.
                     let prompt = if ctx.data.review_only {
@@ -446,8 +462,21 @@ pub(crate) fn build_sdd_loop_step(
                     } else {
                         build_implementer_prompt(&task, None, ctx.data.tdd)
                     };
-                    (agent_name.clone(), prompt, !ctx.data.review_only)
+                    (
+                        agent_name.clone(),
+                        prompt,
+                        !ctx.data.review_only,
+                        first_pass_role,
+                    )
                 };
+
+                // Role identity and tool policy (see `roles.rs`): compiled
+                // into the agent's own flags where its CLI has them, folded
+                // into the prompt otherwise. Done before the corrections
+                // below so a mid-flight correction still leads the prompt
+                // text on agents that get the identity folded in.
+                let (role_args, role_prompt) =
+                    compile_sdd_role(&role_agent, role_kind, &role_prompt);
 
                 // Consume any corrections the heartbeat-tick poll picked up
                 // since the last turn (item #269/#270) — prepended once,
@@ -463,10 +492,16 @@ pub(crate) fn build_sdd_loop_step(
                     )
                 };
 
+                // Resume args lead the argv so a resumed round keeps the
+                // same policy it started with.
+                let mut role_invocation_args =
+                    resume_args_for(&role_agent, &ctx.data.agent_sessions);
+                role_invocation_args.extend(role_args);
+
                 let cwd = (!ctx.data.worktree_path.is_empty())
                     .then(|| std::path::PathBuf::from(&ctx.data.worktree_path));
                 let role_invocation = flare_workflow::json::StepInvocation {
-                    args: resume_args_for(&role_agent, &ctx.data.agent_sessions),
+                    args: role_invocation_args,
                     cwd: cwd.clone(),
                     owner: Some(ctx.data.owner.clone()),
                     ..flare_workflow::json::StepInvocation::simple(role_agent.clone(), role_prompt)
@@ -488,7 +523,7 @@ pub(crate) fn build_sdd_loop_step(
                         // classify.
                         // A job cancelled by a reassignment (item #607) is the
                         // same: retrying would just be refused again.
-                        if crate::auth_runner::is_auth_expired(&message)
+                        if crate::auth_runner::skips_step_retry(&message)
                             || message == agentflare_jobs::cancel::CANCELLED_MESSAGE
                         {
                             return Ok(StepResult::Failed(message));
@@ -546,8 +581,13 @@ pub(crate) fn build_sdd_loop_step(
                     ctx.data.review_only,
                     ctx.data.design_spec,
                 );
+                let (judge_args, judge_prompt) =
+                    compile_sdd_role(&judge_agent_name, SddRole::Judge, &judge_prompt);
+                let mut judge_invocation_args =
+                    resume_args_for(&judge_agent_name, &ctx.data.agent_sessions);
+                judge_invocation_args.extend(judge_args);
                 let judge_invocation = flare_workflow::json::StepInvocation {
-                    args: resume_args_for(&judge_agent_name, &ctx.data.agent_sessions),
+                    args: judge_invocation_args,
                     cwd,
                     owner: Some(ctx.data.owner.clone()),
                     ..flare_workflow::json::StepInvocation::simple(
@@ -564,7 +604,7 @@ pub(crate) fn build_sdd_loop_step(
                         // instead of burning 3 guaranteed-useless attempts.
                         // A job cancelled by a reassignment (item #607) is the
                         // same: retrying would just be refused again.
-                        if crate::auth_runner::is_auth_expired(&message)
+                        if crate::auth_runner::skips_step_retry(&message)
                             || message == agentflare_jobs::cancel::CANCELLED_MESSAGE
                         {
                             return Ok(StepResult::Failed(message));
@@ -689,250 +729,7 @@ pub(crate) fn build_sdd_loop_step(
         ))
 }
 
-/// Wraps `execute_work`'s existing hold/`item_done`/comment/notify tail
-/// (`src/cli/work.rs`'s `HeadlessOutcome::Ok` arm) as the pipeline's last
-/// step. Four outcomes, checked in order:
-///
-/// 1. `ctx.data.hold_reason` set (Task 3's `coder` step detected an
-///    `AGENTFLARE_HOLD:` signal) — release the claim and post an "on hold"
-///    comment instead of calling `item_done`, same as `execute_work`'s hold
-///    branch.
-/// 2. `ctx.data.review_only` set and `ctx.data.design_spec` unset (item #507
-///    — the dispatched item asked for analysis, not implementation) —
-///    release the claim and post the accumulated findings as a comment
-///    instead of ever reaching `item_done`/PR flow, regardless of
-///    `review_issues` state. A design-spec task (item #216) skips this
-///    branch even though it's also `review_only`: its deliverable is a
-///    written spec file, a real artifact that needs to be committed and
-///    land in a PR via the success path below, not just described in a
-///    comment.
-/// 3. `ctx.data.review_issues` still set (Task 4's `review_or_fix` loop hit
-///    `MAX_REVIEW_CYCLES` without ever reaching approval) — gate for a
-///    human with a comment instead of opening a PR on unreviewed code, since
-///    this step has no access to `supervisor`'s label-id lookups for a real
-///    relabel (that stays the supervisor's job on its next discovery tick).
-///    The job is finished either way — release the claim so redispatch /
-///    supervisor discovery can pick the item back up.
-/// 4. Otherwise — the success path: `item_done`, then the same
-///    `cap_reply_for_comment`/`format_success_comment`/comment/notify
-///    sequence `execute_work` runs today.
-///
-/// Retried up to 3 times with exponential backoff (`RetryPolicy`) — this
-/// step's own MCP calls (`item_done` etc.) can fail transiently the same
-/// way `coder`/`review_or_fix`'s agent dispatch can, and unlike those two,
-/// a failure here has already done the real work and just needs to land the
-/// result.
-///
-/// Best-effort claim release on every terminal success except when
-/// `item_done` deliberately left the lease held for an open PR (`in_review`).
-fn finalize_release_claim_best_effort(
-    mcp: &crate::mcp_server::AgentflareMcp,
-    item_id: &str,
-    leave_claim_held: bool,
-) {
-    if leave_claim_held {
-        return;
-    }
-    let _ = mcp.item_release(ItemRequest {
-        action: "release".into(),
-        id: Some(item_id.to_string()),
-        ..Default::default()
-    });
-}
-
-/// `item_id`/`notify_recipient`/`owner` are read from `ctx.data` at
-/// execution time (not closed over here) so a run resumed by
-/// `engine().recover()` after a crash calls `item_done`/`item_release`
-/// against the real item the crashed run persisted, not an empty
-/// placeholder. `mcp` stays a registration-time closure — it's a generic
-/// backend handle (lazily opens the real DB on first use), not per-item
-/// state, so it's safe to share across every run.
-pub(crate) fn build_finalize_step(
-    mcp: std::sync::Arc<AgentflareMcp>,
-) -> StepDefinition<WorkItemData> {
-    let executor = std::sync::Arc::new(FunctionStep::new(
-        move |ctx: &mut WorkflowContext<WorkItemData>| {
-            let mcp = mcp.clone();
-            Box::pin(async move {
-                // Read at execution time, not closed over at
-                // step-registration time -- see `WorkItemData::item_id`'s
-                // doc comment. An empty id means identity genuinely
-                // couldn't be reconstructed (e.g. a run started before this
-                // field existed) -- fail closed rather than guess, same as
-                // this used to fail (by erroring inside `item_done`) when
-                // the boot-time recovery definition closed over a
-                // placeholder id.
-                if ctx.data.item_id.is_empty() {
-                    return Ok(StepResult::Failed(
-                        "finalize: item_id is empty, cannot reconstruct run identity".to_string(),
-                    ));
-                }
-                // A job cancelled by a reassignment (item #607) must not push
-                // or open a PR for an item that now belongs to another agent.
-                let cancel_owner = ctx.data.owner.clone();
-                let cancelled = tokio::task::spawn_blocking(move || {
-                    crate::agent_launch::owner_job_cancelled(&cancel_owner)
-                })
-                .await
-                .unwrap_or(false);
-                if cancelled {
-                    return Ok(StepResult::Failed(
-                        agentflare_jobs::cancel::CANCELLED_MESSAGE.to_string(),
-                    ));
-                }
-                let item_id = ctx.data.item_id.clone();
-                let notify_recipient = ctx.data.notify_recipient.clone();
-                let owner = ctx.data.owner.clone();
-                crate::claims::with_owner_override(owner, || {
-                    if let Some(reason) = ctx.data.hold_reason.clone() {
-                        finalize_release_claim_best_effort(&mcp, &item_id, false);
-                        let body = format!("## agentflare work — on hold\n\n{reason}");
-                        let _ = mcp.comment_impl(CommentRequest {
-                            action: "create".into(),
-                            item_id: Some(item_id.clone()),
-                            body: Some(body.clone()),
-                            ..Default::default()
-                        });
-                        if let Some(recipient) = notify_recipient.as_deref() {
-                            crate::cli::work::notify(recipient, &body, &item_id);
-                        }
-                        return Ok(StepResult::Success);
-                    }
-
-                    if ctx.data.review_only && !ctx.data.design_spec {
-                        let findings = if ctx.data.review_findings.is_empty() {
-                            ctx.data
-                                .last_report
-                                .clone()
-                                .or_else(|| ctx.data.review_issues.clone())
-                                .unwrap_or_else(|| "No findings reported.".to_string())
-                        } else {
-                            ctx.data.review_findings.join("\n\n---\n\n")
-                        };
-                        finalize_release_claim_best_effort(&mcp, &item_id, false);
-                        let body = format!("## agentflare work — review findings\n\n{findings}");
-                        let _ = mcp.comment_impl(CommentRequest {
-                            action: "create".into(),
-                            item_id: Some(item_id.clone()),
-                            body: Some(body.clone()),
-                            ..Default::default()
-                        });
-                        if let Some(recipient) = notify_recipient.as_deref() {
-                            crate::cli::work::notify(recipient, &body, &item_id);
-                        }
-                        return Ok(StepResult::Success);
-                    }
-
-                    if ctx.data.review_issues.is_some() {
-                        let issues = ctx.data.review_issues.clone().unwrap_or_default();
-                        finalize_release_claim_best_effort(&mcp, &item_id, false);
-                        let _ = mcp.comment_impl(CommentRequest {
-                            action: "create".into(),
-                            item_id: Some(item_id.clone()),
-                            body: Some(format!(
-                                "## agentflare work — needs human review\n\n\
-                             Automated review/fix did not converge after {MAX_REVIEW_CYCLES} \
-                             cycles. Latest outstanding issues:\n\n{issues}"
-                            )),
-                            ..Default::default()
-                        });
-                        return Ok(StepResult::Success);
-                    }
-
-                    // A correction landed too late for any task turn to
-                    // consume it (posted after the last `sdd_loop` iteration
-                    // ran, e.g. during the final turn itself) — gate the
-                    // same way `hold_reason` above does rather than silently
-                    // opening a PR the correction says not to (item
-                    // #269/#270's whole premise: PR #753 shipped exactly the
-                    // approach a comment said to disregard).
-                    if !ctx.data.pending_corrections.is_empty() {
-                        let corrections = ctx.data.pending_corrections.join("\n\n---\n\n");
-                        finalize_release_claim_best_effort(&mcp, &item_id, false);
-                        let body = format!(
-                            "## agentflare work — on hold\n\n\
-                             Unread correction posted after this task started -- needs a \
-                             fresh pass before this item can be marked done:\n\n{corrections}"
-                        );
-                        let _ = mcp.comment_impl(CommentRequest {
-                            action: "create".into(),
-                            item_id: Some(item_id.clone()),
-                            body: Some(body.clone()),
-                            ..Default::default()
-                        });
-                        if let Some(recipient) = notify_recipient.as_deref() {
-                            crate::cli::work::notify(recipient, &body, &item_id);
-                        }
-                        return Ok(StepResult::Success);
-                    }
-
-                    // Squash checkpoint commits (item #193) into one diff
-                    // before `item_done`'s own commit, so the LOC-freeze
-                    // gate sees the whole run at once. `.take()`: a retry
-                    // of this step must not re-squash an already-squashed
-                    // commit.
-                    if let Some(base_sha) = ctx.data.checkpoint_base_sha.take()
-                        && !ctx.data.worktree_path.is_empty()
-                    {
-                        let worktree_path = std::path::PathBuf::from(&ctx.data.worktree_path);
-                        if let Err(e) = crate::worktree::squash_since(&worktree_path, &base_sha) {
-                            eprintln!(
-                                "finalize: squashing sdd_loop checkpoint commits for item {item_id} failed: {e}"
-                            );
-                        }
-                    }
-
-                    let done_resp = mcp
-                        .item_done(ItemRequest {
-                            action: "done".into(),
-                            id: Some(item_id.clone()),
-                            summary: Some(ctx.data.reply_text.clone()),
-                            ..Default::default()
-                        })
-                        .map_err(|e| WorkflowError::StepFailed {
-                            step_id: StepId::new("finalize"),
-                            message: e.message.to_string(),
-                        })?;
-                    let done_val: serde_json::Value =
-                        serde_json::from_str(&done_resp).unwrap_or(serde_json::Value::Null);
-                    ctx.data.pr_url = done_val["pr_url"].as_str().map(str::to_string);
-                    let leave_claim_held = done_val["status"].as_str() == Some("in_review");
-                    finalize_release_claim_best_effort(&mcp, &item_id, leave_claim_held);
-
-                    let comment_reply = crate::cli::work::cap_reply_for_comment(
-                        &mcp,
-                        &item_id,
-                        &ctx.data.reply_text,
-                    );
-                    let comment_body = crate::cli::work::format_success_comment(
-                        &comment_reply,
-                        ctx.data.session_id.as_deref(),
-                        ctx.data.cost_usd,
-                        ctx.data.pr_url.as_deref(),
-                    );
-                    let _ = mcp.comment_impl(CommentRequest {
-                        action: "create".into(),
-                        item_id: Some(item_id.clone()),
-                        body: Some(comment_body.clone()),
-                        ..Default::default()
-                    });
-                    if let Some(recipient) = notify_recipient.as_deref() {
-                        crate::cli::work::notify(recipient, &comment_body, &item_id);
-                    }
-                    Ok(StepResult::Success)
-                })
-            })
-        },
-    ));
-
-    StepDefinition::new("finalize", "finalize", executor).with_retry(flare_workflow::RetryPolicy {
-        max_attempts: 3,
-        backoff: flare_workflow::BackoffStrategy::Exponential {
-            base: std::time::Duration::from_secs(1),
-            max: std::time::Duration::from_secs(30),
-        },
-    })
-}
+include!("work_item_pipeline/finalize.rs");
 
 /// Assembles the full `sdd_loop` → `finalize` pipeline as a registerable
 /// `WorkflowDefinition`. Real entry point: dispatches through
@@ -996,6 +793,14 @@ fn real_agent_send_hook(
                         agentflare_jobs::cancel::CANCELLED_MESSAGE.to_string(),
                     );
                 }
+                // Per dispatch, keyed on the role's actual agent (the judge
+                // may run on a different CLI than the implementer): make a
+                // Claude Code job self-contained on a host `init` never
+                // wired. Filesystem work, so it stays on the blocking pool.
+                let mut all_args = all_args;
+                if let Some(agent_enum) = agent_registry::agent_by_name(&agent) {
+                    all_args.extend(crate::claude_job_config::job_scoped_args(agent_enum));
+                }
                 match &cwd {
                     // Explicit cwd (the item's own worktree, threaded through
                     // `WorkItemData::worktree_path`) instead of the ambient
@@ -1028,14 +833,18 @@ fn real_agent_send_hook(
             .await
             .map_err(|e| format!("agent task panicked: {e}"))?;
             match outcome {
-                crate::agent_launch::HeadlessOutcome::Ok(reply) => Ok((
-                    encode_session(
-                        &crate::agent_launch::clean_agent_reply(&agent_for_reply, reply.text),
-                        reply.session_id.as_deref(),
-                    ),
-                    0,
-                    0,
-                )),
+                crate::agent_launch::HeadlessOutcome::Ok(reply) => {
+                    let session_id = reply.session_id.clone();
+                    let (text, in_tok, out_tok) = crate::agent_launch::reply_payload(reply);
+                    Ok((
+                        encode_session(
+                            &crate::agent_launch::clean_agent_reply(&agent_for_reply, text),
+                            session_id.as_deref(),
+                        ),
+                        in_tok,
+                        out_tok,
+                    ))
+                }
                 crate::agent_launch::HeadlessOutcome::UnknownAgent(e)
                 | crate::agent_launch::HeadlessOutcome::NotHeadless(e)
                 | crate::agent_launch::HeadlessOutcome::NotFound(e)
@@ -1104,6 +913,7 @@ async fn poll_pending_corrections(
     item_id: &str,
     owner: &str,
 ) {
+    poll_agent_messages(eng, run_id, owner).await;
     let Ok(listed) = mcp.comment_impl(CommentRequest {
         action: "list".into(),
         item_id: Some(item_id.to_string()),
@@ -1126,6 +936,9 @@ async fn poll_pending_corrections(
         .filter(|c| {
             c.created_at > cursor
                 && crate::claims::agent_of(&c.author_agent) != crate::claims::agent_of(owner)
+                // Mirror of an agent message this run already got directly
+                // (see `poll_agent_messages`).
+                && !c.body.starts_with(crate::messages::ITEM_COMMENT_PREFIX)
         })
         .map(|c| c.body)
         .collect();
@@ -1150,6 +963,8 @@ async fn poll_pending_corrections(
     }
 }
 
+include!("work_item_pipeline/agent_messages.rs");
+
 /// Mirrors an advanced comment cursor onto the item's own metadata (the
 /// same merge-then-`item_update` pattern as `persist_run_id`) so it
 /// outlives this run -- read back by a later fresh dispatch's
@@ -1171,18 +986,15 @@ fn persist_comment_cursor(mcp: &AgentflareMcp, item_id: &str, cursor: i64) {
     let Ok(item) = serde_json::from_str::<agentflare_backend::item::Item>(&raw) else {
         return;
     };
-    let existing_metadata: serde_json::Value = serde_json::from_str(&item.metadata)
-        .unwrap_or(serde_json::Value::Object(Default::default()));
-    let mut merged = existing_metadata
-        .as_object()
-        .cloned()
-        .map(serde_json::Value::Object)
-        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
-    merged["last_seen_comment_at"] = serde_json::Value::from(cursor);
+    let mut merged = crate::mcp_server::metadata_object(&item.metadata);
+    merged.insert(
+        "last_seen_comment_at".into(),
+        serde_json::Value::from(cursor),
+    );
     let _ = mcp.item_update(ItemRequest {
         action: "update".into(),
         id: Some(item_id.to_string()),
-        metadata: Some(merged),
+        metadata: Some(serde_json::Value::Object(merged)),
         ..Default::default()
     });
 }
@@ -1366,10 +1178,11 @@ pub(crate) fn run_or_resume_with_sender(
                 ) =>
             {
                 // Non-terminal, and confirmed above to be this item's own
-                // run: either already resumed by the boot-time `recover()`
-                // sweep (Task 8) or genuinely still running in this same
-                // live process. Either way, do NOT start a second run
-                // against it — just await this one.
+                // run: resumed by the boot-time `recover()` sweep (Task 8),
+                // still running in this same live process, or left behind
+                // by a process that died. Never start a second run against
+                // it — adopt it (see `adopt_existing_run`) and await it.
+                adopt_existing_run(eng, run_id, &state, &owner).await?;
                 run_id
             }
             _ => {
@@ -1392,27 +1205,116 @@ pub(crate) fn run_or_resume_with_sender(
         // against this loop's 200ms poll cadence.
         let mut last_heartbeat = std::time::Instant::now();
         const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+        // Job-cancel checks read SQLite; ~1/s is plenty for a loop whose
+        // only job is to notice.
+        let mut last_cancel_check = std::time::Instant::now();
+        const CANCEL_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+        let waiter = attach_run_waiter(run_id);
+        let mut takeovers = 0u32;
+        // Registers this run under its claim owner with this process's pid,
+        // so claim liveness judges the claim by whether this process is
+        // alive (exact) rather than by heartbeat age. Ended on every return.
+        let mut session =
+            crate::claim_liveness::HeadlessSession::register(&heartbeat_owner, &item.id, &worktree_path);
+        // An operator pause ends this job as a stop on request (no retry,
+        // not counted as a failure, own claim released, worktree kept -- see
+        // `cli::work::PAUSED_MESSAGE`) while the run itself stays paused for
+        // a later resume to continue.
+        let paused_message =
+            || format!("{}: workflow run {run_id}", crate::cli::work::PAUSED_MESSAGE);
 
         loop {
             let state = eng.get_status(run_id).await.map_err(|e| e.to_string())?;
             match state.status {
                 WorkflowStatus::Completed => return Ok(()),
-                WorkflowStatus::Failed | WorkflowStatus::Cancelled => {
+                WorkflowStatus::Paused => return Err(paused_message()),
+                // A cancelled run, or one that failed while this job was
+                // cancelled (the killed agent turn failing its step), is the
+                // deliberate stop it is, not a failure. A Cancelled run needs
+                // no job-flag check: an operator cancel marks the run before
+                // it flags the job, and that window must not read as failure.
+                WorkflowStatus::Cancelled => {
+                    return Err(agentflare_jobs::cancel::CANCELLED_MESSAGE.to_string());
+                }
+                WorkflowStatus::Failed
+                    if crate::agent_launch::owner_job_cancelled(&heartbeat_owner) =>
+                {
+                    return Err(agentflare_jobs::cancel::CANCELLED_MESSAGE.to_string());
+                }
+                WorkflowStatus::Failed => {
                     return Err(state
                         .error
                         .unwrap_or_else(|| "workflow run failed".to_string()));
                 }
                 _ => {
+                    if waiter.is_superseded() {
+                        // The newer waiter shares this owner key; leave its
+                        // session registration in place.
+                        session.keep_on_drop();
+                        // A newer dispatch in this process adopted the run
+                        // and reports its outcome; stepping aside quietly
+                        // (no release/comment) keeps this attempt from
+                        // touching a claim that may now be the newer one's.
+                        eprintln!(
+                            "work_item_pipeline: item {}: a newer dispatch attached to run                              {run_id}; this waiter is stepping aside",
+                            item.id
+                        );
+                        return Ok(());
+                    }
+                    // Nobody is executing it (its process died, or its
+                    // driver here exited without settling it): take it over
+                    // rather than wait on a run that will never move.
+                    if !eng.is_driving(run_id) && !eng.is_leased_elsewhere(&state) {
+                        takeovers += 1;
+                        if takeovers > MAX_RUN_TAKEOVERS {
+                            return Err(format!(
+                                "workflow run {run_id} keeps stalling without an executor \
+                                 (taken over {MAX_RUN_TAKEOVERS} times); giving up"
+                            ));
+                        }
+                        if eng.resume_run(run_id).await.map_err(|e| e.to_string())? {
+                            eprintln!(
+                                "work_item_pipeline: item {}: took over orphaned run {run_id}",
+                                item.id
+                            );
+                        }
+                    }
+                    if last_cancel_check.elapsed() >= CANCEL_CHECK_INTERVAL {
+                        last_cancel_check = std::time::Instant::now();
+                        poll_agent_messages(eng, run_id, &heartbeat_owner).await;
+                        if crate::agent_launch::owner_job_cancelled(&heartbeat_owner) {
+                            // A pause cancels the job too, but the run must
+                            // stay paused (resumable), not be cancelled.
+                            if eng
+                                .get_status(run_id)
+                                .await
+                                .is_ok_and(|s| s.status == WorkflowStatus::Paused)
+                            {
+                                return Err(paused_message());
+                            }
+                            let _ = eng.cancel_workflow(run_id).await;
+                            return Err(agentflare_jobs::cancel::CANCELLED_MESSAGE.to_string());
+                        }
+                    }
                     if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
-                        let _ = crate::claims::with_owner_override(heartbeat_owner.clone(), || {
-                            mcp.item_heartbeat(ItemRequest {
-                                action: "heartbeat".into(),
-                                id: Some(item.id.clone()),
-                                ..Default::default()
-                            })
-                        });
+                        let heartbeat =
+                            crate::claims::with_owner_override(heartbeat_owner.clone(), || {
+                                mcp.item_heartbeat(ItemRequest {
+                                    action: "heartbeat".into(),
+                                    id: Some(item.id.clone()),
+                                    ..Default::default()
+                                })
+                            });
+                        if heartbeat_lost_claim(&heartbeat)
+                            && let Some(msg) =
+                                stop_run_after_lost_claim(eng, run_id, &item.id, &heartbeat_owner)
+                                    .await
+                        {
+                            return Err(msg);
+                        }
                         poll_pending_corrections(&mcp, eng, run_id, &item.id, &heartbeat_owner)
                             .await;
+                        session.touch();
                         last_heartbeat = std::time::Instant::now();
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1422,54 +1324,199 @@ pub(crate) fn run_or_resume_with_sender(
     })
 }
 
-/// Merge `workflow_run_id` into the item's *current* metadata JSON and save
-/// it via `item_update` — how a fresh/re-dispatched run's id gets recorded
-/// so `run_or_resume`'s next call (or a boot-time `recover()`) can find it.
+/// Boot-time `recover_with` filter: don't resurrect a run whose item was
+/// completed or cancelled while the daemon was down — resuming it would just
+/// spend agent turns on (and possibly `item_done`) an item that's finished.
+/// Fail-open: a run whose item can't be looked up is still recovered.
+/// Pass it to `engine().recover_with(..)` in `dashboard::server`'s boot path.
+pub(crate) fn should_recover_at_boot(state: &flare_workflow::WorkflowState<WorkItemData>) -> bool {
+    let item_id = &state.context.data.item_id;
+    if item_id.is_empty() {
+        return true;
+    }
+    let group = AgentflareMcp::default()
+        .with_backend_db(|conn| {
+            let item = agentflare_backend::item::get(conn, item_id).ok()?;
+            agentflare_backend::state::get(conn, &item.state_id)
+                .ok()
+                .map(|s| s.group_name)
+        })
+        .ok()
+        .flatten();
+    !matches!(group.as_deref(), Some("completed" | "cancelled"))
+}
+
+/// How many times one `run_or_resume_with_sender` call will re-drive a run
+/// it finds with no live executor before giving up — bounds a run whose
+/// execution keeps erroring out straight away (e.g. a broken store) instead
+/// of spinning on it at the wait loop's poll cadence.
+const MAX_RUN_TAKEOVERS: u32 = 3;
+
+/// Adopt an existing non-terminal run for the dispatch now awaiting it.
 ///
-/// Re-fetches the item's metadata immediately before merging, rather than
-/// reusing `run_or_resume_with_sender`'s stale function-entry snapshot —
-/// same pattern `persist_comment_cursor`/`supervisor::persist_repair_track`
-/// use. Merging into a stale snapshot silently reverts metadata written in
-/// between; live-confirmed on item #281, where a human's plan approval was
-/// wiped back to "pending" by exactly this wholesale overwrite.
+/// 1. Rebind its persisted claim owner to `owner`. After a restart the run
+///    still carries the dead job's `<agent>:<job-id>`, whose claim the boot
+///    reconcile released; this dispatch re-claimed under a new id, so
+///    without the rebind every later turn's `AGENTFLARE_CLAIM_OWNER` and
+///    `finalize`'s `item_done` would run as the old owner and be refused
+///    for owner drift. `patch_run_data` also re-applies it over a step that
+///    was already mid-flight, so its write-back can't revert it.
+/// 2. Take it over if nothing is executing it: a run left `Running` by a
+///    process that died has a stale (or no) executor lease and would never
+///    progress on its own. A fresh lease held by another live process
+///    (e.g. a concurrent `agentflare work`) is left to that process.
+async fn adopt_existing_run(
+    eng: &WorkflowEngine<WorkItemData, SqliteStore<WorkItemData>>,
+    run_id: flare_workflow::WorkflowRunId,
+    state: &flare_workflow::WorkflowState<WorkItemData>,
+    owner: &str,
+) -> Result<(), String> {
+    if state.context.data.owner != owner {
+        eprintln!(
+            "work_item_pipeline: rebinding run {run_id}'s claim owner {:?} -> {owner:?}",
+            state.context.data.owner
+        );
+        let new_owner = owner.to_string();
+        eng.patch_run_data(run_id, move |data: &mut WorkItemData| {
+            data.owner = new_owner.clone();
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    if !eng.is_driving(run_id)
+        && !eng.is_leased_elsewhere(state)
+        && eng.resume_run(run_id).await.map_err(|e| e.to_string())?
+    {
+        eprintln!("work_item_pipeline: took over orphaned run {run_id} for this dispatch");
+    }
+    Ok(())
+}
+
+/// Whether an `item_heartbeat` response says the claim is no longer held by
+/// the heartbeating owner. A transport/DB error is not evidence either way.
+fn heartbeat_lost_claim<E>(response: &Result<String, E>) -> bool {
+    response
+        .as_ref()
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|v| v["heartbeat"].as_bool())
+        == Some(false)
+}
+
+/// The claim this waiter heartbeats for is gone (expired and re-claimed,
+/// released, or stolen), so the run is now working an item it doesn't own —
+/// stop it instead of heartbeating a lease that isn't ours forever. `None`
+/// when the run is in `finalize` or already terminal: `finalize` releases
+/// the claim itself right before the run settles, which reads the same way.
+async fn stop_run_after_lost_claim(
+    eng: &WorkflowEngine<WorkItemData, SqliteStore<WorkItemData>>,
+    run_id: flare_workflow::WorkflowRunId,
+    item_id: &str,
+    owner: &str,
+) -> Option<String> {
+    let state = eng.get_status(run_id).await.ok()?;
+    let finishing = matches!(
+        state.status,
+        WorkflowStatus::Completed | WorkflowStatus::Failed | WorkflowStatus::Cancelled
+    ) || state.current_step == Some(StepId::new("finalize"));
+    if finishing {
+        return None;
+    }
+    let _ = eng.cancel_workflow(run_id).await;
+    Some(format!(
+        "claim on item {item_id} is no longer held by {owner}; cancelled workflow run {run_id}"
+    ))
+}
+
+/// The waiter currently attached to each run in this process. A second
+/// dispatch awaiting the same run (e.g. a watchdog retry whose timed-out
+/// attempt is still alive) supersedes the first, so there is only ever one
+/// waiter heartbeating and reporting for a run.
+type RunWaiters = std::collections::HashMap<
+    flare_workflow::WorkflowRunId,
+    (u64, std::sync::Arc<std::sync::atomic::AtomicBool>),
+>;
+static RUN_WAITERS: std::sync::LazyLock<std::sync::Mutex<RunWaiters>> =
+    std::sync::LazyLock::new(Default::default);
+static NEXT_WAITER_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+struct RunWaiter {
+    run_id: flare_workflow::WorkflowRunId,
+    token: u64,
+    superseded: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RunWaiter {
+    fn is_superseded(&self) -> bool {
+        self.superseded.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for RunWaiter {
+    fn drop(&mut self) {
+        let mut waiters = RUN_WAITERS.lock().unwrap_or_else(|e| e.into_inner());
+        if waiters
+            .get(&self.run_id)
+            .is_some_and(|(token, _)| *token == self.token)
+        {
+            waiters.remove(&self.run_id);
+        }
+    }
+}
+
+fn attach_run_waiter(run_id: flare_workflow::WorkflowRunId) -> RunWaiter {
+    let token = NEXT_WAITER_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let superseded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let previous = RUN_WAITERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(run_id, (token, superseded.clone()));
+    if let Some((_, previous)) = previous {
+        previous.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    RunWaiter {
+        run_id,
+        token,
+        superseded,
+    }
+}
+
+/// Merge `workflow_run_id` into the item's *current* metadata JSON and save
+/// it -- how a fresh/re-dispatched run's id gets recorded so
+/// `run_or_resume`'s next call (or a boot-time `recover()`) can find it.
+///
+/// The read of the stored metadata and the write back happen inside one
+/// IMMEDIATE transaction (`merge_item_metadata`), never against a snapshot:
+/// merging into a stale copy silently reverts metadata written in between
+/// (live-confirmed on item #281, where a human's plan approval was wiped
+/// back to "pending" by exactly this wholesale overwrite), and a re-fetch
+/// followed by a separate `item_update` still left a window for another
+/// process's write to land between the two.
 fn persist_run_id(
     mcp: &AgentflareMcp,
     item_id: &str,
     run_id: flare_workflow::WorkflowRunId,
 ) -> Result<(), String> {
-    let raw = mcp
-        .item_get(ItemRequest {
-            action: "get".into(),
-            id: Some(item_id.to_string()),
-            ..Default::default()
+    mcp.with_backend_db(|conn| {
+        let id = mcp
+            .resolve_item_id(conn, item_id)
+            .map_err(|e| e.message.to_string())?;
+        crate::mcp_server::merge_item_metadata(conn, &id, |metadata| {
+            metadata.insert(
+                "workflow_run_id".into(),
+                serde_json::Value::String(run_id.to_string()),
+            );
         })
-        .map_err(|e| e.message.to_string())?;
-    let item: agentflare_backend::item::Item =
-        serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-    // `item.metadata` can be a non-object (e.g. a double-JSON-encoded
-    // string, confirmed live on item #331) when the item's stored metadata
-    // is corrupted -- `Value`'s `IndexMut` panics assigning a key into
-    // anything that isn't already `Object`, so coerce defensively instead
-    // of trusting the stored value's shape.
-    let mut merged = serde_json::from_str::<serde_json::Value>(&item.metadata)
-        .ok()
-        .and_then(|v| v.as_object().cloned())
-        .map(serde_json::Value::Object)
-        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
-    merged["workflow_run_id"] = serde_json::Value::String(run_id.to_string());
-    mcp.item_update(ItemRequest {
-        action: "update".into(),
-        id: Some(item_id.to_string()),
-        metadata: Some(merged),
-        ..Default::default()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
     })
-    .map(|_| ())
-    .map_err(|e| e.message.to_string())
+    .map_err(|e| e.message.to_string())?
 }
 
 include!("work_item_pipeline/task_sourcing.rs");
 
 include!("work_item_pipeline/prompt_builders.rs");
+include!("work_item_pipeline/roles.rs");
 
 #[cfg(test)]
 mod cancel_tests;
@@ -1477,6 +1524,8 @@ mod cancel_tests;
 mod cap_tests;
 #[cfg(test)]
 mod judge_decision_tests;
+#[cfg(test)]
+mod pause_tests;
 #[cfg(test)]
 mod pipeline_assembly_tests;
 #[cfg(test)]

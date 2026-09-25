@@ -489,6 +489,24 @@ impl<D: WorkflowData> StateStore<D> for SqliteStore<D> {
         .await
     }
 
+    async fn is_paused(&self, run_id: WorkflowRunId) -> WorkflowResult<bool> {
+        let conn = Arc::clone(&self.conn);
+        blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
+            conn.query_row(
+                "SELECT status = 'paused' FROM workflow_runs WHERE id = ?1",
+                params![run_id.to_string()],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map_err(|e| WorkflowError::Store(format!("is_paused: {e}")))?
+            .ok_or(WorkflowError::NotFound(run_id))
+        })
+        .await
+    }
+
     async fn cleanup_old_workflows(&self, ttl: Duration) -> usize {
         let conn = Arc::clone(&self.conn);
         let result = blocking(move || {

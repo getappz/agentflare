@@ -47,6 +47,55 @@ pub enum ItemCommands {
         /// Item id (#1 or UUID)
         id: String,
     },
+    /// Cancel an item for good: kills its running agent, cancels its queued
+    /// jobs and workflow run, and moves it to the cancelled state
+    Cancel {
+        /// Item id (#1 or UUID)
+        id: String,
+        /// Why (posted as a comment on the item)
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Pause an item's run at its next step boundary (worktree and run state
+    /// are kept; the running agent is stopped)
+    Pause {
+        /// Item id (#1 or UUID)
+        id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Resume a paused item: the next dispatch continues its run from the
+    /// same step
+    Resume {
+        /// Item id (#1 or UUID)
+        id: String,
+    },
+    /// Re-arm an item for dispatch, optionally to a different agent (the
+    /// previous agent's jobs are cancelled and its claim released)
+    Redispatch {
+        /// Item id (#1 or UUID)
+        id: String,
+        /// Agent to hand the item to (e.g. claude-code, codex)
+        #[arg(long)]
+        agent: Option<String>,
+    },
+}
+
+/// Runs one operator control through `job_controls::item_action` and prints
+/// its JSON reply, exiting non-zero on error.
+pub(crate) fn run_item_control(
+    id: &str,
+    action: &str,
+    reason: Option<String>,
+    agent: Option<String>,
+) {
+    match crate::job_controls::item_action(id, action, reason, agent) {
+        Ok(json) => println!("{json}"),
+        Err(e) => {
+            crate::ui::error(&e);
+            std::process::exit(1);
+        }
+    }
 }
 
 /// `Some(message)` when the caller is an AI agent. `approve-plan` is the CLI
@@ -66,6 +115,12 @@ fn approve_plan_denial(agent: Option<&str>) -> Option<String> {
 impl ItemArgs {
     pub fn run(self) {
         match self.command {
+            ItemCommands::Cancel { id, reason } => run_item_control(&id, "cancel", reason, None),
+            ItemCommands::Pause { id, reason } => run_item_control(&id, "pause", reason, None),
+            ItemCommands::Resume { id } => run_item_control(&id, "resume", None, None),
+            ItemCommands::Redispatch { id, agent } => {
+                run_item_control(&id, "redispatch", None, agent)
+            }
             ItemCommands::ApprovePlan { id } => {
                 if let Some(msg) = approve_plan_denial(agent_detector::agent_name().as_deref()) {
                     eprintln!("error: {msg}");

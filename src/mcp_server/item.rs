@@ -7,16 +7,6 @@
 use super::*;
 use rusqlite::Connection;
 
-/// Bounds `groom`'s shortlist size — caps the O(n^2) duplicate-detection
-/// pass and the SQLite `IN (...)` parameter list built from it.
-const MAX_GROOM_LIMIT: i64 = 200;
-
-/// Bounds `health`'s velocity window — without this, a caller-supplied
-/// `window_weeks` (e.g. `i64::MAX`) would build a `Vec<VelocityWeek>` of
-/// that literal size regardless of how much data actually exists, while
-/// holding the backend DB lock.
-const MAX_WINDOW_WEEKS: i64 = 52;
-
 /// Default/max page size for `list` — omitting `limit` used to return every
 /// matching item unbounded, which can blow past the MCP response token cap
 /// on large projects (155 items / 52k chars observed). Mirrors the
@@ -24,22 +14,34 @@ const MAX_WINDOW_WEEKS: i64 = 52;
 const DEFAULT_LIST_LIMIT: i64 = 50;
 const MAX_LIST_LIMIT: i64 = 500;
 
+/// Takes a per-item action's required `id`: a missing one names the action,
+/// a blank one gets the plain "id is required" every handler already returned.
+fn require_id(id: Option<String>, action: &str) -> Result<String, ErrorData> {
+    let id =
+        id.ok_or_else(|| ErrorData::invalid_params(format!("id is required for {action}"), None))?;
+    if id.trim().is_empty() {
+        return Err(ErrorData::invalid_params("id is required", None));
+    }
+    Ok(id)
+}
+
+/// The calling task's progress sender, or `None` outside a
+/// `PROGRESS_SENDER` scope (e.g. the CLI) -- fetched once instead of calling
+/// the consumer twice via `try_with(..).unwrap_or_else(..)`.
+fn current_progress_sender() -> Option<ProgressSender> {
+    PROGRESS_SENDER.try_with(Clone::clone).ok().flatten()
+}
+
+fn internal_err(e: impl std::fmt::Display) -> ErrorData {
+    ErrorData::internal_error(e.to_string(), None)
+}
+
 /// Response warning for a reassignment whose job cancellation failed (item
 /// #607): the old agent's job may still be running next to the new assignee.
 fn job_cancel_warning(err: &str) -> String {
     format!(
         "reassigned, but the previous agent's jobs could not be cancelled ({err}); a running job may keep working until it finishes"
     )
-}
-
-fn priority_rank(p: &str) -> u8 {
-    match p {
-        "urgent" => 5,
-        "high" => 4,
-        "medium" => 3,
-        "low" => 2,
-        _ => 1,
-    }
 }
 
 /// Parses the free-form `metadata` JSON blob and unwraps it, defensively,
@@ -443,14 +445,12 @@ fn confirmed_duplicate_ids(
          SELECT depends_on_item_id FROM item_dependencies WHERE relation_type = 'duplicate' AND depends_on_item_id IN ({placeholders})"
     );
     let params: Vec<&String> = item_ids.iter().chain(item_ids.iter()).collect();
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+    let mut stmt = conn.prepare(&sql).map_err(internal_err)?;
     let rows = stmt
         .query_map(rusqlite::params_from_iter(params), |row| {
             row.get::<_, String>(0)
         })
-        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        .map_err(internal_err)?;
     rows.collect::<std::result::Result<_, _>>()
         .map_err(|e: rusqlite::Error| ErrorData::internal_error(e.to_string(), None))
 }
@@ -461,7 +461,7 @@ fn confirmed_duplicate_ids(
 /// without an N+1 `get` per item. Every underlying lookup (dependency
 /// edges/fan-in, near-duplicates, confirmed duplicates, comment counts,
 /// claim staleness) runs once for the whole batch, not once per item.
-fn compute_annotations(
+pub(super) fn compute_annotations(
     conn: &Connection,
     items: &[agentflare_backend::item::Item],
     state_by_id: &std::collections::HashMap<&str, &agentflare_backend::state::State>,
@@ -481,7 +481,7 @@ fn compute_annotations(
         agentflare_backend::comment::count_by_items(conn, &ids).map_err(map_backend_err)?;
     let stale_claims: std::collections::HashSet<String> =
         agentflare_backend::claim::list_all(conn, now, claim_ttl_secs)
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+            .map_err(internal_err)?
             .into_iter()
             .filter(|c| c.stale && c.key.len() == 1)
             .filter_map(|c| c.key.into_iter().next())
@@ -545,7 +545,7 @@ fn compute_filter_signals(
         agentflare_backend::comment::count_by_items(conn, &ids).map_err(map_backend_err)?;
     let stale_claims: std::collections::HashSet<String> =
         agentflare_backend::claim::list_all(conn, now, claim_ttl_secs)
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+            .map_err(internal_err)?
             .into_iter()
             .filter(|c| c.stale && c.key.len() == 1)
             .filter_map(|c| c.key.into_iter().next())
@@ -581,42 +581,6 @@ fn matches_filter_signals(signals: &FilterSignals, req: &ItemRequest) -> bool {
         && req
             .unestimated
             .is_none_or(|want| signals.unestimated == want)
-}
-
-fn to_standup_item(i: &agentflare_backend::item::Item) -> StandupItem {
-    StandupItem {
-        id: i.id.clone(),
-        sequence_id: i.sequence_id,
-        name: i.name.clone(),
-        priority: i.priority.clone(),
-        assignee_agent: i.assignee_agent.clone(),
-        updated_at: i.updated_at,
-    }
-}
-
-/// Now/Next/Later planning buckets. Unestimated items are excluded outright
-/// (can't be planned without a size); of the rest, blocked items go to
-/// `later`, and ready items split into `now` (first `capacity`, in existing
-/// rank order) and `next` (the remainder).
-fn capacity_buckets(
-    items: &[GroomItem],
-    capacity: i64,
-) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
-    let capacity = capacity.max(0) as usize;
-    let mut needs_estimation = Vec::new();
-    let mut later = Vec::new();
-    let mut ready = Vec::new();
-    for i in items {
-        if i.annotations.unestimated {
-            needs_estimation.push(i.id.clone());
-        } else if !i.annotations.blocked_by.is_empty() {
-            later.push(i.id.clone());
-        } else {
-            ready.push(i.id.clone());
-        }
-    }
-    let next = ready.split_off(capacity.min(ready.len()));
-    (ready, next, later, needs_estimation)
 }
 
 impl AgentflareMcp {
@@ -846,12 +810,7 @@ impl AgentflareMcp {
     }
 
     pub(crate) fn item_get(&self, req: ItemRequest) -> Result<String, ErrorData> {
-        let raw = req
-            .id
-            .ok_or_else(|| ErrorData::invalid_params("id is required for get", None))?;
-        if raw.trim().is_empty() {
-            return Err(ErrorData::invalid_params("id is required", None));
-        }
+        let raw = require_id(req.id, "get")?;
         self.with_backend_db(|conn| {
             let id = self.resolve_item_id(conn, &raw)?;
             let item = agentflare_backend::item::get(conn, &id).map_err(map_backend_err)?;
@@ -986,15 +945,30 @@ impl AgentflareMcp {
         })?
     }
 
-    pub(crate) fn item_update(&self, req: ItemRequest) -> Result<String, ErrorData> {
-        let raw = req
-            .id
-            .ok_or_else(|| ErrorData::invalid_params("id is required for update", None))?;
-        if raw.trim().is_empty() {
-            return Err(ErrorData::invalid_params("id is required", None));
-        }
+    pub(crate) fn item_update(&self, mut req: ItemRequest) -> Result<String, ErrorData> {
+        let raw = require_id(req.id.take(), "update")?;
+        // One IMMEDIATE transaction around the read of the current metadata
+        // (which `restore_plan_transition_fields`/`default_plan_gate_patch`/
+        // `merge_submitted_plan` all merge against) and the write below:
+        // other processes write metadata on their own connections, and a
+        // write landing between the two used to be silently overwritten.
         self.with_backend_db(|conn| {
-            let id = self.resolve_item_id(conn, &raw)?;
+            crate::mcp_server::in_immediate_tx(
+                conn,
+                |e| ErrorData::internal_error(e.to_string(), None),
+                || self.item_update_in(conn, &raw, req),
+            )
+        })?
+    }
+
+    fn item_update_in(
+        &self,
+        conn: &Connection,
+        raw: &str,
+        req: ItemRequest,
+    ) -> Result<String, ErrorData> {
+        {
+            let id = self.resolve_item_id(conn, raw)?;
             // `parent_id` used to be accepted and silently dropped here (#377).
             // An explicit empty string detaches the item; anything else is a
             // sequence_id or UUID resolved the same way `id` is.
@@ -1083,19 +1057,14 @@ impl AgentflareMcp {
                     &id,
                     req.assignee_agent.as_deref(),
                 )
-                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                .map_err(internal_err)?;
             }
             Ok(serde_json::to_string_pretty(&item).unwrap_or_default())
-        })?
+        }
     }
 
     pub(super) fn item_update_state(&self, req: ItemRequest) -> Result<String, ErrorData> {
-        let raw = req
-            .id
-            .ok_or_else(|| ErrorData::invalid_params("id is required for update_state", None))?;
-        if raw.trim().is_empty() {
-            return Err(ErrorData::invalid_params("id is required", None));
-        }
+        let raw = require_id(req.id, "update_state")?;
         self.with_backend_db(|conn| {
             let project = self.resolve_project(conn)?;
             fn non_empty(s: &str) -> Option<&str> {
@@ -1116,12 +1085,7 @@ impl AgentflareMcp {
     }
 
     pub(super) fn item_delete(&self, req: ItemRequest) -> Result<String, ErrorData> {
-        let raw = req
-            .id
-            .ok_or_else(|| ErrorData::invalid_params("id is required for delete", None))?;
-        if raw.trim().is_empty() {
-            return Err(ErrorData::invalid_params("id is required", None));
-        }
+        let raw = require_id(req.id, "delete")?;
         self.with_backend_db(|conn| {
             let id = self.resolve_item_id(conn, &raw)?;
             agentflare_backend::item::delete(conn, &id).map_err(map_backend_err)?;
@@ -1130,12 +1094,7 @@ impl AgentflareMcp {
     }
 
     pub(crate) fn item_claim(&self, req: ItemRequest) -> Result<String, ErrorData> {
-        let raw = req
-            .id
-            .ok_or_else(|| ErrorData::invalid_params("id is required for claim", None))?;
-        if raw.trim().is_empty() {
-            return Err(ErrorData::invalid_params("id is required", None));
-        }
+        let raw = require_id(req.id, "claim")?;
         let owner = crate::claims::owner_id();
         let now = crate::claims::now();
         let ttl = backend_claim_ttl_secs();
@@ -1144,9 +1103,15 @@ impl AgentflareMcp {
         // backend lock; `git worktree add` below is a blocking
         // filesystem+subprocess operation that has no business
         // running while the shared DB mutex is held.
-        let (outcome, item_id, item, target_branch, ttl_used) =
-            self.with_backend_db(|conn| {
+        let (outcome, item_id, item, target_branch, ttl_used, before_claim) = self
+            .with_backend_db(|conn| {
                 let item_id = self.resolve_item_id(conn, &raw)?;
+                // What `item::claim` is about to change (state -> "started",
+                // assignee), so a claim whose worktree then can't be created
+                // can be put back exactly as it was found.
+                let before_claim = agentflare_backend::item::get(conn, &item_id)
+                    .ok()
+                    .map(|i| (i.state_id, i.assignee_agent));
                 // Read again (cheap) so a `Held` response can report the TTL it
                 // was actually gated by -- `item::claim` computes this internally
                 // for in-review items but doesn't hand it back (item #108).
@@ -1163,19 +1128,37 @@ impl AgentflareMcp {
                     } else {
                         (None, None)
                     };
-                Ok::<_, ErrorData>((outcome, item_id, item, target_branch, ttl_used))
+                Ok::<_, ErrorData>((
+                    outcome,
+                    item_id,
+                    item,
+                    target_branch,
+                    ttl_used,
+                    before_claim,
+                ))
             })??;
         let worktree_result = match (&item, &target_branch) {
-            (Some(item), Some(target)) => Some(
-                PROGRESS_SENDER
-                    .try_with(|ps| {
-                        crate::worktree::create_worktree(item, &repo_root, target, ps.as_ref())
-                    })
-                    .unwrap_or_else(|_| {
-                        crate::worktree::create_worktree(item, &repo_root, target, None)
-                    }),
-            ),
+            (Some(item), Some(target)) => Some(crate::worktree::create_worktree(
+                item,
+                &repo_root,
+                target,
+                current_progress_sender().as_ref(),
+            )),
             _ => None,
+        };
+        // A claim with no worktree is a wedge: the item sits "started" under
+        // a live lease with nowhere to do the work. Unless the failure is a
+        // transient registration/lock race (the job path retries those with
+        // the same owner, so the claim must stay), give the claim back and
+        // restore the item's prior state/assignee right here, rather than
+        // relying on every caller to clean up after it.
+        let claim_rolled_back = match (&worktree_result, &before_claim) {
+            (Some(Err(e)), Some((prev_state_id, prev_assignee)))
+                if !flare_git_core::worktree::is_retryable_worktree_race(e) =>
+            {
+                self.roll_back_claim(&item_id, &owner, prev_state_id, prev_assignee.as_deref())
+            }
+            _ => false,
         };
         // A re-claimed/redispatched worktree is never refreshed by
         // `create_worktree` itself (its own fetch only ever runs on first
@@ -1218,6 +1201,13 @@ impl AgentflareMcp {
                     }
                     Some(Err(e)) => {
                         resp["worktree_error"] = serde_json::Value::String(e);
+                        // The response shape (`status: acquired` plus
+                        // `worktree_error`) is what `cli::work` keys its
+                        // comment + retry/fatal classification off, so it is
+                        // kept; this flag says the lease is already gone.
+                        if claim_rolled_back {
+                            resp["claim_released"] = serde_json::Value::Bool(true);
+                        }
                     }
                     // Only reachable when `item::get` fails to read the item
                     // back right after this same claim acquired it —
@@ -1444,29 +1434,58 @@ impl AgentflareMcp {
     }
 
     pub(crate) fn item_heartbeat(&self, req: ItemRequest) -> Result<String, ErrorData> {
-        let raw = req
-            .id
-            .ok_or_else(|| ErrorData::invalid_params("id is required for heartbeat", None))?;
-        if raw.trim().is_empty() {
-            return Err(ErrorData::invalid_params("id is required", None));
-        }
+        let raw = require_id(req.id, "heartbeat")?;
         let owner = crate::claims::owner_id();
         let now = crate::claims::now();
         self.with_backend_db(|conn| {
             let item_id = self.resolve_item_id(conn, &raw)?;
             let ok = agentflare_backend::claim::heartbeat(conn, &item_id, &owner, now)
-                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                .map_err(internal_err)?;
             Ok(serde_json::json!({"heartbeat": ok, "item_id": item_id}).to_string())
         })?
     }
 
-    pub(crate) fn item_release(&self, req: ItemRequest) -> Result<String, ErrorData> {
-        let raw = req
-            .id
-            .ok_or_else(|| ErrorData::invalid_params("id is required for release", None))?;
-        if raw.trim().is_empty() {
-            return Err(ErrorData::invalid_params("id is required", None));
+    /// When `item_id`'s claim is held by someone other than `caller` whose
+    /// owner is known dead (`claim_liveness::judge_owner`: its job finished,
+    /// its session ended, its process is gone), release that claim so the
+    /// caller's `release`/`done` below treats it like an abandoned one right
+    /// away instead of refusing until the multi-hour TTL lapses. A live or
+    /// unknown holder is left alone -- the TTL gate still applies to it.
+    fn release_dead_holders_claim(&self, conn: &Connection, item_id: &str, caller: &str, now: i64) {
+        let Ok(Some(holder)) =
+            agentflare_backend::claim::live_claim_on_item(conn, item_id, now, i64::MAX / 4)
+        else {
+            return;
+        };
+        if holder.owner == caller {
+            return;
         }
+        // Tests on an isolated backend DB must not read the real registry.
+        let sessions = if self.backend_db_override.is_some() {
+            None
+        } else {
+            crate::db::open().ok()
+        };
+        let queue = self.job_queue().ok().flatten();
+        if let crate::claim_liveness::OwnerLiveness::Dead(reason) =
+            crate::claim_liveness::judge_owner(
+                &holder.owner,
+                now - holder.age_secs,
+                now,
+                sessions.as_ref(),
+                queue.as_ref(),
+            )
+        {
+            eprintln!(
+                "agentflare: releasing item {item_id}'s claim held by dead owner {} ({reason})",
+                holder.owner
+            );
+            let _ = agentflare_backend::claim::release(conn, item_id, &holder.owner);
+        }
+    }
+
+    pub(crate) fn item_release(&self, req: ItemRequest) -> Result<String, ErrorData> {
+        let raw = require_id(req.id, "release")?;
         let owner = crate::claims::owner_id();
         let now = crate::claims::now();
         let ttl = backend_claim_ttl_secs();
@@ -1483,8 +1502,9 @@ impl AgentflareMcp {
             let item_id = self.resolve_item_id(conn, &raw)?;
             let item = agentflare_backend::item::get(conn, &item_id).ok();
             let owns_claim = agentflare_backend::claim::is_owner(conn, &item_id, &owner)
-                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                .map_err(internal_err)?;
             if !owns_claim {
+                self.release_dead_holders_claim(conn, &item_id, &owner, now);
                 // Not ours -- steal the lease only if it's abandoned, using
                 // the exact same stale-TTL gate `claim()` already uses to
                 // steal on acquire. A live claim held by someone else is a
@@ -1498,8 +1518,10 @@ impl AgentflareMcp {
                 if let agentflare_backend::claim::Acquire::Held {
                     owner: holder,
                     age_secs,
-                } = agentflare_backend::claim::acquire(conn, &item_id, &owner, now, ttl)
-                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+                } = agentflare_backend::claim::acquire_if_stale_only(conn, &item_id, &owner, now, ttl)
+                    .map_err(internal_err)?
+                    // No claim row: nothing to release (e.g. redispatched away).
+                    .unwrap_or(agentflare_backend::claim::Acquire::Acquired)
                 {
                     return Err(ErrorData::invalid_params(
                         format!(
@@ -1529,12 +1551,7 @@ impl AgentflareMcp {
     }
 
     pub(crate) fn item_done(&self, req: ItemRequest) -> Result<String, ErrorData> {
-        let raw = req
-            .id
-            .ok_or_else(|| ErrorData::invalid_params("id is required for done", None))?;
-        if raw.trim().is_empty() {
-            return Err(ErrorData::invalid_params("id is required", None));
-        }
+        let raw = require_id(req.id, "done")?;
         let owner = crate::claims::owner_id();
         let now = crate::claims::now();
         let ttl = backend_claim_ttl_secs();
@@ -1551,17 +1568,35 @@ impl AgentflareMcp {
         // even when a PR ends up open and unreviewed (item #420).
         let (item_id, owns_claim, item, target_branch) = self.with_backend_db(|conn| {
             let item_id = self.resolve_item_id(conn, &raw)?;
+            // A finished item has nothing left to publish: re-running `done`
+            // on it would steal its (released) lease, re-push its branch and
+            // possibly open a second PR. Refuse up front, non-retryably.
+            let state = agentflare_backend::item::get(conn, &item_id)
+                .and_then(|i| agentflare_backend::state::get(conn, &i.state_id))
+                .map_err(map_backend_err)?;
+            if matches!(state.group_name.as_str(), "completed" | "cancelled") {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "item {item_id} is already {} -- refusing to mark it done again",
+                        state.group_name
+                    ),
+                    None,
+                ));
+            }
             let mut owns_claim = agentflare_backend::claim::is_owner(conn, &item_id, &owner)
-                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                .map_err(internal_err)?;
             if !owns_claim {
+                self.release_dead_holders_claim(conn, &item_id, &owner, now);
                 // Same abandoned-claim steal `item_release` uses (item
                 // #83): a live claim held by someone else is a real
                 // identity conflict (error, don't silently no-op); a
                 // stale/absent one is fair game, and stealing it here
                 // means the rest of `done` below runs exactly as if we'd
                 // claimed it ourselves.
-                owns_claim = match agentflare_backend::claim::acquire(conn, &item_id, &owner, now, ttl)
-                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+                owns_claim = match agentflare_backend::item::steal_abandoned_claim(
+                    conn, &item_id, &owner, now, ttl,
+                )
+                .map_err(map_backend_err)?
                 {
                     agentflare_backend::claim::Acquire::Held {
                         owner: holder,
@@ -1645,12 +1680,7 @@ impl AgentflareMcp {
                          uncommitted in the item's worktree; it was left in place rather than \
                          reported as done."
                     );
-                    let _ = self.comment_impl(CommentRequest {
-                        action: "create".into(),
-                        item_id: Some(item_id.clone()),
-                        body: Some(comment_body),
-                        ..Default::default()
-                    });
+                    self.post_item_comment(&item_id, comment_body);
                     return Err(ErrorData::internal_error(
                         format!("item {item_id}: auto-commit of uncommitted changes failed: {err}"),
                         None,
@@ -1659,24 +1689,24 @@ impl AgentflareMcp {
             }
         }
         let agent = crate::claims::agent_of(&owner);
-        let pr_url = match (&item, &target_branch) {
-            (Some(item), Some(target)) if should_push => PROGRESS_SENDER
-                .try_with(|ps| {
-                    crate::worktree::push_and_open_pr(
-                        item,
-                        agent,
-                        &repo_root,
-                        target,
-                        ps.as_ref(),
-                        summary,
-                    )
-                })
-                .unwrap_or_else(|_| {
-                    crate::worktree::push_and_open_pr(
-                        item, agent, &repo_root, target, None, summary,
-                    )
-                }),
-            _ => None,
+        let pr_outcome = match (&item, &target_branch) {
+            (Some(item), Some(target)) if should_push => crate::worktree::push_and_open_pr(
+                item,
+                agent,
+                &repo_root,
+                target,
+                current_progress_sender().as_ref(),
+                summary,
+            ),
+            _ => crate::worktree::PrOutcome::NothingToPush,
+        };
+        let (pr_url, no_pr, pr_failure) = match pr_outcome {
+            crate::worktree::PrOutcome::Opened(url) => (Some(url), None, None),
+            crate::worktree::PrOutcome::NoPrPossible { pushed, reason } => {
+                (None, Some((pushed, reason)), None)
+            }
+            crate::worktree::PrOutcome::Failed(reason) => (None, None, Some(reason)),
+            crate::worktree::PrOutcome::NothingToPush => (None, None, None),
         };
         // An open PR (freshly created, or already existed) means the work
         // isn't actually finished: move to "in_review" instead of
@@ -1708,18 +1738,25 @@ impl AgentflareMcp {
         // and sailed straight through to `mark_completed` below with zero
         // code changed.
         let nothing_was_ever_committed = !in_review && owns_claim && !diverged;
-        // A real commit exists but push/PR creation soft-failed and never
-        // produced a PR (item #109) -- hard-error instead of completing.
-        let push_or_pr_failed = !in_review && owns_claim && should_push && diverged;
+        // A real commit exists but push/PR creation failed in a way a retry
+        // may fix (item #109) -- hard-error instead of completing, so the
+        // caller (finalize's retry, or the failure hook's redispatch) tries
+        // again. A PR that is impossible by configuration (`no_pr`: no
+        // origin, a non-GitHub remote, no credentials) is NOT this case:
+        // retrying can never change it, and erroring here used to make
+        // `done` fail forever in such repos. Those complete below instead.
+        let push_or_pr_failed =
+            !in_review && owns_claim && should_push && diverged && no_pr.is_none();
         if push_or_pr_failed {
-            let _ = self.comment_impl(CommentRequest {
-                action: "create".into(),
-                item_id: Some(item_id.clone()),
-                body: Some(format!(
-                    "## agentflare work — PR creation failed\n\nThe branch has real commits but no pull request resulted; check server logs for item {item_id}. Left in place rather than completed."
-                )),
-                ..Default::default()
-            });
+            let detail = pr_failure
+                .as_deref()
+                .unwrap_or("no pull request resulted; check server logs");
+            self.post_item_comment(
+                &item_id,
+                format!(
+                    "## agentflare work — PR creation failed\n\nThe branch has real commits but no pull request resulted ({detail}) for item {item_id}. Left in place rather than completed."
+                ),
+            );
             return Err(ErrorData::internal_error(
                 format!("item {item_id}: real commits but no PR resulted -- not marking completed"),
                 None,
@@ -1775,9 +1812,9 @@ impl AgentflareMcp {
             if !marked {
                 return Err(ErrorData::internal_error(
                     format!(
-                        "item {item_id}: PR was opened but the claim was lost before the item \
-                         could be marked in_review (owner mismatch) -- item state was NOT \
-                         updated"
+                        "item {item_id}: PR was opened but the claim was lost, or the item left \
+                         started/in_review (cancelled, completed or redispatched), before it \
+                         could be marked in_review -- item state was NOT updated"
                     ),
                     None,
                 ));
@@ -1789,6 +1826,11 @@ impl AgentflareMcp {
                     .map_err(map_backend_err)
             })??;
             if moved {
+                if let Some((pushed, reason)) = &no_pr
+                    && diverged
+                {
+                    self.record_no_pr_completion(&item_id, *pushed, reason);
+                }
                 release_claim_and_cleanup(&item);
             }
             moved
@@ -1803,6 +1845,12 @@ impl AgentflareMcp {
         let mut resp = serde_json::json!({"done": done, "item_id": item_id, "status": status});
         if let Some(url) = pr_url {
             resp["pr_url"] = serde_json::Value::String(url.clone());
+        }
+        if done
+            && diverged
+            && let Some((_, reason)) = &no_pr
+        {
+            resp["no_pr"] = serde_json::Value::String(reason.clone());
         }
         Ok(super::item_force::with_forced(resp, forced))
     }
@@ -1819,12 +1867,7 @@ impl AgentflareMcp {
     /// (item #65) once it sees `worktree::PrCiStatus::Merged`, the same way
     /// `item_claim` is already called directly from `cli::work`.
     pub(crate) fn item_check_merge(&self, req: ItemRequest) -> Result<String, ErrorData> {
-        let raw = req
-            .id
-            .ok_or_else(|| ErrorData::invalid_params("id is required for check_merge", None))?;
-        if raw.trim().is_empty() {
-            return Err(ErrorData::invalid_params("id is required", None));
-        }
+        let raw = require_id(req.id, "check_merge")?;
         let repo_root = self.worktree_repo_root();
         let forced =
             self.force_if_requested(req.force, req.force_reason.as_deref(), &raw, "check_merge")?;
@@ -1858,8 +1901,15 @@ impl AgentflareMcp {
             .to_string());
         }
         let promoted = self.with_backend_db(|conn| {
-            agentflare_backend::item::promote_in_review_to_completed(conn, &item_id)
-                .map_err(map_backend_err)
+            // Compare-and-set on the PR verified merged above: a redispatch +
+            // new PR landing during that network check must not complete the
+            // item off the old one.
+            agentflare_backend::item::promote_in_review_to_completed_if_pr(
+                conn,
+                &item_id,
+                crate::worktree::pr_number_from_metadata(&item),
+            )
+            .map_err(map_backend_err)
         })??;
         if promoted {
             self.with_backend_db(|conn| {
@@ -1872,15 +1922,25 @@ impl AgentflareMcp {
     }
 
     pub(super) fn item_cancel(&self, req: ItemRequest) -> Result<String, ErrorData> {
-        let raw = req
-            .id
-            .ok_or_else(|| ErrorData::invalid_params("id is required for cancel", None))?;
-        if raw.trim().is_empty() {
-            return Err(ErrorData::invalid_params("id is required", None));
-        }
+        let raw = require_id(req.id, "cancel")?;
         let owner = crate::claims::owner_id();
-        self.with_backend_db(|conn| {
+        // Stop the work first, then settle the item: a cancel has to actually
+        // stop the agent (not just relabel the item under a job that keeps
+        // running and later pushes), and must be terminal -- the run is
+        // cancelled so no dispatch resumes it, and the jobs are cancelled,
+        // which `Queue::fail` never retries.
+        let (item_id, run_id) = self.with_backend_db(|conn| {
             let item_id = self.resolve_item_id(conn, &raw)?;
+            let item = agentflare_backend::item::get(conn, &item_id).map_err(map_backend_err)?;
+            Ok::<_, ErrorData>((item_id, crate::job_controls::run_id_of(&item.metadata)))
+        })??;
+        let run_cancelled = match run_id {
+            Some(run_id) => crate::job_controls::cancel_run(run_id)
+                .map_err(|e| ErrorData::internal_error(e, None))?,
+            None => false,
+        };
+        let jobs_cancelled = self.cancel_all_jobs_for_item(&item_id);
+        self.with_backend_db(|conn| {
             let project = self.resolve_project(conn)?;
             let cancelled =
                 agentflare_backend::state::first_in_group(conn, &project.id, "cancelled")
@@ -1893,6 +1953,25 @@ impl AgentflareMcp {
             // claim_done release). No-ops if someone else holds it
             // or nobody does — `release` is owner-scoped.
             let _ = agentflare_backend::claim::release(conn, &item_id, &owner);
+            // ...and whichever job or session still holds it: its work was
+            // just stopped above, so the lease guards nothing any more.
+            if let Some(holder) = agentflare_backend::claim::current_owner(conn, &item_id) {
+                let _ = agentflare_backend::claim::release(conn, &item_id, &holder);
+            }
+            let _ = crate::job_controls::set_item_label(
+                conn,
+                &item,
+                crate::supervisor::PAUSED_LABEL,
+                false,
+            );
+            if let Some(reason) = req.reason.as_deref().filter(|r| !r.trim().is_empty()) {
+                let _ = agentflare_backend::comment::create(
+                    conn,
+                    &item_id,
+                    &owner,
+                    &format!("## agentflare — cancelled\n\n{reason}"),
+                );
+            }
             // Best-effort: strip dispatch-lifecycle labels, mirroring what
             // `redispatch` already does in reverse (item #225) — without
             // this a cancel shortly after handoff, before any orphan/failure
@@ -1909,8 +1988,222 @@ impl AgentflareMcp {
                     }
                 }
             }
-            Ok(serde_json::to_string_pretty(&item).unwrap_or_default())
+            let mut resp = serde_json::to_value(&item).unwrap_or_default();
+            if let Some(obj) = resp.as_object_mut() {
+                obj.insert("jobs_cancelled".into(), jobs_cancelled.into());
+                obj.insert("run_cancelled".into(), run_cancelled.into());
+            }
+            Ok(serde_json::to_string_pretty(&resp).unwrap_or_default())
         })?
+    }
+
+    /// Cancels every queued or running dispatch job for `item_id`, whatever
+    /// agent it targets; a running one's agent is killed by its executor.
+    /// Best-effort (0 when there is no queue to reach) -- the callers go on
+    /// to settle the item regardless.
+    fn cancel_all_jobs_for_item(&self, item_id: &str) -> usize {
+        let Ok(Some(queue)) = self.job_queue() else {
+            return 0;
+        };
+        queue
+            .cancel_for_item(item_id, |_| false)
+            .map(|ids| ids.len())
+            .unwrap_or_else(|e| {
+                eprintln!("agentflare: could not cancel jobs for item {item_id}: {e}");
+                0
+            })
+    }
+
+    /// Pauses an item's work: the workflow run stops at its next step
+    /// boundary, the running job is cancelled (killing its agent turn), the
+    /// claim is released and the item is labeled `paused` so nothing
+    /// re-dispatches it. The worktree and the run's persisted state are kept
+    /// for `resume`. See `crate::job_controls` for why the claim is released.
+    pub(crate) fn item_pause(&self, req: ItemRequest) -> Result<String, ErrorData> {
+        let raw = req
+            .id
+            .ok_or_else(|| ErrorData::invalid_params("id is required for pause", None))?;
+        let author = crate::claims::owner_id();
+        let (item_id, run_id) = self.with_backend_db(|conn| {
+            let item_id = self.resolve_item_id(conn, &raw)?;
+            let item = agentflare_backend::item::get(conn, &item_id).map_err(map_backend_err)?;
+            let group = agentflare_backend::state::get(conn, &item.state_id)
+                .map_err(map_backend_err)?
+                .group_name;
+            if matches!(group.as_str(), "completed" | "cancelled") {
+                return Err(ErrorData::invalid_params(
+                    format!("item {item_id} is already {group}; nothing to pause"),
+                    None,
+                ));
+            }
+            Ok((item_id, crate::job_controls::run_id_of(&item.metadata)))
+        })??;
+        // Pause the run before cancelling the job: the job's killed agent
+        // turn must find the run already paused, or the engine would record
+        // that step as failed.
+        let run_paused = match run_id {
+            Some(run_id) => crate::job_controls::pause_run(run_id)
+                .map_err(|e| ErrorData::internal_error(e, None))?,
+            None => false,
+        };
+        let jobs_cancelled = self.cancel_all_jobs_for_item(&item_id);
+        let claim_released = self.with_backend_db(|conn| {
+            let item = agentflare_backend::item::get(conn, &item_id).map_err(map_backend_err)?;
+            let holder = agentflare_backend::claim::current_owner(conn, &item_id);
+            let released = match &holder {
+                Some(holder) => agentflare_backend::claim::release(conn, &item_id, holder)
+                    .map_err(internal_err)?,
+                None => false,
+            };
+            for name in [
+                crate::supervisor::READY_LABEL,
+                crate::supervisor::DISPATCHED_LABEL,
+            ] {
+                crate::job_controls::set_item_label(conn, &item, name, false)
+                    .map_err(map_backend_err)?;
+            }
+            crate::job_controls::set_item_label(conn, &item, crate::supervisor::PAUSED_LABEL, true)
+                .map_err(map_backend_err)?;
+            let reason = req
+                .reason
+                .as_deref()
+                .filter(|r| !r.trim().is_empty())
+                .map(|r| format!("\n\n{r}"))
+                .unwrap_or_default();
+            let _ = agentflare_backend::comment::create(
+                conn,
+                &item_id,
+                &author,
+                &format!(
+                    "## agentflare — paused\n\nWork is paused; the worktree and run state are \
+                     kept. Resume with `agentflare item resume {}`.{reason}",
+                    item.sequence_id
+                ),
+            );
+            Ok::<_, ErrorData>(released)
+        })??;
+        Ok(serde_json::json!({
+            "item_id": item_id,
+            "paused": true,
+            "run_id": run_id.map(|r| r.to_string()),
+            "run_paused": run_paused,
+            "jobs_cancelled": jobs_cancelled,
+            "claim_released": claim_released,
+        })
+        .to_string())
+    }
+
+    /// Resumes a paused item: drops the `paused` label and re-arms it for
+    /// dispatch (`item::redispatch`). The dispatched job adopts the item's
+    /// paused run and continues it from its persisted step, in the same
+    /// worktree.
+    pub(crate) fn item_resume(&self, req: ItemRequest) -> Result<String, ErrorData> {
+        let raw = req
+            .id
+            .ok_or_else(|| ErrorData::invalid_params("id is required for resume", None))?;
+        let author = crate::claims::owner_id();
+        let (item_id, run_id, labeled_paused) = self.with_backend_db(|conn| {
+            let item_id = self.resolve_item_id(conn, &raw)?;
+            let item = agentflare_backend::item::get(conn, &item_id).map_err(map_backend_err)?;
+            let paused_label = agentflare_backend::label::list_by_project(conn, &item.project_id)
+                .map_err(map_backend_err)?
+                .into_iter()
+                .find(|l| l.name == crate::supervisor::PAUSED_LABEL);
+            let labeled = match paused_label {
+                Some(label) => agentflare_backend::item::list_labels(conn, &item_id)
+                    .map_err(map_backend_err)?
+                    .contains(&label.id),
+                None => false,
+            };
+            Ok::<_, ErrorData>((
+                item_id,
+                crate::job_controls::run_id_of(&item.metadata),
+                labeled,
+            ))
+        })??;
+        let run_status = run_id.and_then(crate::job_controls::run_status);
+        let run_paused = run_status == Some(flare_workflow::WorkflowStatus::Paused);
+        if !labeled_paused && !run_paused {
+            return Err(ErrorData::invalid_params(
+                format!("item {item_id} is not paused"),
+                None,
+            ));
+        }
+        if let Some(run_id) = run_id.filter(|_| run_paused)
+            && crate::job_controls::run_still_stopping(run_id)
+        {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "item {item_id}'s run {run_id} is still stopping at its step boundary -- \
+                     retry the resume in a few seconds"
+                ),
+                None,
+            ));
+        }
+        self.with_backend_db(|conn| {
+            let item = agentflare_backend::item::get(conn, &item_id).map_err(map_backend_err)?;
+            crate::job_controls::set_item_label(
+                conn,
+                &item,
+                crate::supervisor::PAUSED_LABEL,
+                false,
+            )
+            .map_err(map_backend_err)?;
+            let outcome = agentflare_backend::item::redispatch(conn, &item_id, None)
+                .map_err(map_backend_err)?;
+            let agentflare_backend::item::RedispatchOutcome::Ready { assignee_agent } = outcome
+            else {
+                // Keep it parked rather than half-resumed.
+                let _ = crate::job_controls::set_item_label(
+                    conn,
+                    &item,
+                    crate::supervisor::PAUSED_LABEL,
+                    true,
+                );
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "item {item_id} has no assignee_agent to resume with -- set one via \
+                         item(action=\"redispatch\", assignee_agent=...)"
+                    ),
+                    None,
+                ));
+            };
+            let _ = agentflare_backend::comment::create(
+                conn,
+                &item_id,
+                &author,
+                &format!(
+                    "## agentflare — resumed\n\nRe-queued for {assignee_agent}; the next dispatch \
+                     continues the paused run in the existing worktree."
+                ),
+            );
+            Ok(serde_json::json!({
+                "item_id": item_id,
+                "resumed": true,
+                "assignee_agent": assignee_agent,
+                "run_id": run_id.map(|r| r.to_string()),
+                "continues_run": run_paused,
+            })
+            .to_string())
+        })?
+    }
+
+    /// The operator controls (`cancel`/`pause`/`resume`/`redispatch`) behind
+    /// one entry point for the CLI, dashboard and chat surfaces, which don't
+    /// go through the MCP tool router.
+    pub(crate) fn item_control(&self, req: ItemRequest) -> Result<String, ErrorData> {
+        match req.action.as_str() {
+            "cancel" => self.item_cancel(req),
+            "pause" => self.item_pause(req),
+            "resume" => self.item_resume(req),
+            "redispatch" => self.item_redispatch(req),
+            other => Err(ErrorData::invalid_params(
+                format!(
+                    "unknown control action '{other}' -- expected cancel|pause|resume|redispatch"
+                ),
+                None,
+            )),
+        }
     }
 
     pub(super) fn item_search(&self, req: ItemRequest) -> Result<String, ErrorData> {
@@ -2160,12 +2453,7 @@ impl AgentflareMcp {
     /// where `None` means "leave untouched", so `update` alone can't express
     /// clearing the column back to NULL.
     pub(crate) fn item_clear_start_date(&self, req: ItemRequest) -> Result<String, ErrorData> {
-        let raw = req.id.ok_or_else(|| {
-            ErrorData::invalid_params("id is required for clear_start_date", None)
-        })?;
-        if raw.trim().is_empty() {
-            return Err(ErrorData::invalid_params("id is required", None));
-        }
+        let raw = require_id(req.id, "clear_start_date")?;
         self.with_backend_db(|conn| {
             let id = self.resolve_item_id(conn, &raw)?;
             let item = agentflare_backend::item::clear_item_start_date(conn, &id)
@@ -2176,12 +2464,7 @@ impl AgentflareMcp {
 
     /// Same shape as `item_clear_start_date`, for `due_date`.
     pub(crate) fn item_clear_due_date(&self, req: ItemRequest) -> Result<String, ErrorData> {
-        let raw = req
-            .id
-            .ok_or_else(|| ErrorData::invalid_params("id is required for clear_due_date", None))?;
-        if raw.trim().is_empty() {
-            return Err(ErrorData::invalid_params("id is required", None));
-        }
+        let raw = require_id(req.id, "clear_due_date")?;
         self.with_backend_db(|conn| {
             let id = self.resolve_item_id(conn, &raw)?;
             let item = agentflare_backend::item::clear_item_due_date(conn, &id)
@@ -2196,12 +2479,7 @@ impl AgentflareMcp {
     /// to dispatch it directly. See `agentflare_backend::item::redispatch`
     /// for exactly what it resets.
     pub(crate) fn item_redispatch(&self, req: ItemRequest) -> Result<String, ErrorData> {
-        let raw = req
-            .id
-            .ok_or_else(|| ErrorData::invalid_params("id is required for redispatch", None))?;
-        if raw.trim().is_empty() {
-            return Err(ErrorData::invalid_params("id is required", None));
-        }
+        let raw = require_id(req.id, "redispatch")?;
         let req_assignee = req.assignee_agent.clone();
         let now = crate::claims::now();
         let ttl = crate::mcp_server::types::backend_claim_ttl_secs();
@@ -2234,7 +2512,7 @@ impl AgentflareMcp {
                             &item_id,
                             Some(&assignee_agent),
                         )
-                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                        .map_err(internal_err)?;
                     }
                     let effective_ttl =
                         agentflare_backend::claim::effective_ttl_secs(conn, &item_id, ttl);
@@ -2244,7 +2522,7 @@ impl AgentflareMcp {
                         now,
                         effective_ttl,
                     )
-                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                    .map_err(internal_err)?;
                     let blocked_by = live.filter(|c| c.owner != assignee_agent);
                     let dispatchable = blocked_by.is_none();
                     let mut resp = serde_json::json!({
@@ -2277,366 +2555,6 @@ impl AgentflareMcp {
                     ))
                 }
             }
-        })?
-    }
-
-    /// One-call groom: filtered + priority/staleness-ranked shortlist with
-    /// full description plus stale/unassigned/blocked/duplicate signals
-    /// computed server-side. Replaces the `list` + N×`get` round trips a
-    /// manual groom otherwise costs.
-    pub(super) fn item_groom(&self, req: ItemRequest) -> Result<String, ErrorData> {
-        if req.limit.is_some_and(|l| l < 0) {
-            return Err(ErrorData::invalid_params(
-                "limit must be non-negative",
-                None,
-            ));
-        }
-        let staleness_days = req.staleness_days.unwrap_or(14).max(0);
-        // Bounds the shortlist's O(n^2) duplicate-detection pass and the
-        // SQLite `IN (...)` parameter list built from it.
-        let cap = req.limit.unwrap_or(15).clamp(0, MAX_GROOM_LIMIT) as usize;
-        self.with_backend_db(|conn| {
-            let project = self.resolve_project_for_read(conn, req.project.as_deref())?;
-            let mut items = agentflare_backend::item::list_by_project(conn, &project.id)
-                .map_err(map_backend_err)?;
-            let states = agentflare_backend::state::list_by_project(conn, &project.id)
-                .map_err(map_backend_err)?;
-            let state_by_id: std::collections::HashMap<&str, &agentflare_backend::state::State> =
-                states.iter().map(|s| (s.id.as_str(), s)).collect();
-
-            let wanted_groups: Vec<&str> = req
-                .state_group
-                .as_deref()
-                .unwrap_or("backlog,unstarted")
-                .split(',')
-                .map(str::trim)
-                .collect();
-            items.retain(|i| {
-                state_by_id
-                    .get(i.state_id.as_str())
-                    .map(|s| wanted_groups.contains(&s.group_name.as_str()))
-                    .unwrap_or(false)
-            });
-
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            let stale_cutoff = now - staleness_days.saturating_mul(86_400);
-
-            // Priority first, then most-recently-touched within a priority tier.
-            items.sort_by(|a, b| {
-                priority_rank(&b.priority)
-                    .cmp(&priority_rank(&a.priority))
-                    .then(b.updated_at.cmp(&a.updated_at))
-            });
-            let shortlist: Vec<_> = items.into_iter().take(cap).collect();
-
-            let claim_ttl_secs = backend_claim_ttl_secs();
-            let mut annotations_by_id = compute_annotations(
-                conn,
-                &shortlist,
-                &state_by_id,
-                now,
-                stale_cutoff,
-                claim_ttl_secs,
-            )?;
-
-            let groom_items: Vec<GroomItem> = shortlist
-                .into_iter()
-                .map(|i| {
-                    let state = state_by_id.get(i.state_id.as_str());
-                    let annotations = annotations_by_id
-                        .remove(&i.id)
-                        .expect("compute_annotations returns an entry for every input item");
-                    GroomItem {
-                        id: i.id,
-                        sequence_id: i.sequence_id,
-                        name: i.name,
-                        description: i.description,
-                        state: state.map(|s| s.name.clone()).unwrap_or_default(),
-                        state_group: state.map(|s| s.group_name.clone()).unwrap_or_default(),
-                        priority: i.priority,
-                        assignee_agent: i.assignee_agent,
-                        updated_at: i.updated_at,
-                        due_date: i.due_date,
-                        annotations,
-                    }
-                })
-                .collect();
-
-            let pull_next: Vec<String> = groom_items
-                .iter()
-                .filter(|i| {
-                    i.annotations.unassigned
-                        && !i.annotations.stale
-                        && i.annotations.blocked_by.is_empty()
-                })
-                .take(3)
-                .map(|i| i.id.clone())
-                .collect();
-
-            // Only computed when `capacity` is set — omitted from the response
-            // otherwise (backward compatible).
-            let (now, next, later, needs_estimation) = match req.capacity {
-                Some(capacity) => {
-                    let (now, next, later, needs_estimation) =
-                        capacity_buckets(&groom_items, capacity);
-                    (Some(now), Some(next), Some(later), Some(needs_estimation))
-                }
-                None => (None, None, None, None),
-            };
-
-            let resp = GroomResponse {
-                staleness_days,
-                stale_count: groom_items.iter().filter(|i| i.annotations.stale).count(),
-                unassigned_count: groom_items
-                    .iter()
-                    .filter(|i| i.annotations.unassigned)
-                    .count(),
-                unestimated_count: groom_items
-                    .iter()
-                    .filter(|i| i.annotations.unestimated)
-                    .count(),
-                items: groom_items,
-                pull_next,
-                now,
-                next,
-                later,
-                needs_estimation,
-            };
-            Ok(serde_json::to_string_pretty(&resp).unwrap_or_default())
-        })?
-    }
-
-    /// One-call standup: done/in-progress(grouped by assignee)/stuck, computed
-    /// server-side from a single state-filtered read instead of the caller
-    /// bucketing a flat `list` result by hand.
-    pub(super) fn item_standup(&self, req: ItemRequest) -> Result<String, ErrorData> {
-        let cutoff_hours = req.cutoff_hours.unwrap_or(24).max(0);
-        let stuck_days = req.staleness_days.unwrap_or(7).max(0);
-        self.with_backend_db(|conn| {
-            let project = self.resolve_project_for_read(conn, req.project.as_deref())?;
-            let mut items = agentflare_backend::item::list_by_project(conn, &project.id)
-                .map_err(map_backend_err)?;
-            let states = agentflare_backend::state::list_by_project(conn, &project.id)
-                .map_err(map_backend_err)?;
-            let state_by_id: std::collections::HashMap<&str, &agentflare_backend::state::State> =
-                states.iter().map(|s| (s.id.as_str(), s)).collect();
-            items.retain(|i| {
-                state_by_id
-                    .get(i.state_id.as_str())
-                    .map(|s| matches!(s.group_name.as_str(), "started" | "completed"))
-                    .unwrap_or(false)
-            });
-
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            let done_cutoff = now - cutoff_hours.saturating_mul(3_600);
-            let stuck_cutoff = now - stuck_days.saturating_mul(86_400);
-
-            // completed_at, not updated_at: editing an already-completed item
-            // (e.g. fixing a typo) bumps updated_at without re-completing it —
-            // using updated_at here would make old work spuriously reappear
-            // in a "done recently" digest.
-            let mut done_items: Vec<&agentflare_backend::item::Item> = items
-                .iter()
-                .filter(|i| {
-                    state_by_id
-                        .get(i.state_id.as_str())
-                        .map(|s| s.group_name == "completed")
-                        .unwrap_or(false)
-                        && i.completed_at.is_some_and(|t| t >= done_cutoff)
-                })
-                .collect();
-            done_items.sort_by_key(|i| std::cmp::Reverse(i.completed_at));
-            let done: Vec<StandupItem> = done_items.into_iter().map(to_standup_item).collect();
-
-            let in_progress_items: Vec<_> = items
-                .iter()
-                .filter(|i| {
-                    state_by_id
-                        .get(i.state_id.as_str())
-                        .map(|s| s.group_name == "started")
-                        .unwrap_or(false)
-                })
-                .collect();
-
-            let stuck: Vec<StandupItem> = in_progress_items
-                .iter()
-                .filter(|i| i.updated_at < stuck_cutoff)
-                .map(|i| to_standup_item(i))
-                .collect();
-
-            let mut by_assignee: std::collections::BTreeMap<String, Vec<StandupItem>> =
-                std::collections::BTreeMap::new();
-            for i in &in_progress_items {
-                by_assignee
-                    .entry(
-                        i.assignee_agent
-                            .clone()
-                            .unwrap_or_else(|| "unassigned".into()),
-                    )
-                    .or_default()
-                    .push(to_standup_item(i));
-            }
-            let in_progress: Vec<StandupGroup> = by_assignee
-                .into_iter()
-                .map(|(assignee, items)| StandupGroup { assignee, items })
-                .collect();
-
-            let resp = StandupResponse {
-                cutoff_hours,
-                stuck_days,
-                done_count: done.len(),
-                done,
-                in_progress_count: in_progress_items.len(),
-                in_progress,
-                stuck_count: stuck.len(),
-                stuck,
-            };
-            Ok(serde_json::to_string_pretty(&resp).unwrap_or_default())
-        })?
-    }
-
-    /// One-call health scorecard: velocity (trailing weekly windows, updated_at
-    /// proxy per rubric.md), WIP, stuck, and bottlenecks (items handed between
-    /// agents ≥2× in the window, from the `item_assignment_events` log written
-    /// by `item::update` — history starts at that migration, so transitions
-    /// predating it are not counted).
-    ///
-    /// No precomputed rollup table backs velocity — at this project's actual
-    /// scale (~40 items) a live scan is sub-millisecond (see the groom
-    /// benchmark). Revisit if item volume grows enough that this scan is ever
-    /// measured as slow — don't estimate it.
-    pub(super) fn item_health(&self, req: ItemRequest) -> Result<String, ErrorData> {
-        let window_weeks = req.window_weeks.unwrap_or(4).clamp(1, MAX_WINDOW_WEEKS);
-        let stuck_days = req.staleness_days.unwrap_or(7).max(0);
-        self.with_backend_db(|conn| {
-            let project = self.resolve_project_for_read(conn, req.project.as_deref())?;
-            let items = agentflare_backend::item::list_by_project(conn, &project.id)
-                .map_err(map_backend_err)?;
-            let states = agentflare_backend::state::list_by_project(conn, &project.id)
-                .map_err(map_backend_err)?;
-            let state_by_id: std::collections::HashMap<&str, &agentflare_backend::state::State> =
-                states.iter().map(|s| (s.id.as_str(), s)).collect();
-            let group_of = |i: &agentflare_backend::item::Item| -> &str {
-                state_by_id
-                    .get(i.state_id.as_str())
-                    .map(|s| s.group_name.as_str())
-                    .unwrap_or("")
-            };
-
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-
-            let completed: Vec<&agentflare_backend::item::Item> = items
-                .iter()
-                .filter(|i| group_of(i) == "completed")
-                .collect();
-            let mut velocity: Vec<VelocityWeek> = (0..window_weeks)
-                .map(|w| {
-                    let week_end = now - w.saturating_mul(7 * 86_400);
-                    let week_start = week_end - 7 * 86_400;
-                    // completed_at, not updated_at (see the standup fix above —
-                    // same reason: editing a completed item must not move it
-                    // between velocity weeks). Upper bound inclusive: an item
-                    // completed in the same second as this call must not be
-                    // excluded from "this week".
-                    let completed_count = completed
-                        .iter()
-                        .filter(|i| {
-                            i.completed_at
-                                .is_some_and(|t| t > week_start && t <= week_end)
-                        })
-                        .count();
-                    VelocityWeek {
-                        week_start,
-                        week_end,
-                        completed_count,
-                    }
-                })
-                .collect();
-            velocity.reverse(); // oldest -> newest
-            let velocity_trend = match velocity.len() {
-                n if n >= 2 => {
-                    let last = velocity[n - 1].completed_count;
-                    let prev = velocity[n - 2].completed_count;
-                    match last.cmp(&prev) {
-                        std::cmp::Ordering::Greater => "up",
-                        std::cmp::Ordering::Less => "down",
-                        std::cmp::Ordering::Equal => "flat",
-                    }
-                }
-                _ => "flat",
-            }
-            .to_string();
-
-            let wip: Vec<StandupItem> = items
-                .iter()
-                .filter(|i| group_of(i) == "started")
-                .map(to_standup_item)
-                .collect();
-            let stuck_cutoff = now - stuck_days.saturating_mul(86_400);
-            let stuck: Vec<StandupItem> = wip
-                .iter()
-                .filter(|i| i.updated_at < stuck_cutoff)
-                .cloned()
-                .collect();
-
-            let window_start = now - window_weeks.saturating_mul(7 * 86_400);
-            let handoff_stats = agentflare_backend::assignment_events::handoff_stats_since(
-                conn,
-                &project.id,
-                window_start,
-            )
-            .map_err(map_backend_err)?;
-            let item_by_id: std::collections::HashMap<&str, &agentflare_backend::item::Item> =
-                items.iter().map(|i| (i.id.as_str(), i)).collect();
-            let bottlenecks: Vec<String> = handoff_stats
-                .iter()
-                .filter(|s| s.handoffs >= 2)
-                .map(|s| {
-                    let label = item_by_id
-                        .get(s.item_id.as_str())
-                        .map(|i| format!("#{} {}", i.sequence_id, i.name))
-                        .unwrap_or_else(|| s.item_id.clone());
-                    format!(
-                        "{label} — {} handoffs ({})",
-                        s.handoffs,
-                        s.owners.join(" → ")
-                    )
-                })
-                .collect();
-            let bottleneck_note = if bottlenecks.is_empty() {
-                "no item was handed between agents ≥2× in the window (handoff history \
-                 is recorded from the assignment-log migration onward — earlier \
-                 transitions are not counted)"
-                    .to_string()
-            } else {
-                format!(
-                    "items handed between agents ≥2× in the last {window_weeks} week(s) — \
-                     repeated handoffs usually mean unclear ownership or a stuck dependency"
-                )
-            };
-
-            let resp = HealthResponse {
-                window_weeks,
-                velocity,
-                velocity_trend,
-                wip_count: wip.len(),
-                wip,
-                stuck_days,
-                stuck_count: stuck.len(),
-                stuck,
-                bottlenecks,
-                bottleneck_note,
-            };
-            Ok(serde_json::to_string_pretty(&resp).unwrap_or_default())
         })?
     }
 }

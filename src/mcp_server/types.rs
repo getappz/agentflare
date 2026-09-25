@@ -1187,6 +1187,32 @@ pub(crate) struct CommentRequest {
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub(crate) struct MessageRequest {
+    #[schemars(description = "Action: send|list|inbox|read|whoami")]
+    pub(crate) action: String,
+    #[schemars(
+        description = "Recipient (send): a session key from action=list, a unique session name, item:<id> (whoever is working that item; also recorded as an item comment), agent:<name> (every live session of that agent), or * (every live session)"
+    )]
+    #[serde(default)]
+    pub(crate) to: Option<String>,
+    #[schemars(description = "Message text (send), at most 16KB")]
+    #[serde(default)]
+    pub(crate) body: Option<String>,
+    #[schemars(description = "Id of the message this answers (send)")]
+    #[serde(default)]
+    pub(crate) reply_to: Option<i64>,
+    #[schemars(description = "Message ids to mark read (read)")]
+    #[serde(default)]
+    pub(crate) ids: Option<Vec<i64>>,
+    #[schemars(description = "Only unread messages (inbox; default true)")]
+    #[serde(default)]
+    pub(crate) unread_only: Option<bool>,
+    #[schemars(description = "Max messages returned (inbox; default 20, max 100)")]
+    #[serde(default)]
+    pub(crate) limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct LabelRequest {
     #[schemars(description = "Action: create|list|update|delete")]
     pub(crate) action: String,

@@ -979,8 +979,13 @@ fn run_discovery_tick_dispatches_ready_items_from_every_registered_project_not_j
     // inside it) must get its ready-for-work items picked up too.
     let mcp = test_mcp();
     let queue = test_queue();
-    let item_a = seed_ready_item_in_project(&mcp, "proj-a", "/repo/a");
-    let item_b = seed_ready_item_in_project(&mcp, "proj-b", "/repo/b");
+    // Real folders: discovery skips a project whose folder doesn't exist.
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let path_a = dir_a.path().to_string_lossy().to_string();
+    let path_b = dir_b.path().to_string_lossy().to_string();
+    let item_a = seed_ready_item_in_project(&mcp, "proj-a", &path_a);
+    let item_b = seed_ready_item_in_project(&mcp, "proj-b", &path_b);
 
     let auth_conn = test_auth_conn();
     let result = run_discovery_tick(
@@ -999,13 +1004,13 @@ fn run_discovery_tick_dispatches_ready_items_from_every_registered_project_not_j
 
     let job_a = jobs.iter().find(|j| j.args.contains(&item_a)).unwrap();
     assert!(
-        job_a.args.contains(&"/repo/a".to_string()),
+        job_a.args.contains(&path_a),
         "job for proj-a's item must carry proj-a's own folder path, got {:?}",
         job_a.args
     );
     let job_b = jobs.iter().find(|j| j.args.contains(&item_b)).unwrap();
     assert!(
-        job_b.args.contains(&"/repo/b".to_string()),
+        job_b.args.contains(&path_b),
         "job for proj-b's item must carry proj-b's own folder path, got {:?}",
         job_b.args
     );
@@ -1360,6 +1365,9 @@ fn run_review_sweep_skips_a_numbered_item_the_same_way_when_no_remote_resolves()
 #[path = "supervisor/tests/stray_pr_tests.rs"]
 mod stray_pr_tests;
 
+#[path = "supervisor/tests/multi_project_sweep_tests.rs"]
+mod multi_project_sweep_tests;
+
 #[test]
 fn run_review_sweep_scans_in_review_items_from_every_registered_project_not_just_one() {
     // Item #124: review sweep used to resolve a single project via
@@ -1394,168 +1402,8 @@ fn run_review_sweep_scans_in_review_items_from_every_registered_project_not_just
     );
 }
 
-// --- auto-merge on CI-green + approval label (item #194) ---
-
-#[test]
-fn merge_approved_pr_merges_via_squash_on_success() {
-    let server = crate::github::test_support::MockServer::start(vec![
-        crate::github::test_support::MockResponse::json(200, r#"{"merged":true}"#),
-    ]);
-    let client = server.client(Some("tok"));
-    let repo = crate::github::RepoId {
-        owner: "o".into(),
-        repo: "r".into(),
-    };
-
-    assert!(merge_approved_pr(&client, &repo, 42));
-
-    let reqs = server.requests();
-    assert_eq!(reqs[0].method, "PUT");
-    assert_eq!(reqs[0].path, "/repos/o/r/pulls/42/merge");
-    let sent: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
-    assert_eq!(sent["merge_method"], "squash");
-}
-
-#[test]
-fn merge_approved_pr_returns_false_and_does_not_panic_on_github_error() {
-    // Branch protection / an unresolved conflict -- GitHub answers 405 on
-    // the merge endpoint. The safety property is that this falls through to
-    // `skipped` (no panic, no retry loop here); the sweep just polls again
-    // next tick.
-    let server = crate::github::test_support::MockServer::start(vec![
-        crate::github::test_support::MockResponse::json(405, r#"{"message":"not mergeable"}"#),
-    ]);
-    let client = server.client(Some("tok"));
-    let repo = crate::github::RepoId {
-        owner: "o".into(),
-        repo: "r".into(),
-    };
-
-    assert!(!merge_approved_pr(&client, &repo, 42));
-}
-
-#[test]
-fn merge_if_approved_skips_without_touching_network_when_label_is_absent() {
-    // No approval label on the PR -- CI green alone must never be enough to
-    // merge. The label check must happen before any GitHub call, so this
-    // must return false even with an unresolvable repo/no credentials.
-    let repo = throwaway_repo();
-    let mcp = test_mcp_with_repo(repo.path().to_path_buf());
-    let item_id = seed_in_review_item(&mcp, Some("claude-code"));
-    let item = mcp
-        .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
-        .unwrap();
-
-    let merged = merge_if_approved(&mcp, &item, repo.path(), 42, &["size/s".to_string()]);
-
-    assert!(!merged);
-    let still_in_review = mcp
-        .with_backend_db(|conn| {
-            let refetched = agentflare_backend::item::get(conn, &item_id).unwrap();
-            let state = agentflare_backend::state::get(conn, &refetched.state_id).unwrap();
-            state.group_name == "in_review"
-        })
-        .unwrap();
-    assert!(still_in_review, "an unapproved item must not be promoted");
-}
-
-#[test]
-fn run_review_sweep_never_merges_when_the_approval_label_only_exists_on_the_project_not_the_pr() {
-    // Regression for the safety property in item #194's spec: the approval
-    // label must gate on the PR's OWN GitHub labels (carried by
-    // `PrCiStatus::Passing`), never merely on the label existing somewhere
-    // in the project's label table. A throwaway repo with no remote always
-    // resolves to `PrCiStatus::Unknown`, so this also covers Pending/Failing
-    // by construction -- none of those variants carry PR labels for
-    // `merge_if_approved` to check in the first place.
-    let repo = throwaway_repo();
-    let mcp = test_mcp_with_repo(repo.path().to_path_buf());
-    let _item_id = seed_in_review_item(&mcp, Some("claude-code"));
-    mcp.with_backend_db(|conn| {
-        let project = mcp.resolve_project(conn).unwrap();
-        agentflare_backend::label::create(
-            conn,
-            agentflare_backend::label::CreateLabel {
-                project_id: Some(project.id.clone()),
-                workspace_id: project.workspace_id.clone(),
-                name: PR_APPROVAL_LABEL.into(),
-                color: None,
-                parent_id: None,
-                sort_order: None,
-                external_source: None,
-                external_id: None,
-            },
-        )
-        .unwrap();
-    })
-    .unwrap();
-    let queue = test_queue();
-    let auth_conn = test_auth_conn();
-
-    let result = run_review_sweep(
-        &mcp,
-        &queue,
-        &auth_conn,
-        agentflare_resource_gate::Policy::Normal,
-    );
-
-    assert_eq!(result.promoted, 0);
-    assert_eq!(result.skipped, 1);
-}
-
-#[test]
-fn merge_or_repair_findings_never_merges_a_ci_green_approved_pr_with_unresolved_findings() {
-    // Regression for item #628 (GitHub PR 791): an approved, CI-green PR
-    // must not be merged while CodeRabbit findings are still unresolved on
-    // it, no matter what `merge_if_approved` would otherwise decide. Claim
-    // is backdated past the in_review TTL cap so the dispatch path is live
-    // rather than gated, proving the findings genuinely routed to repair
-    // instead of silently no-op'ing past both checks.
-    let repo = throwaway_repo();
-    let mcp = test_mcp_with_repo(repo.path().to_path_buf());
-    let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
-    let item = mcp
-        .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
-        .unwrap();
-    let label_id_by_name = seed_gate_label(&mcp);
-    let queue = test_queue();
-    let auth_conn = test_auth_conn();
-    let findings = vec![coderabbit_finding(1, "coderabbitai[bot]")];
-
-    let outcome = merge_or_repair_findings(
-        &mcp,
-        &queue,
-        &auth_conn,
-        agentflare_resource_gate::Policy::Normal,
-        &item,
-        repo.path(),
-        42,
-        &findings,
-        &[PR_APPROVAL_LABEL.to_string()],
-        &label_id_by_name,
-        "/repo",
-    );
-
-    assert!(
-        !matches!(outcome, PassingPrOutcome::Merged),
-        "unresolved CodeRabbit findings must block the merge even with the approval label present"
-    );
-    assert!(matches!(
-        outcome,
-        PassingPrOutcome::Repair(SelfRepairOutcome::Dispatched)
-    ));
-    let still_in_review = mcp
-        .with_backend_db(|conn| {
-            let refetched = agentflare_backend::item::get(conn, &item_id).unwrap();
-            let state = agentflare_backend::state::get(conn, &refetched.state_id).unwrap();
-            state.group_name == "in_review"
-        })
-        .unwrap();
-    assert!(
-        still_in_review,
-        "an item with unresolved findings must not be promoted"
-    );
-}
+#[path = "supervisor/tests/auto_merge_tests.rs"]
+mod auto_merge_tests;
 
 // --- cross-machine self-repair claim arbitration (item #261) ---
 

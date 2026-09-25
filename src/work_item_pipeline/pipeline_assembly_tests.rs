@@ -81,7 +81,124 @@ async fn sdd_loop_resumes_the_implementer_session_on_the_next_fix_round() {
     let recorded = calls.lock().unwrap();
     let (agent, _prompt, args) = recorded[4].clone();
     assert_eq!(agent, "claude-code");
-    assert_eq!(args, vec!["--resume".to_string(), "sess-1".to_string()]);
+    assert_eq!(
+        &args[..2],
+        ["--resume".to_string(), "sess-1".to_string()],
+        "the resume pair leads the argv"
+    );
+    assert!(
+        args.contains(&"--append-system-prompt".to_string()),
+        "the resumed round keeps its role identity as a flag: {args:?}"
+    );
+}
+
+/// The value following `flag` in `args`, if present.
+fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
+}
+
+#[tokio::test]
+async fn sdd_loop_compiles_role_policy_into_claude_flags_and_folds_it_into_other_prompts() {
+    let (send, calls) = super::sdd_test_support::mock_send(vec![
+        "DONE: added the flag",
+        r#"{"action":"advance_task","rationale":"looks done","ledger_line":"Task 0: implementer done","task_model_tier":null}"#,
+    ]);
+    let pipeline =
+        build_work_item_pipeline_with_sender(std::sync::Arc::new(AgentflareMcp::default()), send);
+    let mut data = super::sdd_test_support::one_task_data();
+    data.agent_name = "opencode".to_string();
+    data.judge_agent_name = "claude-code".to_string();
+    let mut ctx = WorkflowContext::new(Default::default(), data);
+    pipeline.steps[0]
+        .executor
+        .execute(&mut ctx)
+        .await
+        .expect("executes");
+
+    let recorded = calls.lock().unwrap();
+
+    // opencode has no confirmed system-prompt flag: the implementer's
+    // identity is folded into the prompt and the argv stays empty.
+    let (agent, prompt, args) = recorded[0].clone();
+    assert_eq!(agent, "opencode");
+    assert!(
+        args.is_empty(),
+        "no unconfirmed flags for opencode: {args:?}"
+    );
+    assert!(
+        prompt.starts_with("You are the implementer in an agentflare SDD pipeline"),
+        "identity folded into the prompt: {prompt:?}"
+    );
+    assert!(prompt.contains("Add --verbose"), "task body still present");
+
+    // Claude Code carries the judge's identity and tool policy as flags,
+    // so the prompt is not also prefixed with it.
+    let (agent, prompt, args) = recorded[1].clone();
+    assert_eq!(agent, "claude-code");
+    assert_eq!(
+        flag_value(&args, "--append-system-prompt").map(|s| s.starts_with("You are the judge")),
+        Some(true),
+        "{args:?}"
+    );
+    let denied = flag_value(&args, "--disallowedTools").expect("judge is tool-restricted");
+    for tool in ["Edit", "Write", "NotebookEdit", "Bash"] {
+        assert!(
+            denied.split(',').any(|t| t == tool),
+            "judge must not have {tool}: {denied}"
+        );
+    }
+    assert!(
+        !prompt.starts_with("You are the judge in an agentflare SDD pipeline"),
+        "identity must not be duplicated into the prompt when the argv carries it"
+    );
+    assert!(prompt.contains("You are the judge for an autonomous multi-task execution pipeline"));
+}
+
+#[tokio::test]
+async fn sdd_loop_reviewer_on_claude_code_is_read_only_but_keeps_the_shell() {
+    let (send, calls) = super::sdd_test_support::mock_send(vec![
+        // Iteration 1: implementer reports; judge asks to continue so the
+        // report goes to review.
+        "did the thing",
+        r#"{"action":"continue_task","rationale":"review it","ledger_line":"Task 0: implemented","task_model_tier":null}"#,
+        // Iteration 2: task reviewer approves; judge advances.
+        "REVIEW_APPROVED",
+        r#"{"action":"advance_task","rationale":"approved","ledger_line":"Task 0: approved","task_model_tier":null}"#,
+    ]);
+    let pipeline =
+        build_work_item_pipeline_with_sender(std::sync::Arc::new(AgentflareMcp::default()), send);
+    let mut data = super::sdd_test_support::one_task_data();
+    data.agent_name = "claude-code".to_string();
+    data.judge_agent_name = "claude-code".to_string();
+    let mut ctx = WorkflowContext::new(Default::default(), data);
+    for _ in 0..2 {
+        pipeline.steps[0]
+            .executor
+            .execute(&mut ctx)
+            .await
+            .expect("executes");
+    }
+
+    let recorded = calls.lock().unwrap();
+    let (_, _, implementer_args) = recorded[0].clone();
+    assert!(
+        flag_value(&implementer_args, "--disallowedTools").is_none(),
+        "the implementer keeps every tool: {implementer_args:?}"
+    );
+    let (_, prompt, reviewer_args) = recorded[2].clone();
+    assert!(
+        prompt.contains("Review this task's implementation"),
+        "{prompt:?}"
+    );
+    let denied = flag_value(&reviewer_args, "--disallowedTools").expect("reviewer is read-only");
+    assert!(denied.split(',').any(|t| t == "Edit"), "{denied}");
+    assert!(
+        !denied.split(',').any(|t| t == "Bash"),
+        "the reviewer must keep the shell to run verification: {denied}"
+    );
 }
 
 /// Regression test: `sdd_loop`'s per-iteration engine timeout must not

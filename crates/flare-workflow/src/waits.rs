@@ -79,7 +79,12 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             }
         };
         self.state_store
-            .update(run_id, |s| s.status = WorkflowStatus::Waiting)
+            .update(run_id, |s| {
+                // Never un-settle a run (e.g. cancelled concurrently).
+                if !s.status.is_terminal() {
+                    s.status = WorkflowStatus::Waiting;
+                }
+            })
             .await?;
         self.event_bus
             .publish(WorkflowEvent::StepWaiting {
@@ -162,7 +167,12 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 .await?;
         }
         self.state_store
-            .update(run_id, |s| s.status = WorkflowStatus::Waiting)
+            .update(run_id, |s| {
+                // Never un-settle a run (e.g. cancelled concurrently).
+                if !s.status.is_terminal() {
+                    s.status = WorkflowStatus::Waiting;
+                }
+            })
             .await?;
         self.event_bus
             .publish(WorkflowEvent::StepWaiting {

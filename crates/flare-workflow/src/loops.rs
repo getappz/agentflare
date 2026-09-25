@@ -54,9 +54,13 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             if self.state_store.is_cancelled(run_id).await? {
                 return Err(WorkflowError::Cancelled(run_id));
             }
+            if self.should_stop(run_id).await? {
+                return Err(WorkflowError::Paused(run_id));
+            }
 
             let state = self.state_store.load(run_id).await?;
             let mut context = state.context.clone();
+            self.apply_data_patch(run_id, &mut context.data);
             context.input = state.input.clone();
             context.variables = state.variables.clone();
             context.output.clear();
@@ -119,7 +123,10 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                     Err(_) => true,
                     _ => false,
                 };
-                if !retryable || retry_attempt >= max_retry_attempts {
+                if !retryable
+                    || retry_attempt >= max_retry_attempts
+                    || self.should_stop(run_id).await?
+                {
                     break attempt_result;
                 }
                 let delay = backoff
@@ -133,6 +140,11 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 retry_attempt += 1;
             };
             let duration_ms = step_start.elapsed().as_millis() as u64;
+            // Superseded mid-iteration (see `execute_step_with_retry`):
+            // record nothing, the new lease holder re-runs this iteration.
+            if self.is_superseded(run_id) {
+                return Err(WorkflowError::Paused(run_id));
+            }
 
             match result {
                 Ok(Ok(StepResult::Success)) => {
@@ -141,6 +153,9 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                     self.state_store
                         .update(run_id, |s| {
                             s.context = context.clone();
+                            // See the matching write-back in
+                            // `execute_step_with_retry`.
+                            self.apply_data_patch(run_id, &mut s.context.data);
                             s.input = out.clone();
                             s.output = Some(out.clone());
                             if let Some(var) = step.output_var.as_deref() {
@@ -176,6 +191,12 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 | Ok(Ok(StepResult::Failed(_)))
                 | Ok(Err(_))
                 | Err(_) => {
+                    // Stopped by a pause (see `execute_step_with_retry`): this
+                    // iteration re-runs on resume, nothing is journaled.
+                    if self.state_store.is_paused(run_id).await? {
+                        self.mark_step_paused(run_id, &step.id).await?;
+                        return Err(WorkflowError::Paused(run_id));
+                    }
                     let error_msg = match &result {
                         Ok(Ok(StepResult::Failed(msg))) => msg.clone(),
                         Err(_) => format!("Step timed out after {step_timeout:?}"),

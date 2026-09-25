@@ -141,6 +141,62 @@ impl ClaimLedger {
         })
     }
 
+    /// Like `acquire`, but only ever takes over an EXISTING row — same
+    /// done/stale/already-ours overwrite rule, never an insert. Returns
+    /// `None` when there is no row for `key` at all. For a steal path whose
+    /// caller is finishing work it believes it started: a missing row means
+    /// the lease was released out from under it (e.g. reassigned, then
+    /// released by its new owner), and silently minting a fresh claim there
+    /// would hand the key back to a caller that has already lost it.
+    pub fn acquire_existing(
+        &self,
+        conn: &Connection,
+        key: &[&str],
+        owner: &str,
+        now: i64,
+        ttl_secs: i64,
+    ) -> rusqlite::Result<Option<Acquire>> {
+        let stale_before = now - ttl_secs;
+        let owner_p = key.len() + 1;
+        let now_p = key.len() + 2;
+        let stale_p = key.len() + 3;
+        let t = self.table;
+        let sql = format!(
+            "UPDATE {t} SET owner = ?{owner_p}, status = 'claimed',
+                 created_at = ?{now_p}, heartbeat_at = ?{now_p}
+             WHERE {pred}
+               AND (status = 'done' OR heartbeat_at < ?{stale_p} OR owner = ?{owner_p})
+             RETURNING owner",
+            pred = self.where_pred()
+        );
+        let mut params = self.key_params(key);
+        params.push(&owner);
+        params.push(&now);
+        params.push(&stale_before);
+        let written = conn
+            .query_row(&sql, params.as_slice(), |r| r.get::<_, String>(0))
+            .optional()?;
+        if written.is_some() {
+            return Ok(Some(Acquire::Acquired));
+        }
+        // Either no row, or a live one held by someone else — only the
+        // latter is a Held; the read-back just tells the two apart.
+        let select_sql = format!(
+            "SELECT owner, heartbeat_at FROM {t} WHERE {}",
+            self.where_pred()
+        );
+        let key_params = self.key_params(key);
+        let row: Option<(String, i64)> = conn
+            .query_row(&select_sql, key_params.as_slice(), |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?;
+        Ok(row.map(|(row_owner, heartbeat_at)| Acquire::Held {
+            owner: row_owner,
+            age_secs: now - heartbeat_at,
+        }))
+    }
+
     /// Refreshes the lease on a claim we own. Returns false if the claim is
     /// gone or owned by someone else (don't heartbeat what isn't yours).
     pub fn heartbeat(
@@ -300,7 +356,8 @@ mod tests {
         (conn, ClaimLedger::new("test_single", &["id"]))
     }
 
-    // --- ported verbatim (behaviorally) from src/claims.rs's composite-key tests ---
+    // --- ported (behaviorally) from src/claims.rs's composite-key tests, which now
+    // rely on these instead of keeping their own copies ---
 
     #[test]
     fn acquire_free_target_then_held_by_other() {
@@ -415,6 +472,59 @@ mod tests {
         let r1: Vec<_> = all.iter().filter(|c| c.key[0] == "o/r1").collect();
         assert_eq!(r1.len(), 1);
         assert_eq!(r1[0].key, vec!["o/r1", "issue#1"]);
+    }
+
+    #[test]
+    fn acquire_existing_never_mints_a_row_for_a_missing_key() {
+        let (c, l) = composite_ledger();
+        assert_eq!(
+            l.acquire_existing(&c, &["o/r", "issue#1"], "a:1", 1000, TTL)
+                .unwrap(),
+            None
+        );
+        let rows: i64 = c
+            .query_row("SELECT COUNT(*) FROM claims", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "a missing key must stay missing");
+    }
+
+    #[test]
+    fn acquire_existing_takes_over_stale_done_or_own_rows_but_not_a_live_one() {
+        let (c, l) = single_ledger();
+        l.acquire(&c, &["item-1"], "a:1", 1000, TTL).unwrap();
+        // Live and someone else's — Held, untouched.
+        match l
+            .acquire_existing(&c, &["item-1"], "b:2", 1001, TTL)
+            .unwrap()
+        {
+            Some(Acquire::Held { owner, age_secs }) => {
+                assert_eq!(owner, "a:1");
+                assert_eq!(age_secs, 1);
+            }
+            other => panic!("expected Held, got {other:?}"),
+        }
+        // Our own live row — refreshed.
+        assert_eq!(
+            l.acquire_existing(&c, &["item-1"], "a:1", 1100, TTL)
+                .unwrap(),
+            Some(Acquire::Acquired)
+        );
+        // Stale — stolen.
+        assert_eq!(
+            l.acquire_existing(&c, &["item-1"], "b:2", 1100 + TTL + 1, TTL)
+                .unwrap(),
+            Some(Acquire::Acquired)
+        );
+        // Done — re-acquirable.
+        assert!(l.done(&c, &["item-1"], "b:2", 5000).unwrap());
+        assert_eq!(
+            l.acquire_existing(&c, &["item-1"], "c:3", 5001, TTL)
+                .unwrap(),
+            Some(Acquire::Acquired)
+        );
+        let all = l.list(&c, true, 5001, TTL).unwrap();
+        assert_eq!(all[0].owner, "c:3");
+        assert_eq!(all[0].status, "claimed");
     }
 
     // --- single-column key proves the same matrix works with key arity 1 ---

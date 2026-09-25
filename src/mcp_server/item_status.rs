@@ -39,13 +39,19 @@ fn pr_status_summary(
             labels,
         } => ("failing", Some(number), checks, labels),
         crate::worktree::PrCiStatus::Pending => ("pending", known_number, vec![], vec![]),
-        crate::worktree::PrCiStatus::Passing { number, labels } => {
+        crate::worktree::PrCiStatus::Passing { number, labels, .. } => {
             ("passing", Some(number), vec![], labels)
         }
-        crate::worktree::PrCiStatus::Behind { number } => ("behind", Some(number), vec![], vec![]),
+        crate::worktree::PrCiStatus::AwaitingReview { number, labels } => {
+            ("awaiting_review", Some(number), vec![], labels)
+        }
+        crate::worktree::PrCiStatus::Behind { number, .. } => {
+            ("behind", Some(number), vec![], vec![])
+        }
         crate::worktree::PrCiStatus::Conflicting { number } => {
             ("conflicting", Some(number), vec![], vec![])
         }
+        crate::worktree::PrCiStatus::Closed { number } => ("closed", Some(number), vec![], vec![]),
         crate::worktree::PrCiStatus::Unknown => ("unknown", known_number, vec![], vec![]),
     };
     PrStatusSummary {
