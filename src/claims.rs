@@ -390,7 +390,7 @@ pub fn owner_id() -> String {
     let agent = std::env::var("AGENTFLARE_AGENT")
         .ok()
         .filter(|s| !s.is_empty())
-        .or_else(agent_detector::agent_name)
+        .or_else(flare_process::agent_name)
         .unwrap_or_else(|| "cli".to_string());
     let instance = std::env::var("AGENTFLARE_SESSION")
         .ok()

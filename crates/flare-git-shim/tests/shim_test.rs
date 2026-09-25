@@ -99,7 +99,7 @@ const AGENT_DETECTOR_ENV_VARS: &[&str] = &[
 /// ambient absence of whichever one happens not to be set -- `LEAN_CTX_AGENT`
 /// in particular IS ambient here, since this whole suite runs under lean-ctx.
 /// Also sets `AGENTFLARE_GIT_ASSUME_HUMAN=1` to short-circuit
-/// `agent-detector`'s `process-tree` feature, which walks ancestor processes
+/// `flare_process::agent`'s ancestor-process walk, which scans parent processes
 /// for agent markers -- a signal that survives env-var stripping when this
 /// test suite itself runs under an agent-driven session
 /// (opencode/claude/cursor/...), and would otherwise make these "human"

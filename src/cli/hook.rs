@@ -60,11 +60,11 @@ pub struct HookArgs {
 
 /// Explicit `--agent` wins; otherwise auto-detect the host that invoked this
 /// hook the same way the MCP server resolves its own identity (parent
-/// process walk + agent env fingerprints, via the `agent-detector` crate).
+/// process walk + agent env fingerprints, via `flare_process::agent`).
 fn resolve_agent(explicit: Option<agent_registry::Agent>) -> String {
     explicit
         .map(|a| a.as_str().to_string())
-        .or_else(agent_detector::agent_name)
+        .or_else(flare_process::agent_name)
         .unwrap_or_else(|| "unknown".to_string())
 }
 

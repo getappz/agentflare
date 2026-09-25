@@ -122,7 +122,7 @@ impl ItemArgs {
                 run_item_control(&id, "redispatch", None, agent)
             }
             ItemCommands::ApprovePlan { id } => {
-                if let Some(msg) = approve_plan_denial(agent_detector::agent_name().as_deref()) {
+                if let Some(msg) = approve_plan_denial(flare_process::agent_name().as_deref()) {
                     eprintln!("error: {msg}");
                     std::process::exit(1);
                 }
