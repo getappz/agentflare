@@ -1263,6 +1263,11 @@ mod tests {
     /// machine; it is now bounded to the ancestor chain.
     #[test]
     fn agent_detector_flags_the_claudecode_marker_run_denies_on() {
+        // Whatever this process already looks like before the marker is set:
+        // an agent ancestor (or an ambient marker) wins over CLAUDECODE, so the
+        // exact name is only checkable when nothing is detected ambiently --
+        // which is the CI case, where this stays a precise assertion.
+        let ambient = flare_process::agent_name();
         // SAFETY: test-only; CLAUDECODE isn't touched by any other test in this
         // process, and set/remove here always run on the same thread.
         unsafe {
@@ -1272,7 +1277,13 @@ mod tests {
         unsafe {
             std::env::remove_var("CLAUDECODE");
         }
-        assert_eq!(detected.as_deref(), Some("claude-code"));
+        match ambient {
+            None => assert_eq!(detected.as_deref(), Some("claude-code")),
+            Some(_) => assert!(
+                detected.is_some(),
+                "CLAUDECODE marker must trigger the guard"
+            ),
+        }
     }
 
     #[test]
