@@ -2,10 +2,13 @@
 //! with no credential, maps status codes to `GitHubError`, and applies
 //! GitHub's published client etiquette process-wide: a backoff deadline after
 //! any rate limit (primary or secondary) during which no call is made at all,
-//! and serialized, spaced-out mutating requests.
+//! serialized, spaced-out mutating requests, and conditional GETs
+//! (`If-None-Match` from a per-host ETag cache, so an unchanged resource is
+//! a 304 that costs no rate-limit budget instead of a re-download).
 
 use crate::github::GitHubError;
 use crate::github::auth;
+use crate::github::etag_cache::{CachedGet, EtagCache};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -41,11 +44,12 @@ const MUTATION_SPACING: Duration = Duration::from_secs(1);
 /// explicit wait -- GitHub's docs say to wait "at least one minute".
 const DEFAULT_SECONDARY_BACKOFF: Duration = Duration::from_secs(60);
 
-/// Per-host throttle state, shared by every `Client` in the process aimed at
-/// the same base URL. Keyed by host rather than truly global so the test
-/// binary's many concurrent mock servers (one per ephemeral port) never
-/// throttle each other; production only ever talks to one host, so there it
-/// is effectively process-wide.
+/// Per-host throttle state and ETag cache, shared by every `Client` in the
+/// process aimed at the same base URL. Keyed by host rather than truly
+/// global so the test binary's many concurrent mock servers (one per
+/// ephemeral port) never throttle each other or see each other's cached
+/// responses; production only ever talks to one host, so there it is
+/// effectively process-wide.
 struct HostThrottle {
     /// No request to this host before this instant (a rate-limit backoff),
     /// indexed by [`backoff_slot`]: anonymous and authenticated requests
@@ -55,6 +59,8 @@ struct HostThrottle {
     /// Held for the whole of a mutating request, so writes go out one at a
     /// time; stores when the previous one finished, for spacing.
     last_mutation: Mutex<Option<Instant>>,
+    /// Validators and bodies of past GETs, for conditional requests.
+    etags: Mutex<EtagCache>,
 }
 
 fn host_throttle(base_url: &str) -> Arc<HostThrottle> {
@@ -67,6 +73,7 @@ fn host_throttle(base_url: &str) -> Arc<HostThrottle> {
         Arc::new(HostThrottle {
             backoff_until: [Mutex::new(None), Mutex::new(None)],
             last_mutation: Mutex::new(None),
+            etags: Mutex::new(EtagCache::default()),
         })
     }))
 }
@@ -178,6 +185,17 @@ fn backoff_for(status: u16, headers: &RateHeaders, body: &str, now_epoch: u64) -
         return Some(DEFAULT_SECONDARY_BACKOFF);
     }
     None
+}
+
+/// A response body as JSON: an empty body (204, or a 200 with nothing to
+/// say) is `Null`, anything else must parse. Shared by the fresh and the
+/// 304-served paths, so a cached empty body decodes the same way it did the
+/// first time.
+fn decode_body(text: &str) -> Result<serde_json::Value, GitHubError> {
+    if text.trim().is_empty() {
+        return Ok(serde_json::Value::Null);
+    }
+    serde_json::from_str(text).map_err(|e| GitHubError::Parse(e.to_string()))
 }
 
 fn now_epoch() -> u64 {
@@ -420,22 +438,58 @@ impl Client {
         if let Some(tok) = token {
             req = req.set("Authorization", &format!("Bearer {tok}"));
         }
+        // Conditional GET: the cache is keyed by representation as well as
+        // URL, since `Accept` selects different bodies for the same path.
+        // The cached entry is held here for the length of the exchange, so
+        // a concurrent eviction can't leave a 304 with nothing to serve.
+        let cache_key = (method == "GET").then(|| format!("{accept} {url}"));
+        let cached: Option<CachedGet> = cache_key.as_deref().and_then(|key| {
+            self.throttle
+                .etags
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(key)
+                .cloned()
+        });
+        if let Some(c) = &cached {
+            req = req.set("If-None-Match", &c.etag);
+        }
         let result = match body {
             Some(b) => req.send_json(b),
             None => req.call(),
         };
         match result {
+            Ok(resp) if resp.status() == 304 => {
+                // Unchanged since the validator we sent: GitHub charged no
+                // rate-limit budget for this, and the body we kept is current.
+                let Some(c) = cached else {
+                    return Err(GitHubError::Transport(
+                        "GitHub answered 304 to a request that sent no validator".to_string(),
+                    ));
+                };
+                let headers = RateHeaders::from_response(&resp);
+                decode_body(&c.body).map(|json| (json, headers))
+            }
             Ok(resp) => {
+                let etag = resp.header("etag").map(str::to_string);
                 let headers = RateHeaders::from_response(&resp);
                 let text = resp
                     .into_string()
                     .map_err(|e| GitHubError::Transport(e.to_string()))?;
-                if text.trim().is_empty() {
-                    return Ok((serde_json::Value::Null, headers));
+                if let Some(key) = cache_key.as_deref() {
+                    let mut etags = self
+                        .throttle
+                        .etags
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    match etag {
+                        Some(etag) => etags.insert(key, &etag, &text),
+                        // No validator on this response: whatever we held
+                        // for the URL is stale now.
+                        None => etags.remove(key),
+                    }
                 }
-                serde_json::from_str(&text)
-                    .map(|json| (json, headers))
-                    .map_err(|e| GitHubError::Parse(e.to_string()))
+                decode_body(&text).map(|json| (json, headers))
             }
             Err(ureq::Error::Status(code, resp)) => {
                 let headers = RateHeaders::from_response(&resp);
@@ -680,6 +734,135 @@ mod tests {
             reqs.len(),
             1,
             "the backoff must stop the second call locally"
+        );
+    }
+
+    #[test]
+    fn a_repeated_get_sends_if_none_match_and_serves_the_cached_body_on_304() {
+        let server = MockServer::start(vec![
+            MockResponse::json(200, r#"{"a":1}"#).with_header("ETag", "W/\"v1\""),
+            MockResponse::json(304, ""),
+            MockResponse::json(200, r#"{"a":2}"#).with_header("ETag", "W/\"v2\""),
+            MockResponse::json(304, ""),
+        ]);
+        let client = server.client(Some("tok"));
+        assert_eq!(client.request("GET", "/thing", None).unwrap()["a"], 1);
+        // Unchanged: the server says 304 and the first body is served again.
+        assert_eq!(client.request("GET", "/thing", None).unwrap()["a"], 1);
+        // Changed: a fresh body replaces the cached one and its validator.
+        assert_eq!(client.request("GET", "/thing", None).unwrap()["a"], 2);
+        assert_eq!(client.request("GET", "/thing", None).unwrap()["a"], 2);
+
+        let reqs = server.requests();
+        assert_eq!(reqs.len(), 4);
+        assert_eq!(reqs[0].header("if-none-match"), None);
+        assert_eq!(reqs[1].header("if-none-match"), Some("W/\"v1\""));
+        assert_eq!(reqs[2].header("if-none-match"), Some("W/\"v1\""));
+        assert_eq!(reqs[3].header("if-none-match"), Some("W/\"v2\""));
+    }
+
+    #[test]
+    fn a_304_for_a_cached_empty_body_decodes_to_null_like_the_first_time() {
+        let server = MockServer::start(vec![
+            MockResponse::json(200, "").with_header("ETag", "\"empty\""),
+            MockResponse::json(304, ""),
+        ]);
+        let client = server.client(Some("tok"));
+        assert_eq!(
+            client.request("GET", "/nothing", None).unwrap(),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            client.request("GET", "/nothing", None).unwrap(),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            server.requests()[1].header("if-none-match"),
+            Some("\"empty\"")
+        );
+    }
+
+    #[test]
+    fn the_etag_cache_is_keyed_by_representation_and_only_used_for_gets() {
+        let server = MockServer::start(vec![
+            MockResponse::json(200, r#"{"a":1}"#).with_header("ETag", "\"v1\""),
+            MockResponse::json(200, r#"{"a":1,"body_html":"x"}"#).with_header("ETag", "\"h1\""),
+            MockResponse::json(201, r#"{"a":1}"#).with_header("ETag", "\"p1\""),
+            MockResponse::json(304, ""),
+        ]);
+        let client = server.client(Some("tok"));
+        client.request("GET", "/thing", None).unwrap();
+        client
+            .request_with_accept("GET", "/thing", None, "application/vnd.github.html+json")
+            .unwrap();
+        client
+            .request("POST", "/thing", Some(serde_json::json!({})))
+            .unwrap();
+        let again = client.request("GET", "/thing", None).unwrap();
+        assert_eq!(again["a"], 1);
+        assert!(
+            again.get("body_html").is_none(),
+            "served the json+json body"
+        );
+
+        let reqs = server.requests();
+        assert_eq!(
+            reqs[1].header("if-none-match"),
+            None,
+            "other Accept, other key"
+        );
+        assert_eq!(
+            reqs[2].header("if-none-match"),
+            None,
+            "writes are never conditional"
+        );
+        assert_eq!(reqs[3].header("if-none-match"), Some("\"v1\""));
+    }
+
+    #[test]
+    fn a_response_without_an_etag_evicts_the_stale_entry() {
+        let server = MockServer::start(vec![
+            MockResponse::json(200, r#"{"a":1}"#).with_header("ETag", "\"v1\""),
+            MockResponse::json(200, r#"{"a":2}"#),
+            MockResponse::json(200, r#"{"a":3}"#),
+        ]);
+        let client = server.client(Some("tok"));
+        client.request("GET", "/thing", None).unwrap();
+        assert_eq!(client.request("GET", "/thing", None).unwrap()["a"], 2);
+        assert_eq!(client.request("GET", "/thing", None).unwrap()["a"], 3);
+        let reqs = server.requests();
+        assert_eq!(reqs[1].header("if-none-match"), Some("\"v1\""));
+        assert_eq!(
+            reqs[2].header("if-none-match"),
+            None,
+            "the validator went with the body it validated"
+        );
+    }
+
+    #[test]
+    fn a_rate_limit_backoff_still_refuses_a_get_that_has_a_cached_copy() {
+        // A cached body is only known current after the server confirms it
+        // with a 304, so a backoff must still keep the call off the network
+        // rather than serve the stale copy as if it were fresh.
+        let server = MockServer::start(vec![
+            MockResponse::json(200, r#"{"a":1}"#).with_header("ETag", "\"v1\""),
+            MockResponse::json(403, r#"{"message":"secondary rate limit"}"#)
+                .with_header("retry-after", "60"),
+        ]);
+        let client = server.client(Some("tok"));
+        client.request("GET", "/thing", None).unwrap();
+        assert!(matches!(
+            client.request("GET", "/other", None).unwrap_err(),
+            GitHubError::RateLimited(_)
+        ));
+        assert!(matches!(
+            client.request("GET", "/thing", None).unwrap_err(),
+            GitHubError::RateLimited(_)
+        ));
+        assert_eq!(
+            server.requests().len(),
+            2,
+            "the backoff stopped the third call locally"
         );
     }
 

@@ -44,7 +44,7 @@ fn pr_status_summary(
         crate::worktree::PrCiStatus::Passing { number, labels, .. } => {
             ("passing", Some(number), vec![], labels)
         }
-        crate::worktree::PrCiStatus::AwaitingReview { number, labels } => {
+        crate::worktree::PrCiStatus::AwaitingReview { number, labels, .. } => {
             ("awaiting_review", Some(number), vec![], labels)
         }
         crate::worktree::PrCiStatus::Behind { number, .. } => {
@@ -54,6 +54,9 @@ fn pr_status_summary(
             ("conflicting", Some(number), vec![], vec![])
         }
         crate::worktree::PrCiStatus::Closed { number } => ("closed", Some(number), vec![], vec![]),
+        crate::worktree::PrCiStatus::Draft { number, .. } => {
+            ("draft", Some(number), vec![], vec![])
+        }
         crate::worktree::PrCiStatus::Unknown => ("unknown", known_number, vec![], vec![]),
     };
     PrStatusSummary {

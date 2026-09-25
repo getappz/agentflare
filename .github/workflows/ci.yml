@@ -4,6 +4,10 @@ on:
   push:
     branches: [master]
   pull_request:
+  # A merge queue runs the required checks on the queue's temporary merge
+  # commit before merging; without this event those checks never report and
+  # every queued PR fails out of the queue.
+  merge_group:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -25,12 +29,17 @@ jobs:
     permissions:
       contents: read
     outputs:
-      code: ${{ steps.filter.outputs.code }}
+      # A merge-group run always builds: the queue's merge commit is exactly
+      # what must be proven, and the path filter has no PR base to diff
+      # against there.
+      code: ${{ github.event_name == 'merge_group' && 'true' || steps.filter.outputs.code }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - if: github.event_name != 'merge_group'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           fetch-depth: 0
-      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+      - if: github.event_name != 'merge_group'
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         with:
           # Default predicate-quantifier ('some') matches a filter on ANY

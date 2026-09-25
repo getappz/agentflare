@@ -5,7 +5,8 @@ use crate::github::{Client, GitHubError, RepoId};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-/// The slice of `GET /repos/{owner}/{repo}` post-merge cleanup consults.
+/// The slice of `GET /repos/{owner}/{repo}` the merge path and post-merge
+/// cleanup consult.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoSettings {
     pub default_branch: String,
@@ -15,6 +16,73 @@ pub struct RepoSettings {
     /// The repository's GraphQL node id (`node_id`), which the atomic
     /// `updateRefs` branch deletion addresses the repo by.
     pub node_id: Option<String>,
+    /// "Allow auto-merge" in the repo's settings: whether
+    /// `enablePullRequestAutoMerge` can be used at all.
+    pub allow_auto_merge: bool,
+    pub allow_squash_merge: bool,
+    pub allow_merge_commit: bool,
+    pub allow_rebase_merge: bool,
+}
+
+/// A PR merge method in both spellings GitHub uses: REST's `merge_method`
+/// (`squash`) and GraphQL's `PullRequestMergeMethod` enum (`SQUASH`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeMethod {
+    Squash,
+    Merge,
+    Rebase,
+}
+
+impl MergeMethod {
+    /// REST's `merge_method` value.
+    pub fn rest(self) -> &'static str {
+        match self {
+            MergeMethod::Squash => "squash",
+            MergeMethod::Merge => "merge",
+            MergeMethod::Rebase => "rebase",
+        }
+    }
+
+    /// GraphQL's `PullRequestMergeMethod` enum value.
+    pub fn graphql(self) -> &'static str {
+        match self {
+            MergeMethod::Squash => "SQUASH",
+            MergeMethod::Merge => "MERGE",
+            MergeMethod::Rebase => "REBASE",
+        }
+    }
+}
+
+impl RepoSettings {
+    /// What GitHub falls back to when it can't read a repo's settings: every
+    /// merge method allowed (GitHub's defaults), auto-merge off. Used when
+    /// the settings fetch itself fails, so a merge can still be attempted.
+    pub fn unknown(default_branch: &str) -> RepoSettings {
+        RepoSettings {
+            default_branch: default_branch.to_string(),
+            delete_branch_on_merge: false,
+            node_id: None,
+            allow_auto_merge: false,
+            allow_squash_merge: true,
+            allow_merge_commit: true,
+            allow_rebase_merge: true,
+        }
+    }
+
+    /// The merge method the supervisor uses for this repo: squash when the
+    /// repo allows it (one commit per item, matching agentflare's own
+    /// convention), else a merge commit, else rebase. A repo that allows
+    /// none -- possible when the fetched flags are all false -- still gets
+    /// squash, so the attempt is made and GitHub says why it can't.
+    pub fn merge_method(&self) -> MergeMethod {
+        if self.allow_squash_merge || (!self.allow_merge_commit && !self.allow_rebase_merge) {
+            MergeMethod::Squash
+        } else if self.allow_merge_commit {
+            MergeMethod::Merge
+        } else {
+            MergeMethod::Rebase
+        }
+    }
 }
 
 /// `repo`'s settings, fetched once per process per host+repo: they change
@@ -34,13 +102,21 @@ pub fn settings(client: &Client, repo: &RepoId) -> Result<RepoSettings, GitHubEr
         return Ok(hit);
     }
     let json = client.request("GET", &format!("/repos/{}/{}", repo.owner, repo.repo), None)?;
+    // The `allow_*` flags default to GitHub's own defaults when the response
+    // omits them (a token without admin scope still sees them; a truncated
+    // test fixture may not).
+    let flag = |name: &str, default: bool| json[name].as_bool().unwrap_or(default);
     let fetched = RepoSettings {
         default_branch: json["default_branch"]
             .as_str()
             .ok_or_else(|| GitHubError::Parse("missing default_branch".to_string()))?
             .to_string(),
-        delete_branch_on_merge: json["delete_branch_on_merge"].as_bool().unwrap_or(false),
+        delete_branch_on_merge: flag("delete_branch_on_merge", false),
         node_id: json["node_id"].as_str().map(str::to_string),
+        allow_auto_merge: flag("allow_auto_merge", false),
+        allow_squash_merge: flag("allow_squash_merge", true),
+        allow_merge_commit: flag("allow_merge_commit", true),
+        allow_rebase_merge: flag("allow_rebase_merge", true),
     };
     cache
         .lock()
@@ -208,6 +284,108 @@ pub fn delete_merged_pr_branch(
     delete_ref_if_at(client, node_id, &head.git_ref, &head.sha)
 }
 
+/// The status-check contexts `branch`'s protection requires before a merge,
+/// from both places GitHub keeps them: the classic branch-protection rule
+/// (`GET /branches/{branch}`, whose `protection.required_status_checks`
+/// lists them even when the dedicated protection endpoint needs admin
+/// scope) and repository rulesets (`GET /rules/branches/{branch}`, each
+/// `required_status_checks` rule naming its contexts). Fetched once per
+/// process per host+repo+branch, like [`settings`]: protection changes
+/// about never, and the sweep asks on every approved PR.
+///
+/// A branch with no protection, or one this token can't read, comes back
+/// empty rather than as an error: "nothing is required" is the safe
+/// reading for callers deciding whether a merge-time gate exists. Only a
+/// complete read is cached, though: a transient failure (5xx, rate limit)
+/// must not pin "nothing required" on a gated branch for the rest of the
+/// process, so the next call asks GitHub again.
+pub fn required_status_contexts(client: &Client, repo: &RepoId, branch: &str) -> Vec<String> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
+    let key = format!(
+        "{} {}/{} {branch}",
+        client.host_key(),
+        repo.owner,
+        repo.repo
+    );
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(hit) = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned()
+    {
+        return hit;
+    }
+    let encoded = crate::github::encode_query(branch);
+    let mut contexts: Vec<String> = Vec::new();
+    let mut complete = true;
+    let branch_path = format!("/repos/{}/{}/branches/{encoded}", repo.owner, repo.repo);
+    match client.request("GET", &branch_path, None) {
+        Ok(json) => {
+            let required = &json["protection"]["required_status_checks"];
+            let named = required["contexts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|c| c.as_str())
+                .chain(
+                    required["checks"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|c| c["context"].as_str()),
+                );
+            contexts.extend(named.map(str::to_string));
+        }
+        Err(e) => {
+            complete = false;
+            eprintln!(
+                "github: could not read branch protection of {repo}@{branch}: {}",
+                e.log_safe()
+            );
+        }
+    }
+    let rules_path = format!(
+        "/repos/{}/{}/rules/branches/{encoded}",
+        repo.owner, repo.repo
+    );
+    match client.request("GET", &rules_path, None) {
+        Ok(json) => {
+            let from_rules = json
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|rule| rule["type"] == "required_status_checks")
+                .flat_map(|rule| {
+                    rule["parameters"]["required_status_checks"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                })
+                .filter_map(|check| check["context"].as_str().map(str::to_string));
+            contexts.extend(from_rules);
+        }
+        // No rulesets, or an endpoint this host doesn't have.
+        Err(GitHubError::NotFound) => {}
+        Err(e) => {
+            complete = false;
+            eprintln!(
+                "github: could not read rulesets of {repo}@{branch}: {}",
+                e.log_safe()
+            );
+        }
+    }
+    contexts.sort();
+    contexts.dedup();
+    if complete {
+        cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, contexts.clone());
+    }
+    contexts
+}
+
 /// Fetches `repo`'s default branch via the GitHub API. Used when an explicit
 /// `repo` override is given, since there's no local checkout to read it from.
 pub fn get_default_branch(client: &Client, repo: &RepoId) -> Result<String, GitHubError> {
@@ -232,6 +410,75 @@ mod tests {
     }
 
     #[test]
+    fn required_status_contexts_merges_branch_protection_and_rulesets() {
+        let server = MockServer::start(vec![
+            MockResponse::json(
+                200,
+                r#"{"name":"main","protected":true,"protection":{"required_status_checks":{
+                    "contexts":["CI Green"],
+                    "checks":[{"context":"CI Green","app_id":15368},{"context":"agentflare/judged","app_id":null}]
+                }}}"#,
+            ),
+            MockResponse::json(
+                200,
+                r#"[{"type":"deletion"},{"type":"required_status_checks","parameters":{
+                    "required_status_checks":[{"context":"cargo audit"}]}}]"#,
+            ),
+        ]);
+        let client = server.client(Some("tok"));
+        let contexts = required_status_contexts(&client, &repo(), "main");
+        assert_eq!(
+            contexts,
+            vec!["CI Green", "agentflare/judged", "cargo audit"]
+        );
+        // Cached: a second ask makes no request.
+        assert_eq!(required_status_contexts(&client, &repo(), "main").len(), 3);
+        let reqs = server.requests();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].path, "/repos/o/r/branches/main");
+        assert_eq!(reqs[1].path, "/repos/o/r/rules/branches/main");
+    }
+
+    #[test]
+    fn required_status_contexts_is_empty_for_an_unprotected_or_unreadable_branch() {
+        let server = MockServer::start(vec![
+            MockResponse::json(200, r#"{"name":"dev","protected":false}"#),
+            MockResponse::json(404, r#"{"message":"Not Found"}"#),
+            MockResponse::json(403, r#"{"message":"Resource not accessible"}"#),
+            MockResponse::json(404, r#"{"message":"Not Found"}"#),
+        ]);
+        let client = server.client(Some("tok"));
+        assert!(required_status_contexts(&client, &repo(), "dev").is_empty());
+        assert!(required_status_contexts(&client, &repo(), "private").is_empty());
+        assert_eq!(server.requests().len(), 4);
+    }
+
+    #[test]
+    fn required_status_contexts_does_not_cache_a_failed_read() {
+        // A transient failure must not pin "nothing required" on a gated
+        // branch for the rest of the process: the next ask goes to GitHub
+        // again and finds the requirement.
+        let server = MockServer::start(vec![
+            MockResponse::json(502, r#"{"message":"Bad Gateway"}"#),
+            MockResponse::json(404, r#"{"message":"Not Found"}"#),
+            MockResponse::json(
+                200,
+                r#"{"name":"rel","protected":true,"protection":{"required_status_checks":{"contexts":["agentflare/judged"]}}}"#,
+            ),
+            MockResponse::json(200, "[]"),
+        ]);
+        let client = server.client(Some("tok"));
+        assert!(required_status_contexts(&client, &repo(), "rel").is_empty());
+        assert_eq!(
+            required_status_contexts(&client, &repo(), "rel"),
+            vec!["agentflare/judged"]
+        );
+        // Now complete, so cached: a third ask makes no request.
+        assert_eq!(required_status_contexts(&client, &repo(), "rel").len(), 1);
+        assert_eq!(server.requests().len(), 4);
+    }
+
+    #[test]
     fn get_default_branch_reads_the_field() {
         let server = MockServer::start(vec![MockResponse::json(
             200,
@@ -240,6 +487,41 @@ mod tests {
         let client = server.client(None);
         assert_eq!(get_default_branch(&client, &repo()).unwrap(), "main");
         assert_eq!(server.requests()[0].path, "/repos/o/r");
+    }
+
+    #[test]
+    fn settings_reads_merge_flags_and_defaults_the_missing_ones() {
+        let server = MockServer::start(vec![MockResponse::json(
+            200,
+            r#"{"default_branch":"main","allow_auto_merge":true,"allow_squash_merge":false}"#,
+        )]);
+        let client = server.client(None);
+        let s = settings(&client, &repo()).unwrap();
+        assert!(s.allow_auto_merge);
+        assert!(!s.allow_squash_merge);
+        assert!(s.allow_merge_commit, "GitHub's default when omitted");
+        assert!(s.allow_rebase_merge);
+        assert!(!s.delete_branch_on_merge);
+        assert_eq!(s.merge_method(), MergeMethod::Merge);
+        let _ = server.requests();
+    }
+
+    #[test]
+    fn merge_method_prefers_squash_then_merge_then_rebase() {
+        let mut s = RepoSettings::unknown("main");
+        assert_eq!(s.merge_method(), MergeMethod::Squash);
+        s.allow_squash_merge = false;
+        assert_eq!(s.merge_method(), MergeMethod::Merge);
+        s.allow_merge_commit = false;
+        assert_eq!(s.merge_method(), MergeMethod::Rebase);
+        s.allow_rebase_merge = false;
+        assert_eq!(
+            s.merge_method(),
+            MergeMethod::Squash,
+            "nothing allowed: still try"
+        );
+        assert_eq!(MergeMethod::Squash.rest(), "squash");
+        assert_eq!(MergeMethod::Rebase.graphql(), "REBASE");
     }
 
     #[test]

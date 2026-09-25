@@ -98,6 +98,8 @@ pub(crate) fn pr_number_from_metadata(item: &agentflare_backend::item::Item) -> 
 
 mod discovery;
 pub(crate) use discovery::{discover_untracked_prs, tracked_pr_numbers};
+mod draft;
+pub(crate) use draft::{mark_pr_ready, pr_marked_ready};
 
 /// Checks whether `item`'s branch already has a merged PR — the promotion
 /// signal `check_merge` uses to move an item out of "in_review" (item
@@ -254,6 +256,25 @@ fn find_own_pr_by_branch(
     Some(pr.number)
 }
 
+/// What GitHub's native auto-merge needs beyond a PR number: the PR's
+/// GraphQL node id (the `enablePullRequestAutoMerge` mutation's
+/// `pullRequestId`), whether auto-merge is already armed on it (so the
+/// sweep neither re-arms it every tick nor arms it blind), and what decides
+/// whether arming is safe at all -- the base branch, whose protection may
+/// require `supervisor::JUDGED_STATUS_CONTEXT`, and whether it merges
+/// through a merge queue. All from the same fetch as the CI verdict
+/// (GraphQL `id`/`autoMergeRequest`/`baseRefName`/`isMergeQueueEnabled`,
+/// REST `node_id`/`auto_merge`/`base.ref`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AutoMergeRef {
+    pub node_id: Option<String>,
+    pub enabled: bool,
+    pub base_ref: Option<String>,
+    /// The base branch merges through a merge queue (GraphQL only; REST
+    /// can't tell and reports `false`).
+    pub merge_queue: bool,
+}
+
 /// CI signal the in-review sweep (`supervisor::run_review_sweep`, item #65)
 /// polls per item: merged (promote), failing (self-repair), CI-green with a
 /// human approval label attached (auto-merge, item #194), cleanly behind the
@@ -295,6 +316,7 @@ pub enum PrCiStatus {
         number: u64,
         labels: Vec<String>,
         head_sha: Option<String>,
+        auto_merge: AutoMergeRef,
     },
     /// Required CI is green but GitHub's `mergeStateStatus` is `BLOCKED` on
     /// review: branch protection wants an approving review
@@ -306,6 +328,16 @@ pub enum PrCiStatus {
     AwaitingReview {
         number: u64,
         labels: Vec<String>,
+        /// `reviewDecision == CHANGES_REQUESTED` (a reviewer asked for
+        /// changes) as opposed to `REVIEW_REQUIRED` (nobody has approved
+        /// yet) -- the approval card tells the human which it is.
+        changes_requested: bool,
+        /// The head the green verdict was made on, and the auto-merge
+        /// handle: with the approval label attached and no findings, the
+        /// sweep arms GitHub's auto-merge here so the review landing is
+        /// all it takes to merge.
+        head_sha: Option<String>,
+        auto_merge: AutoMergeRef,
     },
     /// GitHub's own `mergeable_state == "behind"` -- mergeable, no conflict,
     /// just missing commits the base branch has gained since this PR was
@@ -334,6 +366,19 @@ pub enum PrCiStatus {
     /// instead of polling a dead PR (or self-repairing it) forever.
     Closed {
         number: u64,
+    },
+    /// Still a draft. `push_and_open_pr` opens every PR as one and
+    /// `item_done` marks it ready once the item is in review, so a draft on
+    /// an in-review item means that flip never landed (`run_review_sweep`
+    /// retries it, see `draft::mark_pr_ready`) -- or a human converted it
+    /// back on purpose, which the sweep respects. Checked before CI state:
+    /// a draft can neither merge nor be handed to reviewers, so its checks
+    /// are not yet actionable either way.
+    Draft {
+        number: u64,
+        /// The GraphQL node id the ready-for-review mutation needs, when the
+        /// fetch had it.
+        node_id: Option<String>,
     },
     Unknown,
 }
@@ -405,6 +450,12 @@ fn pr_ci_status_impl(
     if pr.state == "closed" {
         return PrCiStatus::Closed { number: pr.number };
     }
+    if pr.draft {
+        return PrCiStatus::Draft {
+            number: pr.number,
+            node_id: pr.node_id.clone(),
+        };
+    }
     let head_sha = pr
         .head
         .as_ref()
@@ -455,6 +506,16 @@ fn pr_ci_status_impl(
             review_decision: None,
             rollup_state: None,
             head_sha: Some(&sha),
+            auto_merge: AutoMergeRef {
+                node_id: pr.node_id.clone(),
+                enabled: pr.auto_merge.is_some(),
+                base_ref: pr.base.as_ref().map(|b| b.git_ref.clone()),
+                merge_queue: false,
+            },
+            // REST doesn't say; a merge-queue repo's PR stays `Pending`
+            // on this path, as it did before.
+            merge_queue_enabled: false,
+            in_merge_queue: false,
         },
     )
 }
@@ -470,6 +531,11 @@ struct MergeSignals<'a> {
     /// Upper-case GraphQL `statusCheckRollup.state`; always `None` on REST.
     rollup_state: Option<&'a str>,
     head_sha: Option<&'a str>,
+    auto_merge: AutoMergeRef,
+    /// The base branch merges through a merge queue (GraphQL only).
+    merge_queue_enabled: bool,
+    /// The PR is already in that queue (GraphQL only).
+    in_merge_queue: bool,
 }
 
 /// The part of the CI-status decision tree that only needs check-run data
@@ -501,6 +567,7 @@ fn decide_from_checks(
         number,
         labels,
         head_sha: signals.head_sha.map(str::to_string),
+        auto_merge: signals.auto_merge.clone(),
     };
     let pending = || PrCiStatus::Pending {
         number,
@@ -511,6 +578,18 @@ fn decide_from_checks(
             signals.review_decision,
             Some("REVIEW_REQUIRED") | Some("CHANGES_REQUESTED")
         );
+    let awaiting = |labels: Vec<String>| PrCiStatus::AwaitingReview {
+        number,
+        labels,
+        changes_requested: signals.review_decision == Some("CHANGES_REQUESTED"),
+        head_sha: signals.head_sha.map(str::to_string),
+        auto_merge: signals.auto_merge.clone(),
+    };
+    // Enqueued: the merge queue's own CI run on the merge group decides
+    // now, and GitHub merges (or kicks it back out) by itself.
+    if signals.in_merge_queue {
+        return pending();
+    }
     let relevant: Vec<crate::github::models::CheckRun> = if checks.iter().any(|c| c.required) {
         checks.iter().filter(|c| c.required).cloned().collect()
     } else {
@@ -534,7 +613,7 @@ fn decide_from_checks(
                 return passing(labels);
             }
             if awaiting_review {
-                return PrCiStatus::AwaitingReview { number, labels };
+                return awaiting(labels);
             }
         }
         return pending();
@@ -562,7 +641,7 @@ fn decide_from_checks(
     // purely on review: hand it to the approval gate rather than polling a
     // PR that only a human can unblock.
     if awaiting_review {
-        return PrCiStatus::AwaitingReview { number, labels };
+        return awaiting(labels);
     }
     // The check-run list above only reflects what GitHub has created so far --
     // gated jobs (e.g. a `build` matrix behind a `changes` job) may not exist
@@ -578,6 +657,16 @@ fn decide_from_checks(
     // that's the exact same incomplete-snapshot window, just caught one tick
     // earlier, so it gets the same treatment.
     if matches!(signals.mergeable_state, Some("blocked") | Some("unknown")) {
+        // A base branch with a merge queue never reports "clean": a direct
+        // merge is refused there by design, and the PR reads "blocked"
+        // until it goes through the queue. With every required context
+        // green and no review outstanding, that is the queue's cue -- the
+        // sweep's merge path arms auto-merge, which is how a PR enters the
+        // queue, and the queue's own CI run on the merge group is the real
+        // gate for whatever a still-missing gated job would have covered.
+        if signals.merge_queue_enabled && signals.mergeable_state == Some("blocked") {
+            return passing(labels);
+        }
         return pending();
     }
     passing(labels)
@@ -601,6 +690,12 @@ pub(crate) fn pr_ci_status_from_batch(
     if data.closed {
         return PrCiStatus::Closed { number };
     }
+    if data.is_draft {
+        return PrCiStatus::Draft {
+            number,
+            node_id: data.node_id.clone(),
+        };
+    }
     if data.mergeable == Some(true) && data.mergeable_state.as_deref() == Some("behind") {
         return PrCiStatus::Behind {
             number,
@@ -620,6 +715,14 @@ pub(crate) fn pr_ci_status_from_batch(
             review_decision: data.review_decision.as_deref(),
             rollup_state: data.rollup_state.as_deref(),
             head_sha: data.head_sha.as_deref(),
+            auto_merge: AutoMergeRef {
+                node_id: data.node_id.clone(),
+                enabled: data.auto_merge_enabled,
+                base_ref: data.base_ref.clone(),
+                merge_queue: data.merge_queue_enabled,
+            },
+            merge_queue_enabled: data.merge_queue_enabled,
+            in_merge_queue: data.in_merge_queue,
         },
     )
 }
@@ -821,8 +924,18 @@ fn merge_and_persist_pr_identity(
     number: u64,
     branch: &str,
 ) {
-    let pr = serde_json::json!({ "number": number, "branch": branch });
     if let Err(e) = crate::mcp_server::merge_item_metadata(conn, &item.id, |merged| {
+        // `pr.ready` (see `draft::persist_pr_ready`) survives a re-run of
+        // `done` that finds the same PR again; a different PR number is a
+        // different PR, whose readiness is unknown.
+        let ready = merged
+            .get("pr")
+            .filter(|pr| pr["number"].as_u64() == Some(number))
+            .is_some_and(|pr| pr["ready"] == true);
+        let mut pr = serde_json::json!({ "number": number, "branch": branch });
+        if ready {
+            pr["ready"] = serde_json::Value::Bool(true);
+        }
         merged.insert("pr".into(), pr);
     }) {
         eprintln!(
@@ -885,11 +998,33 @@ fn recover_pr_after_failed_create(
 /// never result here, by configuration" apart from "this attempt failed and
 /// a retry may succeed", which the old bare `Option<String>` couldn't: a
 /// repo with no GitHub remote or no credentials errored `done` forever.
+/// The PR `push_and_open_pr` created or found, as much of it as `item_done`
+/// needs afterwards: the URL for its response, and what flipping a draft to
+/// ready takes (`draft::mark_pr_ready`) without a second lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenedPr {
+    pub url: String,
+    pub number: u64,
+    pub node_id: Option<String>,
+    pub draft: bool,
+}
+
+impl From<crate::github::models::PullRequest> for OpenedPr {
+    fn from(pr: crate::github::models::PullRequest) -> Self {
+        OpenedPr {
+            url: pr.html_url,
+            number: pr.number,
+            node_id: pr.node_id,
+            draft: pr.draft,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum PrOutcome {
     /// A PR exists for this item's branch (freshly created, or already
-    /// open/merged from an earlier `done`). Carries its URL.
-    Opened(String),
+    /// open/merged from an earlier `done`).
+    Opened(OpenedPr),
     /// Nothing to publish: no worktree was ever created, or the branch never
     /// diverged from its target.
     NothingToPush,
@@ -1042,7 +1177,7 @@ fn open_pr_for_pushed_branch(
         if let Some(p) = progress {
             p.send(1.0, Some(1.0), Some("PR already exists".into()));
         }
-        PrOutcome::Opened(existing.html_url)
+        PrOutcome::Opened(existing.into())
     };
     if let Some(number) = pr_number_from_metadata(item) {
         match crate::github::pulls::get(client, repo, number) {
@@ -1091,14 +1226,35 @@ fn open_pr_for_pushed_branch(
             return PrOutcome::Failed(format!("could not check for an existing PR: {e}"));
         }
     }
-    match crate::github::pulls::create(
-        client,
-        repo,
-        &conventional_pr_title(&item.name),
-        branch,
-        target_branch,
-        Some(body),
-    ) {
+    // Opened as a draft: CI starts, but nobody is asked to review and
+    // nothing can merge until `item_done` has recorded the item as
+    // in_review and flips it ready (`draft::mark_pr_ready`) -- so a `done`
+    // that fails between here and there leaves a PR nobody is chasing yet.
+    let title = conventional_pr_title(&item.name);
+    let create = |draft: bool| {
+        crate::github::pulls::create(
+            client,
+            repo,
+            &title,
+            branch,
+            target_branch,
+            Some(body),
+            draft,
+        )
+    };
+    let created = match create(true) {
+        Err(e) if crate::github::pulls::drafts_unsupported(&e) => {
+            eprintln!(
+                "worktree: {repo} does not support draft PRs ({}); opening item {}'s PR as \
+                 ready for review",
+                e.log_safe(),
+                item.id
+            );
+            create(false)
+        }
+        other => other,
+    };
+    match created {
         Ok(pr) => {
             persist_pr_identity(item, pr.number, branch);
             if let Err(e) = crate::github::issues::add_labels(
@@ -1118,7 +1274,7 @@ fn open_pr_for_pushed_branch(
             if let Some(p) = progress {
                 p.send(1.0, Some(1.0), Some("PR created".into()));
             }
-            PrOutcome::Opened(pr.html_url)
+            PrOutcome::Opened(pr.into())
         }
         Err(e) => {
             // `create` fails this way when two workstations independently

@@ -95,6 +95,35 @@ pub fn list_check_runs(
 /// status was still pending or red. One page of 100 covers every realistic
 /// commit; the combined endpoint already de-duplicates to each context's
 /// latest state.
+/// Posts a Statuses-API status on commit `sha` under `context`. A status is
+/// per commit, so a context branch protection requires becomes a merge-time
+/// gate on exactly the heads that carry it: `supervisor::merge_approved_pr`
+/// marks the head it judged (approval label on, no unresolved CodeRabbit
+/// findings) so a repo that requires the context lets GitHub's auto-merge
+/// land only judged heads, and a later push -- a new sha without it -- waits
+/// for the sweep to judge it. `state` is `success`, `pending`, `failure` or
+/// `error`.
+pub fn create_commit_status(
+    client: &Client,
+    repo: &RepoId,
+    sha: &str,
+    state: &str,
+    context: &str,
+    description: &str,
+) -> Result<(), GitHubError> {
+    let path = format!("/repos/{}/{}/statuses/{sha}", repo.owner, repo.repo);
+    client.request(
+        "POST",
+        &path,
+        Some(serde_json::json!({
+            "state": state,
+            "context": context,
+            "description": description,
+        })),
+    )?;
+    Ok(())
+}
+
 pub fn list_commit_statuses(
     client: &Client,
     repo: &RepoId,
@@ -238,6 +267,31 @@ mod tests {
         assert_eq!(
             server.requests()[0].path,
             "/repos/o/r/commits/abc123/check-runs?per_page=100&page=1"
+        );
+    }
+
+    #[test]
+    fn create_commit_status_posts_state_context_and_description() {
+        let server = MockServer::start(vec![MockResponse::json(201, r#"{"id":1}"#)]);
+        let client = server.client(Some("tok"));
+        create_commit_status(
+            &client,
+            &repo(),
+            "abc123",
+            "success",
+            "agentflare/judged",
+            "approval label on, no unresolved findings",
+        )
+        .unwrap();
+        let reqs = server.requests();
+        assert_eq!(reqs[0].method, "POST");
+        assert_eq!(reqs[0].path, "/repos/o/r/statuses/abc123");
+        let sent: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
+        assert_eq!(sent["state"], "success");
+        assert_eq!(sent["context"], "agentflare/judged");
+        assert_eq!(
+            sent["description"],
+            "approval label on, no unresolved findings"
         );
     }
 

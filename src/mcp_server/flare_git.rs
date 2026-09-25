@@ -69,9 +69,23 @@ impl AgentflareMcp {
                     .base
                     .as_deref()
                     .ok_or_else(|| ErrorData::invalid_params("base is required", None))?;
-                let pr = pulls::create(&client, &repo, title, head, base, req.body.as_deref())
-                    .map_err(to_mcp_error)?;
-                format!("Opened PR #{}: {}", pr.number, pr.html_url)
+                let draft = req.draft.unwrap_or(false);
+                let pr = pulls::create(
+                    &client,
+                    &repo,
+                    title,
+                    head,
+                    base,
+                    req.body.as_deref(),
+                    draft,
+                )
+                .map_err(to_mcp_error)?;
+                format!(
+                    "Opened {}PR #{}: {}",
+                    if draft { "draft " } else { "" },
+                    pr.number,
+                    pr.html_url
+                )
             }
             "pr_list" => {
                 let state = req.state.as_deref().unwrap_or("open");
@@ -85,8 +99,12 @@ impl AgentflareMcp {
                     .ok_or_else(|| ErrorData::invalid_params("number is required", None))?;
                 let pr = pulls::get(&client, &repo, n).map_err(to_mcp_error)?;
                 format!(
-                    "PR #{} [{}] {}: {}",
-                    pr.number, pr.state, pr.title, pr.html_url
+                    "PR #{} [{}] {}: {} (head_sha {})",
+                    pr.number,
+                    pr.state,
+                    pr.title,
+                    pr.html_url,
+                    pr.head.as_ref().map(|h| h.sha.as_str()).unwrap_or("?")
                 )
             }
             "pr_status" => {
@@ -153,8 +171,7 @@ impl AgentflareMcp {
                     .number
                     .ok_or_else(|| ErrorData::invalid_params("number is required", None))?;
                 let method = req.merge_method.as_deref().unwrap_or("merge");
-                pulls::merge(&client, &repo, n, method).map_err(to_mcp_error)?;
-                format!("Merged PR #{n} ({method})")
+                merge_pr_pinned(&client, &repo, n, method, req.head_sha.as_deref())?
             }
             "pr_comment" => {
                 let n = req
@@ -383,6 +400,53 @@ impl AgentflareMcp {
     }
 }
 
+/// `pr_merge`, pinned to a head SHA the way the supervisor's own auto-merge
+/// is (`supervisor::merge_approved_pr`): `head_sha` is the head the caller
+/// last saw, from `pr_get`/`pr_status`/`pr_wait`, so a commit pushed after
+/// the caller judged CI green can never ride along into the merge. Without
+/// one, the PR's current head is read first and pinned instead -- that still
+/// closes the window between that read and the merge itself. A moved head
+/// comes back as an error naming both SHAs, so the caller re-checks the new
+/// head rather than retrying blind. Standalone (no `Client::new()`) so it can
+/// be driven against a mock server.
+fn merge_pr_pinned(
+    client: &crate::github::Client,
+    repo: &crate::github::RepoId,
+    number: u64,
+    method: &str,
+    head_sha: Option<&str>,
+) -> Result<String, ErrorData> {
+    use crate::github::pulls;
+    let current_head = |number: u64| {
+        pulls::get(client, repo, number)
+            .ok()
+            .and_then(|pr| pr.head.map(|h| h.sha))
+    };
+    let pinned = match head_sha.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(sha) => sha.to_string(),
+        None => current_head(number).ok_or_else(|| {
+            ErrorData::internal_error(
+                format!("PR #{number}: could not read its head SHA to pin the merge to"),
+                None,
+            )
+        })?,
+    };
+    match pulls::merge_at_head(client, repo, number, method, Some(&pinned)) {
+        Ok(()) => Ok(format!("Merged PR #{number} ({method}) at {pinned}")),
+        Err(e) if pulls::is_head_moved(&e) => {
+            let now = current_head(number).unwrap_or_else(|| "unknown".to_string());
+            Err(ErrorData::invalid_params(
+                format!(
+                    "PR #{number} was not merged: its head moved since {pinned} (now {now}). \
+                     Re-check CI on the new head, then call pr_merge again with head_sha={now}"
+                ),
+                None,
+            ))
+        }
+        Err(e) => Err(to_mcp_error(e)),
+    }
+}
+
 /// Decides the git ref for `workflow_dispatch`: an explicit `git_ref` wins;
 /// otherwise an overridden `repo` resolves its default branch via
 /// `remote_default` (a GitHub API call), and the no-override case via
@@ -449,5 +513,86 @@ mod tests {
         };
         let err = mcp.flare_git_impl(req).unwrap_err();
         assert!(err.to_string().contains("unknown action: bogus"), "{err}");
+    }
+
+    use crate::github::test_support::{MockResponse, MockServer};
+
+    fn repo() -> crate::github::RepoId {
+        crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        }
+    }
+
+    #[test]
+    fn merge_pr_pinned_sends_the_callers_head_sha_without_rereading_the_pr() {
+        let server = MockServer::start(vec![MockResponse::json(200, r#"{"merged":true}"#)]);
+        let client = server.client(Some("tok"));
+        let out = merge_pr_pinned(&client, &repo(), 7, "squash", Some("abc123")).unwrap();
+        assert!(out.contains("Merged PR #7 (squash) at abc123"), "{out}");
+        let reqs = server.requests();
+        assert_eq!(reqs.len(), 1, "a caller-supplied head needs no PR read");
+        assert_eq!(reqs[0].method, "PUT");
+        assert_eq!(reqs[0].path, "/repos/o/r/pulls/7/merge");
+        let sent: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
+        assert_eq!(sent["sha"], "abc123");
+        assert_eq!(sent["merge_method"], "squash");
+    }
+
+    #[test]
+    fn merge_pr_pinned_reads_and_pins_the_current_head_when_none_is_given() {
+        let server = MockServer::start(vec![
+            MockResponse::json(
+                200,
+                r#"{"number":7,"html_url":"u","state":"open","title":"t","head":{"ref":"task/7","sha":"live"}}"#,
+            ),
+            MockResponse::json(200, r#"{"merged":true}"#),
+        ]);
+        let client = server.client(Some("tok"));
+        let out = merge_pr_pinned(&client, &repo(), 7, "merge", None).unwrap();
+        assert!(out.ends_with("at live"), "{out}");
+        let reqs = server.requests();
+        assert_eq!(reqs[0].method, "GET");
+        assert_eq!(reqs[0].path, "/repos/o/r/pulls/7");
+        let sent: serde_json::Value = serde_json::from_str(&reqs[1].body).unwrap();
+        assert_eq!(sent["sha"], "live");
+    }
+
+    #[test]
+    fn merge_pr_pinned_reports_a_moved_head_with_both_shas_and_does_not_retry() {
+        let server = MockServer::start(vec![
+            MockResponse::json(
+                409,
+                r#"{"message":"Head branch was modified. Review and try the merge again."}"#,
+            ),
+            MockResponse::json(
+                200,
+                r#"{"number":7,"html_url":"u","state":"open","title":"t","head":{"ref":"task/7","sha":"newer"}}"#,
+            ),
+        ]);
+        let client = server.client(Some("tok"));
+        let err = merge_pr_pinned(&client, &repo(), 7, "squash", Some("stale")).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("head moved since stale (now newer)"), "{msg}");
+        assert!(msg.contains("head_sha=newer"), "{msg}");
+        let reqs = server.requests();
+        assert_eq!(
+            reqs.len(),
+            2,
+            "one merge attempt, one re-read for the message"
+        );
+        assert_eq!(reqs[0].method, "PUT");
+        assert_eq!(reqs[1].method, "GET");
+    }
+
+    #[test]
+    fn merge_pr_pinned_surfaces_other_github_errors_unchanged() {
+        let server = MockServer::start(vec![MockResponse::json(
+            405,
+            r#"{"message":"Pull Request is not mergeable"}"#,
+        )]);
+        let client = server.client(Some("tok"));
+        let err = merge_pr_pinned(&client, &repo(), 7, "squash", Some("abc")).unwrap_err();
+        assert!(err.to_string().contains("405"), "{err}");
     }
 }

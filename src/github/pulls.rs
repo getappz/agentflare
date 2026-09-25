@@ -10,14 +10,26 @@ fn search_items(page: &serde_json::Value) -> Vec<serde_json::Value> {
         .unwrap_or_default()
 }
 
-fn create_body(title: &str, head: &str, base: &str, body: Option<&str>) -> serde_json::Value {
+fn create_body(
+    title: &str,
+    head: &str,
+    base: &str,
+    body: Option<&str>,
+    draft: bool,
+) -> serde_json::Value {
     let mut v = serde_json::json!({ "title": title, "head": head, "base": base });
     if let Some(b) = body {
         v["body"] = serde_json::Value::String(b.to_string());
     }
+    if draft {
+        v["draft"] = serde_json::Value::Bool(true);
+    }
     v
 }
 
+/// Opens a PR. `draft` opens it as a draft -- CI runs, but reviewers aren't
+/// requested and it can't merge until `graphql::mark_ready_for_review`
+/// flips it; see [`drafts_unsupported`] for the one repo type that refuses.
 pub fn create(
     client: &Client,
     repo: &RepoId,
@@ -25,10 +37,28 @@ pub fn create(
     head: &str,
     base: &str,
     body: Option<&str>,
+    draft: bool,
 ) -> Result<PullRequest, GitHubError> {
     let path = format!("/repos/{}/{}/pulls", repo.owner, repo.repo);
-    let json = client.request("POST", &path, Some(create_body(title, head, base, body)))?;
+    let json = client.request(
+        "POST",
+        &path,
+        Some(create_body(title, head, base, body, draft)),
+    )?;
     serde_json::from_value(json).map_err(|e| GitHubError::Parse(e.to_string()))
+}
+
+/// True when `create` with `draft: true` failed because the repository
+/// can't have draft PRs at all (private repos on plans without them):
+/// GitHub answers 422 naming draft pull requests. The caller retries as an
+/// ordinary PR; any other failure is what it is.
+pub fn drafts_unsupported(err: &GitHubError) -> bool {
+    match err {
+        GitHubError::Http { status: 422, body } => {
+            body.to_lowercase().contains("draft pull request")
+        }
+        _ => false,
+    }
 }
 
 pub fn list(client: &Client, repo: &RepoId, state: &str) -> Result<Vec<PullRequest>, GitHubError> {
@@ -213,11 +243,8 @@ pub fn get(client: &Client, repo: &RepoId, number: u64) -> Result<PullRequest, G
     serde_json::from_value(json).map_err(|e| GitHubError::Parse(e.to_string()))
 }
 
-pub fn merge(client: &Client, repo: &RepoId, number: u64, method: &str) -> Result<(), GitHubError> {
-    merge_at_head(client, repo, number, method, None)
-}
-
-/// `merge`, pinned to `head_sha` when given: GitHub then refuses with 409
+/// Merges PR `number`, pinned to `head_sha` when given: GitHub then refuses
+/// with 409
 /// if the PR's head has moved since -- a commit pushed after the caller
 /// judged CI green must never ride along into the merge unchecked. Callers
 /// treat that 409 as "look again next tick" (see [`is_head_moved`]).
@@ -359,11 +386,33 @@ mod tests {
 
     #[test]
     fn create_body_includes_optional_body_only_when_present() {
-        let with = create_body("t", "h", "b", Some("desc"));
+        let with = create_body("t", "h", "b", Some("desc"), false);
         assert_eq!(with["title"], "t");
         assert_eq!(with["body"], "desc");
-        let without = create_body("t", "h", "b", None);
+        assert!(without_draft_key(&with), "draft is only sent when set");
+        let without = create_body("t", "h", "b", None, true);
         assert!(without.get("body").is_none());
+        assert_eq!(without["draft"], true);
+    }
+
+    fn without_draft_key(v: &serde_json::Value) -> bool {
+        v.get("draft").is_none()
+    }
+
+    #[test]
+    fn drafts_unsupported_matches_githubs_422_only() {
+        let refused = GitHubError::Http {
+            status: 422,
+            body: r#"{"message":"Draft pull requests are not supported in this repository."}"#
+                .into(),
+        };
+        assert!(drafts_unsupported(&refused));
+        let other_422 = GitHubError::Http {
+            status: 422,
+            body: r#"{"message":"A pull request already exists for o:task/7."}"#.into(),
+        };
+        assert!(!drafts_unsupported(&other_422));
+        assert!(!drafts_unsupported(&GitHubError::NotFound));
     }
 
     fn repo() -> RepoId {
@@ -380,7 +429,7 @@ mod tests {
             r#"{"number":7,"html_url":"https://gh/o/r/pull/7","state":"open","title":"t"}"#,
         )]);
         let client = server.client(Some("tok"));
-        let pr = create(&client, &repo(), "t", "head", "main", Some("desc")).unwrap();
+        let pr = create(&client, &repo(), "t", "head", "main", Some("desc"), true).unwrap();
         assert_eq!(pr.number, 7);
 
         let reqs = server.requests();
@@ -390,6 +439,7 @@ mod tests {
         assert_eq!(sent["head"], "head");
         assert_eq!(sent["base"], "main");
         assert_eq!(sent["body"], "desc");
+        assert_eq!(sent["draft"], true);
     }
 
     #[test]
@@ -631,10 +681,10 @@ mod tests {
     }
 
     #[test]
-    fn merge_puts_the_chosen_method() {
+    fn merge_at_head_puts_the_chosen_method() {
         let server = MockServer::start(vec![MockResponse::json(200, r#"{"merged":true}"#)]);
         let client = server.client(Some("tok"));
-        merge(&client, &repo(), 3, "squash").unwrap();
+        merge_at_head(&client, &repo(), 3, "squash", None).unwrap();
         let reqs = server.requests();
         assert_eq!(reqs[0].method, "PUT");
         assert_eq!(reqs[0].path, "/repos/o/r/pulls/3/merge");
