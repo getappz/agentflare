@@ -60,6 +60,10 @@ impl AgentflareMcp {
                     decisions: req.decisions,
                     files_touched: req.files_touched,
                     evidence: req.evidence,
+                    completed: req.completed,
+                    remaining: req.remaining,
+                    source_ref: req.source_ref,
+                    dropped_fields: req.dropped_fields,
                 };
                 crate::memory::mcp::handle_handoff(input)
                     .map_err(|e| ErrorData::internal_error(e, None))

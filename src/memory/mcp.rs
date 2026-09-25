@@ -315,6 +315,14 @@ pub struct HandoffInput {
     pub decisions: Option<Vec<serde_json::Value>>,
     pub files_touched: Option<Vec<serde_json::Value>>,
     pub evidence: Option<Vec<serde_json::Value>>,
+    /// Authored completed-vs-remaining split (item #674): what is done.
+    pub completed: Option<Vec<serde_json::Value>>,
+    /// Authored completed-vs-remaining split: what is left for the receiver.
+    pub remaining: Option<Vec<serde_json::Value>>,
+    /// Foreign source reference, e.g. `claude_code:<session-id>`.
+    pub source_ref: Option<String>,
+    /// Loss accounting: field names this handoff knowingly drops.
+    pub dropped_fields: Option<Vec<String>>,
 }
 
 pub fn handle_handoff(input: HandoffInput) -> Result<String, String> {
@@ -364,6 +372,14 @@ fn handoff_with_conn(conn: &rusqlite::Connection, input: HandoffInput) -> Result
         .evidence
         .as_ref()
         .map(|v| serde_json::to_string(&v).unwrap_or_default());
+    let completed = input
+        .completed
+        .as_ref()
+        .map(|v| serde_json::to_string(&v).unwrap_or_default());
+    let remaining = input
+        .remaining
+        .as_ref()
+        .map(|v| serde_json::to_string(&v).unwrap_or_default());
 
     let snapshot = json!({
         "session_id": input.session_id,
@@ -372,6 +388,10 @@ fn handoff_with_conn(conn: &rusqlite::Connection, input: HandoffInput) -> Result
         "findings_count": input.findings.as_ref().map(|v| v.len()).unwrap_or(0),
         "decisions_count": input.decisions.as_ref().map(|v| v.len()).unwrap_or(0),
         "files_touched_count": input.files_touched.as_ref().map(|v| v.len()).unwrap_or(0),
+        "completed": input.completed.as_deref().unwrap_or(&[]),
+        "remaining": input.remaining.as_deref().unwrap_or(&[]),
+        "source_ref": input.source_ref,
+        "dropped_fields": input.dropped_fields.as_deref().unwrap_or(&[]),
     })
     .to_string();
 
@@ -614,6 +634,10 @@ mod tests {
             decisions: None,
             files_touched: None,
             evidence: None,
+            completed: None,
+            remaining: None,
+            source_ref: None,
+            dropped_fields: None,
         };
         let out = handoff_with_conn(&conn, input).unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -640,6 +664,10 @@ mod tests {
             decisions: None,
             files_touched: None,
             evidence: None,
+            completed: None,
+            remaining: None,
+            source_ref: None,
+            dropped_fields: None,
         };
         handoff_with_conn(&conn, input).unwrap();
 
@@ -652,6 +680,37 @@ mod tests {
                 .unwrap()
                 .contains("did the thing")
         );
+    }
+
+    // Item #674: the authored completed/remaining split, source ref, and
+    // loss accounting must persist in the snapshot so a receiving agent can
+    // resume without re-deriving them from turns.
+    #[test]
+    fn handoff_persists_authored_split_and_source_ref() {
+        let conn = new_db();
+        let input = HandoffInput {
+            session_id: "sess-split".to_string(),
+            summary: "half done".to_string(),
+            findings: None,
+            decisions: None,
+            files_touched: None,
+            evidence: None,
+            completed: Some(vec![serde_json::json!("migrated sessions")]),
+            remaining: Some(vec![serde_json::json!("wire inbox")]),
+            source_ref: Some("claude_code:abc123".into()),
+            dropped_fields: Some(vec!["tool outputs".into()]),
+        };
+        let out = handoff_with_conn(&conn, input).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["status"], "closed");
+
+        let session = sessions::get(&conn, "sess-split").unwrap().unwrap();
+        let snap: serde_json::Value =
+            serde_json::from_str(session.compaction_snapshot.as_deref().unwrap()).unwrap();
+        assert_eq!(snap["completed"], serde_json::json!(["migrated sessions"]));
+        assert_eq!(snap["remaining"], serde_json::json!(["wire inbox"]));
+        assert_eq!(snap["source_ref"], serde_json::json!("claude_code:abc123"));
+        assert_eq!(snap["dropped_fields"], serde_json::json!(["tool outputs"]));
     }
 
     // Regression test for item 7: the type filter used to be applied via

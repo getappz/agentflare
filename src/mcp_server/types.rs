@@ -453,6 +453,18 @@ pub(crate) struct MemoryRequest {
     #[schemars(description = "Evidence array [{kind, action, detail}] (handoff)")]
     #[serde(default)]
     pub(crate) evidence: Option<Vec<serde_json::Value>>,
+    #[schemars(description = "What's done (handoff, item #674)")]
+    #[serde(default)]
+    pub(crate) completed: Option<Vec<serde_json::Value>>,
+    #[schemars(description = "What's left for the receiver (handoff, item #674)")]
+    #[serde(default)]
+    pub(crate) remaining: Option<Vec<serde_json::Value>>,
+    #[schemars(description = "Foreign source ref, e.g. claude_code:<session-id> (handoff)")]
+    #[serde(default)]
+    pub(crate) source_ref: Option<String>,
+    #[schemars(description = "Field names knowingly dropped from this handoff")]
+    #[serde(default)]
+    pub(crate) dropped_fields: Option<Vec<String>>,
     #[schemars(description = "Source observation ID (relate)")]
     #[serde(default)]
     pub(crate) source_id: Option<i64>,
