@@ -216,28 +216,33 @@ fn ancestor_names() -> Vec<String> {
     let mut sys = System::new();
     let mut names = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut pid = Pid::from_u32(std::process::id());
+    let me = Pid::from_u32(std::process::id());
+    let mut pid = me;
     while names.len() < MAX_HOPS && seen.insert(pid) {
         sys.refresh_processes_specifics(
             ProcessesToUpdate::Some(&[pid]),
             false,
             ProcessRefreshKind::nothing(),
         );
-        let Some(parent) = sys.process(pid).and_then(sysinfo::Process::parent) else {
+        let Some(proc_) = sys.process(pid) else {
             break;
         };
-        sys.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&[parent]),
-            false,
-            ProcessRefreshKind::nothing(),
-        );
-        let Some(proc_) = sys.process(parent) else {
+        if pid != me {
+            names.push(proc_.name().to_string_lossy().into_owned());
+        }
+        let Some(parent) = proc_.parent() else {
             break;
         };
-        names.push(proc_.name().to_string_lossy().into_owned());
         pid = parent;
     }
     names
+}
+
+/// No process-table access on other targets: only the env-marker tier can
+/// identify an agent there.
+#[cfg(not(any(unix, windows)))]
+fn ancestor_names() -> Vec<String> {
+    Vec::new()
 }
 
 #[cfg(test)]
