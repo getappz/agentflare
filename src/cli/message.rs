@@ -205,31 +205,6 @@ fn consumer_gone(m: &messages::Message, take: bool) -> ! {
     std::process::exit(0);
 }
 
-/// Ids this watch already printed, most recent [`Printed::CAP`]. A dropped
-/// `take` stream requeues what may not have reached the client, so a
-/// reconnect can hand back a message that did; this skips reprinting it.
-/// Exact ids, not a cursor: a rerouted message keeps its older id.
-#[derive(Default)]
-struct Printed(std::collections::VecDeque<i64>);
-
-impl Printed {
-    const CAP: usize = 64;
-
-    /// Prints `m` unless this watch already did; exits if the consumer is gone.
-    fn deliver(&mut self, m: &messages::Message, json: bool, take: bool) {
-        if take && self.0.contains(&m.id) {
-            return;
-        }
-        if !emit(m, json) {
-            consumer_gone(m, take);
-        }
-        self.0.push_back(m.id);
-        if self.0.len() > Self::CAP {
-            self.0.pop_front();
-        }
-    }
-}
-
 fn encode(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
@@ -241,16 +216,39 @@ fn encode(s: &str) -> String {
         .collect()
 }
 
-/// Streams `to`'s messages: over the daemon's SSE endpoint when it's up
-/// (pushed the moment they're sent), else by polling the db every second.
-/// With `take`, each message is marked delivered as it's printed -- claimed
-/// one at a time and handed back if printing it fails, so a consumer that
-/// closes the pipe mid-batch never costs the rest of the batch.
+/// Prints `m`; exits (handing a taken `m` back) if the consumer is gone.
+fn deliver(m: &messages::Message, json: bool, take: bool) {
+    if !emit(m, json) {
+        consumer_gone(m, take);
+    }
+}
+
+/// Claims and prints `to`'s undelivered messages one at a time: each is
+/// marked delivered (atomically, so concurrent watchers never both print
+/// it) right before this process prints it, and handed back if printing
+/// fails -- delivery is decided here, where printing is known to succeed.
+fn drain(conn: &rusqlite::Connection, to: &str, json: bool) {
+    for _ in 0..messages::MAX_BATCH {
+        let now = crate::claims::now();
+        let Some(m) = messages::take_undelivered(conn, to, 1, now)
+            .unwrap_or_default()
+            .pop()
+        else {
+            return;
+        };
+        deliver(&m, json, true);
+    }
+}
+
+/// Streams `to`'s messages: woken over the daemon's SSE endpoint when it's
+/// up (pushed the moment they're sent), else by polling the db every
+/// second. With `take`, the stream is only a wake-up: messages are claimed
+/// and printed by [`drain`], never marked delivered by the daemon (SSE gives
+/// no receipt that the client got an event).
 fn watch(to: &str, take: bool, json: bool, port: u16) {
-    let mut after = open_after_cursor(take);
-    let mut printed = Printed::default();
+    let mut after = messages::max_id(&open()).unwrap_or(0);
     loop {
-        if let Some(last) = watch_sse(to, take, json, port, after, &mut printed) {
+        if let Some(last) = watch_sse(to, take, json, port, after) {
             after = after.max(last);
         }
         // Daemon unreachable (or the stream ended): poll until it's back.
@@ -258,23 +256,13 @@ fn watch(to: &str, take: bool, json: bool, port: u16) {
         let mut ticks = 0u32;
         loop {
             if take {
-                for _ in 0..messages::MAX_BATCH {
-                    let now = crate::claims::now();
-                    let Some(m) = messages::take_undelivered(&conn, to, 1, now)
-                        .unwrap_or_default()
-                        .pop()
-                    else {
-                        break;
-                    };
-                    after = after.max(m.id);
-                    printed.deliver(&m, json, take);
-                }
+                drain(&conn, to, json);
             } else {
                 for m in
                     messages::since(&conn, Some(to), after, messages::MAX_BATCH).unwrap_or_default()
                 {
                     after = after.max(m.id);
-                    printed.deliver(&m, json, take);
+                    deliver(&m, json, false);
                 }
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
@@ -287,41 +275,36 @@ fn watch(to: &str, take: bool, json: bool, port: u16) {
     }
 }
 
-/// Where an observe-only watch starts: only messages sent from now on.
-fn open_after_cursor(take: bool) -> i64 {
-    if take {
-        return 0;
-    }
-    messages::max_id(&open()).unwrap_or(0)
-}
-
 /// Reads the SSE stream until it ends; returns the last id seen, or `None`
-/// if it couldn't connect.
-fn watch_sse(
-    to: &str,
-    take: bool,
-    json: bool,
-    port: u16,
-    after: i64,
-    printed: &mut Printed,
-) -> Option<i64> {
+/// if it couldn't connect. With `take`, drains the mailbox on connect and
+/// on every line (an event or the keep-alive), which also picks up mail
+/// rerouted into it without a new send.
+fn watch_sse(to: &str, take: bool, json: bool, port: u16, after: i64) -> Option<i64> {
     let url = format!(
-        "http://127.0.0.1:{port}/api/messages/stream?to={}&take={take}&after={after}",
+        "http://127.0.0.1:{port}/api/messages/stream?to={}&after={after}",
         encode(to)
     );
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(std::time::Duration::from_millis(500))
         .build();
     let resp = agent.get(&url).call().ok()?;
+    let conn = take.then(open);
+    if let Some(c) = &conn {
+        drain(c, to, json);
+    }
     let mut last = after;
     for line in std::io::BufReader::new(resp.into_reader()).lines() {
         let Ok(line) = line else { break };
+        if let Some(c) = &conn {
+            drain(c, to, json);
+            continue;
+        }
         let Some(data) = line.strip_prefix("data:") else {
             continue;
         };
         if let Ok(m) = serde_json::from_str::<messages::Message>(data.trim()) {
             last = last.max(m.id);
-            printed.deliver(&m, json, take);
+            deliver(&m, json, false);
         }
     }
     Some(last)
@@ -339,15 +322,15 @@ mod tests {
     }
 
     #[test]
-    fn printed_remembers_a_bounded_window_of_ids() {
-        let mut p = Printed::default();
-        for id in 0..(Printed::CAP as i64 + 1) {
-            p.0.push_back(id);
-            if p.0.len() > Printed::CAP {
-                p.0.pop_front();
+    fn drain_claims_only_the_watched_mailbox() {
+        crate::paths::test_support::with_temp_home(|| {
+            let conn = crate::db::open().unwrap();
+            for to in ["human:me", "human:me", "human:other"] {
+                messages::send(&conn, "x:1", to, "hi", None, 100, |_| Err(String::new())).unwrap();
             }
-        }
-        assert!(!p.0.contains(&0));
-        assert!(p.0.contains(&(Printed::CAP as i64)));
+            drain(&conn, "human:me", true);
+            assert!(!messages::has_undelivered(&conn, "human:me").unwrap());
+            assert!(messages::has_undelivered(&conn, "human:other").unwrap());
+        });
     }
 }

@@ -270,6 +270,103 @@ fn post_tool_use_matcher() -> String {
     )
 }
 
+/// One agentflare hook wiring for Claude Code. Shared by `wire_claude_code`
+/// (user-scope `~/.claude/settings.json`) and `claude_job_config` (the
+/// job-scoped `--settings` file a headless dispatch carries on a host
+/// `init` never ran on), so the two can't drift apart.
+pub(crate) struct ClaudeHookSpec {
+    pub event: &'static str,
+    /// Substring identifying this wiring in an existing entry (see
+    /// `add_hook_entry`).
+    pub marker: &'static str,
+    pub matcher: Option<String>,
+    pub command: String,
+    pub timeout: u64,
+}
+
+/// Every hook `agentflare init --agent claude-code` wires, in install order.
+pub(crate) fn claude_hook_specs(bin: &str) -> Vec<ClaudeHookSpec> {
+    let spec = |event: &'static str,
+                marker: &'static str,
+                matcher: Option<String>,
+                subcommand: &str,
+                timeout: u64| ClaudeHookSpec {
+        event,
+        marker,
+        matcher,
+        command: format!("\"{bin}\" hook {subcommand}"),
+        timeout,
+    };
+    vec![
+        spec(
+            "SessionStart",
+            "hook session-start",
+            None,
+            "session-start",
+            10,
+        ),
+        spec(
+            "UserPromptSubmit",
+            "hook prompt-submit",
+            None,
+            "prompt-submit",
+            5,
+        ),
+        spec("PreToolUse", "hook pre-tool-use", None, "pre-tool-use", 5),
+        spec("PreCompact", "hook pre-compact", None, "pre-compact", 5),
+        // Inter-agent messaging: Stop blocks an about-to-idle agent to
+        // deliver messages that arrived during its turn; SessionEnd takes
+        // the session out of the live-session registry so it stops being
+        // addressable.
+        spec("Stop", "hook stop", None, "stop", 5),
+        spec("SessionEnd", "hook session-end", None, "session-end", 5),
+        spec(
+            "PostToolUseFailure",
+            "hook post-tool-failure",
+            Some("Bash|Edit|Write".to_string()),
+            "post-tool-failure",
+            5,
+        ),
+        // Completion gate (item #169): records verification evidence off
+        // successful Bash-family calls, invalidates it off a successful
+        // mutating edit, and surfaces the finishing-a-development-branch
+        // menu off a successful `item done`/`check_merge` -- no single tool
+        // name covers all three, so the matcher is scoped to their union
+        // (unlike PreToolUse, which genuinely needs every tool call for the
+        // branch guard) rather than left unmatched, so this doesn't spawn a
+        // subprocess on every Read/Grep/etc call too.
+        spec(
+            "PostToolUse",
+            "hook post-tool-use",
+            Some(post_tool_use_matcher()),
+            "post-tool-use",
+            5,
+        ),
+    ]
+}
+
+/// Applies [`claude_hook_specs`] to a `hooks` object in place (idempotent,
+/// backfilling and matcher-refreshing per `add_hook_entry`), after retiring
+/// the old prompt-type PostToolUseFailure hook (identified by its "genuine
+/// FRICTION" judge-prompt marker) so an upgraded install doesn't run both
+/// the retired and replacement form side by side. Returns whether anything
+/// changed.
+pub(crate) fn apply_claude_hook_specs(hooks_obj: &mut Map<String, Value>, bin: &str) -> bool {
+    let mut added =
+        remove_hook_entries_matching(hooks_obj, "PostToolUseFailure", "genuine FRICTION");
+    for spec in claude_hook_specs(bin) {
+        added |= add_hook_entry(
+            hooks_obj,
+            spec.event,
+            spec.marker,
+            spec.matcher.as_deref(),
+            spec.command,
+            spec.timeout,
+        );
+    }
+    added
+}
+
 fn wire_claude_code() {
     let path = claude_settings_path();
     let mut settings = read_json_object(&path, || json!({}));
@@ -279,87 +376,7 @@ fn wire_claude_code() {
     let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
     let hooks_obj = hooks.as_object_mut().unwrap();
 
-    let mut added = false;
-    added |= add_hook_entry(
-        hooks_obj,
-        "SessionStart",
-        "hook session-start",
-        None,
-        format!("\"{bin}\" hook session-start"),
-        10,
-    );
-    added |= add_hook_entry(
-        hooks_obj,
-        "UserPromptSubmit",
-        "hook prompt-submit",
-        None,
-        format!("\"{bin}\" hook prompt-submit"),
-        5,
-    );
-    added |= add_hook_entry(
-        hooks_obj,
-        "PreToolUse",
-        "hook pre-tool-use",
-        None,
-        format!("\"{bin}\" hook pre-tool-use"),
-        5,
-    );
-    added |= add_hook_entry(
-        hooks_obj,
-        "PreCompact",
-        "hook pre-compact",
-        None,
-        format!("\"{bin}\" hook pre-compact"),
-        5,
-    );
-    // Inter-agent messaging: Stop blocks an about-to-idle agent to deliver
-    // messages that arrived during its turn; SessionEnd takes the session
-    // out of the live-session registry so it stops being addressable.
-    added |= add_hook_entry(
-        hooks_obj,
-        "Stop",
-        "hook stop",
-        None,
-        format!("\"{bin}\" hook stop"),
-        5,
-    );
-    added |= add_hook_entry(
-        hooks_obj,
-        "SessionEnd",
-        "hook session-end",
-        None,
-        format!("\"{bin}\" hook session-end"),
-        5,
-    );
-    // Retire the old prompt-type PostToolUseFailure hook (identified by its
-    // "genuine FRICTION" judge-prompt marker) before wiring the deterministic
-    // command hook that replaces it, so an upgraded install doesn't end up
-    // running both.
-    added |= remove_hook_entries_matching(hooks_obj, "PostToolUseFailure", "genuine FRICTION");
-    added |= add_hook_entry(
-        hooks_obj,
-        "PostToolUseFailure",
-        "hook post-tool-failure",
-        Some("Bash|Edit|Write"),
-        format!("\"{bin}\" hook post-tool-failure"),
-        5,
-    );
-    // Completion gate (item #169): records verification evidence off
-    // successful Bash-family calls, invalidates it off a successful mutating
-    // edit, and surfaces the finishing-a-development-branch menu off a
-    // successful `item done`/`check_merge` -- no single tool name covers all
-    // three, so the matcher is scoped to their union (unlike PreToolUse,
-    // which genuinely needs every tool call for the branch guard) rather
-    // than left unmatched, so this doesn't spawn a subprocess on every Read/
-    // Grep/etc call too.
-    added |= add_hook_entry(
-        hooks_obj,
-        "PostToolUse",
-        "hook post-tool-use",
-        Some(&post_tool_use_matcher()),
-        format!("\"{bin}\" hook post-tool-use"),
-        5,
-    );
+    let added = apply_claude_hook_specs(hooks_obj, &bin);
 
     if !added {
         ui::skip("~/.claude/settings.json hooks (already wired)");

@@ -793,6 +793,14 @@ fn real_agent_send_hook(
                         agentflare_jobs::cancel::CANCELLED_MESSAGE.to_string(),
                     );
                 }
+                // Per dispatch, keyed on the role's actual agent (the judge
+                // may run on a different CLI than the implementer): make a
+                // Claude Code job self-contained on a host `init` never
+                // wired. Filesystem work, so it stays on the blocking pool.
+                let mut all_args = all_args;
+                if let Some(agent_enum) = agent_registry::agent_by_name(&agent) {
+                    all_args.extend(crate::claude_job_config::job_scoped_args(agent_enum));
+                }
                 match &cwd {
                     // Explicit cwd (the item's own worktree, threaded through
                     // `WorkItemData::worktree_path`) instead of the ambient
@@ -825,14 +833,18 @@ fn real_agent_send_hook(
             .await
             .map_err(|e| format!("agent task panicked: {e}"))?;
             match outcome {
-                crate::agent_launch::HeadlessOutcome::Ok(reply) => Ok((
-                    encode_session(
-                        &crate::agent_launch::clean_agent_reply(&agent_for_reply, reply.text),
-                        reply.session_id.as_deref(),
-                    ),
-                    0,
-                    0,
-                )),
+                crate::agent_launch::HeadlessOutcome::Ok(reply) => {
+                    let session_id = reply.session_id.clone();
+                    let (text, in_tok, out_tok) = crate::agent_launch::reply_payload(reply);
+                    Ok((
+                        encode_session(
+                            &crate::agent_launch::clean_agent_reply(&agent_for_reply, text),
+                            session_id.as_deref(),
+                        ),
+                        in_tok,
+                        out_tok,
+                    ))
+                }
                 crate::agent_launch::HeadlessOutcome::UnknownAgent(e)
                 | crate::agent_launch::HeadlessOutcome::NotHeadless(e)
                 | crate::agent_launch::HeadlessOutcome::NotFound(e)

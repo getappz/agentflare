@@ -55,6 +55,12 @@ pub struct StepInvocation {
     /// claim was filed under instead of a fresh process-pid instance. `None`
     /// for callers (e.g. the JSON pipeline) with no claim-owner concept.
     pub owner: Option<String>,
+    /// Named agent definition the step runs *as* (a `JsonStep::persona`):
+    /// on Claude Code the session is launched with `--agent <name>` so the
+    /// definition's own system prompt, tools and model apply natively; the
+    /// send hook folds the definition's body into the prompt for agents
+    /// without an equivalent.
+    pub persona: Option<String>,
 }
 
 impl StepInvocation {
@@ -124,6 +130,13 @@ pub struct JsonStep {
     /// Extra CLI flags passed to `agent`'s headless invocation, verbatim.
     #[serde(default)]
     pub args: Vec<String>,
+    /// Run this step as a named agent definition (an App persona, projected
+    /// to `.claude/agents/<name>.md`). Replaces "read `<file>` and answer in
+    /// that voice" prompt prefixes: on Claude Code the step launches with
+    /// `--agent <name>`; elsewhere the send hook folds the definition into
+    /// the prompt.
+    #[serde(default)]
+    pub persona: Option<String>,
     /// Overrides the send hook's default hard subprocess timeout for this
     /// step.
     #[serde(default)]
@@ -247,6 +260,7 @@ pub fn compile_workflow(
                 args: s.args.clone(),
                 hard_cap_secs: s.hard_cap_secs,
                 idle_timeout_secs: s.idle_timeout_secs,
+                persona: s.persona.clone(),
             }),
         };
         let mut def = StepDefinition::new(s.name.clone(), s.name.clone(), executor)
@@ -359,6 +373,7 @@ struct PromptExecutor {
     args: Vec<String>,
     hard_cap_secs: Option<u64>,
     idle_timeout_secs: Option<u64>,
+    persona: Option<String>,
 }
 
 #[async_trait]
@@ -374,6 +389,7 @@ impl StepExecutor<PipelineData> for PromptExecutor {
             idle_timeout_secs: self.idle_timeout_secs,
             cwd: None,
             owner: None,
+            persona: self.persona.clone(),
         };
         let (output, input_tokens, output_tokens) =
             (self.send)(invocation)
@@ -631,6 +647,51 @@ mod tests {
         assert_eq!(inv.args, vec!["--dangerously-skip-permissions"]);
         assert_eq!(inv.hard_cap_secs, Some(42));
         assert_eq!(inv.idle_timeout_secs, Some(7));
+        assert_eq!(inv.persona, None, "no persona unless the step names one");
+    }
+
+    #[tokio::test]
+    async fn step_persona_reaches_the_send_hook() {
+        let captured: std::sync::Arc<std::sync::Mutex<Option<StepInvocation>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_clone = std::sync::Arc::clone(&captured);
+        let send: SendMessage = Arc::new(move |inv: StepInvocation| {
+            *captured_clone.lock().unwrap() = Some(inv);
+            Box::pin(async move { Ok(("ok".to_string(), 0, 0)) })
+        });
+
+        let json: JsonWorkflow = serde_json::from_str(
+            r#"{
+                "name": "persona-step",
+                "steps": [
+                    { "name": "pitch", "agent": "claude-code", "persona": "ceo-bezos", "prompt": "Pitch one idea." }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let wf = compile_workflow(&json, send).unwrap();
+        let engine = WorkflowEngine::<PipelineData, InMemoryStore<PipelineData>>::new();
+        engine.register_workflow(wf).unwrap();
+        let run = engine
+            .start_workflow(
+                crate::types::WorkflowId::new("persona-step"),
+                PipelineData,
+                "in".into(),
+            )
+            .await
+            .unwrap();
+        engine
+            .wait_for_completion(run, "wf", std::time::Duration::from_secs(10))
+            .await
+            .unwrap();
+
+        let inv = captured.lock().unwrap().clone().expect("send was called");
+        assert_eq!(inv.persona.as_deref(), Some("ceo-bezos"));
+        assert_eq!(
+            inv.prompt, "Pitch one idea.",
+            "the prompt is not rewritten here; the send hook applies the persona"
+        );
     }
 
     /// Build a bare context carrying only the given variables, for testing

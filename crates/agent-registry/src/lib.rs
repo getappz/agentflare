@@ -12,7 +12,9 @@ pub use registry::{
     Agent, AgentSpec, REGISTRY, Tier, agent_by_name, autonomous_args, canonicalize,
     clinepass_model_for_claude, headless_args, json_output_args, mode_flag, resume_arg, spec,
 };
-pub use role::{CompiledRole, PermissionMode, RoleSpec, compile_role, prompt_with_system_fallback};
+pub use role::{
+    CompiledRole, Effort, PermissionMode, RoleSpec, compile_role, prompt_with_system_fallback,
+};
 pub use router::{
     RouteDecision, RouterConfig, RouterRule, RuleMatch, TaskContext, model_for_task,
     parse_router_config, route,

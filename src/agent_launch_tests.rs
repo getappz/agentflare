@@ -856,6 +856,90 @@
     }
 
     #[test]
+    fn parse_json_reply_reads_usage_turns_subtype_and_structured_output() {
+        let raw = r#"{"type":"result","subtype":"success","is_error":false,"num_turns":7,"result":"done","session_id":"s-1","total_cost_usd":0.5,"usage":{"input_tokens":100,"cache_creation_input_tokens":20,"cache_read_input_tokens":30,"output_tokens":40},"structured_output":{"action":"advance_task"}}"#;
+        let reply = parse_json_reply(raw);
+        assert_eq!(reply.subtype.as_deref(), Some("success"));
+        assert!(!reply.is_error);
+        assert_eq!(reply.num_turns, Some(7));
+        assert_eq!(reply.input_tokens, Some(150), "fresh + cache-creation + cache-read");
+        assert_eq!(reply.output_tokens, Some(40));
+        assert_eq!(
+            reply.structured_output,
+            Some(serde_json::json!({"action":"advance_task"}))
+        );
+        let (text, in_tok, out_tok) = reply_payload(reply);
+        assert_eq!(text, r#"{"action":"advance_task"}"#, "structured output wins");
+        assert_eq!((in_tok, out_tok), (150, 40));
+    }
+
+    #[test]
+    fn parse_json_reply_result_event_without_result_text_yields_empty_text_not_the_transcript() {
+        let raw = concat!(
+            r#"{"type":"system","subtype":"init","session_id":"s-2"}"#,
+            "\n",
+            r#"{"type":"result","subtype":"error_max_turns","is_error":true,"session_id":"s-2","num_turns":5}"#,
+        );
+        let reply = parse_json_reply(raw);
+        assert_eq!(reply.text, "");
+        assert_eq!(reply.session_id.as_deref(), Some("s-2"));
+        assert_eq!(reply.subtype.as_deref(), Some("error_max_turns"));
+        assert!(reply.is_error);
+        assert_eq!(reply.input_tokens, None, "no usage block, no fabricated count");
+    }
+
+    #[test]
+    fn reply_payload_reports_zero_tokens_when_the_agent_gave_none() {
+        let reply = parse_json_reply("plain text reply");
+        assert_eq!(reply_payload(reply), ("plain text reply".to_string(), 0, 0));
+    }
+
+    #[test]
+    fn classify_result_reply_keeps_a_cap_hit_usable_with_its_session() {
+        let reply = parse_json_reply(
+            r#"{"type":"result","subtype":"error_max_turns","is_error":true,"result":"halfway there","session_id":"s-3"}"#,
+        );
+        match classify_result_reply("Claude Code", reply) {
+            HeadlessOutcome::Ok(reply) => {
+                assert!(reply.text.starts_with("[agentflare] Claude Code stopped early: error_max_turns"));
+                assert!(reply.text.ends_with("halfway there"));
+                assert_eq!(reply.session_id.as_deref(), Some("s-3"), "resume stays possible");
+            }
+            other => panic!("a cap hit must stay Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_result_reply_fails_on_other_error_subtypes_naming_them() {
+        let reply = parse_json_reply(
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"boom","session_id":"s-4"}"#,
+        );
+        match classify_result_reply("Claude Code", reply) {
+            HeadlessOutcome::Failed(msg) => {
+                assert!(msg.contains("error_during_execution"), "{msg}");
+                assert!(msg.contains("boom"), "{msg}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_result_reply_passes_a_success_through() {
+        let reply = parse_json_reply(r#"{"type":"result","subtype":"success","result":"ok","session_id":"s-5"}"#);
+        assert!(matches!(
+            classify_result_reply("Claude Code", reply),
+            HeadlessOutcome::Ok(r) if r.text == "ok"
+        ));
+    }
+
+    #[test]
+    fn result_subtype_note_names_the_reason_when_stdout_ends_in_a_result_event() {
+        let stdout = "{\"type\":\"system\"}\n{\"type\":\"result\",\"subtype\":\"error_during_execution\"}";
+        assert_eq!(result_subtype_note(stdout), " (error_during_execution)");
+        assert_eq!(result_subtype_note("nothing structured"), "");
+    }
+
+    #[test]
     fn headless_full_args_adds_nothing_when_json_is_not_requested_or_unsupported() {
         let extra = vec!["--full-auto".to_string()];
         assert_eq!(headless_full_args(Agent::ClaudeCode, false, &extra), extra);

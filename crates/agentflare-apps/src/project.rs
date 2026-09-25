@@ -7,10 +7,9 @@ pub fn project_for_claude_code(
     scratch_dir: &Path,
     tools: Option<&ToolsManifest>,
 ) -> Result<(), String> {
-    project_dir(
+    project_personas(
         &app_dir.join("personas"),
         &scratch_dir.join(".claude/agents"),
-        "md",
     )?;
     project_skills(&app_dir.join("skills"), &scratch_dir.join(".claude/skills"))?;
 
@@ -29,19 +28,54 @@ pub fn project_for_claude_code(
     Ok(())
 }
 
-fn project_dir(src: &Path, dst: &Path, ext: &str) -> Result<(), String> {
+/// Copies each `personas/<name>.md` to `<dst>/<name>.md` as a Claude Code
+/// agent definition. Claude Code only loads `.claude/agents/*.md` files
+/// that open with YAML frontmatter carrying `name` and `description`, and
+/// App personas are plain markdown, so [`ensure_agent_frontmatter`] adds
+/// the header each one lacks — which is what lets a workflow step run as
+/// the persona (`--agent <name>`) instead of asking the model to read the
+/// file and role-play.
+fn project_personas(src: &Path, dst: &Path) -> Result<(), String> {
     if !src.is_dir() {
         return Ok(());
     }
     std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
     for entry in std::fs::read_dir(src).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
-        if entry.path().extension().is_some_and(|e| e == ext) {
-            let target = dst.join(entry.file_name());
-            std::fs::copy(entry.path(), target).map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if !path.extension().is_some_and(|e| e == "md") {
+            continue;
         }
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let body = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        std::fs::write(
+            dst.join(entry.file_name()),
+            ensure_agent_frontmatter(&stem, &body),
+        )
+        .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// `body` unchanged when it already opens with `---` frontmatter; otherwise
+/// prefixed with `name: <stem>` and a `description` taken from the first H1
+/// (falling back to the stem), which is the summary Claude shows when
+/// delegating to the agent.
+pub fn ensure_agent_frontmatter(stem: &str, body: &str) -> String {
+    if body.trim_start().starts_with("---") {
+        return body.to_string();
+    }
+    let title = body
+        .lines()
+        .find_map(|l| l.strip_prefix("# "))
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .unwrap_or(stem);
+    let description = title.replace('"', "'");
+    format!("---\nname: {stem}\ndescription: \"{description}\"\n---\n\n{body}")
 }
 
 fn project_skills(src: &Path, dst: &Path) -> Result<(), String> {
@@ -126,7 +160,10 @@ mod tests {
 
         let persona =
             std::fs::read_to_string(scratch.path().join(".claude/agents/ceo.md")).unwrap();
-        assert_eq!(persona, "# CEO\nYou lead the company.");
+        assert_eq!(
+            persona, "---\nname: ceo\ndescription: \"CEO\"\n---\n\n# CEO\nYou lead the company.",
+            "a plain-markdown persona gets the frontmatter Claude Code requires of an agent definition"
+        );
 
         let skill = std::fs::read_to_string(scratch.path().join(".claude/skills/pricing/SKILL.md"))
             .unwrap();
@@ -140,6 +177,22 @@ mod tests {
             settings["enableAllProjectMcpServers"],
             serde_json::json!(true)
         );
+    }
+
+    #[test]
+    fn frontmatter_is_left_alone_when_the_persona_already_has_it() {
+        let body = "---\nname: cto\ndescription: Builds things\ntools: Read\n---\n# CTO\n";
+        assert_eq!(ensure_agent_frontmatter("cto", body), body);
+    }
+
+    #[test]
+    fn frontmatter_description_falls_back_to_the_stem_and_never_breaks_yaml_quoting() {
+        assert_eq!(
+            ensure_agent_frontmatter("qa-bach", "No heading here.\n"),
+            "---\nname: qa-bach\ndescription: \"qa-bach\"\n---\n\nNo heading here.\n"
+        );
+        let quoted = ensure_agent_frontmatter("x", "# Says \"hi\": loudly\n");
+        assert!(quoted.starts_with("---\nname: x\ndescription: \"Says 'hi': loudly\"\n---\n"));
     }
 
     #[test]

@@ -4,16 +4,14 @@
 //! - `GET /api/messages?to=KEY[&all=true][&limit=N]` -- a mailbox, read-only.
 //! - `POST /api/messages` `{to, body, reply_to?}` -- send as the local human
 //!   (`human:<user>`); a dashboard caller can't speak as an agent session.
-//! - `GET /api/messages/stream?to=KEY[&take=true][&after=ID]` -- SSE, one
-//!   `message` event per message. Sends made in this process are pushed off
-//!   the in-process bus at once; sends from other processes (agents' MCP
-//!   servers, the CLI) are picked up by a 500ms db poll. With `take=true`
-//!   each streamed message is marked delivered (and handed back if the
-//!   client disconnects before it's known received -- the stream *is* the
-//!   recipient's delivery path, e.g. `agentflare message watch`). That is
-//!   at-least-once: a message in flight at a disconnect may be delivered
-//!   again on the next take, never lost (see `pump_taken`); otherwise
-//!   the stream only observes, starting after `after` (default: now).
+//! - `GET /api/messages/stream?to=KEY[&after=ID]` -- SSE, one `message`
+//!   event per message past `after` (default: now). Sends made in this
+//!   process are pushed off the in-process bus at once; sends from other
+//!   processes (agents' MCP servers, the CLI) are picked up by a 500ms db
+//!   poll. The stream only observes: it never marks anything delivered,
+//!   since SSE gives no receipt. A consumer that is the recipient's delivery
+//!   path (`agentflare message watch` on its own mailbox) treats events as a
+//!   wake-up and claims each message itself with `messages::take_undelivered`.
 
 use crate::messages;
 use axum::{
@@ -118,8 +116,6 @@ async fn send_handler(Json(req): Json<SendRequest>) -> Response {
 #[derive(Deserialize)]
 struct StreamQuery {
     to: Option<String>,
-    #[serde(default)]
-    take: bool,
     after: Option<i64>,
 }
 
@@ -141,31 +137,6 @@ fn next_batch(
     messages::since(c, to, after, 100).unwrap_or_default()
 }
 
-/// Takes (marks delivered) `to`'s single oldest undelivered message.
-fn take_one(conn: &mut Option<rusqlite::Connection>, to: &str) -> Option<messages::Message> {
-    if conn.is_none() {
-        *conn = crate::db::open().ok();
-    }
-    messages::take_undelivered(conn.as_ref()?, to, 1, crate::claims::now())
-        .ok()?
-        .into_iter()
-        .next()
-}
-
-/// Hands taken-but-possibly-unreceived messages back to the mailbox.
-async fn requeue_unsent(conn: Option<rusqlite::Connection>, ids: Vec<i64>) {
-    if ids.is_empty() {
-        return;
-    }
-    let _ = tokio::task::spawn_blocking(move || {
-        let conn = conn.or_else(|| crate::db::open().ok());
-        if let Some(c) = conn {
-            let _ = messages::requeue(&c, &ids);
-        }
-    })
-    .await;
-}
-
 fn message_event(m: &messages::Message) -> Option<Event> {
     let data = serde_json::to_string(m).ok()?;
     Some(
@@ -174,70 +145,6 @@ fn message_event(m: &messages::Message) -> Option<Event> {
             .id(m.id.to_string())
             .data(data),
     )
-}
-
-/// Channel capacity of a `take=true` stream. Kept at 1 so a granted send
-/// permit proves the previously sent event was pulled off the channel by
-/// the SSE body.
-const TAKE_CHANNEL_CAPACITY: usize = 1;
-
-/// Taken ids that may not have reached the client yet: the one sitting in
-/// the channel plus the one the SSE body pulled but may not have flushed.
-const TAKE_IN_FLIGHT: usize = TAKE_CHANNEL_CAPACITY + 1;
-
-/// The `take=true` delivery loop, at-least-once: a message is taken (marked
-/// delivered) only after a send permit is held, one at a time, and the last
-/// [`TAKE_IN_FLIGHT`] taken ids are remembered for as long as the stream is
-/// open, since SSE gives no receipt. When the client goes away, those are
-/// requeued -- so a disconnect can deliver a message twice (it may have
-/// reached the client just before the drop), which is preferred over
-/// marking it delivered and losing it. `agentflare message watch` skips ids
-/// it already printed when it reconnects.
-async fn pump_taken(tx: tokio::sync::mpsc::Sender<Event>, to: String) {
-    let mut bus = messages::bus().subscribe();
-    let mut conn: Option<rusqlite::Connection> = None;
-    let mut in_flight: std::collections::VecDeque<i64> = std::collections::VecDeque::new();
-    loop {
-        // A granted permit means the channel has room again, i.e. the
-        // previous event was pulled by the SSE body.
-        let Ok(permit) = tx.reserve().await else {
-            requeue_unsent(conn, in_flight.into()).await;
-            return;
-        };
-        let to_q = to.clone();
-        let Ok((c, taken)) = tokio::task::spawn_blocking(move || {
-            let m = take_one(&mut conn, &to_q);
-            (conn, m)
-        })
-        .await
-        else {
-            return;
-        };
-        conn = c;
-        if let Some(m) = taken {
-            // Unserializable: nothing could ever be sent for it; leave it
-            // delivered rather than spin on it.
-            if let Some(event) = message_event(&m) {
-                permit.send(event);
-                in_flight.push_back(m.id);
-                while in_flight.len() > TAKE_IN_FLIGHT {
-                    in_flight.pop_front();
-                }
-            }
-            continue;
-        }
-        drop(permit);
-        tokio::select! {
-            _ = bus.recv() => {}
-            // Being pulled off the channel doesn't prove the client got
-            // it, so in-flight ids stay requeueable until the stream closes.
-            () = tokio::time::sleep(STREAM_POLL) => {}
-            () = tx.closed() => {
-                requeue_unsent(conn, in_flight.into()).await;
-                return;
-            }
-        }
-    }
 }
 
 /// The observe-only loop: streams everything past `after`, marks nothing.
@@ -298,18 +205,8 @@ async fn stream_handler(
     Query(q): Query<StreamQuery>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
     let to = q.to.filter(|t| !t.trim().is_empty());
-    let rx = match to {
-        Some(to) if q.take => {
-            let (tx, rx) = tokio::sync::mpsc::channel::<Event>(TAKE_CHANNEL_CAPACITY);
-            tokio::spawn(pump_taken(tx, to));
-            rx
-        }
-        to => {
-            let (tx, rx) = tokio::sync::mpsc::channel::<Event>(64);
-            tokio::spawn(pump_observed(tx, to, q.after));
-            rx
-        }
-    };
+    let (tx, rx) = tokio::sync::mpsc::channel::<Event>(64);
+    tokio::spawn(pump_observed(tx, to, q.after));
     let stream = tokio_stream::StreamExt::map(tokio_stream::wrappers::ReceiverStream::new(rx), Ok);
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
@@ -317,61 +214,6 @@ async fn stream_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_dropped_take_stream_requeues_what_it_may_not_have_delivered() {
-        crate::paths::test_support::with_temp_home(|| {
-            const TO: &str = "human:probe-requeue";
-            let conn = crate::db::open().unwrap();
-            for body in ["one", "two", "three"] {
-                messages::send(&conn, "x:1", TO, body, None, 100, |_| Err(String::new())).unwrap();
-            }
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(TAKE_CHANNEL_CAPACITY);
-                let pump = tokio::spawn(pump_taken(tx, TO.to_string()));
-                // The client pulls one event, then goes away.
-                assert!(rx.recv().await.is_some());
-                drop(rx);
-                tokio::time::timeout(std::time::Duration::from_secs(5), pump)
-                    .await
-                    .expect("the pump stops once the client is gone")
-                    .unwrap();
-            });
-            // Nothing is lost: everything but at most the one event the
-            // client pulled is back in the mailbox (a duplicate of that one
-            // is allowed).
-            let back = messages::take_undelivered(&conn, TO, 10, 200).unwrap();
-            let bodies: Vec<&str> = back.iter().map(|m| m.body.as_str()).collect();
-            assert!(bodies.contains(&"two"), "{bodies:?}");
-            assert!(bodies.contains(&"three"), "{bodies:?}");
-        });
-    }
-
-    #[test]
-    fn a_pulled_event_stays_requeueable_through_an_idle_poll() {
-        crate::paths::test_support::with_temp_home(|| {
-            const TO: &str = "human:probe-idle";
-            let conn = crate::db::open().unwrap();
-            messages::send(&conn, "x:1", TO, "only", None, 100, |_| Err(String::new())).unwrap();
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(TAKE_CHANNEL_CAPACITY);
-                let pump = tokio::spawn(pump_taken(tx, TO.to_string()));
-                // Pulled off the channel, but not proven to reach the client:
-                // the stream idles past a poll, then the client drops.
-                assert!(rx.recv().await.is_some());
-                tokio::time::sleep(STREAM_POLL * 3).await;
-                drop(rx);
-                tokio::time::timeout(std::time::Duration::from_secs(5), pump)
-                    .await
-                    .expect("the pump stops once the client is gone")
-                    .unwrap();
-            });
-            let back = messages::take_undelivered(&conn, TO, 10, 200).unwrap();
-            assert_eq!(back.len(), 1, "{back:?}");
-        });
-    }
 
     fn test_queue() -> agentflare_jobs::Queue {
         let dir = tempfile::tempdir().unwrap().keep();
@@ -417,10 +259,10 @@ mod tests {
                     .unwrap();
                 assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
 
-                // Taking stream on a mailbox, opened before the send.
+                // Stream on a mailbox, opened before the send.
                 let resp = client
                     .get(format!(
-                        "http://{addr}/api/messages/stream?to=human:probe-7c1&take=true"
+                        "http://{addr}/api/messages/stream?to=human:probe-7c1"
                     ))
                     .send()
                     .await
@@ -451,9 +293,9 @@ mod tests {
                 }
                 assert!(seen.contains("stream probe"), "got: {seen}");
                 assert!(seen.contains("event: message"));
-                // Taken by the stream: delivered.
+                // Observing never marks delivered: SSE gives no receipt.
                 let conn = crate::db::open().unwrap();
-                assert!(!messages::has_undelivered(&conn, "human:probe-7c1").unwrap());
+                assert!(messages::has_undelivered(&conn, "human:probe-7c1").unwrap());
             });
         });
     }
