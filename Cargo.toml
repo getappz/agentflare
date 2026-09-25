@@ -131,6 +131,9 @@ semantic = ["agentflare-store/embeddings"]
 built = { version = "0.8", features = ["chrono"] }
 
 [dev-dependencies]
+# Test-only cheap Argon2 params for the root vault/gateway_secrets tests;
+# flare-vault refuses to compile with this on in a release build.
+flare-vault = { path = "crates/flare-vault", features = ["insecure-fast-kdf"] }
 insta = { version = "1", features = ["json"] }
 pretty_assertions = "1"
 reqwest = { version = "0.12", default-features = false, features = ["stream", "json"] }

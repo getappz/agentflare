@@ -7,7 +7,16 @@ use sha2::Sha256;
 const MAGIC: &[u8] = b"AFVE";
 const SALT_SIZE: usize = 16;
 const NONCE_SIZE: usize = 12;
-const ITERATIONS: u32 = 600_000;
+
+/// PBKDF2-HMAC-SHA256 iterations used for real vault secrets.
+const PRODUCTION_ITERATIONS: u32 = 600_000;
+
+/// Test builds derive keys with a single iteration so every gateway-secrets
+/// and vault test runs in milliseconds instead of ~13s.
+#[cfg(not(test))]
+const ITERATIONS: u32 = PRODUCTION_ITERATIONS;
+#[cfg(test)]
+const ITERATIONS: u32 = 1;
 
 pub fn get_passphrase() -> Option<String> {
     if let Ok(pw) = std::env::var("AGENTFLARE_VAULT_PASSPHRASE")
@@ -64,6 +73,13 @@ pub fn decrypt(data: &[u8], passphrase: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_iterations_are_pinned() {
+        // Deliberate change only: this defines the cost of brute-forcing
+        // every existing gateway secret.
+        assert_eq!(PRODUCTION_ITERATIONS, 600_000);
+    }
 
     #[test]
     fn roundtrip() {
