@@ -1,5 +1,5 @@
 [workspace]
-members = ["agentflare-workspace-hack","crates/flare-insights","crates/flare-code", "crates/agent-registry", "crates/skill-registry", "crates/gateway-registry", "crates/flare-output", "crates/agentflare-artifacts", "crates/agentflare-backend", "crates/agentflare-db-kit", "crates/flare-search-kit", "crates/agentflare-store", "crates/flare-proxy", "crates/agentflare-shim", "crates/flare-git-core", "crates/flare-process", "crates/flare-git-shim", "crates/agentflare-jobs", "crates/flare-docs", "crates/flare-vault", "crates/agentflare-resource-gate", "crates/flare-workflow", "crates/flare-sandbox", "crates/agentflare-apps", "crates/flare-browser", "crates/agentflare-config", "crates/flare-channels", "crates/agentflare-approval"]
+members = ["agentflare-workspace-hack","crates/flare-insights","crates/flare-code", "crates/agent-registry", "crates/skill-registry", "crates/gateway-registry", "crates/flare-output", "crates/agentflare-artifacts", "crates/agentflare-backend", "crates/agentflare-db-kit", "crates/flare-search-kit", "crates/agentflare-store", "crates/flare-proxy", "crates/agentflare-shim", "crates/flare-git-core", "crates/flare-process", "crates/flare-git-shim", "crates/agentflare-jobs", "crates/flare-docs", "crates/flare-vault", "crates/agentflare-resource-gate", "crates/flare-workflow", "crates/flare-sandbox", "crates/agentflare-apps", "crates/flare-browser", "crates/agentflare-config", "crates/flare-channels", "crates/agentflare-approval", "crates/agentflare-core"]
 # flare-db(-macros) are deliberately NOT workspace members: sqlx's `sqlite` feature pulls in
 # libsqlite3-sys ^0.28-^0.30 (checked every 0.7-0.9 sqlx-sqlite release on crates.io), which
 # can never coexist with this workspace's rusqlite 0.40 (-> libsqlite3-sys ^0.38) -- both crates
@@ -109,6 +109,7 @@ dunce = "1"
 agentflare-apps = { path = "crates/agentflare-apps" }
 agentflare-config = { path = "crates/agentflare-config" }
 tempfile = "3"
+agentflare-core = { path = "crates/agentflare-core" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -135,6 +136,7 @@ built = { version = "0.8", features = ["chrono"] }
 # Test-only cheap Argon2 params for the root vault/gateway_secrets tests;
 # flare-vault refuses to compile with this on in a release build.
 flare-vault = { path = "crates/flare-vault", features = ["insecure-fast-kdf"] }
+agentflare-core = { path = "crates/agentflare-core", features = ["test-support"] }
 insta = { version = "1", features = ["json"] }
 pretty_assertions = "1"
 reqwest = { version = "0.12", default-features = false, features = ["stream", "json"] }

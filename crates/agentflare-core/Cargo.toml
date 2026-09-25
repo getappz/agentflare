@@ -1,0 +1,38 @@
+[package]
+name = "agentflare-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+description = "Foundation types shared across agentflare crates: paths, local state/store, errors, dispatch-failure ceiling, mise install"
+license = "Apache-2.0"
+repository = "https://github.com/getappz/agentflare"
+publish = false
+
+[dependencies]
+agent-registry = { package = "agentflare-agent-registry", path = "../agent-registry" }
+agentflare-backend = { package = "agentflare-backend", path = "../agentflare-backend" }
+agentflare-config = { path = "../agentflare-config" }
+agentflare-store = { path = "../agentflare-store" }
+dirs = "6"
+flare-process = { path = "../flare-process" }
+rmcp = "1.8.0"
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+skill-registry = { package = "agentflare-skill-registry", path = "../skill-registry" }
+thiserror = "2"
+tempfile = { version = "3", optional = true }
+agentflare-workspace-hack = { version = "0.1", path = "../../agentflare-workspace-hack" }
+
+[features]
+test-support = ["dep:tempfile"]
+
+[dev-dependencies]
+agentflare-core = { path = ".", features = ["test-support"] }
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
