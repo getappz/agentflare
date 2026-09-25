@@ -13,12 +13,19 @@
 #
 # One legitimate test does exceed the new 60s cap by design and needs its
 # own override below: `pause_then_resume_continues_the_same_run_in_the_same_worktree`
-# polls on a real `Instant::now() + Duration::from_secs(60)` deadline (see
+# polls on a real `Instant::now() + Duration::from_secs(...)` deadline (see
 # the comment at its call site -- it's bounded by wall-clock, not a fixed
 # retry count, because the paused driver's wind-down is itself slower than
 # that under a loaded, fully-parallel nextest run). A PR run (36113600932,
-# 2026-09-25) hit exactly this: nextest's 60.00-60.006s kill landed a hair
-# before the test's own 60s deadline check could return, on all 3 tries.
+# 2026-09-25) first hit this at the 60s workspace default: nextest's kill
+# landed a hair before the test's own 60s deadline check could return, on
+# all 3 tries. Raising just nextest's own kill window here (this override)
+# wasn't sufficient by itself: PR #812's run 36132844357 still failed all
+# 3 tries, now via the test's *own* panic at 62.4-62.5s each time (not a
+# nextest kill) -- the driver genuinely hadn't let go by the 60s mark under
+# that run's load. The test's internal deadline was raised to 150s
+# alongside this override for real headroom; this override's generous
+# 300s kill just needs to stay comfortably above that.
 # Every other `Duration::from_secs(60|120|300|600)` found nearby in the
 # suite (agent_launch_tests.rs, pipeline_assembly_tests.rs,
 # work_item_pipeline/tests.rs, gateway-registry's circuit-breaker tests) is
