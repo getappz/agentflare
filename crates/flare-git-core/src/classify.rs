@@ -116,8 +116,9 @@ pub fn extra_trust_root_paths_from_env() -> Vec<String> {
 }
 
 /// `true` if this invocation is (self-reportedly) agent-driven, not an
-/// interactive human shell. Delegates to the `agent-detector` crate (already
-/// a dependency here, see `provenance.rs`) rather than maintaining a second,
+/// interactive human shell. Delegates to `flare_process::is_agent` (an
+/// ancestor-process walk plus the `agent-detector` crate's env-marker
+/// catalog, see that module's docs) rather than maintaining a second,
 /// narrower hardcoded env-var list of the same kind `agentflare-shim` and
 /// `flare-code::detect` each already carry -- `agent-detector` covers a much
 /// wider agent catalog (opencode, codex, gemini, cursor, windsurf, aider,
@@ -137,10 +138,9 @@ pub fn extra_trust_root_paths_from_env() -> Vec<String> {
 /// (item #637).
 ///
 /// `AGENTFLARE_GIT_ASSUME_HUMAN`, when set to a non-empty value,
-/// short-circuits this to `false` before either check runs. This crate is
-/// compiled with `agent-detector`'s `process-tree` feature, which walks
-/// ancestor processes for agent markers (opencode/claude/cursor/...) --
-/// a signal no env var can strip. Test-only escape hatch for suites that
+/// short-circuits this to `false` before either check runs. The detection
+/// walks ancestor processes for agent executables (opencode/claude/cursor/
+/// ...) -- a signal no env var can strip. Test-only escape hatch for suites that
 /// need to prove the human path while running *under* an agent-driven
 /// session themselves (see `flare-git-shim`'s `human_shim` test helper).
 #[must_use]
@@ -148,7 +148,7 @@ pub fn agent_invocation_detected() -> bool {
     if std::env::var_os("AGENTFLARE_GIT_ASSUME_HUMAN").is_some_and(|s| !s.is_empty()) {
         return false;
     }
-    agent_detector::is_agent()
+    flare_process::is_agent()
         || std::env::var_os("AGENTFLARE_AGENT").is_some_and(|s| !s.is_empty())
         || std::env::var_os("LEAN_CTX_AGENT").is_some_and(|s| !s.is_empty())
 }

@@ -546,7 +546,7 @@ pub(crate) fn notify(recipient: &str, body: &str, item_id: &str) {
 include!("work_duplicate_pr.rs");
 impl WorkArgs {
     pub fn run(self) {
-        if let Some(agent) = agent_detector::agent_name() {
+        if let Some(agent) = flare_process::agent_name() {
             eprintln!(
                 "error: `agentflare work` is a human-only command — it bypasses the daemon's \
                  claim/queue tracking that the dashboard and autonomous self-repair depend on \
@@ -1251,26 +1251,39 @@ mod tests {
         }
     }
 
-    /// `WorkArgs::run`'s guard denies whenever `agent_detector::agent_name()` returns
+    /// `WorkArgs::run`'s guard denies whenever `flare_process::agent_name()` returns
     /// `Some`, so exercising that same primitive here is what actually proves the guard
     /// fires -- there's no separate marker list of our own left to drift out of sync.
     /// Only the "detects" direction is asserted: unlike the env var it sets and clears,
-    /// `agent_detector::agent_name()` also walks the parent process tree, which a sandboxed
+    /// `flare_process::agent_name()` also walks the ancestor process chain, which a sandboxed
     /// dev session (this one included) can make non-empty even with every marker env var
     /// cleared, so asserting the "clear -> None" side here would be flaky by environment
-    /// rather than by test bug.
+    /// rather than by test bug. This exact test hung for nextest's full 300s slow-timeout
+    /// on windows-latest (item #314) back when that walk enumerated every process on the
+    /// machine; it is now bounded to the ancestor chain.
     #[test]
     fn agent_detector_flags_the_claudecode_marker_run_denies_on() {
+        // Whatever this process already looks like before the marker is set:
+        // an agent ancestor (or an ambient marker) wins over CLAUDECODE, so the
+        // exact name is only checkable when nothing is detected ambiently --
+        // which is the CI case, where this stays a precise assertion.
+        let ambient = flare_process::agent_name();
         // SAFETY: test-only; CLAUDECODE isn't touched by any other test in this
         // process, and set/remove here always run on the same thread.
         unsafe {
             std::env::set_var("CLAUDECODE", "1");
         }
-        let detected = agent_detector::agent_name();
+        let detected = flare_process::agent_name();
         unsafe {
             std::env::remove_var("CLAUDECODE");
         }
-        assert_eq!(detected.as_deref(), Some("claude-code"));
+        match ambient {
+            None => assert_eq!(detected.as_deref(), Some("claude-code")),
+            Some(_) => assert!(
+                detected.is_some(),
+                "CLAUDECODE marker must trigger the guard"
+            ),
+        }
     }
 
     #[test]
