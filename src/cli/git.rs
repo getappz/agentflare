@@ -1510,7 +1510,7 @@ fn ship_cmd(opts: ShipArgs) {
                 .body
                 .clone()
                 .unwrap_or_else(|| default_pr_body(&repo_root, &base, &head));
-            match pulls::create(&client, &repo, &title, &head, &base, Some(&body)) {
+            match pulls::create(&client, &repo, &title, &head, &base, Some(&body), false) {
                 Ok(pr) => {
                     crate::ui::success(&format!("opened PR #{}: {}", pr.number, pr.html_url));
                     pr

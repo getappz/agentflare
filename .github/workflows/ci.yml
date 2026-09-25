@@ -4,6 +4,10 @@ on:
   push:
     branches: [master]
   pull_request:
+  # A merge queue runs the required checks on the queue's temporary merge
+  # commit before merging; without this event those checks never report and
+  # every queued PR fails out of the queue.
+  merge_group:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -25,12 +29,17 @@ jobs:
     permissions:
       contents: read
     outputs:
-      code: ${{ steps.filter.outputs.code }}
+      # A merge-group run always builds: the queue's merge commit is exactly
+      # what must be proven, and the path filter has no PR base to diff
+      # against there.
+      code: ${{ github.event_name == 'merge_group' && 'true' || steps.filter.outputs.code }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - if: github.event_name != 'merge_group'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           fetch-depth: 0
-      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+      - if: github.event_name != 'merge_group'
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         with:
           # Default predicate-quantifier ('some') matches a filter on ANY
@@ -118,6 +127,27 @@ jobs:
       # workspace has none today, as insurance against one being added later.
       - if: needs.changes.result != 'success' || needs.changes.outputs.code == 'true'
         run: cargo nextest run --workspace --verbose
+      # windows-latest showed 0 compile requests / 0 cache hits in the
+      # sccache-action's post-job stats print in run 36074365887, despite a
+      # compile phase slower than ubuntu's (so sccache wasn't just idle
+      # because nothing needed building). Re-running this same job today
+      # (github.com/getappz/agentflare/actions/runs/36108680940) shows sccache
+      # genuinely active on windows-latest -- both this explicit step and the
+      # action's own post-job print report identical, healthy stats (533
+      # compile requests, 329 cache hits, 90.88% Rust hit rate). What made
+      # the earlier run report 0 is unconfirmed; Windows nextest/build
+      # oddities are tracked in item #314. This step is a near-free duplicate
+      # read of the same stats right after the compile, kept in case the
+      # action's own post-job print is timing-sensitive on Windows in some
+      # runs.
+      #
+      # !cancelled() (not the implicit success()-only default every other
+      # step here uses): a failing `cargo nextest run` is exactly when cache
+      # stats are most useful for debugging, so this step should still run
+      # after a test failure -- it should only skip when the whole run was
+      # cancelled, not just because a prior step failed.
+      - if: "!cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true')"
+        run: sccache --show-stats
       - if: needs.changes.result != 'success' || needs.changes.outputs.code == 'true'
         run: cargo test --doc --workspace --verbose
 

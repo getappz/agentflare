@@ -185,9 +185,17 @@ fn pause_then_resume_continues_the_same_run_in_the_same_worktree() {
         // idle machine -- a fixed 200 x 20ms budget expired there every time
         // while the driver was still letting go. A driver that never lets
         // go still fails the test, just later.
+        //
+        // 60s wasn't enough headroom: PR #812's ubuntu-latest build (run
+        // 36132844357) hit this deadline for real on all 3 nextest tries,
+        // panicking at 62.4-62.5s each time -- not a nextest kill (the
+        // nextest.toml override for this test allows up to 300s), the
+        // driver itself hadn't let go yet at the 60s mark under that run's
+        // load. 150s gives real margin over the observed ~62s without
+        // approaching the 300s nextest override's own ceiling.
         cancel.store(false, Ordering::SeqCst);
         let mut resumed = None;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(150);
         while std::time::Instant::now() < deadline {
             match mcp.item_resume(ItemRequest {
                 action: "resume".into(),

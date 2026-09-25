@@ -243,6 +243,7 @@ fn a_passing_pr_is_not_evidence_unless_the_caller_is_on_its_pushed_branch() {
         number: 7,
         labels: vec![],
         head_sha: None,
+        auto_merge: Default::default(),
     };
     // A live owner's PR going green must not let a bystander take over.
     assert_eq!(branch_gate(false, passing()), None);
@@ -262,6 +263,9 @@ fn a_passing_pr_is_not_evidence_unless_the_caller_is_on_its_pushed_branch() {
     let awaiting_review = PrCiStatus::AwaitingReview {
         number: 8,
         labels: vec![],
+        changes_requested: false,
+        head_sha: None,
+        auto_merge: Default::default(),
     };
     assert!(
         branch_gate(true, awaiting_review)

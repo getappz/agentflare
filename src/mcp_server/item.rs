@@ -1716,14 +1716,15 @@ impl AgentflareMcp {
             ),
             _ => crate::worktree::PrOutcome::NothingToPush,
         };
-        let (pr_url, no_pr, pr_failure) = match pr_outcome {
-            crate::worktree::PrOutcome::Opened(url) => (Some(url), None, None),
+        let (opened_pr, no_pr, pr_failure) = match pr_outcome {
+            crate::worktree::PrOutcome::Opened(pr) => (Some(pr), None, None),
             crate::worktree::PrOutcome::NoPrPossible { pushed, reason } => {
                 (None, Some((pushed, reason)), None)
             }
             crate::worktree::PrOutcome::Failed(reason) => (None, None, Some(reason)),
             crate::worktree::PrOutcome::NothingToPush => (None, None, None),
         };
+        let pr_url = opened_pr.as_ref().map(|pr| pr.url.clone());
         // An open PR (freshly created, or already existed) means the work
         // isn't actually finished: move to "in_review" instead of
         // "completed", leave the claim lease held (so nobody else can
@@ -1834,6 +1835,25 @@ impl AgentflareMcp {
                     ),
                     None,
                 ));
+            }
+            // The work is done and the item is in review: the draft
+            // `push_and_open_pr` opened can go to reviewers now. A failure
+            // here only logs -- the review sweep retries the flip on every
+            // tick it still sees a draft (`PrCiStatus::Draft`).
+            if let (Some(item), Some(pr)) = (&item, &opened_pr)
+                && pr.draft
+                && !crate::worktree::mark_pr_ready(
+                    item,
+                    &repo_root,
+                    pr.number,
+                    pr.node_id.as_deref(),
+                )
+            {
+                eprintln!(
+                    "worktree: PR #{} for item {item_id} is still a draft; the review sweep \
+                     will mark it ready",
+                    pr.number
+                );
             }
             marked
         } else {

@@ -1,19 +1,51 @@
 [profile.default]
-# A single hung test shouldn't be able to pin a runner for the job's full
-# 25-minute timeout (see ci.yml) — kill it well before that and let the rest
-# of the suite keep going.
-slow-timeout = { period = "60s", terminate-after = 5 }
+# Measured on ci.yml's windows-latest `build` job (run 36074365887 + 5 other
+# recent runs): the longest legitimate test observed was 25.5s on
+# windows-latest (`vault::tests::migrates_legacy_gateway_secret_on_first_unlock`),
+# 21.2s on ubuntu-latest. Hung tests always died at exactly the old
+# slow-timeout's 300s boundary, then passed on retry in 1-3s, and came in
+# bursts of 4-6 concurrent hangs filling every worker slot at once, not as a
+# single trailing straggler. Windows wall time tracked timeout count almost
+# exactly (0 -> 387s/425s, 1 -> 579s, 5 -> 818s, 6 -> 982s/1066s), so each
+# burst was costing 5 minutes. 30s/2 caps that at 60s per hang. Root cause
+# (item #314) was fixed separately (PR #811); this only bounds the cost of
+# whatever's left.
+#
+# One legitimate test does exceed the new 60s cap by design and needs its
+# own override below: `pause_then_resume_continues_the_same_run_in_the_same_worktree`
+# polls on a real `Instant::now() + Duration::from_secs(...)` deadline (see
+# the comment at its call site -- it's bounded by wall-clock, not a fixed
+# retry count, because the paused driver's wind-down is itself slower than
+# that under a loaded, fully-parallel nextest run). A PR run (36113600932,
+# 2026-09-25) first hit this at the 60s workspace default: nextest's kill
+# landed a hair before the test's own 60s deadline check could return, on
+# all 3 tries. Raising just nextest's own kill window here (this override)
+# wasn't sufficient by itself: PR #812's run 36132844357 still failed all
+# 3 tries, now via the test's *own* panic at 62.4-62.5s each time (not a
+# nextest kill) -- the driver genuinely hadn't let go by the 60s mark under
+# that run's load. The test's internal deadline was raised to 150s
+# alongside this override for real headroom; this override's generous
+# 300s kill just needs to stay comfortably above that.
+# Every other `Duration::from_secs(60|120|300|600)` found nearby in the
+# suite (agent_launch_tests.rs, pipeline_assembly_tests.rs,
+# work_item_pipeline/tests.rs, gateway-registry's circuit-breaker tests) is
+# a *configured ceiling* passed into the function under test, not a real
+# wait in the test's own control flow -- each of those asserts (or is
+# driven by mocked/fast steps into) a real runtime of seconds, so they
+# don't need an override. Don't add one preemptively without confirming the
+# same way this one was confirmed: read the test body, not just the grep hit.
+slow-timeout = { period = "30s", terminate-after = 2 }
 
-# windows-latest CI used to hit one signature over and over (PRs
-# #436/#438/#441/#443, then 1-7 tests per run through 2026-09-25): a
-# *different* test each time, killed at exactly this slow-timeout's 300s
-# boundary, passing instantly on retry. Root cause (item #314): every one
-# of those tests reached `agent-detector`'s process-tree walk -- directly
-# via `claims::owner_id()`, or through the git PATH shim that cargo's
-# target-dir-on-PATH makes bare `git` spawns resolve to on Windows -- and
-# that walk opened a handle to every process on the machine; under
-# parallel test load that call intermittently never returned. The walk is
-# now bounded to the ancestor chain (`flare_process::agent`). Retries stay
-# as a generic backstop for runner flakes, not as cover for that hang --
-# see nexte.st/docs/configuration for the field.
+# Retries stay as a generic backstop for runner flakes, not as cover for the
+# item #314 hang above -- see nexte.st/docs/configuration for the field.
+retries = 2
+
+[[profile.default.overrides]]
+filter = 'test(work_item_pipeline::pause_tests::pause_then_resume_continues_the_same_run_in_the_same_worktree)'
+# Back to the pre-item-#651 default (300s) for this one test -- see the
+# comment above [profile.default]. This specific 300s/2-retries combination
+# was already empirically safe here across 6 measured CI runs before this
+# change (typical runtime 3.6s, never a false timeout), so it's the
+# validated choice rather than a new guess.
+slow-timeout = { period = "60s", terminate-after = 5 }
 retries = 2

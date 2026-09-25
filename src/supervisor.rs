@@ -1433,7 +1433,12 @@ pub(crate) fn run_review_sweep(
             // chunk, or GitHub couldn't resolve that PR) is treated exactly
             // like any other soft-fail: `Unknown`, polled again next tick --
             // never an error for the whole sweep.
-            let status = match batch_data.get(&number) {
+            let data = batch_data.get(&number);
+            // An auto-merge this sweep armed earlier is re-judged on every
+            // tick, whatever the CI state: a push since then must disarm it
+            // before GitHub can merge commits nobody checked for findings.
+            reconcile_armed_auto_merge(mcp, item, &repo_root, number, data);
+            let status = match data {
                 Some(data) => crate::worktree::pr_ci_status_from_batch(number, data),
                 None => crate::worktree::PrCiStatus::Unknown,
             };
@@ -1509,6 +1514,10 @@ fn handle_pr_status(
             checks,
             labels,
         } => {
+            // The repair push that may follow moves the head; an armed
+            // auto-merge must not be waiting to merge it the moment its
+            // checks go green.
+            disarm_our_auto_merge(mcp, item, repo_root, number, "CI is failing");
             match self_repair_or_gate(
                 mcp,
                 queue,
@@ -1530,6 +1539,7 @@ fn handle_pr_status(
             number,
             labels,
             head_sha,
+            auto_merge,
         } => handle_ci_green(
             mcp,
             queue,
@@ -1540,6 +1550,7 @@ fn handle_pr_status(
             &labels,
             CiGreenMerge::Allowed {
                 head_sha: head_sha.as_deref(),
+                auto_merge: &auto_merge,
             },
             label_id_by_name,
             folder_path,
@@ -1551,7 +1562,13 @@ fn handle_pr_status(
         // repair labels cleared, the approval gate surfaced (the whole point:
         // this used to read as `Pending` and never reached the gate), and
         // CodeRabbit findings still repaired while it waits.
-        crate::worktree::PrCiStatus::AwaitingReview { number, labels } => handle_ci_green(
+        crate::worktree::PrCiStatus::AwaitingReview {
+            number,
+            labels,
+            changes_requested,
+            head_sha,
+            auto_merge,
+        } => handle_ci_green(
             mcp,
             queue,
             auth_conn,
@@ -1559,7 +1576,11 @@ fn handle_pr_status(
             item,
             number,
             &labels,
-            CiGreenMerge::BlockedOnReview,
+            CiGreenMerge::BlockedOnReview {
+                changes_requested,
+                head_sha: head_sha.as_deref(),
+                auto_merge: &auto_merge,
+            },
             label_id_by_name,
             folder_path,
             repo_root,
@@ -1573,6 +1594,7 @@ fn handle_pr_status(
             }
         }
         crate::worktree::PrCiStatus::Conflicting { number } => {
+            disarm_our_auto_merge(mcp, item, repo_root, number, "the PR has a merge conflict");
             if auto_resolve_conflicts_enabled(repo_root) {
                 match self_repair_or_gate(
                     mcp,
@@ -1607,6 +1629,21 @@ fn handle_pr_status(
         crate::worktree::PrCiStatus::Closed { number } => {
             if requeue_closed_pr_item(mcp, item, number) {
                 result.requeued += 1;
+            } else {
+                result.skipped += 1;
+            }
+        }
+        // An in-review item's PR is agentflare's to keep ready for review:
+        // `item_done` flips the draft it opened, and this is the retry when
+        // that flip failed (network, a lost race). A draft the item already
+        // records as flipped was converted back by a human on purpose --
+        // held, never re-flipped, and never merged or self-repaired either,
+        // since `Draft` is decided before any CI state is looked at.
+        crate::worktree::PrCiStatus::Draft { number, node_id } => {
+            if crate::worktree::pr_marked_ready(item) {
+                result.waiting += 1;
+            } else if crate::worktree::mark_pr_ready(item, repo_root, number, node_id.as_deref()) {
+                result.updated += 1;
             } else {
                 result.skipped += 1;
             }
@@ -1743,6 +1780,8 @@ pub(crate) mod notify;
 pub(crate) use notify::*;
 mod merge;
 use merge::*;
+mod auto_merge;
+use auto_merge::*;
 mod review_bots;
 pub(crate) mod review_findings;
 use review_bots::*;

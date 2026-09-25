@@ -46,6 +46,18 @@ pub struct RecordedRequest {
     pub method: String,
     pub path: String,
     pub body: String,
+    /// Every request header, names lower-cased, in wire order.
+    pub headers: Vec<(String, String)>,
+}
+
+impl RecordedRequest {
+    /// The first value of header `name` (any case), if it was sent.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
 }
 
 pub struct MockServer {
@@ -59,6 +71,7 @@ fn reason(status: u16) -> &'static str {
         200 => "OK",
         201 => "Created",
         204 => "No Content",
+        304 => "Not Modified",
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
@@ -183,16 +196,19 @@ fn handle_connection(stream: &mut std::net::TcpStream) -> Option<RecordedRequest
     let path = parts.next()?.to_string();
 
     let mut content_length = 0usize;
+    let mut headers = Vec::new();
     loop {
         let mut line = String::new();
         reader.read_line(&mut line).ok()?;
         if line == "\r\n" || line.is_empty() {
             break;
         }
-        if let Some((name, value)) = line.split_once(':')
-            && name.eq_ignore_ascii_case("content-length")
-        {
-            content_length = value.trim().parse().unwrap_or(0);
+        if let Some((name, value)) = line.split_once(':') {
+            let (name, value) = (name.trim().to_ascii_lowercase(), value.trim().to_string());
+            if name == "content-length" {
+                content_length = value.parse().unwrap_or(0);
+            }
+            headers.push((name, value));
         }
     }
 
@@ -205,6 +221,7 @@ fn handle_connection(stream: &mut std::net::TcpStream) -> Option<RecordedRequest
         method,
         path,
         body: String::from_utf8_lossy(&body).into_owned(),
+        headers,
     })
 }
 
