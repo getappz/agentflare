@@ -1,5 +1,13 @@
 #![allow(clippy::incompatible_msrv)]
 
+// `insecure-fast-kdf` swaps the Argon2id defaults for the cheapest parameters
+// Argon2 accepts so vault tests run in milliseconds. It exists for test builds
+// only; refuse to compile a release binary with it on.
+#[cfg(all(feature = "insecure-fast-kdf", not(debug_assertions)))]
+compile_error!(
+    "flare-vault feature `insecure-fast-kdf` is test-only and must not be enabled in a release build"
+);
+
 pub mod crypto;
 pub mod error;
 pub mod inject;
