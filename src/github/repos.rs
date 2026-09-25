@@ -295,7 +295,10 @@ pub fn delete_merged_pr_branch(
 ///
 /// A branch with no protection, or one this token can't read, comes back
 /// empty rather than as an error: "nothing is required" is the safe
-/// reading for callers deciding whether a merge-time gate exists.
+/// reading for callers deciding whether a merge-time gate exists. Only a
+/// complete read is cached, though: a transient failure (5xx, rate limit)
+/// must not pin "nothing required" on a gated branch for the rest of the
+/// process, so the next call asks GitHub again.
 pub fn required_status_contexts(client: &Client, repo: &RepoId, branch: &str) -> Vec<String> {
     static CACHE: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
     let key = format!(
@@ -315,6 +318,7 @@ pub fn required_status_contexts(client: &Client, repo: &RepoId, branch: &str) ->
     }
     let encoded = crate::github::encode_query(branch);
     let mut contexts: Vec<String> = Vec::new();
+    let mut complete = true;
     let branch_path = format!("/repos/{}/{}/branches/{encoded}", repo.owner, repo.repo);
     match client.request("GET", &branch_path, None) {
         Ok(json) => {
@@ -333,10 +337,13 @@ pub fn required_status_contexts(client: &Client, repo: &RepoId, branch: &str) ->
                 );
             contexts.extend(named.map(str::to_string));
         }
-        Err(e) => eprintln!(
-            "github: could not read branch protection of {repo}@{branch}: {}",
-            e.log_safe()
-        ),
+        Err(e) => {
+            complete = false;
+            eprintln!(
+                "github: could not read branch protection of {repo}@{branch}: {}",
+                e.log_safe()
+            );
+        }
     }
     let rules_path = format!(
         "/repos/{}/{}/rules/branches/{encoded}",
@@ -360,17 +367,22 @@ pub fn required_status_contexts(client: &Client, repo: &RepoId, branch: &str) ->
         }
         // No rulesets, or an endpoint this host doesn't have.
         Err(GitHubError::NotFound) => {}
-        Err(e) => eprintln!(
-            "github: could not read rulesets of {repo}@{branch}: {}",
-            e.log_safe()
-        ),
+        Err(e) => {
+            complete = false;
+            eprintln!(
+                "github: could not read rulesets of {repo}@{branch}: {}",
+                e.log_safe()
+            );
+        }
     }
     contexts.sort();
     contexts.dedup();
-    cache
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(key, contexts.clone());
+    if complete {
+        cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, contexts.clone());
+    }
     contexts
 }
 
@@ -438,6 +450,31 @@ mod tests {
         let client = server.client(Some("tok"));
         assert!(required_status_contexts(&client, &repo(), "dev").is_empty());
         assert!(required_status_contexts(&client, &repo(), "private").is_empty());
+        assert_eq!(server.requests().len(), 4);
+    }
+
+    #[test]
+    fn required_status_contexts_does_not_cache_a_failed_read() {
+        // A transient failure must not pin "nothing required" on a gated
+        // branch for the rest of the process: the next ask goes to GitHub
+        // again and finds the requirement.
+        let server = MockServer::start(vec![
+            MockResponse::json(502, r#"{"message":"Bad Gateway"}"#),
+            MockResponse::json(404, r#"{"message":"Not Found"}"#),
+            MockResponse::json(
+                200,
+                r#"{"name":"rel","protected":true,"protection":{"required_status_checks":{"contexts":["agentflare/judged"]}}}"#,
+            ),
+            MockResponse::json(200, "[]"),
+        ]);
+        let client = server.client(Some("tok"));
+        assert!(required_status_contexts(&client, &repo(), "rel").is_empty());
+        assert_eq!(
+            required_status_contexts(&client, &repo(), "rel"),
+            vec!["agentflare/judged"]
+        );
+        // Now complete, so cached: a third ask makes no request.
+        assert_eq!(required_status_contexts(&client, &repo(), "rel").len(), 1);
         assert_eq!(server.requests().len(), 4);
     }
 
