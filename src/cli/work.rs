@@ -527,7 +527,7 @@ pub(crate) fn release_and_comment(
 
 pub(crate) fn notify(recipient: &str, body: &str, item_id: &str) {
     let outcome = crate::cli::handoff::HandoffArgs {
-        recipient: recipient.to_string(),
+        recipient: Some(recipient.to_string()),
         file: None,
         content: Some(body.to_string()),
         thread: None,
@@ -536,6 +536,7 @@ pub(crate) fn notify(recipient: &str, body: &str, item_id: &str) {
         session: "handoffs".to_string(),
         sender: None,
         dir: None,
+        command: None,
     }
     .publish();
     if let Err(e) = outcome {

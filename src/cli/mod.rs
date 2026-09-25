@@ -121,7 +121,7 @@ pub enum Commands {
     /// Serve live-shareable artifact pages from AI agent sessions.
     Artifacts(artifacts::ArtifactsArgs),
     /// Hand a work product to another agent's inbox.
-    Handoff(handoff::HandoffArgs),
+    Handoff(Box<handoff::HandoffArgs>),
     /// Configure the GitHub work-item bridge for this repo.
     GithubBridge(github_bridge::GithubBridgeArgs),
     #[command(alias = "flare", visible_alias = "opt")]

@@ -1,4 +1,4 @@
-use clap::Args;
+use clap::{Args, Subcommand};
 use std::path::PathBuf;
 
 /// Hand a work product to another agent's inbox (publishes an artifact
@@ -6,7 +6,7 @@ use std::path::PathBuf;
 #[derive(Args)]
 pub struct HandoffArgs {
     /// Target agent/runtime (e.g. opencode, claude-code, codex).
-    pub recipient: String,
+    pub recipient: Option<String>,
     /// File whose content to hand off.
     pub file: Option<PathBuf>,
     /// Inline content instead of a file.
@@ -30,6 +30,66 @@ pub struct HandoffArgs {
     /// Storage directory (default: ~/.agentflare/artifacts).
     #[arg(long)]
     pub dir: Option<PathBuf>,
+    #[command(subcommand)]
+    pub command: Option<HandoffCommands>,
+}
+
+/// Cross-agent continuity over agentflare's own store (item #674):
+/// render/verify handoffs from read-only foreign-agent sessions.
+/// Publish (no subcommand) keeps the original file|--content flow.
+#[derive(Subcommand)]
+pub enum HandoffCommands {
+    /// Render the handoff markdown to stdout. Zero writes.
+    Preview {
+        /// Insights session id (`agentflare insights list`).
+        session: String,
+        /// Receiving agent/runtime.
+        #[arg(long, default_value = "opencode")]
+        target: String,
+        /// minimal|standard|verbose|full (turn budget 3|10|20|50).
+        #[arg(long, default_value = "standard")]
+        verbosity: String,
+        /// Insights DB (default: ~/.local/share/agentflare/insights/observatory.db).
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+    /// Render and write to a file (md|json), or stdout when --out is absent.
+    Export {
+        /// Insights session id.
+        session: String,
+        /// Receiving agent/runtime.
+        #[arg(long, default_value = "opencode")]
+        target: String,
+        /// minimal|standard|verbose|full.
+        #[arg(long, default_value = "standard")]
+        verbosity: String,
+        /// md|json.
+        #[arg(long, default_value = "md")]
+        format: String,
+        /// Output file (default: stdout).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Insights DB (default: ~/.local/share/agentflare/insights/observatory.db).
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+    /// Pre-flight loss accounting: what would be carried vs dropped.
+    Verify {
+        /// Insights session id.
+        session: String,
+        /// Receiving agent/runtime.
+        #[arg(long, default_value = "opencode")]
+        target: String,
+        /// Insights DB (default: ~/.local/share/agentflare/insights/observatory.db).
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+    /// Health of the handoff path: memory DB, insights DB, sources.
+    Doctor {
+        /// Insights DB (default: ~/.local/share/agentflare/insights/observatory.db).
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug)]
@@ -41,7 +101,15 @@ pub struct HandoffOutcome {
 
 impl HandoffArgs {
     pub fn run(self) {
-        let recipient = self.recipient.clone();
+        if let Some(cmd) = self.command {
+            return run_continuity(cmd);
+        }
+        let Some(recipient) = self.recipient.clone() else {
+            crate::ui::error(
+                "missing recipient — pass an agent or a preview|export|verify|doctor subcommand",
+            );
+            std::process::exit(1);
+        };
         match self.publish() {
             Ok(out) => {
                 println!(
@@ -116,7 +184,7 @@ impl HandoffArgs {
             favicon: Some("🤝".into()),
             base_version: None,
             sender: Some(sender),
-            recipient: Some(self.recipient),
+            recipient: self.recipient,
             thread_id: Some(thread_id.clone()),
             reply_to: self.reply_to,
             git: crate::mcp_server::AgentflareMcp::git_provenance(),
@@ -130,13 +198,45 @@ impl HandoffArgs {
     }
 }
 
+fn run_continuity(cmd: HandoffCommands) {
+    let out = match cmd {
+        HandoffCommands::Preview {
+            session,
+            target,
+            verbosity,
+            db,
+        } => crate::handoff::preview(db, &session, &target, &verbosity),
+        HandoffCommands::Export {
+            session,
+            target,
+            verbosity,
+            format,
+            out,
+            db,
+        } => crate::handoff::export_body(db, &session, &target, &verbosity, &format, out),
+        HandoffCommands::Verify {
+            session,
+            target,
+            db,
+        } => crate::handoff::verify(db, &session, &target),
+        HandoffCommands::Doctor { db } => crate::handoff::doctor(db),
+    };
+    match out {
+        Ok(text) => println!("{text}"),
+        Err(e) => {
+            crate::ui::error(&e);
+            std::process::exit(1);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn args(dir: &std::path::Path) -> HandoffArgs {
         HandoffArgs {
-            recipient: "opencode".into(),
+            recipient: Some("opencode".into()),
             file: None,
             content: None,
             thread: None,
@@ -145,6 +245,7 @@ mod tests {
             session: "handoffs".into(),
             sender: None,
             dir: Some(dir.to_path_buf()),
+            command: None,
         }
     }
 
