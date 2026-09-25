@@ -1,18 +1,44 @@
 [profile.default]
 # Measured on ci.yml's windows-latest `build` job (run 36074365887 + 5 other
-# recent runs): the longest legitimate test is 25.5s on windows-latest
-# (`vault::tests::migrates_legacy_gateway_secret_on_first_unlock`), 21.2s on
-# ubuntu-latest -- nothing legitimate comes close to 60s. Hung tests always
-# die at exactly the old slow-timeout's 300s boundary, then pass on retry in
-# 1-3s, and they come in bursts of 4-6 concurrent hangs filling every worker
-# slot at once, not as a single trailing straggler. Windows wall time tracks
-# timeout count almost exactly (0 -> 387s/425s, 1 -> 579s, 5 -> 818s, 6 ->
-# 982s/1066s), so each burst was costing 5 minutes. 30s/2 caps that at 60s
-# per hang without touching anything running in the legitimate range. Root
-# cause (item #314, still open) is a separate hunt; this only bounds the
-# cost per occurrence.
+# recent runs): the longest legitimate test observed was 25.5s on
+# windows-latest (`vault::tests::migrates_legacy_gateway_secret_on_first_unlock`),
+# 21.2s on ubuntu-latest. Hung tests always died at exactly the old
+# slow-timeout's 300s boundary, then passed on retry in 1-3s, and came in
+# bursts of 4-6 concurrent hangs filling every worker slot at once, not as a
+# single trailing straggler. Windows wall time tracked timeout count almost
+# exactly (0 -> 387s/425s, 1 -> 579s, 5 -> 818s, 6 -> 982s/1066s), so each
+# burst was costing 5 minutes. 30s/2 caps that at 60s per hang. Root cause
+# (item #314) was fixed separately (PR #811); this only bounds the cost of
+# whatever's left.
+#
+# One legitimate test does exceed the new 60s cap by design and needs its
+# own override below: `pause_then_resume_continues_the_same_run_in_the_same_worktree`
+# polls on a real `Instant::now() + Duration::from_secs(60)` deadline (see
+# the comment at its call site -- it's bounded by wall-clock, not a fixed
+# retry count, because the paused driver's wind-down is itself slower than
+# that under a loaded, fully-parallel nextest run). A PR run (36113600932,
+# 2026-09-25) hit exactly this: nextest's 60.00-60.006s kill landed a hair
+# before the test's own 60s deadline check could return, on all 3 tries.
+# Every other `Duration::from_secs(60|120|300|600)` found nearby in the
+# suite (agent_launch_tests.rs, pipeline_assembly_tests.rs,
+# work_item_pipeline/tests.rs, gateway-registry's circuit-breaker tests) is
+# a *configured ceiling* passed into the function under test, not a real
+# wait in the test's own control flow -- each of those asserts (or is
+# driven by mocked/fast steps into) a real runtime of seconds, so they
+# don't need an override. Don't add one preemptively without confirming the
+# same way this one was confirmed: read the test body, not just the grep hit.
 slow-timeout = { period = "30s", terminate-after = 2 }
 
 # Retries stay as a generic backstop for runner flakes, not as cover for the
 # item #314 hang above -- see nexte.st/docs/configuration for the field.
+retries = 2
+
+[[profile.default.overrides]]
+filter = 'test(work_item_pipeline::pause_tests::pause_then_resume_continues_the_same_run_in_the_same_worktree)'
+# Back to the pre-item-#651 default (300s) for this one test -- see the
+# comment above [profile.default]. This specific 300s/2-retries combination
+# was already empirically safe here across 6 measured CI runs before this
+# change (typical runtime 3.6s, never a false timeout), so it's the
+# validated choice rather than a new guess.
+slow-timeout = { period = "60s", terminate-after = 5 }
 retries = 2
