@@ -140,7 +140,13 @@ jobs:
       # read of the same stats right after the compile, kept in case the
       # action's own post-job print is timing-sensitive on Windows in some
       # runs.
-      - if: needs.changes.result != 'success' || needs.changes.outputs.code == 'true'
+      #
+      # !cancelled() (not the implicit success()-only default every other
+      # step here uses): a failing `cargo nextest run` is exactly when cache
+      # stats are most useful for debugging, so this step should still run
+      # after a test failure -- it should only skip when the whole run was
+      # cancelled, not just because a prior step failed.
+      - if: "!cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true')"
         run: sccache --show-stats
       - if: needs.changes.result != 'success' || needs.changes.outputs.code == 'true'
         run: cargo test --doc --workspace --verbose
