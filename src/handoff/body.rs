@@ -28,6 +28,7 @@ const SECRET_PREFIXES: &[&str] = &[
     "sk-", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "xox", "AKIA", "AIza",
 ];
 
+/// Origin of a handoff: which tool's store the session came from.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandoffSource {
     pub tool: String,
@@ -35,6 +36,7 @@ pub struct HandoffSource {
     pub project: String,
 }
 
+/// One flattened conversation turn (user or assistant side).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandoffTurn {
     pub seq: u32,
@@ -42,6 +44,7 @@ pub struct HandoffTurn {
     pub text: String,
 }
 
+/// Best-effort repo state at handoff time; `None` when unresolvable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandoffGit {
     pub root: String,
@@ -50,6 +53,7 @@ pub struct HandoffGit {
     pub dirty_count: usize,
 }
 
+/// Full-fidelity counts behind the (possibly truncated) carried text.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandoffCounts {
     pub turns: usize,
@@ -58,6 +62,8 @@ pub struct HandoffCounts {
     pub subagents: usize,
 }
 
+/// Versioned handoff payload: everything a receiving agent needs to
+/// continue, plus an explicit list of what was knowingly dropped.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandoffBodyV1 {
     pub version: u32,
@@ -366,6 +372,7 @@ fn mask_secret_words(input: &str) -> String {
         .collect()
 }
 
+/// Char-boundary truncation with an ellipsis marker when cut.
 pub fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         s.to_string()
@@ -477,7 +484,10 @@ mod tests {
     #[test]
     fn ordinary_words_survive_masking() {
         let out = redact("fix task-list and disk-based risk-free builds");
-        assert!(!out.contains("[REDACTED]"), "{out}");
+        assert!(
+            !out.contains("[REDACTED]"),
+            "ordinary words must survive masking"
+        );
     }
 
     #[test]
@@ -492,8 +502,7 @@ mod tests {
         let b = build(&session(), &turns, &[], &[], 0, "opencode", 10, None, 0);
         assert!(
             !b.objective.contains("sk-ant-abcdefghij"),
-            "{}",
-            b.objective
+            "objective must not carry raw secrets"
         );
     }
 

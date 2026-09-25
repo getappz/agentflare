@@ -23,6 +23,7 @@ pub fn target_file(target: &str) -> &str {
     }
 }
 
+/// Inputs for materializing a handoff into an instruction file.
 pub struct ApplyRequest {
     pub source: String,
     pub session_id: String,
@@ -33,6 +34,7 @@ pub struct ApplyRequest {
     pub dry_run: bool,
 }
 
+/// Where the section landed and whether disk changed.
 pub struct ApplyOutcome {
     pub path: std::path::PathBuf,
     pub wrote: bool,

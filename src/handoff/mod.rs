@@ -56,10 +56,20 @@ pub fn load_body(
         .map_err(|e| format!("session lookup failed: {e}"))?
         .ok_or_else(|| format!("session not found: {session_id}"))?;
     let max_turns = parse_verbosity(verbosity).max_turns();
-    let turns = store.get_turns(&session.id).unwrap_or_default();
-    let tools = store.get_tool_calls(&session.id).unwrap_or_default();
-    let files = store.get_file_events(&session.id).unwrap_or_default();
-    let subagents = store.get_subagents(&session.id).unwrap_or_default();
+    // A handoff built on silently dropped turns/tools would look complete
+    // while missing context: fail loudly instead of shipping it partial.
+    let turns = store
+        .get_turns(&session.id)
+        .map_err(|e| format!("turn lookup failed: {e}"))?;
+    let tools = store
+        .get_tool_calls(&session.id)
+        .map_err(|e| format!("tool lookup failed: {e}"))?;
+    let files = store
+        .get_file_events(&session.id)
+        .map_err(|e| format!("file lookup failed: {e}"))?;
+    let subagents = store
+        .get_subagents(&session.id)
+        .map_err(|e| format!("subagent lookup failed: {e}"))?;
     let git = git_context(session.cwd.as_deref());
     Ok(build(
         &session,
@@ -176,6 +186,7 @@ pub fn doctor(db: Option<PathBuf>) -> Result<String, String> {
 /// publish it as a versioned artifact addressed to the receiving agent.
 /// The artifact publish is the only write in this module; sources stay
 /// read-only.
+/// Inputs for a targeted inbox send; `artifact_dir` overrides the store.
 pub struct SendRequest {
     pub source: String,
     pub session_id: String,
@@ -190,6 +201,7 @@ pub struct SendRequest {
 }
 
 #[derive(Debug)]
+/// Address of the published handoff artifact for the receiver to fetch.
 pub struct SendOutcome {
     pub id: String,
     pub version: u32,

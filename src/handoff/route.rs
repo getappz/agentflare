@@ -86,6 +86,7 @@ pub fn live_agents() -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
+/// Inputs for failover routing; `execute` needs `session_id`.
 pub struct RouteRequest {
     /// Exhausted agent (`claude_code`, `codex`, ...; aliases accepted).
     pub from: String,
@@ -103,6 +104,7 @@ pub struct RouteRequest {
 }
 
 #[derive(Debug)]
+/// Routing decision: who takes over, why, and what was sent (if anything).
 pub struct RouteOutcome {
     pub from: String,
     pub signal: Option<String>,

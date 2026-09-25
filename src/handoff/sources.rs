@@ -13,6 +13,7 @@ use flare_insights::model::{FileEvent, Session, ToolCall, Turn};
 /// Sources with a reusable ingest adapter, in auto-detect order.
 pub const SUPPORTED: &[&str] = &["claude_code", "codex", "opencode"];
 
+/// One foreign session with its parts, ready for [`super::body::build`].
 #[derive(Debug)]
 pub struct SessionBundle {
     pub session: Session,
