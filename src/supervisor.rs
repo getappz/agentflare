@@ -1611,7 +1611,16 @@ fn handle_pr_status(
                 result.skipped += 1;
             }
         }
-        crate::worktree::PrCiStatus::Pending | crate::worktree::PrCiStatus::Unknown => {
+        // A review bot's own pending "review paused" status is one way a PR
+        // reads as pending forever: the bot never reviews the new head on
+        // its own, and nothing else here would summon it.
+        crate::worktree::PrCiStatus::Pending { number, head_sha } => {
+            if let Some(head) = head_sha.as_deref() {
+                nudge_paused_review_for_pending(mcp, item, repo_root, number, head);
+            }
+            result.skipped += 1;
+        }
+        crate::worktree::PrCiStatus::Unknown => {
             result.skipped += 1;
         }
     }

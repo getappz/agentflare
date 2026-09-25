@@ -346,10 +346,11 @@ pub(super) fn delete_merged_head_branch_with(
 /// checked in the wrong order -- `merge_if_approved` ran first and findings
 /// were only checked in the branch where it did NOT merge -- so an approved,
 /// CI-green PR with real findings still sitting on it got merged untouched;
-/// see GitHub PR 791). Findings the agent is to work on are dispatched; a
-/// non-optional thread still open for any other reason (waiting on the bot
-/// to accept a reply, a fix not yet pushed, escalated to a human) holds the
-/// merge without a dispatch.
+/// see GitHub PR 791). Findings the agent is to work on are dispatched when
+/// any of them is non-optional (nitpicks alone never start a repair or hold
+/// the merge); a non-optional thread still open for any other reason
+/// (waiting on the bot to accept a reply, a fix not yet pushed, escalated
+/// to a human) holds the merge without a dispatch.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn merge_or_repair_findings(
     mcp: &AgentflareMcp,
@@ -365,7 +366,7 @@ pub(super) fn merge_or_repair_findings(
     folder_path: &str,
     merge: CiGreenMerge<'_>,
 ) -> PassingPrOutcome {
-    if !review.to_dispatch.is_empty() {
+    if review.dispatch_needed() {
         return PassingPrOutcome::Repair(coderabbit_repair_or_gate(
             mcp,
             queue,

@@ -72,7 +72,9 @@ pub(super) fn coderabbit_findings_fingerprint(findings: &[BotFinding]) -> String
 #[derive(Debug, Default)]
 pub(crate) struct ReviewBotState {
     /// Findings whose next round is the agent's to work: dispatched by
-    /// `coderabbit_repair_or_gate` when non-empty.
+    /// `coderabbit_repair_or_gate` when at least one of them is not
+    /// optional (`dispatch_needed`); optional ones ride along, never start
+    /// a repair on their own.
     pub to_dispatch: Vec<BotFinding>,
     /// Unresolved, non-optional threads not yet accepted by the bot --
     /// these hold the merge whatever else happens this tick.
@@ -83,6 +85,10 @@ pub(crate) struct ReviewBotState {
     pub waiting_push: usize,
     /// Threads at or past `max_rounds`, gated for a human.
     pub escalated: usize,
+    /// The thread fetch failed (rate limit, transport, no client): the
+    /// review state is unknown, so the merge is held rather than treated
+    /// as clean.
+    pub unknown: bool,
 }
 
 impl ReviewBotState {
@@ -97,8 +103,23 @@ impl ReviewBotState {
         }
     }
 
+    /// Whether a repair job is worth starting: some actionable finding is
+    /// not optional. A PR carrying only nitpicks merges (once approved)
+    /// instead of bouncing to an agent for them.
+    pub fn dispatch_needed(&self) -> bool {
+        self.to_dispatch.iter().any(|f| !f.optional())
+    }
+
     pub fn blocks_merge(&self) -> bool {
-        self.blocking > 0 || !self.to_dispatch.is_empty()
+        self.unknown || self.blocking > 0 || self.dispatch_needed()
+    }
+
+    /// The state for a sweep that could not look: holds the merge.
+    fn unknown() -> Self {
+        ReviewBotState {
+            unknown: true,
+            ..Default::default()
+        }
     }
 }
 
@@ -129,10 +150,10 @@ pub(super) fn fetch_review_bot_state(
     folder_path: &str,
 ) -> ReviewBotState {
     let Some(repo) = RepoId::resolve_from_remote(repo_root) else {
-        return ReviewBotState::default();
+        return ReviewBotState::unknown();
     };
     let Ok(client) = Client::new() else {
-        return ReviewBotState::default();
+        return ReviewBotState::unknown();
     };
     let cfg = ReviewBotConfig::load(repo_root);
     sweep_review_threads(
@@ -198,23 +219,37 @@ pub(crate) fn sweep_review_threads(
                 input.number,
                 e.log_safe()
             );
+            state.unknown = true;
             return state;
         }
     };
     let by_id: std::collections::HashMap<&str, &ReviewThread> =
         threads.iter().map(|t| (t.id.as_str(), t)).collect();
-    let findings = classify_threads(&threads, cfg);
     let meta = current_metadata(mcp, item);
+    let findings = classify_threads(&threads, cfg, &meta);
     let in_flight = job_in_flight(queue, &item.id);
     let mut commits: Option<Vec<String>> = None;
 
     // A restart between a fix's reply and its resolve leaves the thread
     // open with our marker as its last word: finish the resolve, never
-    // repeat the reply.
+    // repeat the reply. Only when that marker really is the last word --
+    // a human who answered after it has reopened the thread, and a marker
+    // the item's records don't vouch for is not ours.
     for f in &findings {
-        if let ThreadStatus::Waiting {
-            outcome: ReviewOutcome::Fixed,
-        } = f.status
+        let last_is_our_fix = by_id.get(f.thread_id.as_str()).is_some_and(|t| {
+            t.comments
+                .last()
+                .and_then(|c| ReplyMarker::parse(&c.body))
+                .is_some_and(|m| {
+                    m.outcome == ReviewOutcome::Fixed && marker_trusted(&m, &t.id, &meta)
+                })
+        });
+        if matches!(
+            f.status,
+            ThreadStatus::Waiting {
+                outcome: ReviewOutcome::Fixed
+            }
+        ) && last_is_our_fix
         {
             match review_threads::resolve_review_thread(client, &f.thread_id) {
                 Ok(()) => state.replied += 1,
@@ -237,9 +272,24 @@ pub(crate) fn sweep_review_threads(
         if let Some(result) = thread_result(&meta, &f.thread_id).filter(|r| r.round.max(1) == next)
         {
             if result.outcome == ReviewOutcome::Fixed {
-                let shas = commits.get_or_insert_with(|| {
-                    review_threads::pr_commit_shas(client, repo, input.number).unwrap_or_default()
-                });
+                // A failed commit list is not an empty one: the fix may well
+                // be on the branch, so the thread waits for the next tick
+                // instead of having its report discarded.
+                if commits.is_none() {
+                    match review_threads::pr_commit_shas(client, repo, input.number) {
+                        Ok(s) => commits = Some(s),
+                        Err(e) => {
+                            eprintln!(
+                                "agentflare-supervisor: could not list commits of PR #{}: {}",
+                                input.number,
+                                e.log_safe()
+                            );
+                            state.waiting_push += 1;
+                            continue;
+                        }
+                    }
+                }
+                let shas = commits.as_deref().unwrap_or_default();
                 let pushed = result
                     .sha
                     .as_deref()
@@ -328,7 +378,7 @@ fn reply_and_settle(
         sha: result.sha.clone().unwrap_or_default(),
         outcome: result.outcome,
     };
-    let replied = already_replied(thread, round);
+    let replied = already_replied(thread, round, result);
     match (result.outcome, replied) {
         (ReviewOutcome::Fixed, false) => {
             review_threads::reply_then_resolve(
@@ -469,13 +519,35 @@ fn post_detached_results(
     });
 }
 
+/// The paused-review nudge for a PR the sweep sees as `Pending`: the bot's
+/// own "Review paused" commit status is pending, so the PR reads as
+/// pending CI and never reaches `sweep_review_threads` -- without this the
+/// pause would hold the PR forever. Same soft-fail as `fetch_review_bot_state`.
+pub(super) fn nudge_paused_review_for_pending(
+    mcp: &AgentflareMcp,
+    item: &agentflare_backend::item::Item,
+    repo_root: &std::path::Path,
+    number: u64,
+    head: &str,
+) {
+    let Some(repo) = RepoId::resolve_from_remote(repo_root) else {
+        return;
+    };
+    let Ok(client) = Client::new() else {
+        return;
+    };
+    let cfg = ReviewBotConfig::load(repo_root);
+    let meta = current_metadata(mcp, item);
+    nudge_paused_review(&client, &repo, mcp, item, number, head, &cfg, &meta);
+}
+
 /// A bot that auto-paused on a busy branch never reviews the new head on
 /// its own: when its status says paused and it has not reviewed `head`,
 /// summon it once for that head. The pause check itself runs once per head
 /// (`REVIEW_NUDGED_HEAD_KEY` records the head last checked), so a PR that
 /// isn't paused costs one status GET per push, not per tick.
 #[allow(clippy::too_many_arguments)]
-fn nudge_paused_review(
+pub(super) fn nudge_paused_review(
     client: &Client,
     repo: &RepoId,
     mcp: &AgentflareMcp,

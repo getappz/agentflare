@@ -56,20 +56,26 @@ fn normalize_login(login: &str) -> String {
 }
 
 impl ReviewBotConfig {
-    /// Whether `login` (a comment author, or a commit-status context such
-    /// as `CodeRabbit`) names a configured bot: one is a prefix of the
-    /// other, and the shorter is long enough to mean something.
+    /// Whether comment author `login` is a configured bot: an exact match on
+    /// the normalized login. A prefix match would let a human account such
+    /// as `coderabbitai-helper` open findings, push back on our replies, or
+    /// "accept" one of them.
     pub fn is_bot(&self, login: &str) -> bool {
         let login = normalize_login(login);
-        self.bots.iter().any(|b| {
-            let b = normalize_login(b);
-            let (short, long) = if b.len() <= login.len() {
-                (&b, &login)
-            } else {
-                (&login, &b)
-            };
-            short.len() >= 5 && long.starts_with(short.as_str())
-        })
+        !login.is_empty() && self.bots.iter().any(|b| normalize_login(b) == login)
+    }
+
+    /// Whether a commit-status context (`CodeRabbit`) belongs to a configured
+    /// bot. A status context is the app's own label, not an account anyone
+    /// can register, so a loose prefix match is fine here and needed: the
+    /// context is shorter than the login.
+    pub fn is_bot_context(&self, context: &str) -> bool {
+        let ctx = normalize_login(context);
+        ctx.len() >= 5
+            && self.bots.iter().any(|b| {
+                let b = normalize_login(b);
+                b.starts_with(ctx.as_str()) || ctx.starts_with(b.as_str())
+            })
     }
 
     /// The `@handle` to summon the first configured bot with.
@@ -249,9 +255,15 @@ pub(crate) fn parse_finding_body(body: &str) -> ParsedFinding {
         .unwrap_or_default();
     let title = cap(&title, 200);
 
-    let ai_prompt = body
-        .to_lowercase()
-        .find("prompt for ai agents")
+    // Matched on the original text: an offset from `to_lowercase()` can be
+    // off (or land mid-character) once a case-folded character changes
+    // byte length, and the body is untrusted.
+    static PROMPT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)prompt for ai agents").expect("valid regex")
+    });
+    let ai_prompt = PROMPT
+        .find(body)
+        .map(|m| m.start())
         .and_then(|at| {
             let end = body[at..]
                 .find("</details>")
@@ -379,12 +391,36 @@ impl ReplyMarker {
     }
 }
 
-fn is_our_reply(c: &ThreadComment) -> bool {
-    ReplyMarker::parse(&c.body).is_some()
+/// Whether a marker found on `thread_id` is one this supervisor wrote, as
+/// opposed to marker text a PR participant pasted: the marker must name
+/// the thread it sits on, and the item's own records must back it -- a
+/// round we recorded as replied, or the pending result (same round,
+/// outcome and sha) whose reply a restart interrupted before the record
+/// was written. Anything else is ignored, so a forged marker can neither
+/// settle a thread nor skip a reply.
+pub(crate) fn marker_trusted(marker: &ReplyMarker, thread_id: &str, meta: &Meta) -> bool {
+    if marker.thread != marker_field(thread_id) {
+        return false;
+    }
+    if marker.round <= thread_record(meta, thread_id).replied_round {
+        return true;
+    }
+    thread_result(meta, thread_id).is_some_and(|r| {
+        r.round.max(1) == marker.round
+            && r.outcome == marker.outcome
+            && (r.outcome != ReviewOutcome::Fixed
+                || r.sha.as_deref().map(marker_field).as_deref() == Some(&marker.sha))
+    })
+}
+
+fn our_marker(c: &ThreadComment, thread_id: &str, meta: &Meta) -> Option<ReplyMarker> {
+    ReplyMarker::parse(&c.body).filter(|m| marker_trusted(m, thread_id, meta))
 }
 
 /// A bot comment that merely acknowledges rather than raising a concern:
-/// no severity/category markers, no agent prompt, and an acceptance cue.
+/// no severity/category markers, no agent prompt, an acceptance cue near
+/// the top, and nothing anywhere that qualifies or contradicts it
+/// ("thanks, but this still reproduces" is a pushback, not an acceptance).
 pub(crate) fn looks_like_acceptance(body: &str) -> bool {
     let lower = body.to_lowercase();
     let raises = ['🔴', '🟠', '🟡', '🔵', '⚠', '🛠']
@@ -393,6 +429,28 @@ pub(crate) fn looks_like_acceptance(body: &str) -> bool {
         || lower.contains("prompt for ai agents")
         || lower.contains("```suggestion");
     if raises {
+        return false;
+    }
+    let contradicts = [
+        "but ",
+        "but,",
+        "however",
+        "still ",
+        "remain",
+        "reproduc",
+        "disagree",
+        "incorrect",
+        "not sure",
+        "actually",
+        "though",
+        "nevertheless",
+        "unfortunately",
+        "yet ",
+        "?",
+    ]
+    .iter()
+    .any(|cue| lower.contains(cue));
+    if contradicts {
         return false;
     }
     let head: String = lower.chars().take(240).collect();
@@ -404,7 +462,7 @@ pub(crate) fn looks_like_acceptance(body: &str) -> bool {
             "thanks",
             "thank you",
             "got it",
-            "fair",
+            "fair enough",
             "makes sense",
             "sounds good",
             "agreed",
@@ -500,8 +558,13 @@ impl BotFinding {
 
 /// Every unresolved thread rooted by a configured bot, classified by whose
 /// word is the latest on it. Resolved threads, threads a human opened, and
-/// threads with no comments are dropped.
-pub(crate) fn classify_threads(threads: &[ReviewThread], cfg: &ReviewBotConfig) -> Vec<BotFinding> {
+/// threads with no comments are dropped. `meta` is the item's metadata:
+/// only markers it vouches for (`marker_trusted`) count as our replies.
+pub(crate) fn classify_threads(
+    threads: &[ReviewThread],
+    cfg: &ReviewBotConfig,
+    meta: &Meta,
+) -> Vec<BotFinding> {
     threads
         .iter()
         .filter(|t| !t.is_resolved)
@@ -515,8 +578,7 @@ pub(crate) fn classify_threads(threads: &[ReviewThread], cfg: &ReviewBotConfig) 
                 .iter()
                 .enumerate()
                 .rev()
-                .find(|(_, c)| is_our_reply(c))
-                .and_then(|(i, c)| ReplyMarker::parse(&c.body).map(|m| (i, m)));
+                .find_map(|(i, c)| our_marker(c, &t.id, meta).map(|m| (i, m)));
             let (status, follow_up) = match ours {
                 None => (ThreadStatus::Actionable { next_round: 1 }, None),
                 Some((our_idx, marker)) => {
@@ -524,7 +586,7 @@ pub(crate) fn classify_threads(threads: &[ReviewThread], cfg: &ReviewBotConfig) 
                     let last_bot = later.iter().rev().find(|c| cfg.is_bot(&c.login)).copied();
                     let human_took_over = later
                         .iter()
-                        .any(|c| !cfg.is_bot(&c.login) && !is_our_reply(c));
+                        .any(|c| !cfg.is_bot(&c.login) && our_marker(c, &t.id, meta).is_none());
                     match last_bot {
                         None => (
                             ThreadStatus::Waiting {
@@ -571,14 +633,22 @@ pub(crate) fn classify_threads(threads: &[ReviewThread], cfg: &ReviewBotConfig) 
         .collect()
 }
 
-/// Whether `thread` already carries our reply for `round` -- the restart
-/// guard before posting one.
-pub(crate) fn already_replied(thread: &ReviewThread, round: u32) -> bool {
+/// Whether `thread` already carries our reply for `round` of `result` --
+/// the restart guard before posting one. Only a marker that matches the
+/// reply we would post (thread, round, outcome, and the sha for a fix)
+/// counts; a pasted look-alike does not skip the reply.
+pub(crate) fn already_replied(thread: &ReviewThread, round: u32, result: &ReviewResult) -> bool {
+    let sha = result.sha.as_deref().map(marker_field).unwrap_or_default();
     thread
         .comments
         .iter()
         .filter_map(|c| ReplyMarker::parse(&c.body))
-        .any(|m| m.round == round)
+        .any(|m| {
+            m.thread == marker_field(&thread.id)
+                && m.round == round
+                && m.outcome == result.outcome
+                && (result.outcome != ReviewOutcome::Fixed || m.sha == sha)
+        })
 }
 
 /// Escapes anything in an untrusted body that could pass for one of our
@@ -855,7 +925,7 @@ const NUDGE_MARKER_OPEN: &str = "<!-- agentflare:review-nudge sha=";
 pub(crate) fn review_paused(statuses: &[CommitStatusDetail], cfg: &ReviewBotConfig) -> bool {
     statuses
         .iter()
-        .any(|s| cfg.is_bot(&s.context) && s.description.to_lowercase().contains("paused"))
+        .any(|s| cfg.is_bot_context(&s.context) && s.description.to_lowercase().contains("paused"))
 }
 
 /// Whether a configured bot has submitted a review against `head_sha`.

@@ -279,7 +279,13 @@ pub enum PrCiStatus {
         checks: Vec<String>,
         labels: Vec<String>,
     },
-    Pending,
+    /// CI still running (or GitHub still computing mergeability). Carries
+    /// the PR number and head so the sweep can nudge a review bot whose own
+    /// pending "review paused" status is what keeps the PR here.
+    Pending {
+        number: u64,
+        head_sha: Option<String>,
+    },
     /// CI is green. Carries the PR number and its GitHub label names so
     /// `run_review_sweep` can decide whether to auto-merge without a second
     /// API round-trip just to re-fetch labels, plus the head commit the
@@ -496,6 +502,10 @@ fn decide_from_checks(
         labels,
         head_sha: signals.head_sha.map(str::to_string),
     };
+    let pending = || PrCiStatus::Pending {
+        number,
+        head_sha: signals.head_sha.map(str::to_string),
+    };
     let awaiting_review = signals.mergeable_state == Some("blocked")
         && matches!(
             signals.review_decision,
@@ -516,7 +526,7 @@ fn decide_from_checks(
                     labels,
                 };
             }
-            Some("PENDING") | Some("EXPECTED") => return PrCiStatus::Pending,
+            Some("PENDING") | Some("EXPECTED") => return pending(),
             _ => {}
         }
         if signals.mergeable == Some(true) {
@@ -527,11 +537,11 @@ fn decide_from_checks(
                 return PrCiStatus::AwaitingReview { number, labels };
             }
         }
-        return PrCiStatus::Pending;
+        return pending();
     }
     let summary = crate::github::mcp::checks_wait_summary(&relevant, 0);
     if summary["pending"].as_bool().unwrap_or(true) {
-        return PrCiStatus::Pending;
+        return pending();
     }
     let failed: Vec<String> = summary["failed_checks"]
         .as_array()
@@ -568,7 +578,7 @@ fn decide_from_checks(
     // that's the exact same incomplete-snapshot window, just caught one tick
     // earlier, so it gets the same treatment.
     if matches!(signals.mergeable_state, Some("blocked") | Some("unknown")) {
-        return PrCiStatus::Pending;
+        return pending();
     }
     passing(labels)
 }
