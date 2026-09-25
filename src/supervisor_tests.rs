@@ -1795,43 +1795,22 @@ fn stale_stage_label_is_none_when_neither_stage_label_is_present() {
 
 // --- coderabbit_repair_or_gate (item #273) ---
 
-pub(crate) fn coderabbit_finding(id: u64, login: &str) -> crate::github::models::ReviewComment {
-    crate::github::models::ReviewComment {
-        id,
-        user: crate::github::models::User {
-            login: login.to_string(),
-        },
+/// A fresh (round 1, never replied to) bot finding on `src/lib.rs:42`,
+/// the shape `sweep_review_threads` hands `coderabbit_repair_or_gate`.
+pub(crate) fn coderabbit_finding(id: u64, login: &str) -> BotFinding {
+    let body = "this could panic on an empty slice".to_string();
+    BotFinding {
+        thread_id: format!("PRRT_{id}"),
+        root_comment_id: id,
+        login: login.to_string(),
         path: "src/lib.rs".to_string(),
         line: Some(42),
-        body: "this could panic on an empty slice".to_string(),
+        is_outdated: false,
+        parsed: parse_finding_body(&body),
+        body,
+        status: ThreadStatus::Actionable { next_round: 1 },
+        follow_up: None,
     }
-}
-
-#[test]
-fn unresolved_coderabbit_comments_keeps_only_unresolved_coderabbit_findings() {
-    let comments = vec![
-        coderabbit_finding(1, "coderabbitai[bot]"),
-        coderabbit_finding(2, "coderabbitai[bot]"),
-        coderabbit_finding(3, "a-human-reviewer"),
-    ];
-    let mut resolved = std::collections::HashSet::new();
-    resolved.insert(2u64); // this CodeRabbit comment's thread was resolved
-
-    let unresolved = unresolved_coderabbit_comments(&comments, &resolved);
-
-    assert_eq!(
-        unresolved.iter().map(|c| c.id).collect::<Vec<_>>(),
-        vec![1],
-        "must drop the resolved CodeRabbit comment and the human reviewer's \
-         comment, keeping only the still-unresolved CodeRabbit one"
-    );
-}
-
-#[test]
-fn unresolved_coderabbit_comments_matches_the_bot_login_case_insensitively() {
-    let comments = vec![coderabbit_finding(1, "CodeRabbitAI[bot]")];
-    let unresolved = unresolved_coderabbit_comments(&comments, &std::collections::HashSet::new());
-    assert_eq!(unresolved.len(), 1);
 }
 
 #[test]

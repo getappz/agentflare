@@ -109,7 +109,21 @@ pub(super) fn handle_ci_green(
     if already_gated_or_in_flight(mcp, queue, item, label_id_by_name) {
         result.skipped += 1;
     } else {
-        let findings = fetch_unresolved_coderabbit_comments(repo_root, number);
+        let head_sha = match merge {
+            CiGreenMerge::Allowed { head_sha } => head_sha,
+            CiGreenMerge::BlockedOnReview => None,
+        };
+        let review = fetch_review_bot_state(
+            mcp,
+            queue,
+            item,
+            repo_root,
+            number,
+            head_sha,
+            labels,
+            label_id_by_name,
+            folder_path,
+        );
         match merge_or_repair_findings(
             mcp,
             queue,
@@ -118,7 +132,7 @@ pub(super) fn handle_ci_green(
             item,
             repo_root,
             number,
-            &findings,
+            &review,
             labels,
             label_id_by_name,
             folder_path,
@@ -323,15 +337,19 @@ pub(super) fn delete_merged_head_branch_with(
     }
 }
 
-/// Routes a CI-green PR to either a CodeRabbit review-repair dispatch or an
-/// approval-gated merge attempt -- `findings` (pre-fetched by the caller,
-/// same convention as `self_repair_or_gate`'s `failed_checks`) is checked
-/// FIRST, so a PR with unresolved CodeRabbit findings can never reach
-/// `merge_if_approved`, regardless of its approval label or CI status (item
-/// #628: the two were previously checked in the wrong order -- `merge_if_approved`
-/// ran first and findings were only checked in the branch where it did NOT
-/// merge -- so an approved, CI-green PR with real findings still sitting on
-/// it got merged untouched; see GitHub PR 791).
+/// Routes a CI-green PR to either a review-bot repair dispatch or an
+/// approval-gated merge attempt -- `review` (the sweep of the PR's bot
+/// threads, pre-fetched by the caller, same convention as
+/// `self_repair_or_gate`'s `failed_checks`) is checked FIRST, so a PR with
+/// unresolved bot findings can never reach `merge_if_approved`, regardless
+/// of its approval label or CI status (item #628: the two were previously
+/// checked in the wrong order -- `merge_if_approved` ran first and findings
+/// were only checked in the branch where it did NOT merge -- so an approved,
+/// CI-green PR with real findings still sitting on it got merged untouched;
+/// see GitHub PR 791). Findings the agent is to work on are dispatched; a
+/// non-optional thread still open for any other reason (waiting on the bot
+/// to accept a reply, a fix not yet pushed, escalated to a human) holds the
+/// merge without a dispatch.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn merge_or_repair_findings(
     mcp: &AgentflareMcp,
@@ -341,13 +359,13 @@ pub(super) fn merge_or_repair_findings(
     item: &agentflare_backend::item::Item,
     repo_root: &std::path::Path,
     number: u64,
-    findings: &[crate::github::models::ReviewComment],
+    review: &ReviewBotState,
     labels: &[String],
     label_id_by_name: &std::collections::HashMap<String, String>,
     folder_path: &str,
     merge: CiGreenMerge<'_>,
 ) -> PassingPrOutcome {
-    if !findings.is_empty() {
+    if !review.to_dispatch.is_empty() {
         return PassingPrOutcome::Repair(coderabbit_repair_or_gate(
             mcp,
             queue,
@@ -355,11 +373,14 @@ pub(super) fn merge_or_repair_findings(
             host_policy,
             item,
             number,
-            findings,
+            &review.to_dispatch,
             labels,
             label_id_by_name,
             folder_path,
         ));
+    }
+    if review.blocks_merge() {
+        return PassingPrOutcome::NotMerged;
     }
     let summary = maybe_post_repair_complete_summary(
         mcp,
