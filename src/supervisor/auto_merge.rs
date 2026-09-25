@@ -93,9 +93,11 @@ fn set_pr_auto_merge(
     }
 }
 
-/// Disarms auto-merge on PR `number` if this sweep armed it (and forgets
-/// the arming); a no-op, with no network call, for auto-merge nobody here
-/// armed. Returns whether it acted.
+/// Disarms auto-merge on PR `number` if this sweep armed it, and forgets the
+/// arming once GitHub has confirmed the disarm; a no-op, with no network
+/// call, for auto-merge nobody here armed. A disarm GitHub refused keeps the
+/// record, so the next tick tries again rather than losing track of an
+/// arming that is still live. Returns whether the PR is known disarmed.
 pub(super) fn disarm_our_auto_merge(
     mcp: &AgentflareMcp,
     item: &agentflare_backend::item::Item,
@@ -112,31 +114,38 @@ pub(super) fn disarm_our_auto_merge(
     let Ok(client) = crate::github::Client::new() else {
         return false;
     };
-    disarm_auto_merge_with(&client, &repo, number, &armed.node_id, why);
+    if !disarm_auto_merge_with(&client, &repo, number, &armed.node_id, why) {
+        return false;
+    }
     clear_armed_auto_merge(mcp, item);
     true
 }
 
 /// `disarm_our_auto_merge`'s GitHub half, split out for mock-server tests
-/// the same way `merge_approved_pr` is. Soft-fails: a disarm GitHub refused
-/// is logged, and the recorded arming is still cleared by the caller so the
-/// next tick re-judges from GitHub's own `autoMergeRequest`.
+/// the same way `merge_approved_pr` is. Returns whether GitHub accepted the
+/// disarm; a refusal is logged and left for the next tick to retry.
 pub(super) fn disarm_auto_merge_with(
     client: &crate::github::Client,
     repo: &crate::github::RepoId,
     number: u64,
     node_id: &str,
     why: &str,
-) {
+) -> bool {
     match crate::github::graphql::disable_auto_merge(client, node_id) {
-        Ok(()) => eprintln!(
-            "agentflare-supervisor: disarmed GitHub auto-merge on PR #{number} in {repo}: {why}"
-        ),
-        Err(e) => eprintln!(
-            "agentflare-supervisor: could not disarm GitHub auto-merge on PR #{number} in \
-             {repo}: {}",
-            e.log_safe()
-        ),
+        Ok(()) => {
+            eprintln!(
+                "agentflare-supervisor: disarmed GitHub auto-merge on PR #{number} in {repo}: {why}"
+            );
+            true
+        }
+        Err(e) => {
+            eprintln!(
+                "agentflare-supervisor: could not disarm GitHub auto-merge on PR #{number} in \
+                 {repo}: {}; will retry next tick",
+                e.log_safe()
+            );
+            false
+        }
     }
 }
 

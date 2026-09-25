@@ -520,6 +520,43 @@ pub(super) fn merge_if_approved(
     }
 }
 
+/// The commit-status context the sweep stamps on a head it has judged fit
+/// to merge (approval label on, no unresolved CodeRabbit findings). Auto-
+/// merge is GitHub's to fire, and a push from a write-access account keeps
+/// it armed, so sweep-time reconciliation (`auto_merge::reconcile_armed_auto_merge`)
+/// alone can't stop GitHub merging a head pushed and gone green between two
+/// ticks. A repo that requires this context in its branch protection closes
+/// that window at merge time: a new head carries no status until the sweep
+/// judges it, so GitHub waits. Repos that don't require it see it as an
+/// informational status only.
+pub(crate) const JUDGED_STATUS_CONTEXT: &str = "agentflare/judged";
+
+/// Stamps `JUDGED_STATUS_CONTEXT` on `sha`, right after arming auto-merge
+/// on it. Soft-fails: the arming already happened, and a missing status only
+/// matters to repos that require the context, where it makes GitHub wait --
+/// the safe direction.
+fn mark_head_judged(
+    client: &crate::github::Client,
+    repo: &crate::github::RepoId,
+    number: u64,
+    sha: &str,
+) {
+    if let Err(e) = crate::github::actions::create_commit_status(
+        client,
+        repo,
+        sha,
+        "success",
+        JUDGED_STATUS_CONTEXT,
+        "approval label on, no unresolved CodeRabbit findings",
+    ) {
+        eprintln!(
+            "agentflare-supervisor: could not mark head {sha} of PR #{number} in {repo} as \
+             judged: {}",
+            e.log_safe()
+        );
+    }
+}
+
 /// The actual GitHub merge for an approved, CI-green PR. Split out from
 /// `merge_if_approved` so tests can drive it against a mock server instead
 /// of `Client::new()`'s real credentials/host, mirroring `github::pulls`'
@@ -577,6 +614,9 @@ pub(super) fn merge_approved_pr(
                          {repo}; GitHub merges it once every requirement holds",
                         method.rest()
                     );
+                    if let Some(sha) = head_sha {
+                        mark_head_judged(client, repo, number, sha);
+                    }
                     return MergeAttempt::AutoMergeArmed;
                 }
                 Err(e) => eprintln!(

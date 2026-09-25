@@ -91,6 +91,7 @@ fn merge_approved_pr_arms_github_auto_merge_pinned_to_the_head_when_the_repo_all
             200,
             r#"{"data":{"enablePullRequestAutoMerge":{"pullRequest":{"autoMergeRequest":{"enabledAt":"x"}}}}}"#,
         ),
+        MockResponse::json(201, r#"{"id":1}"#),
     ]);
     let client = server.client(Some("tok"));
     let auto = AutoMergeRef {
@@ -104,12 +105,23 @@ fn merge_approved_pr_arms_github_auto_merge_pinned_to_the_head_when_the_repo_all
     );
 
     let reqs = server.requests();
-    assert_eq!(reqs.len(), 2, "armed: no direct merge call follows");
+    assert_eq!(
+        reqs.len(),
+        3,
+        "armed and stamped: no direct merge call follows"
+    );
     assert_eq!(reqs[1].path, "/graphql");
     let sent: serde_json::Value = serde_json::from_str(&reqs[1].body).unwrap();
     assert_eq!(sent["variables"]["input"]["pullRequestId"], "PR_1");
     assert_eq!(sent["variables"]["input"]["mergeMethod"], "SQUASH");
     assert_eq!(sent["variables"]["input"]["expectedHeadOid"], "abc123");
+    // The judged head is stamped so a repo requiring the context lets
+    // GitHub merge exactly this head, not a later push.
+    assert_eq!(reqs[2].method, "POST");
+    assert_eq!(reqs[2].path, "/repos/o/r/statuses/abc123");
+    let status: serde_json::Value = serde_json::from_str(&reqs[2].body).unwrap();
+    assert_eq!(status["state"], "success");
+    assert_eq!(status["context"], JUDGED_STATUS_CONTEXT);
 }
 
 #[test]
@@ -135,7 +147,9 @@ fn merge_approved_pr_arms_auto_merge_on_a_review_blocked_pr_but_never_merges_it_
         merge_approved_pr(&client, &gh_repo(), 42, blocked),
         MergeAttempt::AutoMergeArmed
     );
-    assert_eq!(server.requests().len(), 2);
+    // Settings, the arming mutation, and the judged-head status; a failed
+    // status post (no canned response left) is soft, never a merge attempt.
+    assert_eq!(server.requests().len(), 3);
 
     // Arming refused (or the repo has auto-merge off): a review-blocked PR
     // gets no direct merge attempt either -- GitHub would only refuse it.
@@ -223,9 +237,22 @@ fn disarm_auto_merge_with_sends_the_disable_mutation_and_soft_fails() {
         MockResponse::json(500, r#"{"message":"boom"}"#),
     ]);
     let client = server.client(Some("tok"));
-    disarm_auto_merge_with(&client, &gh_repo(), 42, "PR_1", "test");
-    // A failure only logs; the sweep must not panic over it.
-    disarm_auto_merge_with(&client, &gh_repo(), 42, "PR_1", "test");
+    assert!(disarm_auto_merge_with(
+        &client,
+        &gh_repo(),
+        42,
+        "PR_1",
+        "test"
+    ));
+    // A failure only logs and reports false, so the caller keeps its
+    // record and retries next tick; the sweep must not panic over it.
+    assert!(!disarm_auto_merge_with(
+        &client,
+        &gh_repo(),
+        42,
+        "PR_1",
+        "test"
+    ));
     let reqs = server.requests();
     assert_eq!(reqs.len(), 2);
     let sent: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
