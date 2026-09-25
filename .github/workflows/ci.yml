@@ -127,15 +127,19 @@ jobs:
       # workspace has none today, as insurance against one being added later.
       - if: needs.changes.result != 'success' || needs.changes.outputs.code == 'true'
         run: cargo nextest run --workspace --verbose
-      # sccache-action's own post-job stats print (see mozilla-actions/
-      # sccache-action#183) queries the local sccache server after every
-      # other step in the job has finished, and on this Windows leg that
-      # server is gone by then -- it reports 0 compile requests every time
-      # even though the compile above genuinely went through sccache
-      # (verified: a cold-cache run still shows real Compiling lines, not
-      # Fresh, followed by 0 stats). Querying right after the step that did
-      # the compiling, before whatever reaps the server gets to it, is the
-      # workaround documented in that issue.
+      # windows-latest showed 0 compile requests / 0 cache hits in the
+      # sccache-action's post-job stats print in run 36074365887, despite a
+      # compile phase slower than ubuntu's (so sccache wasn't just idle
+      # because nothing needed building). Re-running this same job today
+      # (github.com/getappz/agentflare/actions/runs/36108680940) shows sccache
+      # genuinely active on windows-latest -- both this explicit step and the
+      # action's own post-job print report identical, healthy stats (533
+      # compile requests, 329 cache hits, 90.88% Rust hit rate). What made
+      # the earlier run report 0 is unconfirmed; Windows nextest/build
+      # oddities are tracked in item #314. This step is a near-free duplicate
+      # read of the same stats right after the compile, kept in case the
+      # action's own post-job print is timing-sensitive on Windows in some
+      # runs.
       - if: needs.changes.result != 'success' || needs.changes.outputs.code == 'true'
         run: sccache --show-stats
       - if: needs.changes.result != 'success' || needs.changes.outputs.code == 'true'
