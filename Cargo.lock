@@ -57,16 +57,12 @@ name = "agent-detector"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9bfb5cc9405a158bc050668e34b3bbbd3ace4ff7c4e06036e7418417f90a9ab5"
-dependencies = [
- "sysinfo 0.38.4",
-]
 
 [[package]]
 name = "agentflare"
 version = "1.7.0"
 dependencies = [
  "aes-gcm",
- "agent-detector",
  "agentflare-agent-registry",
  "agentflare-apps",
  "agentflare-artifacts",
@@ -241,7 +237,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "sysinfo 0.34.2",
+ "sysinfo",
 ]
 
 [[package]]
@@ -331,7 +327,7 @@ name = "agentflare-resource-gate"
 version = "0.1.0"
 dependencies = [
  "agentflare-workspace-hack",
- "sysinfo 0.34.2",
+ "sysinfo",
 ]
 
 [[package]]
@@ -428,7 +424,6 @@ dependencies = [
  "litemap",
  "memchr",
  "num-traits",
- "objc2-core-foundation",
  "once_cell",
  "percent-encoding",
  "potential_utf",
@@ -461,7 +456,7 @@ dependencies = [
  "ureq 2.12.1",
  "uuid",
  "winapi",
- "windows 0.62.2",
+ "windows-sys 0.59.0",
  "windows-sys 0.61.2",
  "writeable",
  "yoke",
@@ -1585,7 +1580,6 @@ dependencies = [
 name = "flare-git-core"
 version = "0.1.0"
 dependencies = [
- "agent-detector",
  "agentflare-backend",
  "agentflare-shim",
  "agentflare-workspace-hack",
@@ -1620,7 +1614,10 @@ dependencies = [
 name = "flare-process"
 version = "0.1.0"
 dependencies = [
+ "agent-detector",
  "agentflare-workspace-hack",
+ "sysinfo",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2873,16 +2870,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a180dd8642fa45cdb7dd721cd4c11b1cadd4929ce112ebd8b9f5803cc79d536"
 dependencies = [
  "bitflags 2.13.0",
-]
-
-[[package]]
-name = "objc2-io-kit"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33fafba39597d6dc1fb709123dfa8289d39406734be322956a69f0931c73bb15"
-dependencies = [
- "libc",
- "objc2-core-foundation",
 ]
 
 [[package]]
@@ -4355,20 +4342,6 @@ dependencies = [
  "ntapi",
  "objc2-core-foundation",
  "windows 0.57.0",
-]
-
-[[package]]
-name = "sysinfo"
-version = "0.38.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92ab6a2f8bfe508deb3c6406578252e491d299cbbf3bc0529ecc3313aee4a52f"
-dependencies = [
- "libc",
- "memchr",
- "ntapi",
- "objc2-core-foundation",
- "objc2-io-kit",
- "windows 0.62.2",
 ]
 
 [[package]]

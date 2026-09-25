@@ -81,7 +81,7 @@ pub fn build_trailers(repo_root: &Path) -> Trailers {
     let agent = std::env::var("AGENTFLARE_AGENT")
         .ok()
         .filter(|s| !s.is_empty())
-        .or_else(agent_detector::agent_name);
+        .or_else(flare_process::agent_name);
     let branch = current_branch(repo_root);
     let item_id = item_id_from_branch(branch.as_deref());
     let session_id = resolve_session_id();

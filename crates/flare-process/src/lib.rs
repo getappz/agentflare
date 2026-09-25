@@ -23,6 +23,9 @@
 use std::ffi::OsStr;
 use std::process::Command;
 
+pub mod agent;
+pub use agent::{agent_name, is_agent};
+
 /// `Command::new(program)` plus `CREATE_NO_WINDOW` on Windows: the child never
 /// allocates a console window of its own. Only fresh console *allocation* is
 /// suppressed -- piped handles behave identically, and handles inherited from

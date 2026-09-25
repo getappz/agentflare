@@ -4,11 +4,21 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
 license = "Apache-2.0"
-description = "Console-window-safe child-process spawning for agentflare -- one constructor every background spawn goes through so children never flash a terminal over the user's desktop on Windows."
+description = "Console-window-safe child-process spawning for agentflare -- one constructor every background spawn goes through so children never flash a terminal over the user's desktop on Windows -- plus caller-agent detection (which AI agent is driving this process)."
 publish = false
 
 [dependencies]
+# Env-marker tiers only. Its `process-tree` feature is deliberately OFF:
+# that walk enumerates and opens every process on the machine and hangs
+# under parallel test load on Windows -- `agent.rs` walks ancestors itself.
+agent-detector = { version = "0.2.1", default-features = false }
 agentflare-workspace-hack = { version = "0.1", path = "../../agentflare-workspace-hack" }
+
+[target.'cfg(unix)'.dependencies]
+sysinfo = { version = "0.34", default-features = false, features = ["system"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp"] }
 
 [lints.rust]
 unsafe_code = "warn"
