@@ -760,7 +760,7 @@ pub(crate) fn base64_encode(bytes: &[u8]) -> String {
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ItemRequest {
     #[schemars(
-        description = "Action: create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|add_relation|remove_relation|list_relations|redispatch|submit_plan|approve_plan|reject_plan|groom|standup|health|doctor|status|clear_start_date|clear_due_date"
+        description = "Action: create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|add_relation|remove_relation|list_relations|redispatch|review_result|submit_plan|approve_plan|reject_plan|groom|standup|health|doctor|status|clear_start_date|clear_due_date"
     )]
     pub(crate) action: String,
     #[schemars(
@@ -917,9 +917,34 @@ pub(crate) struct ItemRequest {
     )]
     #[serde(default)]
     pub(crate) plan_approver: Option<String>,
-    #[schemars(description = "Reason text (reject_plan)")]
+    #[schemars(
+        description = "Reason text (reject_plan; also accepted as `note` for review_result)"
+    )]
     #[serde(default)]
     pub(crate) reason: Option<String>,
+    #[schemars(
+        description = "review_result: the review thread id the result is for, exactly as the dispatch task listed it (a GraphQL `PRRT_...` node id). An id that is not a thread on the PR (a finding from the review body, outside the diff) is reported in one PR-level comment instead of a thread reply."
+    )]
+    #[serde(default)]
+    pub(crate) thread_id: Option<String>,
+    #[schemars(
+        description = "review_result: fixed|not_valid|out_of_scope|skipped. `fixed` needs `sha`; `skipped` is only for findings the task marked optional."
+    )]
+    #[serde(default)]
+    pub(crate) outcome: Option<String>,
+    #[schemars(
+        description = "review_result (fixed only): the full sha of the commit carrying the fix -- the supervisor replies on the thread only once this commit is on the PR branch."
+    )]
+    #[serde(default)]
+    pub(crate) sha: Option<String>,
+    #[schemars(
+        description = "review_result: one or two sentences -- what changed (fixed), or why the finding stays as is (not_valid/out_of_scope/skipped). Quoted verbatim in the thread reply."
+    )]
+    #[serde(default)]
+    pub(crate) note: Option<String>,
+    #[schemars(description = "review_result (fixed): the name of the test covering the fix.")]
+    #[serde(default)]
+    pub(crate) test: Option<String>,
     #[schemars(
         description = "Structural filter (list, search): true = only unassigned items, false = only assigned items, omit = no filter. Combinable with blocked/has_comments/stale_claim/unestimated. Every returned row carries this and the other annotation flags regardless of whether the filter is set."
     )]

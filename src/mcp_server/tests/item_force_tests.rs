@@ -250,7 +250,16 @@ fn a_passing_pr_is_not_evidence_unless_the_caller_is_on_its_pushed_branch() {
     assert_eq!(branch_gate(false, PrCiStatus::Merged), None);
     assert!(branch_gate(true, passing()).unwrap().contains("PR #7"));
     assert!(branch_gate(true, PrCiStatus::Merged).is_some());
-    assert_eq!(branch_gate(true, PrCiStatus::Pending), None);
+    assert_eq!(
+        branch_gate(
+            true,
+            PrCiStatus::Pending {
+                number: 1,
+                head_sha: None
+            }
+        ),
+        None
+    );
     let awaiting_review = PrCiStatus::AwaitingReview {
         number: 8,
         labels: vec![],

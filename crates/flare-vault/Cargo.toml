@@ -30,6 +30,12 @@ libc = "0.2"
 
 [features]
 default = []
+# TEST ONLY. Replaces the Argon2id defaults (3 / 64 MiB / 4 lanes) with the
+# cheapest parameters Argon2 accepts so every vault test derives keys in
+# milliseconds instead of ~8s. Enable from a consumer's [dev-dependencies];
+# lib.rs rejects it with compile_error! when debug_assertions is off, so it
+# cannot reach a release binary.
+insecure-fast-kdf = []
 
 [dev-dependencies]
 tempfile = "3"

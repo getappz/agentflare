@@ -38,7 +38,9 @@ fn pr_status_summary(
             checks,
             labels,
         } => ("failing", Some(number), checks, labels),
-        crate::worktree::PrCiStatus::Pending => ("pending", known_number, vec![], vec![]),
+        crate::worktree::PrCiStatus::Pending { number, .. } => {
+            ("pending", Some(number), vec![], vec![])
+        }
         crate::worktree::PrCiStatus::Passing { number, labels, .. } => {
             ("passing", Some(number), vec![], labels)
         }
