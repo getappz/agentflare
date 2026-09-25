@@ -377,6 +377,12 @@ fn run_continuity(cmd: HandoffCommands) {
                     "\nnote: liveness registry unreadable — recommendation uses static priority only",
                 );
             }
+            if !out.skipped_unavailable.is_empty() {
+                text.push_str(&format!(
+                    "\nskipped (known down): {}",
+                    out.skipped_unavailable.join(", ")
+                ));
+            }
             if let Some(sent) = out.sent {
                 text.push_str(&format!(
                     "\nsent artifact {} (v{}) to {} (thread {})",

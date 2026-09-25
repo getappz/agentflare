@@ -102,6 +102,15 @@ fn to_handoff_canon(agent: &str) -> String {
     agent.replace('-', "_")
 }
 
+/// True when the dispatch failover has no record of `canon` being down.
+/// Unknown-to-the-registry names fail open: ranking already ordered them.
+fn dispatch_available(canon: &str) -> bool {
+    let Some(agent) = agent_registry::agent_by_name(&canon.replace('_', "-")) else {
+        return true;
+    };
+    !crate::quota::failover::known_unavailable(agent)
+}
+
 /// Inputs for failover routing; `execute` needs `session_id`.
 pub struct RouteRequest {
     /// Exhausted agent (`claude_code`, `codex`, ...; aliases accepted).
@@ -130,6 +139,9 @@ pub struct RouteOutcome {
     /// True when the liveness registry was unreadable and the recommendation
     /// rests on static priority alone.
     pub liveness_unknown: bool,
+    /// Ranked agents skipped because the dispatch failover already knows
+    /// they are down (cooldowns, usage thresholds).
+    pub skipped_unavailable: Vec<String>,
     /// Present only when `execute` ran a real send.
     pub sent: Option<super::SendOutcome>,
 }
@@ -165,7 +177,22 @@ pub fn route(req: RouteRequest) -> Result<RouteOutcome, String> {
         );
     }
     let (live, liveness_unknown) = live_agents();
-    let alternatives = rank(&live, &from);
+    let ranked = rank(&live, &from);
+    // Share state with the dispatch failover (`quota::failover`): skip agents
+    // it already knows are down instead of bouncing the handoff into another
+    // exhausted wallet. An explicit --to bypasses this; a human decided.
+    let mut skipped_unavailable = Vec::new();
+    let alternatives: Vec<String> = ranked
+        .into_iter()
+        .filter(|a| {
+            if dispatch_available(a) {
+                true
+            } else {
+                skipped_unavailable.push(a.clone());
+                false
+            }
+        })
+        .collect();
     // An explicit target must name a real, different agent — otherwise
     // --execute would publish the handoff back into the exhausted wallet.
     let explicit_to = match &req.to {
@@ -227,6 +254,7 @@ pub fn route(req: RouteRequest) -> Result<RouteOutcome, String> {
         alternatives,
         depth: req.depth,
         liveness_unknown,
+        skipped_unavailable,
         sent,
     })
 }

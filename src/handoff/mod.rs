@@ -18,7 +18,9 @@ use std::path::{Path, PathBuf};
 
 /// Default insights DB, mirroring `src/cli/insights.rs`.
 pub fn default_insights_db() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".local/share/agentflare/insights/observatory.db")
 }
 
@@ -210,6 +212,15 @@ pub struct SendOutcome {
 }
 
 pub fn send(req: SendRequest) -> Result<SendOutcome, String> {
+    // The chain cap is enforced here as well as in `route`: a direct send
+    // must not overshoot it via an explicit --depth.
+    if req.depth >= route::MAX_DEPTH {
+        return Err(format!(
+            "failover chain depth {} reached (cap {}) — stop and ask a human",
+            req.depth,
+            route::MAX_DEPTH
+        ));
+    }
     let bundle = sources::load_session(&req.source, &req.session_id)?;
     let max_turns = parse_verbosity(&req.verbosity).max_turns();
     let git = body::git_context(bundle.session.cwd.as_deref());
@@ -272,4 +283,26 @@ pub fn send(req: SendRequest) -> Result<SendOutcome, String> {
         thread_id,
         recipient: target,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn send_refuses_depth_at_cap() {
+        let err = send(SendRequest {
+            source: "auto".into(),
+            session_id: "ses-test".into(),
+            target: "opencode".into(),
+            verbosity: "minimal".into(),
+            thread: None,
+            reply_to: None,
+            name: None,
+            artifact_dir: None,
+            depth: route::MAX_DEPTH,
+        })
+        .unwrap_err();
+        assert!(err.contains("cap"), "{err}");
+    }
 }

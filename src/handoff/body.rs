@@ -8,10 +8,10 @@
 //! output) is listed in `dropped_fields` instead of being fabricated —
 //! loss accounting, not silent loss.
 //!
-//! Redaction is intentionally local and std-only here: `agentflare-approval`
-//! is not a dependency of the root crate, and its scrubber is
-//! command-oriented (space-split tokens, 512-char cap) while turn text
-//! needs whole-prose masking without a length cap.
+//! Home-path scrubbing reuses `agentflare-approval::redact::scrub_paths`
+//! (pattern-based, env-independent); secret masking stays local because that
+//! scrubber is command-oriented (space-split tokens, 512-char cap) while
+//! turn text needs whole-prose masking without a length cap.
 
 use flare_insights::model::{FileEvent, Session, ToolCall, Turn};
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,27 @@ const MAX_OBJECTIVE_CHARS: usize = 280;
 /// `agentflare-approval::redact::SECRET_PREFIXES`.
 const SECRET_PREFIXES: &[&str] = &[
     "sk-", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "xox", "AKIA", "AIza",
+];
+
+/// Flag/env-var names whose `key=value` value must never be carried
+/// verbatim, mirroring `agentflare-approval`'s sensitive flag list. Only the
+/// `key=value` shape is masked (never bare prose words): an `=` signals an
+/// assignment, so `password=hunter2` is caught while "the token expires"
+/// passes through untouched.
+const SENSITIVE_NAMES: &[&str] = &[
+    "password",
+    "passwd",
+    "pwd",
+    "token",
+    "secret",
+    "api_key",
+    "apikey",
+    "auth",
+    "authorization",
+    "access_key",
+    "access_token",
+    "private_key",
+    "client_secret",
 ];
 
 /// Origin of a handoff: which tool's store the session came from.
@@ -286,27 +307,18 @@ pub fn render_markdown(body: &HandoffBodyV1) -> String {
 
 /// Best-effort git context for a session working directory. Every step
 /// bails to `None`: a handoff must never fail because git is absent.
+/// Shells out through `flare-git-core` (safe git resolution, no shim
+/// recursion) instead of a hand-rolled `Command`.
 pub fn git_context(cwd: Option<&str>) -> Option<HandoffGit> {
+    use flare_git_core::shell::run_in_opt;
     let cwd = cwd.filter(|c| !c.is_empty())?;
-    let run = |args: &[&str]| -> Option<String> {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(cwd)
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let s = String::from_utf8(out.stdout).ok()?;
-        let t = s.trim().to_string();
-        (!t.is_empty()).then_some(t)
-    };
-    let root = run(&["rev-parse", "--show-toplevel"])?;
-    let branch = run(&["rev-parse", "--abbrev-ref", "HEAD"])?;
-    let commit = run(&["rev-parse", "--short", "HEAD"])?;
+    let dir = std::path::Path::new(cwd);
+    let root = run_in_opt(dir, &["rev-parse", "--show-toplevel"])?;
+    let branch = run_in_opt(dir, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let commit = run_in_opt(dir, &["rev-parse", "--short", "HEAD"])?;
     // A failed status probe must not fabricate "0 dirty files": bail the
     // whole context instead (the caller records the loss in dropped_fields).
-    let dirty_count = run(&["status", "--porcelain"]).map(|s| s.lines().count())?;
+    let dirty_count = run_in_opt(dir, &["status", "--porcelain"]).map(|s| s.lines().count())?;
     Some(HandoffGit {
         root,
         branch,
@@ -315,23 +327,13 @@ pub fn git_context(cwd: Option<&str>) -> Option<HandoffGit> {
     })
 }
 
-/// Whole-prose secret scrubber: home-dir folding, secret-prefix word
-/// masking, and private-key block masking. No length cap — truncation is
-/// the caller's job (`truncate` before `redact`).
+/// Whole-prose secret scrubber: home-path scrubbing, secret-prefix word
+/// masking, sensitive `key=value` masking, and private-key block masking.
+/// No length cap — truncation is the caller's job (`truncate` before `redact`).
 pub fn redact(input: &str) -> String {
-    let folded = fold_home(input);
+    let folded = agentflare_approval::redact::scrub_paths(input);
     let unkeyed = mask_key_blocks(&folded);
     mask_secret_words(&unkeyed)
-}
-
-fn fold_home(input: &str) -> String {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_default();
-    if home.is_empty() {
-        return input.to_string();
-    }
-    input.replace(&home, "~")
 }
 
 fn mask_key_blocks(input: &str) -> String {
@@ -393,13 +395,28 @@ fn mask_secret_words(input: &str) -> String {
                     at_boundary && word.len() - i > p.len() + 4
                 })
             });
-            if suspicious {
+            if suspicious || has_sensitive_name(word) {
                 format!("[REDACTED]{tail}")
             } else {
                 tok.to_string()
             }
         })
         .collect()
+}
+
+/// True for `key=value` words whose key is a known secret name
+/// (`password=hunter2`, `--api-key=sk-...`). Bare prose words never match:
+/// without an `=` there is no assignment to mask.
+fn has_sensitive_name(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    let bare = name
+        .trim()
+        .trim_start_matches('-')
+        .trim_matches(|c| c == '"' || c == '\'')
+        .to_ascii_lowercase();
+    SENSITIVE_NAMES.contains(&bare.as_str())
 }
 
 /// Char-boundary truncation with an ellipsis marker when cut.
@@ -541,6 +558,21 @@ mod tests {
         let out = redact(input);
         assert!(out.contains("MIIBcert"), "{out}");
         assert!(!out.contains("[REDACTED PRIVATE KEY]"), "{out}");
+    }
+
+    #[test]
+    fn sensitive_key_values_masked_prose_untouched() {
+        let out = redact("deploy with password=hunter2 now");
+        assert!(!out.contains("hunter2"), "{out}");
+        assert!(out.contains("[REDACTED]"), "{out}");
+        let out = redact("the token expires soon");
+        assert!(!out.contains("[REDACTED]"), "{out}");
+    }
+
+    #[test]
+    fn home_paths_scrubbed_without_env() {
+        let out = redact("edit /Users/bob/proj/main.rs now");
+        assert!(!out.contains("bob"), "{out}");
     }
 
     #[test]

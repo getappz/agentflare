@@ -15,10 +15,11 @@ pub const START_MARK: &str = "<!-- agentflare:continuity:start -->";
 pub const END_MARK: &str = "<!-- agentflare:continuity:end -->";
 
 /// Instruction file per receiving agent. Codex reads `AGENTS.md` like
-/// OpenCode; only Claude Code prefers `CLAUDE.md`.
+/// OpenCode; only Claude Code prefers `CLAUDE.md`. Accepts both the
+/// underscore canon and the kebab-case registry name.
 pub fn target_file(target: &str) -> &str {
     match target {
-        "claude_code" | "claude" | "cc" => "CLAUDE.md",
+        "claude_code" | "claude" | "cc" | "claude-code" | "claude-code-cli" => "CLAUDE.md",
         _ => "AGENTS.md",
     }
 }
@@ -174,22 +175,11 @@ fn render_section(body: &HandoffBodyV1) -> String {
 
 /// Insert or replace the marked section. Content outside the markers is
 /// never modified; a file without markers gets the section appended.
+/// Delegates to `bashenv::upsert_block` so a truncated block (start marker
+/// with no end, e.g. from a manual edit) is left alone instead of gaining
+/// a duplicate copy after it.
 pub fn upsert_section(prev: &str, section: &str) -> String {
-    let block = format!("{START_MARK}\n{section}\n{END_MARK}");
-    match (prev.find(START_MARK), prev.find(END_MARK)) {
-        (Some(s), Some(e)) if s < e => {
-            let end = e + END_MARK.len();
-            format!("{}{block}{}", &prev[..s], &prev[end..])
-        }
-        _ => {
-            let sep = if prev.is_empty() || prev.ends_with('\n') {
-                ""
-            } else {
-                "\n"
-            };
-            format!("{prev}{sep}\n{block}\n")
-        }
-    }
+    crate::bashenv::upsert_block(prev, START_MARK, END_MARK, section).0
 }
 
 #[cfg(test)]
@@ -199,6 +189,7 @@ mod tests {
     #[test]
     fn target_file_mapping() {
         assert_eq!(target_file("claude_code"), "CLAUDE.md");
+        assert_eq!(target_file("claude-code"), "CLAUDE.md");
         assert_eq!(target_file("cc"), "CLAUDE.md");
         assert_eq!(target_file("opencode"), "AGENTS.md");
         assert_eq!(target_file("codex"), "AGENTS.md");
@@ -220,6 +211,12 @@ mod tests {
     fn unchanged_section_reports_no_write() {
         let prev = upsert_section("", "A");
         assert_eq!(upsert_section(&prev, "A"), prev);
+    }
+
+    #[test]
+    fn truncated_block_is_left_alone_not_duplicated() {
+        let prev = format!("# T\n{START_MARK}\nhalf-written");
+        assert_eq!(upsert_section(&prev, "replacement"), prev);
     }
 
     #[test]

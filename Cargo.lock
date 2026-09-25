@@ -64,6 +64,7 @@ version = "1.7.0"
 dependencies = [
  "aes-gcm",
  "agentflare-agent-registry",
+ "agentflare-approval",
  "agentflare-apps",
  "agentflare-artifacts",
  "agentflare-backend",

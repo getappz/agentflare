@@ -25,14 +25,19 @@ pub struct SessionBundle {
 
 /// Canonical source name for a user-supplied alias (`cc`/`claude`,
 /// `oc`, `codex`, `auto` passes through for multi-source probing).
+/// Kebab-case registry names (`claude-code`, `gemini-cli`) are accepted too:
+/// the repo canon is kebab-case (`agent-registry`), this module's internal
+/// canon is underscores (matching `flare_insights` adapters).
 /// `gemini` names a valid failover *target* (recipient); it has no ingest
 /// adapter yet, so it never appears in [`SUPPORTED`] scan order.
 pub fn normalize_source(input: &str) -> Result<String, String> {
     match input {
-        "claude_code" | "claude" | "cc" => Ok("claude_code".into()),
+        "claude_code" | "claude" | "cc" | "claude-code" | "claude-code-cli" => {
+            Ok("claude_code".into())
+        }
         "codex" => Ok("codex".into()),
         "opencode" | "oc" => Ok("opencode".into()),
-        "gemini" => Ok("gemini".into()),
+        "gemini" | "gemini-cli" => Ok("gemini".into()),
         "auto" => Ok("auto".into()),
         other => Err(format!(
             "unsupported source '{other}' — use one of: auto, {}",
@@ -154,6 +159,8 @@ mod tests {
         assert_eq!(normalize_source("oc").unwrap(), "opencode");
         assert_eq!(normalize_source("auto").unwrap(), "auto");
         assert_eq!(normalize_source("gemini").unwrap(), "gemini");
+        assert_eq!(normalize_source("gemini-cli").unwrap(), "gemini");
+        assert_eq!(normalize_source("claude-code").unwrap(), "claude_code");
         assert!(normalize_source("cursor").is_err());
     }
 
