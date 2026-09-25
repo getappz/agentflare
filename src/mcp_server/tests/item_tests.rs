@@ -1232,7 +1232,7 @@ fn end_to_end_plan_gate_blocks_then_unblocks_claim() {
     // come from that same agent identity or `claim()`'s handoff freeze
     // (`BlockedByAssignee`) blocks it. Pin the owner explicitly instead of
     // relying on ambient agent-detection (`owner_id()` falls back to
-    // `agent_detector::agent_name()`, which resolves to "claude-code" only
+    // `flare_process::agent_name()`, which resolves to "claude-code" only
     // when actually running inside Claude Code -- a bare CI runner detects
     // nothing and falls back to "cli", which doesn't match).
     crate::claims::with_owner_override("claude-code:test", || {

@@ -4,16 +4,16 @@
 # of the suite keep going.
 slow-timeout = { period = "60s", terminate-after = 5 }
 
-# windows-latest CI has hit this exact signature 5 times across PRs
-# #436/#438/#441/#443(x2): a *different* test each time, always the run's
-# very last one to complete, always killed at exactly this slow-timeout's
-# 300s boundary while everything else (2100+ other tests) passes. #443
-# hardened kill_tree against a suspected taskkill process-tree race and
-# still hit the identical signature on a different test afterward, which
-# rules that out as the sole cause -- this now reads as generic Windows
-# runner resource contention near the tail of a large parallel run, not a
-# specific broken test. A couple of retries is the standard, targeted
-# mitigation for exactly this shape of flake (as opposed to a genuinely
-# hung/broken test, which would fail every retry too) -- see
-# nexte.st/docs/configuration for the field.
+# windows-latest CI used to hit one signature over and over (PRs
+# #436/#438/#441/#443, then 1-7 tests per run through 2026-09-25): a
+# *different* test each time, killed at exactly this slow-timeout's 300s
+# boundary, passing instantly on retry. Root cause (item #314): every one
+# of those tests reached `agent-detector`'s process-tree walk -- directly
+# via `claims::owner_id()`, or through the git PATH shim that cargo's
+# target-dir-on-PATH makes bare `git` spawns resolve to on Windows -- and
+# that walk opened a handle to every process on the machine; under
+# parallel test load that call intermittently never returned. The walk is
+# now bounded to the ancestor chain (`flare_process::agent`). Retries stay
+# as a generic backstop for runner flakes, not as cover for that hang --
+# see nexte.st/docs/configuration for the field.
 retries = 2

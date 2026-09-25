@@ -2090,7 +2090,7 @@ impl AgentflareMcp {
     fn identity(explicit: Option<String>) -> Option<String> {
         explicit
             .filter(|s| !s.is_empty())
-            .or_else(agent_detector::agent_name)
+            .or_else(flare_process::agent_name)
     }
 
     /// Production constructor: identity from AGENTFLARE_AGENT or detection.
