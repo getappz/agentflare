@@ -116,6 +116,26 @@ pub enum HandoffCommands {
         #[arg(long)]
         dir: Option<PathBuf>,
     },
+    /// Materialize a handoff as a section in the target's instruction file.
+    Apply {
+        /// Foreign session id (see `agentflare insights list`).
+        session: String,
+        /// Source store: auto|claude_code|codex|opencode (aliases cc/claude/oc).
+        #[arg(long, default_value = "auto")]
+        source: String,
+        /// Receiving agent/runtime (selects AGENTS.md vs CLAUDE.md).
+        #[arg(long, default_value = "opencode")]
+        target: String,
+        /// minimal|standard|verbose|full.
+        #[arg(long, default_value = "standard")]
+        verbosity: String,
+        /// Explicit instruction file (default: <cwd>/AGENTS.md or CLAUDE.md).
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Print the section without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -271,6 +291,33 @@ fn run_continuity(cmd: HandoffCommands) {
                 out.id, out.version, out.recipient, out.thread_id, out.recipient
             )
         }),
+        HandoffCommands::Apply {
+            session,
+            source,
+            target,
+            verbosity,
+            file,
+            dry_run,
+        } => {
+            let preview = dry_run;
+            crate::handoff::apply::apply(crate::handoff::apply::ApplyRequest {
+                source,
+                session_id: session,
+                target,
+                verbosity,
+                file,
+                dry_run,
+            })
+            .map(|out| {
+                if out.wrote {
+                    format!("applied continuity section to {}", out.path.display())
+                } else if preview {
+                    out.section
+                } else {
+                    format!("section already current in {}", out.path.display())
+                }
+            })
+        }
     };
     match out {
         Ok(text) => println!("{text}"),

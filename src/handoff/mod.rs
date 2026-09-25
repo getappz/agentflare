@@ -7,6 +7,7 @@
 //! the one file the caller asked for: `preview`/`verify`/`doctor` print,
 //! they never publish.
 
+pub mod apply;
 pub mod body;
 pub mod sources;
 

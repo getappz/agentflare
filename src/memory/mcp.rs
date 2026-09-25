@@ -372,14 +372,6 @@ fn handoff_with_conn(conn: &rusqlite::Connection, input: HandoffInput) -> Result
         .evidence
         .as_ref()
         .map(|v| serde_json::to_string(&v).unwrap_or_default());
-    let completed = input
-        .completed
-        .as_ref()
-        .map(|v| serde_json::to_string(&v).unwrap_or_default());
-    let remaining = input
-        .remaining
-        .as_ref()
-        .map(|v| serde_json::to_string(&v).unwrap_or_default());
 
     let snapshot = json!({
         "session_id": input.session_id,
