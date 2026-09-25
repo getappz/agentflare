@@ -186,6 +186,10 @@ pub struct Review {
     #[serde(default)]
     #[allow(dead_code)]
     pub submitted_at: Option<String>,
+    /// The head commit the review was submitted against -- how the sweep
+    /// tells whether a review bot has looked at the current head yet.
+    #[serde(default)]
+    pub commit_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

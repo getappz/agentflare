@@ -215,7 +215,7 @@ fn merge_or_repair_findings_never_attempts_a_merge_while_github_awaits_review() 
         &item,
         repo.path(),
         42,
-        &[],
+        &ReviewBotState::default(),
         &[PR_APPROVAL_LABEL.to_string()],
         &label_id_by_name,
         "/repo",
@@ -242,7 +242,7 @@ fn merge_or_repair_findings_never_merges_a_ci_green_approved_pr_with_unresolved_
     let label_id_by_name = seed_gate_label(&mcp);
     let queue = test_queue();
     let auth_conn = test_auth_conn();
-    let findings = vec![coderabbit_finding(1, "coderabbitai[bot]")];
+    let findings = ReviewBotState::for_dispatch(vec![coderabbit_finding(1, "coderabbitai[bot]")]);
 
     let outcome = merge_or_repair_findings(
         &mcp,

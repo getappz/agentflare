@@ -511,10 +511,16 @@
             vec![check("build", "in_progress", None)],
             vec![],
         );
-        assert!(matches!(
-            pr_ci_status_from_batch(101, &data),
-            PrCiStatus::Pending
-        ));
+        // Pending carries the number and head so the sweep can nudge a
+        // review bot whose own pending "review paused" status is what keeps
+        // the PR here.
+        match pr_ci_status_from_batch(101, &data) {
+            PrCiStatus::Pending { number, head_sha } => {
+                assert_eq!(number, 101);
+                assert_eq!(head_sha.as_deref(), Some("head-sha"));
+            }
+            other => panic!("expected Pending, got {other:?}"),
+        }
     }
 
     // Regression for item #687: gated jobs (e.g. a `build` matrix behind a
@@ -534,7 +540,7 @@
         );
         assert!(matches!(
             pr_ci_status_from_batch(101, &data),
-            PrCiStatus::Pending
+            PrCiStatus::Pending { .. }
         ));
     }
 
@@ -554,7 +560,7 @@
         );
         assert!(matches!(
             pr_ci_status_from_batch(101, &data),
-            PrCiStatus::Pending
+            PrCiStatus::Pending { .. }
         ));
     }
 
@@ -602,7 +608,7 @@
         data.review_decision = Some("REVIEW_REQUIRED".to_string());
         assert!(matches!(
             pr_ci_status_from_batch(101, &data),
-            PrCiStatus::Pending
+            PrCiStatus::Pending { .. }
         ));
     }
 
@@ -655,7 +661,7 @@
         );
         assert!(matches!(
             pr_ci_status_from_batch(101, &data),
-            PrCiStatus::Pending
+            PrCiStatus::Pending { .. }
         ));
     }
 
@@ -673,14 +679,14 @@
         for state in ["blocked", "unknown"] {
             let data = batch_data(false, Some(true), Some(state), vec![], vec![]);
             assert!(
-                matches!(pr_ci_status_from_batch(101, &data), PrCiStatus::Pending),
+                matches!(pr_ci_status_from_batch(101, &data), PrCiStatus::Pending { .. }),
                 "{state}"
             );
         }
         let data = batch_data(false, None, Some("clean"), vec![], vec![]);
         assert!(matches!(
             pr_ci_status_from_batch(101, &data),
-            PrCiStatus::Pending
+            PrCiStatus::Pending { .. }
         ));
         // No checks but blocked only on review: the approval gate, not Pending.
         let mut data = batch_data(false, Some(true), Some("blocked"), vec![], vec![]);
@@ -702,7 +708,7 @@
         data.rollup_state = Some("PENDING".to_string());
         assert!(matches!(
             pr_ci_status_from_batch(101, &data),
-            PrCiStatus::Pending
+            PrCiStatus::Pending { .. }
         ));
     }
 

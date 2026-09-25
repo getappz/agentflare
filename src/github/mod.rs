@@ -17,6 +17,7 @@ pub mod models;
 pub mod pulls;
 pub mod releases;
 pub mod repos;
+pub mod review_threads;
 
 #[cfg(test)]
 pub(crate) mod test_support;

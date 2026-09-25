@@ -179,9 +179,16 @@ fn pause_then_resume_continues_the_same_run_in_the_same_worktree() {
         );
 
         // Resume, retrying while the paused driver finishes winding down.
+        // Bounded by wall-clock, not by a poll count: each refused attempt
+        // costs several backend queries, and under a fully parallel nextest
+        // run those (and the driver's own drain) run far slower than on an
+        // idle machine -- a fixed 200 x 20ms budget expired there every time
+        // while the driver was still letting go. A driver that never lets
+        // go still fails the test, just later.
         cancel.store(false, Ordering::SeqCst);
         let mut resumed = None;
-        for _ in 0..200 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             match mcp.item_resume(ItemRequest {
                 action: "resume".into(),
                 id: Some(item_id.clone()),
@@ -197,7 +204,10 @@ fn pause_then_resume_continues_the_same_run_in_the_same_worktree() {
                 Err(e) => panic!("resume failed: {e:?}"),
             }
         }
-        let resumed: serde_json::Value = serde_json::from_str(&resumed.unwrap()).unwrap();
+        let resumed: serde_json::Value = serde_json::from_str(
+            &resumed.expect("the paused driver let go of the run within the deadline"),
+        )
+        .unwrap();
         assert_eq!(resumed["continues_run"], true, "{resumed}");
         assert!(!has_label(&mcp, &item_id, crate::supervisor::PAUSED_LABEL));
 

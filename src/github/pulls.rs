@@ -339,42 +339,16 @@ pub fn list_review_comments(
 /// Database IDs of review comments belonging to a *resolved* review thread.
 /// REST has no resolution field at all (only GraphQL's `reviewThread.isResolved`
 /// does), so this is a separate GraphQL call whose only job is to produce an
-/// id set that `pr_status` filters the REST comment list against.
-///
-/// ponytail: caps at the first 100 threads / 50 comments per thread (no
-/// cursor pagination) — plenty for a normal PR; revisit if a PR ever has more.
+/// id set that `pr_status` filters the REST comment list against. The thread
+/// query itself lives in `review_threads::list_review_threads` (paginated,
+/// full comment context) since the supervisor's bot-thread follow-up needs
+/// the same data.
 pub fn resolved_review_comment_ids(
     client: &Client,
     repo: &RepoId,
     number: u64,
 ) -> Result<std::collections::HashSet<u64>, GitHubError> {
-    const QUERY: &str = "query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){reviewThreads(first:100){nodes{isResolved comments(first:50){nodes{databaseId}}}}}}}";
-    let body = serde_json::json!({
-        "query": QUERY,
-        "variables": { "owner": repo.owner, "repo": repo.repo, "number": number }
-    });
-    let json = client.graphql(body)?;
-    if let Some(errors) = json.get("errors") {
-        return Err(crate::github::graphql::graphql_error(client, errors));
-    }
-    let threads = json["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    let mut resolved = std::collections::HashSet::new();
-    for t in &threads {
-        if !t["isResolved"].as_bool().unwrap_or(false) {
-            continue;
-        }
-        if let Some(comments) = t["comments"]["nodes"].as_array() {
-            for c in comments {
-                if let Some(id) = c["databaseId"].as_u64() {
-                    resolved.insert(id);
-                }
-            }
-        }
-    }
-    Ok(resolved)
+    crate::github::review_threads::resolved_review_comment_ids(client, repo, number)
 }
 
 #[cfg(test)]
