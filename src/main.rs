@@ -40,6 +40,7 @@ mod errors;
 mod gateway_integrations;
 mod gateway_secrets;
 mod github;
+mod handoff;
 mod hook;
 mod hook_completion_gate;
 mod hook_messages;

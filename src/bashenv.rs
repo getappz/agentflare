@@ -122,7 +122,7 @@ fi"#
 /// Creates or patches a `start`/`end`-delimited block within `content`,
 /// leaving everything outside the markers untouched. Returns the new content
 /// and whether anything changed.
-fn upsert_block(content: &str, start: &str, end: &str, block: &str) -> (String, bool) {
+pub(crate) fn upsert_block(content: &str, start: &str, end: &str, block: &str) -> (String, bool) {
     let full_block = format!("{start}\n{block}\n{end}");
     if let Some(s) = content.find(start) {
         // A start marker with no matching end is a truncated/corrupted block
