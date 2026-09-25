@@ -812,9 +812,9 @@ fn identity_prefers_explicit_override_then_detection() {
     // back to detecting the host that launched us (None outside agents).
     assert_eq!(
         AgentflareMcp::identity(Some(String::new())),
-        agent_detector::agent_name()
+        flare_process::agent_name()
     );
-    assert_eq!(AgentflareMcp::identity(None), agent_detector::agent_name());
+    assert_eq!(AgentflareMcp::identity(None), flare_process::agent_name());
 }
 
 #[test]
