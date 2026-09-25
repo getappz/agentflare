@@ -34,6 +34,7 @@ pub enum MergeMethod {
 }
 
 impl MergeMethod {
+    /// REST's `merge_method` value.
     pub fn rest(self) -> &'static str {
         match self {
             MergeMethod::Squash => "squash",
@@ -42,6 +43,7 @@ impl MergeMethod {
         }
     }
 
+    /// GraphQL's `PullRequestMergeMethod` enum value.
     pub fn graphql(self) -> &'static str {
         match self {
             MergeMethod::Squash => "SQUASH",

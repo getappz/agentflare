@@ -223,9 +223,9 @@ fn disarm_auto_merge_with_sends_the_disable_mutation_and_soft_fails() {
         MockResponse::json(500, r#"{"message":"boom"}"#),
     ]);
     let client = server.client(Some("tok"));
-    disarm_auto_merge_with(&client, &gh_repo(), 42, "PR_1");
+    disarm_auto_merge_with(&client, &gh_repo(), 42, "PR_1", "test");
     // A failure only logs; the sweep must not panic over it.
-    disarm_auto_merge_with(&client, &gh_repo(), 42, "PR_1");
+    disarm_auto_merge_with(&client, &gh_repo(), 42, "PR_1", "test");
     let reqs = server.requests();
     assert_eq!(reqs.len(), 2);
     let sent: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
@@ -235,6 +235,117 @@ fn disarm_auto_merge_with_sends_the_disable_mutation_and_soft_fails() {
             .unwrap()
             .contains("disablePullRequestAutoMerge")
     );
+}
+
+fn batch_snapshot(
+    head: &str,
+    auto_merge_enabled: bool,
+    merged: bool,
+) -> crate::github::graphql::BatchPrData {
+    crate::github::graphql::BatchPrData {
+        merged,
+        closed: false,
+        mergeable: Some(true),
+        mergeable_state: Some("clean".into()),
+        checks: vec![],
+        labels: vec![],
+        head_sha: Some(head.to_string()),
+        review_decision: None,
+        rollup_state: None,
+        node_id: Some("PR_1".into()),
+        auto_merge_enabled,
+        merge_queue_enabled: false,
+        in_merge_queue: false,
+        is_draft: false,
+    }
+}
+
+#[test]
+fn judge_armed_auto_merge_disarms_on_a_moved_head_and_forgets_a_gone_arming() {
+    let armed = ArmedAutoMerge {
+        head: "abc".into(),
+        node_id: "PR_1".into(),
+    };
+    // Same head, still armed: leave it.
+    assert_eq!(
+        judge_armed_auto_merge(&armed, Some(&batch_snapshot("abc", true, false))),
+        ArmedVerdict::Keep
+    );
+    // A push moved the head: the new commits were never judged.
+    assert_eq!(
+        judge_armed_auto_merge(&armed, Some(&batch_snapshot("def", true, false))),
+        ArmedVerdict::Disarm
+    );
+    // GitHub no longer has it armed (someone disarmed it, or it merged).
+    assert_eq!(
+        judge_armed_auto_merge(&armed, Some(&batch_snapshot("def", false, false))),
+        ArmedVerdict::Forget
+    );
+    assert_eq!(
+        judge_armed_auto_merge(&armed, Some(&batch_snapshot("abc", true, true))),
+        ArmedVerdict::Forget
+    );
+    // No snapshot this tick: judge next tick instead.
+    assert_eq!(judge_armed_auto_merge(&armed, None), ArmedVerdict::Keep);
+    // Armed without a known head: a move can't be judged, so it is kept.
+    let headless = ArmedAutoMerge {
+        head: String::new(),
+        node_id: "PR_1".into(),
+    };
+    assert_eq!(
+        judge_armed_auto_merge(&headless, Some(&batch_snapshot("def", true, false))),
+        ArmedVerdict::Keep
+    );
+}
+
+#[test]
+fn armed_auto_merge_is_recorded_in_pr_metadata_and_cleared_again() {
+    let repo = throwaway_repo();
+    let mcp = test_mcp_with_repo(repo.path().to_path_buf());
+    let item_id = seed_in_review_item(&mcp, Some("claude-code"));
+    let fetch = || {
+        mcp.with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
+            .unwrap()
+    };
+    // Existing `pr` fields survive the merge.
+    mcp.with_backend_db(|conn| {
+        crate::mcp_server::merge_item_metadata(conn, &item_id, |m| {
+            m.insert(
+                "pr".into(),
+                serde_json::json!({"number": 42, "branch": "task/1"}),
+            );
+        })
+        .unwrap()
+    })
+    .unwrap();
+    let item = fetch();
+    assert_eq!(armed_auto_merge(&item), None, "nothing recorded yet");
+    // Nothing recorded: the label-absent path must not touch the network
+    // (this repo has no remote, so a call would have nothing to reach
+    // either way -- the assertion is on the return value).
+    assert!(!disarm_our_auto_merge(&mcp, &item, repo.path(), 42, "test"));
+
+    record_armed_auto_merge(&mcp, &item, Some("abc"), "PR_1");
+    let item = fetch();
+    assert_eq!(
+        armed_auto_merge(&item),
+        Some(ArmedAutoMerge {
+            head: "abc".into(),
+            node_id: "PR_1".into(),
+        })
+    );
+    assert_eq!(crate::worktree::pr_number_from_metadata(&item), Some(42));
+
+    // A gone arming is forgotten without any GitHub call.
+    reconcile_armed_auto_merge(
+        &mcp,
+        &item,
+        repo.path(),
+        42,
+        Some(&batch_snapshot("abc", false, false)),
+    );
+    assert_eq!(armed_auto_merge(&fetch()), None);
+    assert_eq!(crate::worktree::pr_number_from_metadata(&fetch()), Some(42));
 }
 
 #[test]

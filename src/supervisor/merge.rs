@@ -33,6 +33,7 @@ pub(super) enum CiGreenMerge<'a> {
 }
 
 impl<'a> CiGreenMerge<'a> {
+    /// The head the green verdict was made on, whichever arm this is.
     pub(super) fn head_sha(self) -> Option<&'a str> {
         match self {
             CiGreenMerge::Allowed { head_sha, .. }
@@ -40,6 +41,7 @@ impl<'a> CiGreenMerge<'a> {
         }
     }
 
+    /// The PR's auto-merge handle, whichever arm this is.
     pub(super) fn auto_merge(self) -> &'a crate::worktree::AutoMergeRef {
         match self {
             CiGreenMerge::Allowed { auto_merge, .. }
@@ -420,10 +422,17 @@ pub(super) fn merge_or_repair_findings(
     merge: CiGreenMerge<'_>,
 ) -> PassingPrOutcome {
     if !findings.is_empty() {
-        // Auto-merge armed on an earlier, findings-free tick would let the
-        // next approving review merge these findings untouched -- the exact
-        // thing item #628 forbids. Disarm it before routing to repair.
-        disarm_auto_merge_if_armed(repo_root, number, merge.auto_merge());
+        // Auto-merge this sweep armed on an earlier, findings-free tick
+        // would let the next approving review merge these findings
+        // untouched -- the exact thing item #628 forbids. Disarm it before
+        // routing to repair.
+        disarm_our_auto_merge(
+            mcp,
+            item,
+            repo_root,
+            number,
+            "unresolved CodeRabbit findings appeared",
+        );
         return PassingPrOutcome::Repair(coderabbit_repair_or_gate(
             mcp,
             queue,
@@ -467,8 +476,10 @@ pub(super) fn merge_or_repair_findings(
 /// sweep, when the PR reads `Merged`.
 ///
 /// The one network call made without the label is disarming an auto-merge
-/// that was armed while the label was still attached: a human who removes
-/// the label has withdrawn the approval it stood for.
+/// this sweep itself armed while the label was still attached: a human who
+/// removes the label has withdrawn the approval it stood for. Auto-merge a
+/// human armed carries no record (`auto_merge::armed_auto_merge`) and is
+/// left alone.
 pub(super) fn merge_if_approved(
     mcp: &AgentflareMcp,
     item: &agentflare_backend::item::Item,
@@ -478,7 +489,13 @@ pub(super) fn merge_if_approved(
     merge: CiGreenMerge<'_>,
 ) -> bool {
     if !labels.iter().any(|l| l == PR_APPROVAL_LABEL) {
-        disarm_auto_merge_if_armed(repo_root, number, merge.auto_merge());
+        disarm_our_auto_merge(
+            mcp,
+            item,
+            repo_root,
+            number,
+            "the approval label was removed",
+        );
         return false;
     }
     let Some(repo) = crate::github::RepoId::resolve_from_remote(repo_root) else {
@@ -487,50 +504,19 @@ pub(super) fn merge_if_approved(
     let Ok(client) = crate::github::Client::new() else {
         return false;
     };
+    let auto = merge.auto_merge();
     match merge_approved_pr(&client, &repo, number, merge) {
         MergeAttempt::Merged => promote_merged_item(mcp, item, repo_root),
-        MergeAttempt::AutoMergeArmed | MergeAttempt::NotMerged => false,
-    }
-}
-
-/// Disarms GitHub's auto-merge on PR `number` when the sweep's snapshot says
-/// it is armed -- no network call otherwise, so the label-absent path of
-/// `merge_if_approved` stays offline for the common case.
-fn disarm_auto_merge_if_armed(
-    repo_root: &std::path::Path,
-    number: u64,
-    auto_merge: &crate::worktree::AutoMergeRef,
-) {
-    let (true, Some(node_id)) = (auto_merge.enabled, auto_merge.node_id.as_deref()) else {
-        return;
-    };
-    let Some(repo) = crate::github::RepoId::resolve_from_remote(repo_root) else {
-        return;
-    };
-    let Ok(client) = crate::github::Client::new() else {
-        return;
-    };
-    disarm_auto_merge_with(&client, &repo, number, node_id);
-}
-
-/// `disarm_auto_merge_if_armed`'s GitHub half, split out for mock-server
-/// tests the same way `merge_approved_pr` is.
-pub(super) fn disarm_auto_merge_with(
-    client: &crate::github::Client,
-    repo: &crate::github::RepoId,
-    number: u64,
-    node_id: &str,
-) {
-    match crate::github::graphql::disable_auto_merge(client, node_id) {
-        Ok(()) => eprintln!(
-            "agentflare-supervisor: disarmed GitHub auto-merge on PR #{number} in {repo}: its \
-             merge conditions no longer hold"
-        ),
-        Err(e) => eprintln!(
-            "agentflare-supervisor: could not disarm GitHub auto-merge on PR #{number} in \
-             {repo}: {}",
-            e.log_safe()
-        ),
+        MergeAttempt::AutoMergeArmed => {
+            // Armed just now (as opposed to found already armed, which may
+            // be a human's): remember the head it was pinned to, so a later
+            // push can be caught and the arming withdrawn.
+            if let (false, Some(node_id)) = (auto.enabled, auto.node_id.as_deref()) {
+                record_armed_auto_merge(mcp, item, merge.head_sha(), node_id);
+            }
+            false
+        }
+        MergeAttempt::NotMerged => false,
     }
 }
 

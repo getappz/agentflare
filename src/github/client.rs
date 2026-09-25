@@ -187,6 +187,17 @@ fn backoff_for(status: u16, headers: &RateHeaders, body: &str, now_epoch: u64) -
     None
 }
 
+/// A response body as JSON: an empty body (204, or a 200 with nothing to
+/// say) is `Null`, anything else must parse. Shared by the fresh and the
+/// 304-served paths, so a cached empty body decodes the same way it did the
+/// first time.
+fn decode_body(text: &str) -> Result<serde_json::Value, GitHubError> {
+    if text.trim().is_empty() {
+        return Ok(serde_json::Value::Null);
+    }
+    serde_json::from_str(text).map_err(|e| GitHubError::Parse(e.to_string()))
+}
+
 fn now_epoch() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -457,9 +468,7 @@ impl Client {
                     ));
                 };
                 let headers = RateHeaders::from_response(&resp);
-                serde_json::from_str(&c.body)
-                    .map(|json| (json, headers))
-                    .map_err(|e| GitHubError::Parse(e.to_string()))
+                decode_body(&c.body).map(|json| (json, headers))
             }
             Ok(resp) => {
                 let etag = resp.header("etag").map(str::to_string);
@@ -480,12 +489,7 @@ impl Client {
                         None => etags.remove(key),
                     }
                 }
-                if text.trim().is_empty() {
-                    return Ok((serde_json::Value::Null, headers));
-                }
-                serde_json::from_str(&text)
-                    .map(|json| (json, headers))
-                    .map_err(|e| GitHubError::Parse(e.to_string()))
+                decode_body(&text).map(|json| (json, headers))
             }
             Err(ureq::Error::Status(code, resp)) => {
                 let headers = RateHeaders::from_response(&resp);
@@ -755,6 +759,27 @@ mod tests {
         assert_eq!(reqs[1].header("if-none-match"), Some("W/\"v1\""));
         assert_eq!(reqs[2].header("if-none-match"), Some("W/\"v1\""));
         assert_eq!(reqs[3].header("if-none-match"), Some("W/\"v2\""));
+    }
+
+    #[test]
+    fn a_304_for_a_cached_empty_body_decodes_to_null_like_the_first_time() {
+        let server = MockServer::start(vec![
+            MockResponse::json(200, "").with_header("ETag", "\"empty\""),
+            MockResponse::json(304, ""),
+        ]);
+        let client = server.client(Some("tok"));
+        assert_eq!(
+            client.request("GET", "/nothing", None).unwrap(),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            client.request("GET", "/nothing", None).unwrap(),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            server.requests()[1].header("if-none-match"),
+            Some("\"empty\"")
+        );
     }
 
     #[test]

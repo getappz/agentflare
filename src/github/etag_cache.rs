@@ -39,6 +39,7 @@ pub(crate) struct EtagCache {
 }
 
 impl EtagCache {
+    /// The cached response for `key`, if one is held.
     pub(crate) fn get(&self, key: &str) -> Option<&CachedGet> {
         self.entries.get(key)
     }
@@ -70,12 +71,14 @@ impl EtagCache {
         );
     }
 
+    /// Drops `key`'s entry and its eviction slot; a no-op for an absent key.
     pub(crate) fn remove(&mut self, key: &str) {
         if self.entries.remove(key).is_some() {
             self.order.retain(|k| k != key);
         }
     }
 
+    /// Number of cached responses.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()

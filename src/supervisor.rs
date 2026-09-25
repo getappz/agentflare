@@ -1480,7 +1480,12 @@ pub(crate) fn run_review_sweep(
             // chunk, or GitHub couldn't resolve that PR) is treated exactly
             // like any other soft-fail: `Unknown`, polled again next tick --
             // never an error for the whole sweep.
-            let status = match batch_data.get(&number) {
+            let data = batch_data.get(&number);
+            // An auto-merge this sweep armed earlier is re-judged on every
+            // tick, whatever the CI state: a push since then must disarm it
+            // before GitHub can merge commits nobody checked for findings.
+            reconcile_armed_auto_merge(mcp, item, &repo_root, number, data);
+            let status = match data {
                 Some(data) => crate::worktree::pr_ci_status_from_batch(number, data),
                 None => crate::worktree::PrCiStatus::Unknown,
             };
@@ -1556,6 +1561,10 @@ fn handle_pr_status(
             checks,
             labels,
         } => {
+            // The repair push that may follow moves the head; an armed
+            // auto-merge must not be waiting to merge it the moment its
+            // checks go green.
+            disarm_our_auto_merge(mcp, item, repo_root, number, "CI is failing");
             match self_repair_or_gate(
                 mcp,
                 queue,
@@ -1632,6 +1641,7 @@ fn handle_pr_status(
             }
         }
         crate::worktree::PrCiStatus::Conflicting { number } => {
+            disarm_our_auto_merge(mcp, item, repo_root, number, "the PR has a merge conflict");
             if auto_resolve_conflicts_enabled(repo_root) {
                 match self_repair_or_gate(
                     mcp,
@@ -1808,6 +1818,8 @@ pub(crate) mod notify;
 pub(crate) use notify::*;
 mod merge;
 use merge::*;
+mod auto_merge;
+use auto_merge::*;
 
 /// Whether `item` is already gated for a human (`NEEDS_HUMAN_GATE_LABEL`) or
 /// has an `agentflare-work` job already queued/running -- the short-circuit
