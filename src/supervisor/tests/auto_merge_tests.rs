@@ -16,8 +16,8 @@ fn gh_repo() -> crate::github::RepoId {
     }
 }
 
-/// `GET /repos/o/r`: the settings read `merge_approved_pr` makes first
-/// (cached per mock server, so once per test).
+/// `GET /repos/o/r`: the settings read `merge_approved_pr` makes right after
+/// the judged-head stamp (cached per mock server, so once per test).
 fn repo_settings(allow_auto_merge: bool, allow_squash: bool) -> MockResponse {
     MockResponse::json(
         200,
@@ -26,6 +26,27 @@ fn repo_settings(allow_auto_merge: bool, allow_squash: bool) -> MockResponse {
         ),
     )
 }
+
+/// The head's combined status without the judged context, then the stamp
+/// POST: what `merge_approved_pr` exchanges first for a head it hasn't
+/// stamped yet.
+fn judged_missing() -> [MockResponse; 2] {
+    [
+        MockResponse::json(200, r#"{"state":"pending","statuses":[]}"#),
+        MockResponse::json(201, r#"{"id":1}"#),
+    ]
+}
+
+/// The head's combined status already carrying the judged context: no
+/// stamp POST follows.
+fn judged_present() -> MockResponse {
+    MockResponse::json(
+        200,
+        r#"{"state":"success","statuses":[{"context":"agentflare/judged","state":"success"}]}"#,
+    )
+}
+
+const STATUS_PATH: &str = "/repos/o/r/commits/abc123/status?per_page=100";
 
 fn allowed<'a>(head_sha: Option<&'a str>, auto_merge: &'a AutoMergeRef) -> CiGreenMerge<'a> {
     CiGreenMerge::Allowed {
@@ -36,7 +57,10 @@ fn allowed<'a>(head_sha: Option<&'a str>, auto_merge: &'a AutoMergeRef) -> CiGre
 
 #[test]
 fn merge_approved_pr_merges_directly_with_the_repos_method_when_auto_merge_is_off() {
+    let [status, stamp] = judged_missing();
     let server = MockServer::start(vec![
+        status,
+        stamp,
         repo_settings(false, true),
         MockResponse::json(200, r#"{"merged":true}"#),
     ]);
@@ -52,17 +76,46 @@ fn merge_approved_pr_merges_directly_with_the_repos_method_when_auto_merge_is_of
     );
 
     let reqs = server.requests();
-    assert_eq!(reqs[0].path, "/repos/o/r", "settings are read first");
-    assert_eq!(reqs[1].method, "PUT");
-    assert_eq!(reqs[1].path, "/repos/o/r/pulls/42/merge");
-    let sent: serde_json::Value = serde_json::from_str(&reqs[1].body).unwrap();
+    // The judged head is stamped before the merge path is chosen, so a
+    // repo requiring the context lets exactly this head merge.
+    assert_eq!(reqs[0].path, STATUS_PATH);
+    assert_eq!(reqs[1].method, "POST");
+    assert_eq!(reqs[1].path, "/repos/o/r/statuses/abc123");
+    let status: serde_json::Value = serde_json::from_str(&reqs[1].body).unwrap();
+    assert_eq!(status["state"], "success");
+    assert_eq!(status["context"], JUDGED_STATUS_CONTEXT);
+    assert_eq!(reqs[2].path, "/repos/o/r", "then the settings");
+    assert_eq!(reqs[3].method, "PUT");
+    assert_eq!(reqs[3].path, "/repos/o/r/pulls/42/merge");
+    let sent: serde_json::Value = serde_json::from_str(&reqs[3].body).unwrap();
     assert_eq!(sent["merge_method"], "squash");
     // Pinned to the head the sweep judged green.
     assert_eq!(sent["sha"], "abc123");
     assert_eq!(
         reqs.len(),
-        2,
+        4,
         "no GraphQL call when the repo has auto-merge off"
+    );
+}
+
+#[test]
+fn merge_approved_pr_leaves_the_stamp_for_the_next_tick_when_the_status_lookup_fails() {
+    let server = MockServer::start(vec![
+        MockResponse::json(500, r#"{"message":"boom"}"#),
+        repo_settings(false, true),
+        MockResponse::json(200, r#"{"merged":true}"#),
+    ]);
+    let client = server.client(Some("tok"));
+    let auto = AutoMergeRef::default();
+    assert_eq!(
+        merge_approved_pr(&client, &gh_repo(), 42, allowed(Some("abc123"), &auto)),
+        MergeAttempt::Merged
+    );
+    let reqs = server.requests();
+    assert_eq!(reqs.len(), 3, "no blind stamp after a failed lookup");
+    assert!(
+        reqs.iter()
+            .all(|r| !r.path.starts_with("/repos/o/r/statuses/"))
     );
 }
 
@@ -85,13 +138,15 @@ fn merge_approved_pr_uses_a_merge_commit_when_the_repo_forbids_squash() {
 
 #[test]
 fn merge_approved_pr_arms_github_auto_merge_pinned_to_the_head_when_the_repo_allows_it() {
+    let [status, stamp] = judged_missing();
     let server = MockServer::start(vec![
+        status,
+        stamp,
         repo_settings(true, true),
         MockResponse::json(
             200,
             r#"{"data":{"enablePullRequestAutoMerge":{"pullRequest":{"autoMergeRequest":{"enabledAt":"x"}}}}}"#,
         ),
-        MockResponse::json(201, r#"{"id":1}"#),
     ]);
     let client = server.client(Some("tok"));
     let auto = AutoMergeRef {
@@ -107,26 +162,25 @@ fn merge_approved_pr_arms_github_auto_merge_pinned_to_the_head_when_the_repo_all
     let reqs = server.requests();
     assert_eq!(
         reqs.len(),
-        3,
-        "armed and stamped: no direct merge call follows"
+        4,
+        "stamped and armed: no direct merge call follows"
     );
-    assert_eq!(reqs[1].path, "/graphql");
-    let sent: serde_json::Value = serde_json::from_str(&reqs[1].body).unwrap();
+    // The judged head is stamped before arming, so a repo requiring the
+    // context lets GitHub merge exactly this head, not a later push.
+    assert_eq!(reqs[0].path, STATUS_PATH);
+    assert_eq!(reqs[1].path, "/repos/o/r/statuses/abc123");
+    assert_eq!(reqs[3].path, "/graphql");
+    let sent: serde_json::Value = serde_json::from_str(&reqs[3].body).unwrap();
     assert_eq!(sent["variables"]["input"]["pullRequestId"], "PR_1");
     assert_eq!(sent["variables"]["input"]["mergeMethod"], "SQUASH");
     assert_eq!(sent["variables"]["input"]["expectedHeadOid"], "abc123");
-    // The judged head is stamped so a repo requiring the context lets
-    // GitHub merge exactly this head, not a later push.
-    assert_eq!(reqs[2].method, "POST");
-    assert_eq!(reqs[2].path, "/repos/o/r/statuses/abc123");
-    let status: serde_json::Value = serde_json::from_str(&reqs[2].body).unwrap();
-    assert_eq!(status["state"], "success");
-    assert_eq!(status["context"], JUDGED_STATUS_CONTEXT);
 }
 
 #[test]
 fn merge_approved_pr_arms_auto_merge_on_a_review_blocked_pr_but_never_merges_it_directly() {
+    // Stamped on an earlier tick: only the lookup, no second POST.
     let server = MockServer::start(vec![
+        judged_present(),
         repo_settings(true, true),
         MockResponse::json(
             200,
@@ -147,26 +201,33 @@ fn merge_approved_pr_arms_auto_merge_on_a_review_blocked_pr_but_never_merges_it_
         merge_approved_pr(&client, &gh_repo(), 42, blocked),
         MergeAttempt::AutoMergeArmed
     );
-    // Settings, the arming mutation, and the judged-head status; a failed
-    // status post (no canned response left) is soft, never a merge attempt.
-    assert_eq!(server.requests().len(), 3);
+    let reqs = server.requests();
+    assert_eq!(reqs.len(), 3, "status lookup, settings, arming mutation");
+    assert_eq!(reqs[0].path, STATUS_PATH);
 
     // Arming refused (or the repo has auto-merge off): a review-blocked PR
     // gets no direct merge attempt either -- GitHub would only refuse it.
-    let server = MockServer::start(vec![repo_settings(false, true)]);
+    let server = MockServer::start(vec![judged_present(), repo_settings(false, true)]);
     let client = server.client(Some("tok"));
     assert_eq!(
         merge_approved_pr(&client, &gh_repo(), 42, blocked),
         MergeAttempt::NotMerged
     );
-    assert_eq!(server.requests().len(), 1, "settings only");
+    assert_eq!(
+        server.requests().len(),
+        2,
+        "status lookup and settings only"
+    );
 }
 
 #[test]
 fn merge_approved_pr_falls_back_to_a_direct_merge_when_arming_auto_merge_is_refused() {
     // GitHub refuses to arm auto-merge on a PR it could merge right now
     // ("clean status"); the direct merge is the fallback, not a skip.
+    let [status, stamp] = judged_missing();
     let server = MockServer::start(vec![
+        status,
+        stamp,
         repo_settings(true, true),
         MockResponse::json(
             200,
@@ -184,12 +245,15 @@ fn merge_approved_pr_falls_back_to_a_direct_merge_when_arming_auto_merge_is_refu
         MergeAttempt::Merged
     );
     let reqs = server.requests();
-    assert_eq!(reqs[2].path, "/repos/o/r/pulls/42/merge");
+    assert_eq!(reqs[4].path, "/repos/o/r/pulls/42/merge");
 }
 
 #[test]
-fn merge_approved_pr_does_not_rearm_an_already_armed_auto_merge() {
-    let server = MockServer::start(vec![repo_settings(true, true)]);
+fn merge_approved_pr_does_not_rearm_an_already_armed_auto_merge_but_stamps_a_missing_head() {
+    // Armed on an earlier tick whose stamp POST failed: the stamp is
+    // retried, the arming is not repeated.
+    let [status, stamp] = judged_missing();
+    let server = MockServer::start(vec![status, stamp, repo_settings(true, true)]);
     let client = server.client(Some("tok"));
     let auto = AutoMergeRef {
         node_id: Some("PR_1".into()),
@@ -199,18 +263,23 @@ fn merge_approved_pr_does_not_rearm_an_already_armed_auto_merge() {
         merge_approved_pr(&client, &gh_repo(), 42, allowed(Some("abc123"), &auto)),
         MergeAttempt::AutoMergeArmed
     );
+    let reqs = server.requests();
     assert_eq!(
-        server.requests().len(),
-        1,
-        "settings only: GitHub is already on it"
+        reqs.len(),
+        3,
+        "stamp and settings only: GitHub is already on it"
     );
+    assert_eq!(reqs[1].path, "/repos/o/r/statuses/abc123");
 }
 
 #[test]
 fn merge_approved_pr_skips_when_the_head_moved_since_ci_was_checked() {
     // GitHub answers 409 when `sha` no longer matches the PR head: an agent
     // pushed after the sweep's snapshot. That is a plain skip, not a merge.
+    let [status, stamp] = judged_missing();
     let server = MockServer::start(vec![
+        status,
+        stamp,
         repo_settings(false, true),
         MockResponse::json(
             409,
@@ -224,7 +293,7 @@ fn merge_approved_pr_skips_when_the_head_moved_since_ci_was_checked() {
         merge_approved_pr(&client, &gh_repo(), 42, allowed(Some("stale"), &auto)),
         MergeAttempt::NotMerged
     );
-    assert_eq!(server.requests().len(), 2, "no retry within the tick");
+    assert_eq!(server.requests().len(), 4, "no retry within the tick");
 }
 
 #[test]

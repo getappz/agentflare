@@ -529,12 +529,48 @@ pub(super) fn merge_if_approved(
 /// that window at merge time: a new head carries no status until the sweep
 /// judges it, so GitHub waits. Repos that don't require it see it as an
 /// informational status only.
+///
+/// Not for branches that merge through a merge queue: the queue evaluates
+/// required statuses on its temporary merge-group commit, which the sweep
+/// never sees, so a required `agentflare/judged` would hold every queued
+/// entry forever. There the queue's own `merge_group` CI run is the gate.
 pub(crate) const JUDGED_STATUS_CONTEXT: &str = "agentflare/judged";
 
-/// Stamps `JUDGED_STATUS_CONTEXT` on `sha`, right after arming auto-merge
-/// on it. Soft-fails: the arming already happened, and a missing status only
-/// matters to repos that require the context, where it makes GitHub wait --
-/// the safe direction.
+/// Stamps `JUDGED_STATUS_CONTEXT` on `sha` unless it already carries it.
+/// Runs before the merge path is chosen, so an already-armed auto-merge, a
+/// direct merge and a review-blocked PR all get the judged head stamped --
+/// a stamp that failed on an earlier tick is retried here, and a lookup
+/// failure skips the tick rather than posting blind. Soft-fails: a missing
+/// status only matters to repos that require the context, where it makes
+/// GitHub wait -- the safe direction.
+fn mark_head_judged_if_missing(
+    client: &crate::github::Client,
+    repo: &crate::github::RepoId,
+    number: u64,
+    sha: &str,
+) {
+    match crate::github::actions::list_commit_statuses(client, repo, sha) {
+        Ok(statuses)
+            if statuses.iter().any(|s| {
+                s.name == JUDGED_STATUS_CONTEXT && s.conclusion.as_deref() == Some("success")
+            }) =>
+        {
+            return;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!(
+                "agentflare-supervisor: could not read statuses of head {sha} of PR #{number} \
+                 in {repo}: {}; leaving the judged stamp for the next tick",
+                e.log_safe()
+            );
+            return;
+        }
+    }
+    mark_head_judged(client, repo, number, sha);
+}
+
+/// Posts `JUDGED_STATUS_CONTEXT` on `sha`, logging a refusal.
 fn mark_head_judged(
     client: &crate::github::Client,
     repo: &crate::github::RepoId,
@@ -586,6 +622,13 @@ pub(super) fn merge_approved_pr(
     number: u64,
     merge: CiGreenMerge<'_>,
 ) -> MergeAttempt {
+    // The head is judged (label on, findings clear) whichever way it merges
+    // from here; stamp it first so a repo requiring the context lets the
+    // direct merge, an arming from an earlier tick, or a review landing on
+    // a blocked PR all go through on exactly this head.
+    if let Some(sha) = merge.head_sha() {
+        mark_head_judged_if_missing(client, repo, number, sha);
+    }
     let settings = crate::github::repos::settings(client, repo).unwrap_or_else(|e| {
         eprintln!(
             "agentflare-supervisor: could not read {repo}'s merge settings ({}); assuming \
@@ -614,9 +657,6 @@ pub(super) fn merge_approved_pr(
                          {repo}; GitHub merges it once every requirement holds",
                         method.rest()
                     );
-                    if let Some(sha) = head_sha {
-                        mark_head_judged(client, repo, number, sha);
-                    }
                     return MergeAttempt::AutoMergeArmed;
                 }
                 Err(e) => eprintln!(
