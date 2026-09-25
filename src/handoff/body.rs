@@ -115,6 +115,15 @@ pub fn build(
     if files_touched.is_empty() {
         dropped.push("files_touched: no write/edit file events".into());
     }
+    if turns.len() > max_turns {
+        dropped.push(format!(
+            "oldest {} turns omitted (verbosity cap {max_turns}; see counts)",
+            turns.len() - max_turns
+        ));
+    }
+    if turns_truncated(turns) {
+        dropped.push(format!("turn text truncated to {MAX_TURN_CHARS} chars"));
+    }
     if git.is_none() {
         dropped.push("git context: no repo resolvable from session cwd".into());
     }
@@ -166,6 +175,19 @@ fn files_touched_of(files: &[FileEvent]) -> Vec<String> {
         }
     }
     out
+}
+
+/// True when any carried turn exceeds the per-turn cap, i.e. the loss
+/// accounting must note truncation.
+fn turns_truncated(turns: &[Turn]) -> bool {
+    turns.iter().any(|t| {
+        t.user_text
+            .as_deref()
+            .is_some_and(|u| u.trim().chars().count() > MAX_TURN_CHARS)
+            || t.assistant_text
+                .as_deref()
+                .is_some_and(|a| a.trim().chars().count() > MAX_TURN_CHARS)
+    })
 }
 
 fn handoff_turns_of(turns: &[Turn], max_turns: usize) -> Vec<HandoffTurn> {
@@ -282,9 +304,9 @@ pub fn git_context(cwd: Option<&str>) -> Option<HandoffGit> {
     let root = run(&["rev-parse", "--show-toplevel"])?;
     let branch = run(&["rev-parse", "--abbrev-ref", "HEAD"])?;
     let commit = run(&["rev-parse", "--short", "HEAD"])?;
-    let dirty_count = run(&["status", "--porcelain"])
-        .map(|s| s.lines().count())
-        .unwrap_or(0);
+    // A failed status probe must not fabricate "0 dirty files": bail the
+    // whole context instead (the caller records the loss in dropped_fields).
+    let dirty_count = run(&["status", "--porcelain"]).map(|s| s.lines().count())?;
     Some(HandoffGit {
         root,
         branch,
@@ -316,7 +338,15 @@ fn mask_key_blocks(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
     while let Some(start) = rest.find("-----BEGIN") {
-        if rest[start..].contains("PRIVATE KEY") {
+        // Judge only the current block: the header line, or up to the next
+        // END when present. Probing the whole remainder mistakes later prose
+        // mentioning "PRIVATE KEY" for a key block and drops real context.
+        let block_end = rest[start..].find("-----END").map(|rel| start + rel);
+        let header_end = rest[start..]
+            .find('\n')
+            .map(|rel| start + rel)
+            .unwrap_or(rest.len());
+        if rest[start..block_end.unwrap_or(header_end)].contains("PRIVATE KEY") {
             out.push_str(&rest[..start]);
             out.push_str("[REDACTED PRIVATE KEY]");
             match rest[start..].find("-----END") {
@@ -465,6 +495,30 @@ mod tests {
     }
 
     #[test]
+    fn dropped_fields_record_turn_cap_and_truncation() {
+        let turns: Vec<Turn> = (1..=5)
+            .map(|i| turn(i, Some(&format!("q{i}")), None))
+            .collect();
+        let b = build(&session(), &turns, &[], &[], 0, "opencode", 2, None, 0);
+        assert!(
+            b.dropped_fields
+                .iter()
+                .any(|d| d.contains("oldest 3 turns omitted"))
+        );
+        let long = "x".repeat(MAX_TURN_CHARS + 1);
+        let turns = vec![turn(1, Some(long.as_str()), None)];
+        let b = build(&session(), &turns, &[], &[], 0, "opencode", 10, None, 0);
+        assert!(b.dropped_fields.iter().any(|d| d.contains("truncated")));
+        let turns = vec![turn(1, Some("q"), None)];
+        let b = build(&session(), &turns, &[], &[], 0, "opencode", 10, None, 0);
+        assert!(
+            b.dropped_fields
+                .iter()
+                .all(|d| !d.contains("omitted") && !d.contains("truncated"))
+        );
+    }
+
+    #[test]
     fn secrets_are_masked_not_carried() {
         let out = redact("call with sk-ant-abcdefghij done");
         assert!(out.contains("[REDACTED]"));
@@ -479,6 +533,14 @@ mod tests {
         assert!(!out.contains("MIIBsecret"));
         assert!(out.contains("[REDACTED PRIVATE KEY]"));
         assert!(out.contains("after"));
+    }
+
+    #[test]
+    fn non_key_blocks_survive_later_prose() {
+        let input = "-----BEGIN CERTIFICATE-----\nMIIBcert\n-----END CERTIFICATE-----\nnote about PRIVATE KEY handling";
+        let out = redact(input);
+        assert!(out.contains("MIIBcert"), "{out}");
+        assert!(!out.contains("[REDACTED PRIVATE KEY]"), "{out}");
     }
 
     #[test]

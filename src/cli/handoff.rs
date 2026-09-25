@@ -372,6 +372,11 @@ fn run_continuity(cmd: HandoffCommands) {
                 out.alternatives.join(", "),
                 out.depth,
             );
+            if out.liveness_unknown {
+                text.push_str(
+                    "\nnote: liveness registry unreadable — recommendation uses static priority only",
+                );
+            }
             if let Some(sent) = out.sent {
                 text.push_str(&format!(
                     "\nsent artifact {} (v{}) to {} (thread {})",

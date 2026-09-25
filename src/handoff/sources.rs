@@ -25,11 +25,14 @@ pub struct SessionBundle {
 
 /// Canonical source name for a user-supplied alias (`cc`/`claude`,
 /// `oc`, `codex`, `auto` passes through for multi-source probing).
+/// `gemini` names a valid failover *target* (recipient); it has no ingest
+/// adapter yet, so it never appears in [`SUPPORTED`] scan order.
 pub fn normalize_source(input: &str) -> Result<String, String> {
     match input {
         "claude_code" | "claude" | "cc" => Ok("claude_code".into()),
         "codex" => Ok("codex".into()),
         "opencode" | "oc" => Ok("opencode".into()),
+        "gemini" => Ok("gemini".into()),
         "auto" => Ok("auto".into()),
         other => Err(format!(
             "unsupported source '{other}' — use one of: auto, {}",
@@ -150,6 +153,7 @@ mod tests {
         assert_eq!(normalize_source("claude").unwrap(), "claude_code");
         assert_eq!(normalize_source("oc").unwrap(), "opencode");
         assert_eq!(normalize_source("auto").unwrap(), "auto");
+        assert_eq!(normalize_source("gemini").unwrap(), "gemini");
         assert!(normalize_source("cursor").is_err());
     }
 

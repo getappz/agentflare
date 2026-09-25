@@ -73,17 +73,33 @@ pub fn rank(live: &[String], from: &str) -> Vec<String> {
     out
 }
 
-/// Live agent names right now (best-effort: registry failures yield an
-/// empty list and routing falls back to static priority).
-pub fn live_agents() -> Vec<String> {
+/// Live agent names right now, plus whether the liveness registry was
+/// unreadable. Callers must surface `unknown` instead of silently routing
+/// on static priority alone: failover's whole point is avoiding dead wallets.
+pub fn live_agents() -> (Vec<String>, bool) {
     let Ok(conn) = crate::db::open() else {
-        return Vec::new();
+        return (Vec::new(), true);
     };
-    crate::sessions::list_live(&conn, crate::claims::now())
-        .unwrap_or_default()
-        .into_iter()
-        .map(|s| s.agent)
-        .collect::<Vec<_>>()
+    match crate::sessions::list_live(&conn, crate::claims::now()) {
+        Ok(live) => (
+            live.into_iter()
+                .map(|s| to_handoff_canon(&s.agent))
+                .collect(),
+            false,
+        ),
+        Err(_) => (Vec::new(), true),
+    }
+}
+
+/// The session registry stores agent names in `agent-registry`'s own
+/// canonical form (hyphenated, e.g. `"claude-code"`), while this module's
+/// canon uses underscores (matching `sources::normalize_source` and
+/// `PRIORITY`, e.g. `"claude_code"`). Without normalizing to one convention
+/// here, `rank()`'s `agent == from` exclusion silently fails to recognize a
+/// live Claude Code session as the exhausted agent, and failover can route
+/// right back to it.
+fn to_handoff_canon(agent: &str) -> String {
+    agent.replace('-', "_")
 }
 
 /// Inputs for failover routing; `execute` needs `session_id`.
@@ -111,6 +127,9 @@ pub struct RouteOutcome {
     pub recommended: Option<String>,
     pub alternatives: Vec<String>,
     pub depth: u32,
+    /// True when the liveness registry was unreadable and the recommendation
+    /// rests on static priority alone.
+    pub liveness_unknown: bool,
     /// Present only when `execute` ran a real send.
     pub sent: Option<super::SendOutcome>,
 }
@@ -145,7 +164,8 @@ pub fn route(req: RouteRequest) -> Result<RouteOutcome, String> {
                 .into(),
         );
     }
-    let alternatives = rank(&live_agents(), &from);
+    let (live, liveness_unknown) = live_agents();
+    let alternatives = rank(&live, &from);
     // An explicit target must name a real, different agent — otherwise
     // --execute would publish the handoff back into the exhausted wallet.
     let explicit_to = match &req.to {
@@ -206,6 +226,7 @@ pub fn route(req: RouteRequest) -> Result<RouteOutcome, String> {
         recommended: Some(recommended),
         alternatives,
         depth: req.depth,
+        liveness_unknown,
         sent,
     })
 }

@@ -238,15 +238,15 @@ pub fn send(req: SendRequest) -> Result<SendOutcome, String> {
     });
     let store: agentflare_artifacts::ArtifactStore = match req.artifact_dir {
         Some(d) => agentflare_artifacts::ArtifactStore::new(d),
-        None => match crate::store::open() {
-            Ok(s) => agentflare_artifacts::ArtifactStore::with_store(s),
-            Err(e) => {
-                eprintln!("[handoff] fallback to flat-file store: {e}");
-                agentflare_artifacts::ArtifactStore::new(
-                    crate::paths::agentflare_dir().join("artifacts"),
-                )
-            }
-        },
+        // No silent flat-file fallback: the receiver's inbox reads the DB
+        // store, so a fallback artifact would report success while remaining
+        // invisible to the recipient. Fail loudly instead.
+        None => {
+            let s = crate::store::open().map_err(|e| {
+                format!("cannot open artifact store: {e} (pass --dir for flat-file output)")
+            })?;
+            agentflare_artifacts::ArtifactStore::with_store(s)
+        }
     };
     let resp = store
         .publish(&agentflare_artifacts::PublishRequest {

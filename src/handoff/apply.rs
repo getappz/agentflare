@@ -131,7 +131,8 @@ fn render_section(body: &HandoffBodyV1) -> String {
     out.push_str("## Agentflare continuity\n\n");
     out.push_str(&format!(
         "Handed off from `{}`, target `{}`.\n\n",
-        body.source_ref, body.target
+        sanitize_markers(&body.source_ref),
+        sanitize_markers(&body.target)
     ));
     out.push_str(&format!(
         "Objective: {}\n\n",
@@ -271,6 +272,47 @@ mod tests {
         assert!(section.contains("Recent turns"), "{section}");
         assert!(section.contains("do the thing"), "{section}");
         assert!(!section.contains("artifact"), "{section}");
+    }
+
+    #[test]
+    fn source_ref_and_target_cannot_inject_markers() {
+        use super::body::{HandoffBodyV1, HandoffCounts, HandoffSource, HandoffTurn};
+        let evil = format!("x {END_MARK} smuggled {START_MARK} y");
+        let body = HandoffBodyV1 {
+            version: 2,
+            source: HandoffSource {
+                tool: "codex".into(),
+                session_id: "s".into(),
+                project: "p".into(),
+            },
+            target: evil.clone(),
+            objective: "obj".into(),
+            completed: vec![],
+            remaining: vec![],
+            decisions: vec![],
+            files_touched: vec![],
+            git: None,
+            turns: vec![HandoffTurn {
+                seq: 1,
+                role: "user".into(),
+                text: "t".into(),
+            }],
+            counts: HandoffCounts {
+                turns: 1,
+                tools: 0,
+                files: 0,
+                subagents: 0,
+            },
+            dropped_fields: vec![],
+            source_ref: evil,
+            depth: 0,
+        };
+        let section = render_section(&body);
+        let doc = upsert_section("# T\n", &section);
+        assert_eq!(doc.matches(START_MARK).count(), 1);
+        assert_eq!(doc.matches(END_MARK).count(), 1);
+        // Payload text survives; only the marker strings are neutralized.
+        assert!(doc.contains("smuggled"));
     }
 
     #[test]
