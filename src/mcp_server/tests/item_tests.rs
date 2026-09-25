@@ -1509,6 +1509,57 @@ fn item_list_defaults_assignee_filter_to_server_identity() {
 }
 
 #[test]
+fn item_list_includes_a_claimed_item_for_its_own_agent() {
+    // item #66: `item::claim` stores the claim owner's raw id
+    // (`<agent>:<instance>`), while the default assignee filter matches the
+    // canonical agent name. Before the fix, exact-string matching dropped a
+    // claimed item from its own agent's `list`, so an in_review item carrying
+    // a (stale) claim was invisible until the claim was released.
+    let tmp = tempfile::tempdir().unwrap();
+    let s = AgentflareMcp {
+        backend_db_override: Some(tmp.path().join("backend.db")),
+        backend_project_link_override: Some(tmp.path().join("project.json")),
+        agent: Some("claude-code".into()),
+        ..Default::default()
+    };
+
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Mine"))).unwrap()).unwrap();
+    s.item(Parameters(ItemRequest {
+        action: "update".into(),
+        id: Some(created["id"].as_str().unwrap().to_string()),
+        assignee_agent: Some("claude-code:job-538".into()),
+        ..Default::default()
+    }))
+    .unwrap();
+
+    serde_json::from_str::<serde_json::Value>(
+        &s.item(Parameters(empty_item_create("Unassigned"))).unwrap(),
+    )
+    .unwrap();
+
+    let listed: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "list".into(),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let names: Vec<&str> = listed["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"Mine"),
+        "a claimed item must stay visible to its own agent's default list, got {names:?}"
+    );
+    assert!(names.contains(&"Unassigned"));
+}
+
+#[test]
 fn item_list_state_group_filter_accepts_comma_separated_groups() {
     let (tmp, s) = harness();
     let open_item: serde_json::Value =
