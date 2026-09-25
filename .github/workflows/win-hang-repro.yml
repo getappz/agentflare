@@ -13,7 +13,7 @@ on:
 
 env:
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
-  REPRO_ITERATIONS: "2"
+  REPRO_ITERATIONS: "3"
   REPRO_ASSUME_HUMAN: "0"
 
 jobs:
@@ -37,7 +37,7 @@ jobs:
         with:
           tool: nextest
       - name: Build test binaries
-        run: cargo nextest run -p agentflare -p flare-git-shim --no-run
+        run: cargo nextest run --workspace --no-run
 
       - name: Loop tests with a hang watcher
         shell: pwsh
@@ -55,7 +55,7 @@ jobs:
               $now = Get-Date
               $procs = Get-CimInstance Win32_Process
               $old = $procs | Where-Object {
-                $_.Name -match '^(git|agentflare|agentflare-[0-9a-f]+|flare_git_shim|shim_test-[0-9a-f]+)\.exe$' -and
+                ($_.Name -match '^(git|gh|agentflare)\.exe$' -or ($_.CommandLine -and $_.CommandLine -match ' --exact ')) -and
                 $_.CreationDate -and (($now - $_.CreationDate).TotalSeconds -gt 30)
               }
               foreach ($p in $old) {
@@ -104,7 +104,7 @@ jobs:
           $n = [int]$env:ITERATIONS
           for ($i = 1; $i -le $n; $i++) {
             "#### iteration $i $(Get-Date -Format o)" | Out-File $dump -Append
-            cargo nextest run -p agentflare -p flare-git-shim --config-file $cfg --no-fail-fast 2>&1 | Tee-Object -FilePath (Join-Path $env:GITHUB_WORKSPACE "nextest-$i.log") | Select-String -Pattern 'SLOW|TMT|FAIL|Summary|TIMEOUT'
+            cargo nextest run --workspace --config-file $cfg --no-fail-fast 2>&1 | Tee-Object -FilePath (Join-Path $env:GITHUB_WORKSPACE "nextest-$i.log") | Select-String -Pattern 'SLOW|TMT|FAIL|Summary|TIMEOUT'
           }
           Stop-Job $watcher
           Receive-Job $watcher
