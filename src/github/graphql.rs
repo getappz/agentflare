@@ -71,6 +71,9 @@ pub struct BatchPrData {
     /// review it -- agentflare opens every PR as one and is expected to have
     /// flipped it by the time the item is in review.
     pub is_draft: bool,
+    /// `baseRefName`: the branch this PR merges into, whose protection
+    /// decides whether arming auto-merge is safe.
+    pub base_ref: Option<String>,
 }
 
 /// One aliased sub-query for PR `number` -- `pr<number>` is a valid GraphQL
@@ -84,7 +87,7 @@ fn pr_alias(number: u64) -> String {
 fn pr_subquery(number: u64) -> String {
     format!(
         "{}: pullRequest(number: {number}) {{ id state merged mergeable mergeStateStatus \
-         isDraft reviewDecision headRefOid \
+         isDraft reviewDecision headRefOid baseRefName \
          isMergeQueueEnabled isInMergeQueue autoMergeRequest {{ enabledAt }} \
          labels(first: 20) {{ nodes {{ name }} }} \
          commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state contexts(first: 100) {{ \
@@ -230,6 +233,7 @@ fn parse_batch_pr(node: &serde_json::Value) -> BatchPrData {
         merge_queue_enabled: node["isMergeQueueEnabled"].as_bool().unwrap_or(false),
         in_merge_queue: node["isInMergeQueue"].as_bool().unwrap_or(false),
         is_draft: node["isDraft"].as_bool().unwrap_or(false),
+        base_ref: string(&node["baseRefName"]),
     }
 }
 
@@ -454,7 +458,7 @@ mod tests {
             200,
             r#"{"data":{"repository":{
                 "pr8":{"id":"PR_kwDOAbc","merged":false,"mergeable":"MERGEABLE","mergeStateStatus":"BLOCKED",
-                       "isMergeQueueEnabled":true,"isInMergeQueue":false,
+                       "baseRefName":"main","isMergeQueueEnabled":true,"isInMergeQueue":false,
                        "autoMergeRequest":{"enabledAt":"2026-09-24T00:00:00Z"},
                        "labels":{"nodes":[]},"commits":{"nodes":[]}},
                 "pr9":{"id":"PR_kwDOAbd","merged":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN",
@@ -470,7 +474,10 @@ mod tests {
         assert!(!out[&8].in_merge_queue);
         assert!(!out[&9].auto_merge_enabled);
         assert!(!out[&9].merge_queue_enabled);
+        assert_eq!(out[&8].base_ref.as_deref(), Some("main"));
+        assert_eq!(out[&9].base_ref, None);
         let sent: serde_json::Value = serde_json::from_str(&server.requests()[0].body).unwrap();
+        assert!(sent["query"].as_str().unwrap().contains(" baseRefName "));
         assert!(
             sent["query"]
                 .as_str()

@@ -256,6 +256,25 @@ fn find_own_pr_by_branch(
     Some(pr.number)
 }
 
+/// What GitHub's native auto-merge needs beyond a PR number: the PR's
+/// GraphQL node id (the `enablePullRequestAutoMerge` mutation's
+/// `pullRequestId`), whether auto-merge is already armed on it (so the
+/// sweep neither re-arms it every tick nor arms it blind), and what decides
+/// whether arming is safe at all -- the base branch, whose protection may
+/// require `supervisor::JUDGED_STATUS_CONTEXT`, and whether it merges
+/// through a merge queue. All from the same fetch as the CI verdict
+/// (GraphQL `id`/`autoMergeRequest`/`baseRefName`/`isMergeQueueEnabled`,
+/// REST `node_id`/`auto_merge`/`base.ref`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AutoMergeRef {
+    pub node_id: Option<String>,
+    pub enabled: bool,
+    pub base_ref: Option<String>,
+    /// The base branch merges through a merge queue (GraphQL only; REST
+    /// can't tell and reports `false`).
+    pub merge_queue: bool,
+}
+
 /// CI signal the in-review sweep (`supervisor::run_review_sweep`, item #65)
 /// polls per item: merged (promote), failing (self-repair), CI-green with a
 /// human approval label attached (auto-merge, item #194), cleanly behind the
@@ -264,18 +283,6 @@ fn find_own_pr_by_branch(
 /// `is_pr_merged` above also treats as "not merged yet" -- no credentials,
 /// no resolvable remote, no PR found, or a lookup error -- since the
 /// caller's fallback is simply to poll again next tick.
-/// What GitHub's native auto-merge needs beyond a PR number: the PR's
-/// GraphQL node id (the `enablePullRequestAutoMerge` mutation's
-/// `pullRequestId`) and whether auto-merge is already armed on it, so the
-/// sweep neither re-arms it every tick nor arms it blind. Both come from the
-/// same fetch as the CI verdict (GraphQL `id`/`autoMergeRequest`, REST
-/// `node_id`/`auto_merge`).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AutoMergeRef {
-    pub node_id: Option<String>,
-    pub enabled: bool,
-}
-
 #[derive(Debug)]
 pub enum PrCiStatus {
     Merged,
@@ -496,6 +503,8 @@ fn pr_ci_status_impl(
             auto_merge: AutoMergeRef {
                 node_id: pr.node_id.clone(),
                 enabled: pr.auto_merge.is_some(),
+                base_ref: pr.base.as_ref().map(|b| b.git_ref.clone()),
+                merge_queue: false,
             },
             // REST doesn't say; a merge-queue repo's PR stays `Pending`
             // on this path, as it did before.
@@ -699,6 +708,8 @@ pub(crate) fn pr_ci_status_from_batch(
             auto_merge: AutoMergeRef {
                 node_id: data.node_id.clone(),
                 enabled: data.auto_merge_enabled,
+                base_ref: data.base_ref.clone(),
+                merge_queue: data.merge_queue_enabled,
             },
             merge_queue_enabled: data.merge_queue_enabled,
             in_merge_queue: data.in_merge_queue,

@@ -284,6 +284,96 @@ pub fn delete_merged_pr_branch(
     delete_ref_if_at(client, node_id, &head.git_ref, &head.sha)
 }
 
+/// The status-check contexts `branch`'s protection requires before a merge,
+/// from both places GitHub keeps them: the classic branch-protection rule
+/// (`GET /branches/{branch}`, whose `protection.required_status_checks`
+/// lists them even when the dedicated protection endpoint needs admin
+/// scope) and repository rulesets (`GET /rules/branches/{branch}`, each
+/// `required_status_checks` rule naming its contexts). Fetched once per
+/// process per host+repo+branch, like [`settings`]: protection changes
+/// about never, and the sweep asks on every approved PR.
+///
+/// A branch with no protection, or one this token can't read, comes back
+/// empty rather than as an error: "nothing is required" is the safe
+/// reading for callers deciding whether a merge-time gate exists.
+pub fn required_status_contexts(client: &Client, repo: &RepoId, branch: &str) -> Vec<String> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
+    let key = format!(
+        "{} {}/{} {branch}",
+        client.host_key(),
+        repo.owner,
+        repo.repo
+    );
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(hit) = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned()
+    {
+        return hit;
+    }
+    let encoded = crate::github::encode_query(branch);
+    let mut contexts: Vec<String> = Vec::new();
+    let branch_path = format!("/repos/{}/{}/branches/{encoded}", repo.owner, repo.repo);
+    match client.request("GET", &branch_path, None) {
+        Ok(json) => {
+            let required = &json["protection"]["required_status_checks"];
+            let named = required["contexts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|c| c.as_str())
+                .chain(
+                    required["checks"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|c| c["context"].as_str()),
+                );
+            contexts.extend(named.map(str::to_string));
+        }
+        Err(e) => eprintln!(
+            "github: could not read branch protection of {repo}@{branch}: {}",
+            e.log_safe()
+        ),
+    }
+    let rules_path = format!(
+        "/repos/{}/{}/rules/branches/{encoded}",
+        repo.owner, repo.repo
+    );
+    match client.request("GET", &rules_path, None) {
+        Ok(json) => {
+            let from_rules = json
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|rule| rule["type"] == "required_status_checks")
+                .flat_map(|rule| {
+                    rule["parameters"]["required_status_checks"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                })
+                .filter_map(|check| check["context"].as_str().map(str::to_string));
+            contexts.extend(from_rules);
+        }
+        // No rulesets, or an endpoint this host doesn't have.
+        Err(GitHubError::NotFound) => {}
+        Err(e) => eprintln!(
+            "github: could not read rulesets of {repo}@{branch}: {}",
+            e.log_safe()
+        ),
+    }
+    contexts.sort();
+    contexts.dedup();
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, contexts.clone());
+    contexts
+}
+
 /// Fetches `repo`'s default branch via the GitHub API. Used when an explicit
 /// `repo` override is given, since there's no local checkout to read it from.
 pub fn get_default_branch(client: &Client, repo: &RepoId) -> Result<String, GitHubError> {
@@ -305,6 +395,50 @@ mod tests {
             owner: "o".into(),
             repo: "r".into(),
         }
+    }
+
+    #[test]
+    fn required_status_contexts_merges_branch_protection_and_rulesets() {
+        let server = MockServer::start(vec![
+            MockResponse::json(
+                200,
+                r#"{"name":"main","protected":true,"protection":{"required_status_checks":{
+                    "contexts":["CI Green"],
+                    "checks":[{"context":"CI Green","app_id":15368},{"context":"agentflare/judged","app_id":null}]
+                }}}"#,
+            ),
+            MockResponse::json(
+                200,
+                r#"[{"type":"deletion"},{"type":"required_status_checks","parameters":{
+                    "required_status_checks":[{"context":"cargo audit"}]}}]"#,
+            ),
+        ]);
+        let client = server.client(Some("tok"));
+        let contexts = required_status_contexts(&client, &repo(), "main");
+        assert_eq!(
+            contexts,
+            vec!["CI Green", "agentflare/judged", "cargo audit"]
+        );
+        // Cached: a second ask makes no request.
+        assert_eq!(required_status_contexts(&client, &repo(), "main").len(), 3);
+        let reqs = server.requests();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].path, "/repos/o/r/branches/main");
+        assert_eq!(reqs[1].path, "/repos/o/r/rules/branches/main");
+    }
+
+    #[test]
+    fn required_status_contexts_is_empty_for_an_unprotected_or_unreadable_branch() {
+        let server = MockServer::start(vec![
+            MockResponse::json(200, r#"{"name":"dev","protected":false}"#),
+            MockResponse::json(404, r#"{"message":"Not Found"}"#),
+            MockResponse::json(403, r#"{"message":"Resource not accessible"}"#),
+            MockResponse::json(404, r#"{"message":"Not Found"}"#),
+        ]);
+        let client = server.client(Some("tok"));
+        assert!(required_status_contexts(&client, &repo(), "dev").is_empty());
+        assert!(required_status_contexts(&client, &repo(), "private").is_empty());
+        assert_eq!(server.requests().len(), 4);
     }
 
     #[test]

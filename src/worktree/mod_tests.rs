@@ -428,6 +428,7 @@
             merge_queue_enabled: false,
             in_merge_queue: false,
             is_draft: false,
+            base_ref: Some("main".to_string()),
         }
     }
 

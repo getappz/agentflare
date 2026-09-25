@@ -593,21 +593,69 @@ fn mark_head_judged(
     }
 }
 
+/// Why arming GitHub's auto-merge on a PR is safe: what stops GitHub from
+/// merging a head pushed after the sweep judged it. Without one, the sweep
+/// never arms auto-merge and merges directly, pinned to the judged head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoMergeGate {
+    /// The base branch merges through a merge queue: nothing merges without
+    /// the queue's own `merge_group` CI run on the exact merge-group commit,
+    /// and a direct merge is refused there anyway.
+    MergeQueue,
+    /// The base branch's protection requires `JUDGED_STATUS_CONTEXT`, so a
+    /// later push is a new sha without the status and waits for the sweep.
+    JudgedStatusRequired,
+}
+
+impl std::fmt::Display for AutoMergeGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AutoMergeGate::MergeQueue => f.write_str("the base branch's merge queue"),
+            AutoMergeGate::JudgedStatusRequired => {
+                write!(f, "the required {JUDGED_STATUS_CONTEXT} status")
+            }
+        }
+    }
+}
+
+/// The merge-time gate that makes arming auto-merge on a PR into `base`
+/// safe, if the branch has one. Read once per branch per process
+/// (`repos::required_status_contexts`).
+fn auto_merge_gate(
+    client: &crate::github::Client,
+    repo: &crate::github::RepoId,
+    base: &str,
+    merge_queue: bool,
+) -> Option<AutoMergeGate> {
+    if merge_queue {
+        return Some(AutoMergeGate::MergeQueue);
+    }
+    crate::github::repos::required_status_contexts(client, repo, base)
+        .iter()
+        .any(|c| c == JUDGED_STATUS_CONTEXT)
+        .then_some(AutoMergeGate::JudgedStatusRequired)
+}
+
 /// The actual GitHub merge for an approved, CI-green PR. Split out from
 /// `merge_if_approved` so tests can drive it against a mock server instead
 /// of `Client::new()`'s real credentials/host, mirroring `github::pulls`'
 /// own test style.
 ///
-/// Prefers GitHub's native auto-merge when the repo allows it: armed once
+/// Prefers GitHub's native auto-merge when the repo allows it and the base
+/// branch has a merge-time gate (`auto_merge_gate`): armed once
 /// (`autoMergeRequest` already set means nothing to do), pinned to the head
 /// the sweep judged, with the merge method the repo's settings allow
 /// (`repos::settings`, read once per process: squash first, matching the
 /// single-commit-per-item convention). Auto-merge is what lets a review-
 /// blocked PR merge the moment the review lands, and the only way onto a
-/// merge queue. GitHub refuses to arm it on a PR it could merge right now,
-/// so a `CiGreenMerge::Allowed` PR falls back to the direct merge call when
-/// arming fails or the repo has auto-merge off; a review-blocked PR never
-/// does, since a direct merge would only be refused too.
+/// merge queue. Without a gate, GitHub's auto-merge would also merge a head
+/// pushed and gone green between two sweep ticks that nobody judged for
+/// findings, so the sweep stays with the direct merge pinned to the judged
+/// head instead. GitHub refuses to arm auto-merge on a PR it could merge
+/// right now, so a `CiGreenMerge::Allowed` PR falls back to the direct
+/// merge call when arming fails, there is no gate, or the repo has
+/// auto-merge off; a review-blocked PR never does, since a direct merge
+/// would only be refused too.
 ///
 /// Logs and falls through (never retries in-line) on failure -- branch
 /// protection or a merge conflict just means the item sits until the next
@@ -644,7 +692,11 @@ pub(super) fn merge_approved_pr(
         if auto.enabled {
             return MergeAttempt::AutoMergeArmed;
         }
-        if let Some(node_id) = auto.node_id.as_deref() {
+        let base = auto.base_ref.as_deref().unwrap_or(&settings.default_branch);
+        if let (Some(node_id), Some(gate)) = (
+            auto.node_id.as_deref(),
+            auto_merge_gate(client, repo, base, auto.merge_queue),
+        ) {
             match crate::github::graphql::enable_auto_merge(
                 client,
                 node_id,
@@ -654,7 +706,7 @@ pub(super) fn merge_approved_pr(
                 Ok(()) => {
                     eprintln!(
                         "agentflare-supervisor: armed GitHub auto-merge ({}) on PR #{number} in \
-                         {repo}; GitHub merges it once every requirement holds",
+                         {repo}, gated by {gate}; GitHub merges it once every requirement holds",
                         method.rest()
                     );
                     return MergeAttempt::AutoMergeArmed;
