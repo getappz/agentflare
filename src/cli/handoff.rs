@@ -112,6 +112,9 @@ pub enum HandoffCommands {
         /// Artifact name (default: handoff-<session>).
         #[arg(long)]
         name: Option<String>,
+        /// Failover chain depth carried into the artifact (default: fresh hop).
+        #[arg(long, default_value = "0")]
+        depth: u32,
         /// Storage directory (default: ~/.agentflare/artifacts).
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -175,7 +178,7 @@ impl HandoffArgs {
         }
         let Some(recipient) = self.recipient.clone() else {
             crate::ui::error(
-                "missing recipient — pass an agent or a preview|export|verify|doctor subcommand",
+                "missing recipient — pass an agent or a preview|export|verify|doctor|send|apply|route subcommand",
             );
             std::process::exit(1);
         };
@@ -297,6 +300,7 @@ fn run_continuity(cmd: HandoffCommands) {
             thread,
             reply_to,
             name,
+            depth,
             dir,
         } => crate::handoff::send(crate::handoff::SendRequest {
             source,
@@ -307,6 +311,7 @@ fn run_continuity(cmd: HandoffCommands) {
             reply_to,
             name,
             artifact_dir: dir,
+            depth,
         })
         .map(|out| {
             format!(

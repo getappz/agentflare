@@ -54,6 +54,8 @@ pub fn apply(req: ApplyRequest) -> Result<ApplyOutcome, String> {
         &req.target,
         max_turns,
         git,
+        // Apply materializes context, it is not a failover hop.
+        0,
     );
     let section = render_section(&built);
     let path = req.file.unwrap_or_else(|| {
@@ -68,7 +70,7 @@ pub fn apply(req: ApplyRequest) -> Result<ApplyOutcome, String> {
             section,
         });
     }
-    let prev = std::fs::read_to_string(&path).unwrap_or_default();
+    let prev = read_prev(&path)?;
     let next = upsert_section(&prev, &section);
     if next == prev {
         return Ok(ApplyOutcome {
@@ -83,12 +85,43 @@ pub fn apply(req: ApplyRequest) -> Result<ApplyOutcome, String> {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     }
-    std::fs::write(&path, &next).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    // Optimistic concurrency: abort rather than overwrite edits that
+    // landed between our read and this write.
+    if read_prev(&path)? != prev {
+        return Err(format!(
+            "{} changed during apply — aborting to avoid overwriting concurrent edits; re-run",
+            path.display()
+        ));
+    }
+    crate::atomic_fs::try_atomic_write(&path, next.as_bytes(), None)
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
     Ok(ApplyOutcome {
         path,
         wrote: true,
         section,
     })
+}
+
+/// Read the instruction file, treating only a missing file as empty.
+/// Any other read error aborts before anything is written, so a file we
+/// cannot understand is never replaced by a continuity section.
+fn read_prev(path: &std::path::Path) -> Result<String, String> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Ok(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(format!(
+            "cannot read {}: {e} (refusing to overwrite)",
+            path.display()
+        )),
+    }
+}
+
+/// Session text must never become a section boundary: neutralize both
+/// marker strings wherever they appear in rendered fields, so
+/// `upsert_section` cannot mistake injected content for its own markers.
+pub fn sanitize_markers(s: &str) -> String {
+    s.replace(START_MARK, "[marker removed]")
+        .replace(END_MARK, "[marker removed]")
 }
 
 fn render_section(body: &HandoffBodyV1) -> String {
@@ -98,22 +131,35 @@ fn render_section(body: &HandoffBodyV1) -> String {
         "Handed off from `{}`, target `{}`.\n\n",
         body.source_ref, body.target
     ));
-    out.push_str(&format!("Objective: {}\n\n", body.objective));
+    out.push_str(&format!(
+        "Objective: {}\n\n",
+        sanitize_markers(&body.objective)
+    ));
     if body.completed.is_empty() && body.remaining.is_empty() {
-        out.push_str("Status: unknown — see conversation turns in the handoff artifact.\n\n");
+        out.push_str("## Status\n\nUnknown — authored split not captured. Recent turns:\n\n");
+        let recent: Vec<_> = body.turns.iter().rev().take(3).collect();
+        for t in recent.into_iter().rev() {
+            out.push_str(&format!(
+                "- turn {} ({}): {}\n",
+                t.seq,
+                t.role,
+                sanitize_markers(&body::truncate(&t.text, 500))
+            ));
+        }
+        out.push('\n');
     } else {
         for c in &body.completed {
-            out.push_str(&format!("- done: {c}\n"));
+            out.push_str(&format!("- done: {}\n", sanitize_markers(c)));
         }
         for r in &body.remaining {
-            out.push_str(&format!("- todo: {r}\n"));
+            out.push_str(&format!("- todo: {}\n", sanitize_markers(r)));
         }
         out.push('\n');
     }
     if !body.files_touched.is_empty() {
         out.push_str("Files:\n\n");
         for f in body.files_touched.iter().take(20) {
-            out.push_str(&format!("- `{f}`\n"));
+            out.push_str(&format!("- `{}`\n", sanitize_markers(f)));
         }
         out.push('\n');
     }
@@ -171,6 +217,58 @@ mod tests {
     fn unchanged_section_reports_no_write() {
         let prev = upsert_section("", "A");
         assert_eq!(upsert_section(&prev, "A"), prev);
+    }
+
+    #[test]
+    fn injected_markers_cannot_hijack_section_bounds() {
+        let evil = format!("x {END_MARK} smuggled {START_MARK} y");
+        let clean = sanitize_markers(&evil);
+        assert!(!clean.contains(START_MARK) && !clean.contains(END_MARK));
+        let doc = upsert_section("# T\n", &clean);
+        assert_eq!(doc.matches(START_MARK).count(), 1);
+        assert_eq!(doc.matches(END_MARK).count(), 1);
+        let again = upsert_section(&doc, "replacement");
+        assert_eq!(again.matches(START_MARK).count(), 1);
+        assert!(again.contains("replacement"));
+        assert!(!again.contains("smuggled"));
+    }
+
+    #[test]
+    fn unknown_status_carries_recent_turns_not_artifact_pointer() {
+        use super::body::{HandoffBodyV1, HandoffCounts, HandoffSource, HandoffTurn};
+        let body = HandoffBodyV1 {
+            version: 2,
+            source: HandoffSource {
+                tool: "codex".into(),
+                session_id: "s".into(),
+                project: "p".into(),
+            },
+            target: "opencode".into(),
+            objective: "obj".into(),
+            completed: vec![],
+            remaining: vec![],
+            decisions: vec![],
+            files_touched: vec![],
+            git: None,
+            turns: vec![HandoffTurn {
+                seq: 7,
+                role: "user".into(),
+                text: "do the thing".into(),
+            }],
+            counts: HandoffCounts {
+                turns: 1,
+                tools: 0,
+                files: 0,
+                subagents: 0,
+            },
+            dropped_fields: vec![],
+            source_ref: "codex:s".into(),
+            depth: 0,
+        };
+        let section = render_section(&body);
+        assert!(section.contains("Recent turns"), "{section}");
+        assert!(section.contains("do the thing"), "{section}");
+        assert!(!section.contains("artifact"), "{section}");
     }
 
     #[test]

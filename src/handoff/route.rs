@@ -134,8 +134,39 @@ pub fn route(req: RouteRequest) -> Result<RouteOutcome, String> {
         .as_deref()
         .and_then(detect_signal)
         .map(str::to_string);
+    // `auto` must never be the exhausted agent: rank() only excludes the
+    // literal name, so routing from `auto` could recommend the very agent
+    // that just ran dry. Require a concrete --from.
+    if from == "auto" {
+        return Err(
+            "route needs a concrete --from agent (auto would let the exhausted agent recommend itself)"
+                .into(),
+        );
+    }
     let alternatives = rank(&live_agents(), &from);
-    let recommended = req.to.clone().or_else(|| alternatives.first().cloned());
+    // An explicit target must name a real, different agent — otherwise
+    // --execute would publish the handoff back into the exhausted wallet.
+    let explicit_to = match &req.to {
+        None => None,
+        Some(t) => {
+            let canon = super::sources::normalize_source(t).map_err(|_| {
+                format!(
+                    "unknown target '{t}' — use one of: {}",
+                    super::sources::SUPPORTED.join(", ")
+                )
+            })?;
+            if canon == "auto" {
+                return Err("--to needs a concrete agent, not auto".into());
+            }
+            if canon == from {
+                return Err(format!(
+                    "target '{canon}' is the exhausted agent — pick another"
+                ));
+            }
+            Some(canon)
+        }
+    };
+    let recommended = explicit_to.or_else(|| alternatives.first().cloned());
 
     if std::env::var(NO_AUTO_ENV).is_ok_and(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
         && req.to.is_none()
@@ -151,6 +182,8 @@ pub fn route(req: RouteRequest) -> Result<RouteOutcome, String> {
         let Some(session_id) = req.session_id.clone() else {
             return Err("--execute needs a session id (--session)".into());
         };
+        // The artifact carries depth+1 so the receiver's next `route`
+        // continues the same chain instead of resetting the cap to 0.
         Some(super::send(super::SendRequest {
             source: from.clone(),
             session_id,
@@ -160,6 +193,7 @@ pub fn route(req: RouteRequest) -> Result<RouteOutcome, String> {
             reply_to: None,
             name: None,
             artifact_dir: None,
+            depth: req.depth + 1,
         })?)
     } else {
         None
@@ -218,6 +252,34 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.contains("cap"), "{err}");
+    }
+
+    fn base_req() -> RouteRequest {
+        RouteRequest {
+            from: "codex".into(),
+            reason: None,
+            to: None,
+            depth: 0,
+            execute: false,
+            session_id: None,
+            verbosity: "minimal".into(),
+        }
+    }
+
+    #[test]
+    fn auto_from_is_rejected() {
+        let mut req = base_req();
+        req.from = "auto".into();
+        let err = route(req).unwrap_err();
+        assert!(err.contains("concrete --from"), "{err}");
+    }
+
+    #[test]
+    fn target_equal_to_exhausted_is_rejected() {
+        let mut req = base_req();
+        req.to = Some("codex".into());
+        let err = route(req).unwrap_err();
+        assert!(err.contains("exhausted agent"), "{err}");
     }
 
     #[test]

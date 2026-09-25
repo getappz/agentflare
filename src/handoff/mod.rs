@@ -70,6 +70,7 @@ pub fn load_body(
         target,
         max_turns,
         git,
+        0,
     ))
 }
 
@@ -184,6 +185,8 @@ pub struct SendRequest {
     pub reply_to: Option<String>,
     pub name: Option<String>,
     pub artifact_dir: Option<PathBuf>,
+    /// Failover chain depth carried into the artifact (0 for a fresh hop).
+    pub depth: u32,
 }
 
 #[derive(Debug)]
@@ -211,6 +214,7 @@ pub fn send(req: SendRequest) -> Result<SendOutcome, String> {
         &target,
         max_turns,
         git,
+        req.depth,
     );
     let content = body::render_markdown(&built);
     let thread_id = req.thread.unwrap_or_else(|| {

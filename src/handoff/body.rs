@@ -16,7 +16,7 @@
 use flare_insights::model::{FileEvent, Session, ToolCall, Turn};
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 /// Per-turn-text cap, matching `flare_insights::handoff` truncation.
 pub const MAX_TURN_CHARS: usize = 4000;
 /// Objective fallback cap for the first-user-turn excerpt.
@@ -73,6 +73,10 @@ pub struct HandoffBodyV1 {
     pub counts: HandoffCounts,
     pub dropped_fields: Vec<String>,
     pub source_ref: String,
+    /// Failover chain depth at send time (v2): the receiver passes it back
+    /// as `--depth` so the cap survives across handoffs instead of
+    /// resetting to 0 at every hop.
+    pub depth: u32,
 }
 
 /// Build a v1 body from already-fetched session parts.
@@ -90,6 +94,7 @@ pub fn build(
     target: &str,
     max_turns: usize,
     git: Option<HandoffGit>,
+    depth: u32,
 ) -> HandoffBodyV1 {
     let objective = objective_of(session, turns);
     let files_touched = files_touched_of(files);
@@ -131,16 +136,17 @@ pub fn build(
         },
         dropped_fields: dropped,
         source_ref: format!("{}:{}", session.source.as_str(), session.id),
+        depth,
     }
 }
 
 fn objective_of(session: &Session, turns: &[Turn]) -> String {
     if let Some(title) = session.title.as_deref().filter(|t| !t.trim().is_empty()) {
-        return truncate(title.trim(), MAX_OBJECTIVE_CHARS);
+        return redact(&truncate(title.trim(), MAX_OBJECTIVE_CHARS));
     }
     for t in turns {
         if let Some(u) = t.user_text.as_deref().filter(|u| !u.trim().is_empty()) {
-            return truncate(u.trim(), MAX_OBJECTIVE_CHARS);
+            return redact(&truncate(u.trim(), MAX_OBJECTIVE_CHARS));
         }
     }
     format!("continue session {}", session.id)
@@ -236,8 +242,8 @@ pub fn render_markdown(body: &HandoffBodyV1) -> String {
     }
     out.push_str("## Appendix\n\n");
     out.push_str(&format!(
-        "counts: turns={} tools={} files={} subagents={}\n\n",
-        body.counts.turns, body.counts.tools, body.counts.files, body.counts.subagents
+        "counts: turns={} tools={} files={} subagents={} | failover depth: {}\n\n",
+        body.counts.turns, body.counts.tools, body.counts.files, body.counts.subagents, body.depth
     ));
     out.push_str("dropped (not carried over):\n\n");
     for d in &body.dropped_fields {
@@ -332,6 +338,10 @@ fn mask_key_blocks(input: &str) -> String {
     out
 }
 
+/// Word-based secret masking with boundary-aware prefix matching: a
+/// prefix only counts at the start of the word or after a non-alphanumeric
+/// character, so ordinary words like `task-list` or `disk-based` survive
+/// while `KEY=sk-...` and `"ghp_..."` are still caught.
 fn mask_secret_words(input: &str) -> String {
     input
         .split_inclusive(|c: char| c.is_whitespace())
@@ -339,9 +349,13 @@ fn mask_secret_words(input: &str) -> String {
             let word = tok.trim_end();
             let tail = &tok[word.len()..];
             let suspicious = SECRET_PREFIXES.iter().any(|p| {
-                word.contains(p)
-                    && word.len() > p.len() + 4
-                    && word.chars().any(|c| c.is_alphanumeric())
+                word.match_indices(p).any(|(i, _)| {
+                    let at_boundary = word[..i]
+                        .chars()
+                        .next_back()
+                        .is_none_or(|c| !c.is_alphanumeric());
+                    at_boundary && word.len() - i > p.len() + 4
+                })
             });
             if suspicious {
                 format!("[REDACTED]{tail}")
@@ -416,7 +430,7 @@ mod tests {
     #[test]
     fn objective_falls_back_to_first_user_turn() {
         let turns = vec![turn(1, Some("fix the login bug"), Some("on it"))];
-        let b = build(&session(), &turns, &[], &[], 0, "opencode", 10, None);
+        let b = build(&session(), &turns, &[], &[], 0, "opencode", 10, None, 0);
         assert_eq!(b.objective, "fix the login bug");
         assert_eq!(b.version, SCHEMA_VERSION);
         assert_eq!(b.turns.len(), 2);
@@ -428,7 +442,7 @@ mod tests {
         let mut s = session();
         s.title = Some("auth refactor".into());
         let turns = vec![turn(1, Some("something else"), None)];
-        let b = build(&s, &turns, &[], &[], 0, "opencode", 10, None);
+        let b = build(&s, &turns, &[], &[], 0, "opencode", 10, None, 0);
         assert_eq!(b.objective, "auth refactor");
     }
 
@@ -437,7 +451,7 @@ mod tests {
         let turns: Vec<Turn> = (1..=5)
             .map(|i| turn(i, Some(&format!("q{i}")), None))
             .collect();
-        let b = build(&session(), &turns, &[], &[], 0, "opencode", 2, None);
+        let b = build(&session(), &turns, &[], &[], 0, "opencode", 2, None, 0);
         let seqs: Vec<u32> = b.turns.iter().map(|t| t.seq).collect();
         assert_eq!(seqs, vec![4, 5]);
         assert_eq!(b.counts.turns, 5);
@@ -461,9 +475,32 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_words_survive_masking() {
+        let out = redact("fix task-list and disk-based risk-free builds");
+        assert!(!out.contains("[REDACTED]"), "{out}");
+    }
+
+    #[test]
+    fn prefixed_secrets_still_masked() {
+        assert!(redact("KEY=sk-ant-abcdefghij").contains("[REDACTED]"));
+        assert!(redact("\"ghp_1234567890abcdef\"").contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn objective_is_redacted() {
+        let turns = vec![turn(1, Some("deploy with key sk-ant-abcdefghij now"), None)];
+        let b = build(&session(), &turns, &[], &[], 0, "opencode", 10, None, 0);
+        assert!(
+            !b.objective.contains("sk-ant-abcdefghij"),
+            "{}",
+            b.objective
+        );
+    }
+
+    #[test]
     fn markdown_renders_all_sections() {
         let turns = vec![turn(1, Some("do x"), Some("did x"))];
-        let b = build(&session(), &turns, &[], &[], 0, "codex", 10, None);
+        let b = build(&session(), &turns, &[], &[], 0, "codex", 10, None, 0);
         let md = render_markdown(&b);
         assert!(md.contains("# Handoff: ses-test → codex"));
         assert!(md.contains("## Objective"));

@@ -67,8 +67,19 @@ pub fn load_session(source: &str, session_id: &str) -> Result<SessionBundle, Str
         vec![source.clone()]
     };
     let mut scanned = 0usize;
+    // In `auto` mode a failing adapter must not hide sessions living in
+    // another store: record its error and keep probing. An explicit source
+    // still fails fast so real breakage stays loud.
+    let mut errors: Vec<String> = Vec::new();
     for name in &order {
-        let bundle = scan_source(name, &config)?;
+        let bundle = match scan_source(name, &config) {
+            Ok(b) => b,
+            Err(e) if source == "auto" => {
+                errors.push(format!("{name}: {e}"));
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         scanned += bundle.sessions.len();
         if let Some(session) = bundle.sessions.into_iter().find(|s| s.id == session_id) {
             let id = session.id.clone();
@@ -98,7 +109,12 @@ pub fn load_session(source: &str, session_id: &str) -> Result<SessionBundle, Str
         }
     }
     Err(format!(
-        "session not found: {session_id} (scanned {scanned} sessions in '{source}'; run `agentflare insights sync` then `insights list` to find ids, or paste the transcript manually)"
+        "session not found: {session_id} (scanned {scanned} sessions in '{source}'; run `agentflare insights sync` then `insights list` to find ids, or paste the transcript manually){}",
+        if errors.is_empty() {
+            String::new()
+        } else {
+            format!(" scan errors: {}", errors.join("; "))
+        }
     ))
 }
 
@@ -170,7 +186,7 @@ mod tests {
         unsafe {
             std::env::remove_var("CLAUDE_PROJECTS_DIR");
         }
-        assert!(err.contains("nope"), "{err}");
+        assert!(err.contains("nope"));
     }
 
     #[test]
@@ -192,6 +208,7 @@ mod tests {
             reply_to: None,
             name: None,
             artifact_dir: Some(out.path().to_path_buf()),
+            depth: 0,
         });
         // SAFETY: same serialization as above; var is ours alone.
         unsafe {
