@@ -199,6 +199,13 @@ impl HandoffArgs {
     }
 
     pub(crate) fn publish(self) -> Result<HandoffOutcome, String> {
+        // Restores the guarantee `recipient: String` (required positional)
+        // used to give for free: `run()` checks this too, but `publish()` is
+        // `pub(crate)` and reachable directly (e.g. `work.rs`), so the
+        // invariant must hold here, not only at the CLI entrypoint.
+        if self.recipient.is_none() {
+            return Err("recipient required".into());
+        }
         let (content, stem, ext) = match (&self.file, self.content) {
             (Some(path), None) => {
                 let content = std::fs::read_to_string(path)
