@@ -1,19 +1,18 @@
 [profile.default]
-# A single hung test shouldn't be able to pin a runner for the job's full
-# 25-minute timeout (see ci.yml) — kill it well before that and let the rest
-# of the suite keep going.
-slow-timeout = { period = "60s", terminate-after = 5 }
+# Measured on ci.yml's windows-latest `build` job (run 36074365887 + 5 other
+# recent runs): the longest legitimate test is 25.5s on windows-latest
+# (`vault::tests::migrates_legacy_gateway_secret_on_first_unlock`), 21.2s on
+# ubuntu-latest -- nothing legitimate comes close to 60s. Hung tests always
+# die at exactly the old slow-timeout's 300s boundary, then pass on retry in
+# 1-3s, and they come in bursts of 4-6 concurrent hangs filling every worker
+# slot at once, not as a single trailing straggler. Windows wall time tracks
+# timeout count almost exactly (0 -> 387s/425s, 1 -> 579s, 5 -> 818s, 6 ->
+# 982s/1066s), so each burst was costing 5 minutes. 30s/2 caps that at 60s
+# per hang without touching anything running in the legitimate range. Root
+# cause (item #314, still open) is a separate hunt; this only bounds the
+# cost per occurrence.
+slow-timeout = { period = "30s", terminate-after = 2 }
 
-# windows-latest CI used to hit one signature over and over (PRs
-# #436/#438/#441/#443, then 1-7 tests per run through 2026-09-25): a
-# *different* test each time, killed at exactly this slow-timeout's 300s
-# boundary, passing instantly on retry. Root cause (item #314): every one
-# of those tests reached `agent-detector`'s process-tree walk -- directly
-# via `claims::owner_id()`, or through the git PATH shim that cargo's
-# target-dir-on-PATH makes bare `git` spawns resolve to on Windows -- and
-# that walk opened a handle to every process on the machine; under
-# parallel test load that call intermittently never returned. The walk is
-# now bounded to the ancestor chain (`flare_process::agent`). Retries stay
-# as a generic backstop for runner flakes, not as cover for that hang --
-# see nexte.st/docs/configuration for the field.
+# Retries stay as a generic backstop for runner flakes, not as cover for the
+# item #314 hang above -- see nexte.st/docs/configuration for the field.
 retries = 2
