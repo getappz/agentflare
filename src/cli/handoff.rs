@@ -90,6 +90,32 @@ pub enum HandoffCommands {
         #[arg(long)]
         db: Option<PathBuf>,
     },
+    /// Load one foreign session read-only and publish it to an agent's inbox.
+    Send {
+        /// Foreign session id (see `agentflare insights list`).
+        session: String,
+        /// Source store: auto|claude_code|codex|opencode (aliases cc/claude/oc).
+        #[arg(long, default_value = "auto")]
+        source: String,
+        /// Receiving agent/runtime.
+        #[arg(long, default_value = "opencode")]
+        target: String,
+        /// minimal|standard|verbose|full.
+        #[arg(long, default_value = "standard")]
+        verbosity: String,
+        /// Thread id grouping an exchange (default: freshly generated).
+        #[arg(long)]
+        thread: Option<String>,
+        /// Artifact id this replies to.
+        #[arg(long)]
+        reply_to: Option<String>,
+        /// Artifact name (default: handoff-<session>).
+        #[arg(long)]
+        name: Option<String>,
+        /// Storage directory (default: ~/.agentflare/artifacts).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug)]
@@ -220,6 +246,31 @@ fn run_continuity(cmd: HandoffCommands) {
             db,
         } => crate::handoff::verify(db, &session, &target),
         HandoffCommands::Doctor { db } => crate::handoff::doctor(db),
+        HandoffCommands::Send {
+            session,
+            source,
+            target,
+            verbosity,
+            thread,
+            reply_to,
+            name,
+            dir,
+        } => crate::handoff::send(crate::handoff::SendRequest {
+            source,
+            session_id: session,
+            target: target.clone(),
+            verbosity,
+            thread,
+            reply_to,
+            name,
+            artifact_dir: dir,
+        })
+        .map(|out| {
+            format!(
+                "Handed off artifact {} (v{}) to {}\n  thread: {}\n  hint: {} reads it via /flare:handoff inbox (or artifact_get)",
+                out.id, out.version, out.recipient, out.thread_id, out.recipient
+            )
+        }),
     };
     match out {
         Ok(text) => println!("{text}"),

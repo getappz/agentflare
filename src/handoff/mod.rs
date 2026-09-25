@@ -8,6 +8,7 @@
 //! they never publish.
 
 pub mod body;
+pub mod sources;
 
 use body::{HandoffBodyV1, build, git_context, render_markdown};
 use flare_insights::handoff::Verbosity;
@@ -166,4 +167,90 @@ pub fn doctor(db: Option<PathBuf>) -> Result<String, String> {
         ));
     }
     Ok(lines.join("\n"))
+}
+
+/// Targeted send: load one foreign session read-only, build the v1 body,
+/// publish it as a versioned artifact addressed to the receiving agent.
+/// The artifact publish is the only write in this module; sources stay
+/// read-only.
+pub struct SendRequest {
+    pub source: String,
+    pub session_id: String,
+    pub target: String,
+    pub verbosity: String,
+    pub thread: Option<String>,
+    pub reply_to: Option<String>,
+    pub name: Option<String>,
+    pub artifact_dir: Option<PathBuf>,
+}
+
+pub struct SendOutcome {
+    pub id: String,
+    pub version: u32,
+    pub thread_id: String,
+    pub recipient: String,
+}
+
+pub fn send(req: SendRequest) -> Result<SendOutcome, String> {
+    let bundle = sources::load_session(&req.source, &req.session_id)?;
+    let max_turns = parse_verbosity(&req.verbosity).max_turns();
+    let git = body::git_context(bundle.session.cwd.as_deref());
+    let short: String = bundle.session.id.chars().take(8).collect();
+    let target = req.target.clone();
+    let sender = bundle.session.source.as_str().to_string();
+    let session_ref = bundle.session.id.clone();
+    let built = body::build(
+        &bundle.session,
+        &bundle.turns,
+        &bundle.tools,
+        &bundle.files,
+        bundle.subagent_count,
+        &target,
+        max_turns,
+        git,
+    );
+    let content = body::render_markdown(&built);
+    let thread_id = req.thread.unwrap_or_else(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        format!("t{nanos}")
+    });
+    let store: agentflare_artifacts::ArtifactStore = match req.artifact_dir {
+        Some(d) => agentflare_artifacts::ArtifactStore::new(d),
+        None => match crate::store::open() {
+            Ok(s) => agentflare_artifacts::ArtifactStore::with_store(s),
+            Err(e) => {
+                eprintln!("[handoff] fallback to flat-file store: {e}");
+                agentflare_artifacts::ArtifactStore::new(
+                    crate::paths::agentflare_dir().join("artifacts"),
+                )
+            }
+        },
+    };
+    let resp = store
+        .publish(&agentflare_artifacts::PublishRequest {
+            name: req.name.unwrap_or_else(|| format!("handoff-{short}")),
+            artifact_type: agentflare_artifacts::ArtifactType::Markdown,
+            content,
+            session_id: "handoffs".into(),
+            update_id: None,
+            label: None,
+            description: Some(format!("continuity handoff {session_ref} → {target}")),
+            favicon: Some("🤝".into()),
+            base_version: None,
+            sender: Some(sender),
+            recipient: Some(target.clone()),
+            thread_id: Some(thread_id.clone()),
+            reply_to: req.reply_to,
+            git: crate::mcp_server::AgentflareMcp::git_provenance(),
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(SendOutcome {
+        id: resp.id,
+        version: resp.version,
+        thread_id,
+        recipient: target,
+    })
 }
