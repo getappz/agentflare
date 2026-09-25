@@ -556,23 +556,29 @@ mod tests {
     fn non_key_blocks_survive_later_prose() {
         let input = "-----BEGIN CERTIFICATE-----\nMIIBcert\n-----END CERTIFICATE-----\nnote about PRIVATE KEY handling";
         let out = redact(input);
-        assert!(out.contains("MIIBcert"), "{out}");
-        assert!(!out.contains("[REDACTED PRIVATE KEY]"), "{out}");
+        assert!(out.contains("MIIBcert"), "non-key blocks must survive");
+        assert!(
+            !out.contains("[REDACTED PRIVATE KEY]"),
+            "prose mentioning keys must not trigger redaction"
+        );
     }
 
     #[test]
     fn sensitive_key_values_masked_prose_untouched() {
         let out = redact("deploy with password=hunter2 now");
-        assert!(!out.contains("hunter2"), "{out}");
-        assert!(out.contains("[REDACTED]"), "{out}");
+        assert!(!out.contains("hunter2"), "secret value must be masked");
+        assert!(
+            out.contains("[REDACTED]"),
+            "secret assignment must be masked"
+        );
         let out = redact("the token expires soon");
-        assert!(!out.contains("[REDACTED]"), "{out}");
+        assert!(!out.contains("[REDACTED]"), "bare prose must survive");
     }
 
     #[test]
     fn home_paths_scrubbed_without_env() {
         let out = redact("edit /Users/bob/proj/main.rs now");
-        assert!(!out.contains("bob"), "{out}");
+        assert!(!out.contains("bob"), "home path must be scrubbed");
     }
 
     #[test]

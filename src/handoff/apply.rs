@@ -266,9 +266,18 @@ mod tests {
             depth: 0,
         };
         let section = render_section(&body);
-        assert!(section.contains("Recent turns"), "{section}");
-        assert!(section.contains("do the thing"), "{section}");
-        assert!(!section.contains("artifact"), "{section}");
+        assert!(
+            section.contains("Recent turns"),
+            "unknown status must list turns"
+        );
+        assert!(
+            section.contains("do the thing"),
+            "turn text must be carried"
+        );
+        assert!(
+            !section.contains("artifact"),
+            "apply must not point at artifacts"
+        );
     }
 
     #[test]
