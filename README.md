@@ -309,11 +309,8 @@ src/
 ├── update/                           # self-update check + binary swap
 ├── ui/                                # terminal UI helpers (spinner, cliclack prompts)
 ├── core/                                # small shared primitives (codesigning helpers)
-├── paths.rs                # home-dir resolution (AGENTFLARE_HOME_OVERRIDE for tests —
-│                           # dirs::home_dir() ignores HOME/USERPROFILE overrides on
-│                           # Windows, learned the hard way)
-├── state.rs                 # ~/.agentflare/state.json — on/off flag for the hooks
-├── rule_text.rs              # shared rule copy (Exa, git, lean-ctx usage)
+├── rule_text.rs              # shared rule copy (Exa, git, lean-ctx usage) — paths.rs/state.rs
+│                           # moved to crates/agentflare-bin-lib
 ├── compact.rs                 # legacy FTS5/BM25 PreCompact scorer, superseded by
 │                             # optimize/context.rs but still wired into the hook path
 ├── claims.rs, review.rs        # work-item claiming, review/consensus core logic
@@ -330,11 +327,11 @@ src/
 │                                         # wires hooks directly for claude-code/cursor
 └── hook.rs                                 # `agentflare hook session-start|prompt-submit|... --agent X`
 
-crates/                     # 17-member Cargo workspace: flare-code, flare-output, flare-search-kit,
+crates/                     # 28-member Cargo workspace: flare-code, flare-output, flare-search-kit,
                             # agentflare-store, agentflare-backend, agentflare-db-kit, agent-registry,
                             # skill-registry, gateway-registry, flare-docs, flare-git-core,
                             # flare-git-shim, agentflare-shim, agentflare-artifacts, agentflare-jobs,
-                            # flare-proxy, flare-vault
+                            # flare-proxy, flare-vault, agentflare-bin-lib, ...
 dashboard/web/               # static frontend served by `agentflare serve`
 .codex-plugin/              # Codex only — its hooks require the plugin loader
 install.sh, install.ps1      # installers (checksum-verified download / local build)

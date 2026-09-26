@@ -719,18 +719,8 @@ pub(crate) fn backend_claim_ttl_secs() -> i64 {
         .unwrap_or(14400) as i64
 }
 
-/// NotFound/Duplicate/InvalidTransition are caller-fixable → invalid_params;
-/// a raw database error is ours to fix → internal_error. Same split as
-/// `skill_load`'s NotFound/Ambiguous handling above.
-pub(crate) fn map_backend_err(e: agentflare_backend::Error) -> ErrorData {
-    match e {
-        agentflare_backend::Error::NotFound(msg)
-        | agentflare_backend::Error::Duplicate(msg)
-        | agentflare_backend::Error::InvalidTransition(msg)
-        | agentflare_backend::Error::Validation(msg) => ErrorData::invalid_params(msg, None),
-        agentflare_backend::Error::Database(e) => ErrorData::internal_error(e.to_string(), None),
-    }
-}
+// Re-exported from agentflare_bin_lib (mcp feature); canonical docs live there.
+pub(crate) use agentflare_bin_lib::errors::map_backend_err;
 
 /// Maps a `GitHubError` to MCP `ErrorData`: client/auth mistakes become
 /// `invalid_params`, transport/parse failures become `internal_error`.
@@ -740,19 +730,6 @@ pub(crate) fn to_mcp_error(err: crate::github::GitHubError) -> ErrorData {
         ErrorData::invalid_params(msg, None)
     } else {
         ErrorData::internal_error(msg, None)
-    }
-}
-
-/// Converts the unified dispatch-layer error type once, at whichever `?`
-/// first needs an `ErrorData` — lets internal helpers (`with_fresh_registry`,
-/// `claim_db`, `resolve_workspace_id`, ...) chain heterogeneous fallible
-/// steps with `?` instead of mapping each one to `ErrorData` individually.
-impl From<crate::errors::AgentflareError> for ErrorData {
-    fn from(e: crate::errors::AgentflareError) -> Self {
-        match e {
-            crate::errors::AgentflareError::Backend(e) => map_backend_err(e),
-            other => ErrorData::internal_error(other.to_string(), None),
-        }
     }
 }
 

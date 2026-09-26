@@ -63,7 +63,8 @@ agentflare/
 │   ├── ui/                                   # terminal UI helpers (cliclack-based)
 │   ├── core/                                  # small shared primitives
 │   ├── init.rs, hook.rs, components.rs          # component registry: init/hook wiring, host-aware
-│   ├── paths.rs, state.rs, rule_text.rs           # home-dir resolution, on/off state, shared rule copy
+│   ├── rule_text.rs                               # shared rule copy (paths.rs/state.rs moved to
+│   │                                                # crates/agentflare-bin-lib)
 │   ├── claims.rs, review.rs, artifacts.rs,
 │   │   channels.rs                                 # coordination-layer core logic
 │   ├── auth.rs, auth_crypt.rs, auth_db.rs,
@@ -72,8 +73,9 @@ agentflare/
 │   │   daemon_client.rs                                # daemon lifecycle
 │   ├── cost.rs, pricing.rs                               # cost/pricing tracking
 │   └── mcp_server.rs, mcp_prompts.rs                       # MCP stdio server wiring
-├── crates/                  # 17-member Cargo workspace (flare-code, flare-output,
-│                            # agentflare-store, agentflare-backend, gateway-registry, ...)
+├── crates/                  # 28-member Cargo workspace (flare-code, flare-output,
+│                            # agentflare-store, agentflare-backend, gateway-registry,
+│                            # agentflare-bin-lib, ...)
 ├── dashboard/web/           # static frontend served by `agentflare serve`
 ├── data/                    # static data files (e.g. anthropic-pricing.json)
 ├── install.sh               # Linux/macOS installer
