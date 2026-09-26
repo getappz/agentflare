@@ -34,7 +34,12 @@ pub fn format_hook_output(event: &str, ctx: &str, platform: &AgentPlatform) -> S
         })
         .to_string(),
         AgentPlatform::Codex => {
-            let mut output = json!({ "additionalContext": ctx });
+            let mut output = json!({
+                "hookSpecificOutput": {
+                    "hookEventName": event,
+                    "additionalContext": ctx,
+                }
+            });
             if event == "SessionStart" {
                 output["systemMessage"] = json!("FLARE CODE:FULL");
             }
@@ -56,12 +61,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn codex_non_session_start_is_flat_json() {
+    fn codex_non_session_start_uses_hook_specific_context() {
         let output = format_hook_output("SubagentStart", "test context", &AgentPlatform::Codex);
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(parsed["additionalContext"], "test context");
-        assert!(parsed.get("hookSpecificOutput").is_none());
-        assert!(parsed.get("hookEventName").is_none());
+        assert_eq!(
+            parsed["hookSpecificOutput"]["hookEventName"],
+            "SubagentStart"
+        );
+        assert_eq!(
+            parsed["hookSpecificOutput"]["additionalContext"],
+            "test context"
+        );
     }
 
     #[test]
@@ -69,7 +79,9 @@ mod tests {
         let output = format_hook_output("SessionStart", "test context", &AgentPlatform::Codex);
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["systemMessage"], "FLARE CODE:FULL");
-        assert_eq!(parsed["additionalContext"], "test context");
-        assert!(parsed.get("hookSpecificOutput").is_none());
+        assert_eq!(
+            parsed["hookSpecificOutput"]["additionalContext"],
+            "test context"
+        );
     }
 }

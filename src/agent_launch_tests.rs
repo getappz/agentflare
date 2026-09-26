@@ -591,6 +591,30 @@
     }
 
     #[test]
+    fn codex_jsonl_preserves_final_message_thread_and_usage() {
+        let raw = concat!(
+            r#"{"type":"thread.started","thread_id":"thread-123"}"#, "\n",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"Working"}}"#, "\n",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"Done"}}"#, "\n",
+            r#"{"type":"turn.completed","usage":{"input_tokens":120,"cached_input_tokens":80,"output_tokens":7}}"#,
+        );
+        let reply = parse_codex_reply(raw);
+        assert_eq!(reply.text, "Done");
+        assert_eq!(reply.session_id.as_deref(), Some("thread-123"));
+        assert_eq!(reply.input_tokens, Some(120));
+        assert_eq!(reply.output_tokens, Some(7));
+    }
+
+    #[test]
+    fn codex_jsonl_surfaces_failed_turn() {
+        let reply = parse_codex_reply(
+            r#"{"type":"turn.failed","error":{"message":"model unavailable"}}"#,
+        );
+        assert!(reply.is_error);
+        assert_eq!(reply.text, "model unavailable");
+    }
+
+    #[test]
     fn parse_claude_reply_falls_back_to_raw_text_on_non_json() {
         let raw = "plain text reply, no JSON here";
         let (text, session_id, cost) = parse_claude_reply(raw);

@@ -28,6 +28,9 @@ FROZEN_LIMIT=2750
 ALLOWLIST=(
   src/mcp_server.rs
   src/components.rs
+  # Already 1546 lines before the Codex session-resume error fix touched it;
+  # freeze this pre-existing debt at FROZEN_LIMIT until a separate split.
+  src/work_item_pipeline.rs
   # Already 1790 lines on master before this fix touched it -- pre-existing
   # debt, not something a security patch should take on splitting. Frozen
   # at <= FROZEN_LIMIT like the others; a real split is separate work.

@@ -15,6 +15,7 @@ pub struct RunArgs {
     pub env: Option<String>,
     #[arg(long)]
     pub model: Option<String>,
+    /// Codex: sandbox policy (read-only, workspace-write, danger-full-access).
     #[arg(long)]
     pub mode: Option<String>,
     /// Run non-interactively on this prompt and print the reply to stdout.

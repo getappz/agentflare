@@ -57,9 +57,9 @@ fn build_extra_args_passes_through_max_turns_and_cost_for_claude() {
 }
 
 #[test]
-fn build_extra_args_for_codex_has_bypass_but_no_json_output() {
+fn build_extra_args_for_codex_uses_supported_sandbox_flags() {
     let args = build_extra_args(agent_registry::Agent::Codex, None, None, None);
-    assert_eq!(args, vec!["--full-auto".to_string()]);
+    assert_eq!(args, vec!["--sandbox", "workspace-write"]);
 }
 
 #[test]

@@ -80,7 +80,7 @@ agentflare/
 ├── data/                    # static data files (e.g. anthropic-pricing.json)
 ├── install.sh               # Linux/macOS installer
 ├── install.ps1              # Windows installer
-├── .codex-plugin/           # Codex plugin manifest (its hooks require the plugin loader)
+├── .codex-plugin/           # optional Codex plugin compatibility manifest
 └── .github/                 # CI, templates, workflows
 ```
 

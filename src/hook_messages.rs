@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 /// host would drop would lose it; those hosts get messages through the MCP
 /// result piggyback instead.
 pub(crate) fn host_injects_context(agent: &str) -> bool {
-    agent == "claude-code"
+    matches!(agent, "claude-code" | "codex")
 }
 
 /// The fields every hook's stdin JSON shares.
@@ -200,6 +200,19 @@ mod tests {
                 .is_empty()
         );
         assert!(messages::has_undelivered(&c, "cursor:s").unwrap());
+    }
+
+    #[test]
+    fn codex_hook_delivers_pending_messages() {
+        let c = conn();
+        messages::send(&c, "a:1", "codex:s", "hi", None, 1, no_item).unwrap();
+        assert_eq!(
+            sync_with(&c, "codex", "codex:s", None, true, 2)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(!messages::has_undelivered(&c, "codex:s").unwrap());
     }
 
     fn msg(id: i64) -> Message {

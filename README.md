@@ -42,8 +42,8 @@ agent session.
 |---|---|---|
 | **lean-ctx** | tool I/O *within* a session — reads, shell output, search, up to 99% | [yvgude/lean-ctx](https://github.com/yvgude/lean-ctx) |
 | **memory** (built-in) | knowledge *across* sessions — decisions, facts, preferences that survive a session ending | ships in the binary, SQLite + FTS5, no separate install |
-| **`agentflare optimize output`** (formerly Caveman, Claude Code only) | conversation verbosity, ~65% | built into the binary |
-| **`agentflare optimize code`** (formerly Ponytail, Claude Code only) | code-writing over-engineering | built into the binary |
+| **`agentflare optimize output`** (formerly Caveman) | opt-in markdown prose compression, ~65% in published Claude Code benchmarks | built into the binary |
+| **`agentflare optimize code`** (formerly Ponytail) | code-writing minimalism, hooked into Claude Code and Codex | built into the binary |
 | **`agentflare optimize context`** | on-demand BM25/FTS5 relevance scoring over a session transcript (`optimize context score`). The `PreCompact` hook is wired for upgrade compatibility but inert: Claude Code's `PreCompact` accepts no injected context, so compaction survival is left to lean-ctx | built into the binary |
 | **`agentflare optimize retrieve`** | reversible-compression retrieve (CCR) — pulls back the original, full-fidelity content that output/context compression replaced, when an agent actually needs it | built into the binary |
 | **runtime layer** (always-on, no CLI surface) | automatic session hygiene and model-routing nudges, surfaced via hooks | built into the binary |
@@ -98,11 +98,9 @@ any machine that installed Claude Code without separately installing Node.
 agentflare is a single static binary; the only runtime dependency is agentflare
 itself.
 
-**No plugin marketplace for Claude Code or Cursor** — `agentflare init --agent X`
-writes the hook config directly into the target's own settings file (Claude
-Code's `~/.claude/settings.json`, Cursor's `.cursor/hooks.json`). Codex is the
-one exception: its hook system only activates through its plugin loader, so
-that wiring ships as a small `.codex-plugin/` manifest instead.
+**No plugin marketplace required for Claude Code, Codex, or Cursor** —
+`agentflare init --agent X` writes hooks into the target's own settings file
+(`~/.claude/settings.json`, `~/.codex/hooks.json`, or `.cursor/hooks.json`).
 
 ## Metrics
 
@@ -246,6 +244,7 @@ immediately, no separate confirm step.
 
 ```bash
 agentflare init --agent claude-code    # writes ~/.claude/settings.json hooks directly, no marketplace
+agentflare init --agent codex          # writes ~/.codex/hooks.json and registers the MCP server
 agentflare init --agent cursor         # writes .cursor/hooks.json directly, no marketplace
 agentflare init --agent windsurf
 agentflare init --agent vscode-copilot
@@ -253,14 +252,10 @@ agentflare init --agent cline
 agentflare init --agent continue
 ```
 
-**Codex** is the one exception — its hook system only activates through its own
-plugin loader:
-```
-codex plugin marketplace add getappz/agentflare
-codex plugin install agentflare
-```
-then `agentflare init --agent codex` for the rules/lean-ctx setup (Codex's
-hook wiring itself comes from the plugin manifest, not `init`).
+Codex loads hooks from `~/.codex/hooks.json`; `init` wires the supported
+agentflare lifecycle hooks there. The `.codex-plugin/` compatibility manifest
+also supports packaging those hooks in a Codex plugin. Use one hook installation
+path per machine so events do not run twice.
 
 Each run: writes rule files (if absent), installs lean-ctx (native `curl | sh`
 or Homebrew installer) if missing, wires hooks/MCP where the host supports
@@ -333,7 +328,8 @@ crates/                     # 28-member Cargo workspace: flare-code, flare-outpu
                             # flare-git-shim, agentflare-shim, agentflare-artifacts, agentflare-jobs,
                             # flare-proxy, flare-vault, agentflare-bin-lib, ...
 dashboard/web/               # static frontend served by `agentflare serve`
-.codex-plugin/              # Codex only — its hooks require the plugin loader
+.codex-plugin/              # optional Codex plugin compatibility manifest
+hooks/                      # Codex plugin lifecycle hooks
 install.sh, install.ps1      # installers (checksum-verified download / local build)
 .github/workflows/          # ci.yml (build+test), release.yml (cross-compile on tag)
 ```

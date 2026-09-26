@@ -14,8 +14,11 @@ the README. If something here looks wrong, check the code and open an issue.
   compression). CI-gated, benchmarked, in daily use.
 - **Built-in memory** (`agentflare memory ...` CLI, the underlying SQLite/FTS5
   store). Storage format and CLI surface are settled.
-- **`agentflare optimize output`/`code`** (formerly the separate Caveman/Ponytail
-  plugins, now built into the binary) for Claude Code. Stable.
+- **`agentflare optimize output`** (formerly Caveman) is an opt-in file
+  compression command available independently of the agent host. Its published
+  benchmark used Claude Code.
+- **`agentflare optimize code`** (formerly Ponytail) hooks into Claude Code and
+  Codex. Its published benchmark used Claude Code; Codex integration is newer.
 - **`agentflare init --agent <X>` / `agentflare update` / `agentflare
   uninstall`** — the cross-tool setup commands themselves (not everything
   they wire up, see below).

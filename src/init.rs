@@ -2,9 +2,7 @@
 // setup command. Runs every component (installs included — no separate
 // confirm step, since running this command IS the consent), then wires the
 // host's hook config directly where a hook mechanism exists (Claude Code,
-// Cursor, Codex). Codex's hooks are gated behind an experimental feature
-// flag (`[features] codex_hooks = true` in config.toml) that Codex itself
-// requires — wire_codex_hooks() upserts it alongside hooks.json.
+// Cursor, Codex). Current Codex versions enable hooks by default.
 use crate::components::{get_components, rule_targets};
 use crate::jsonc::{read_json_object, write_json_pretty};
 use crate::paths::{
@@ -214,14 +212,29 @@ fn add_hook_entry(
         .find(|v| v.to_string().contains(marker))
         .and_then(Value::as_object_mut)
     {
-        let Some(m) = matcher else {
-            return false;
-        };
-        if existing.get("matcher").and_then(Value::as_str) == Some(m) {
-            return false;
+        let mut changed = false;
+        if let Some(m) = matcher
+            && existing.get("matcher").and_then(Value::as_str) != Some(m)
+        {
+            existing.insert("matcher".to_string(), json!(m));
+            changed = true;
         }
-        existing.insert("matcher".to_string(), json!(m));
-        return true;
+        if let Some(handler) = existing
+            .get_mut("hooks")
+            .and_then(Value::as_array_mut)
+            .and_then(|hooks| hooks.first_mut())
+            .and_then(Value::as_object_mut)
+        {
+            if handler.get("command").and_then(Value::as_str) != Some(command.as_str()) {
+                handler.insert("command".to_string(), json!(command));
+                changed = true;
+            }
+            if handler.get("timeout").and_then(Value::as_u64) != Some(timeout) {
+                handler.insert("timeout".to_string(), json!(timeout));
+                changed = true;
+            }
+        }
+        return changed;
     }
     let mut entry =
         json!({ "hooks": [{ "type": "command", "command": command, "timeout": timeout }] });
@@ -466,10 +479,8 @@ fn wire_cursor() {
     }
 }
 
-/// Codex hooks (`~/.codex/hooks.json`, same shape as Claude Code's
-/// settings.json hooks) are gated behind an experimental feature flag Codex
-/// itself requires. Source: https://learn.chatgpt.com/docs/extend/mcp?surface=cli
-/// (verified 2026-07-13) — the flag lives in `config.toml`, not hooks.json.
+/// Install Codex-supported lifecycle hooks in the user config. Codex enables
+/// hooks by default, so this leaves the user's config.toml policy untouched.
 fn wire_codex_hooks() {
     let codex_dir = home().join(".codex");
     let hooks_path = codex_dir.join("hooks.json");
@@ -481,14 +492,37 @@ fn wire_codex_hooks() {
     let hooks_obj = hooks.as_object_mut().unwrap();
 
     let mut added = false;
-    added |= add_hook_entry(
-        hooks_obj,
-        "PreToolUse",
-        "hook pre-tool-use",
-        None,
-        format!("\"{bin}\" hook pre-tool-use"),
-        5,
-    );
+    for (event, command, timeout) in [
+        ("SessionStart", "session-start", 10),
+        ("UserPromptSubmit", "prompt-submit", 5),
+        ("PreToolUse", "pre-tool-use", 5),
+        ("PostToolUse", "post-tool-use", 5),
+        ("Stop", "stop", 5),
+        ("SessionEnd", "session-end", 3),
+    ] {
+        added |= add_hook_entry(
+            hooks_obj,
+            event,
+            &format!("hook {command}"),
+            None,
+            format!("\"{bin}\" hook {command} --agent codex"),
+            timeout,
+        );
+    }
+    for (event, command, timeout) in [
+        ("SessionStart", "session-start", 10),
+        ("SubagentStart", "subagent-start", 5),
+        ("UserPromptSubmit", "prompt-submit", 5),
+    ] {
+        added |= add_hook_entry(
+            hooks_obj,
+            event,
+            &format!("optimize code hook {command}"),
+            None,
+            format!("\"{bin}\" optimize code hook {command}"),
+            timeout,
+        );
+    }
 
     if let Some(parent) = hooks_path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -500,22 +534,6 @@ fn wire_codex_hooks() {
         }
     } else {
         ui::skip("~/.codex/hooks.json (already wired)");
-    }
-
-    let config_path = codex_dir.join("config.toml");
-    let config_content = fs::read_to_string(&config_path).unwrap_or_default();
-    if config_content.contains("codex_hooks") {
-        ui::skip("~/.codex/config.toml (codex_hooks flag already present)");
-        return;
-    }
-    let mut updated = config_content.clone();
-    if !updated.is_empty() && !updated.ends_with('\n') {
-        updated.push('\n');
-    }
-    updated.push_str("[features]\ncodex_hooks = true\n");
-    match fs::write(&config_path, updated) {
-        Ok(_) => ui::success("~/.codex/config.toml: codex_hooks feature flag enabled"),
-        Err(e) => ui::error(&format!("writing ~/.codex/config.toml: {e}")),
     }
 }
 
@@ -1196,6 +1214,40 @@ mod tests {
             let content = fs::read_to_string(cwd().join(".cursor").join("hooks.json")).unwrap();
             assert!(content.contains("agentflare"));
             assert!(content.contains("sessionStart"));
+        });
+    }
+
+    #[test]
+    fn wire_codex_hooks_preserves_config_and_upgrades_existing_entry() {
+        with_temp_home(|| {
+            let codex_dir = home().join(".codex");
+            fs::create_dir_all(&codex_dir).unwrap();
+            let config_path = codex_dir.join("config.toml");
+            let config = "[features]\nweb_search_request = true\n";
+            fs::write(&config_path, config).unwrap();
+            let hooks_path = codex_dir.join("hooks.json");
+            fs::write(&hooks_path, r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"agentflare hook pre-tool-use","timeout":5}]}]}}"#).unwrap();
+
+            wire_codex_hooks();
+
+            assert_eq!(fs::read_to_string(&config_path).unwrap(), config);
+            let first = fs::read_to_string(&hooks_path).unwrap();
+            let parsed: Value = serde_json::from_str(&first).unwrap();
+            for event in [
+                "PreToolUse",
+                "PostToolUse",
+                "Stop",
+                "SessionEnd",
+                "SubagentStart",
+            ] {
+                assert_eq!(parsed["hooks"][event].as_array().unwrap().len(), 1);
+            }
+            for event in ["SessionStart", "UserPromptSubmit"] {
+                assert_eq!(parsed["hooks"][event].as_array().unwrap().len(), 2);
+            }
+            assert!(first.contains("hook pre-tool-use --agent codex"));
+            wire_codex_hooks();
+            assert_eq!(fs::read_to_string(&hooks_path).unwrap(), first);
         });
     }
 
