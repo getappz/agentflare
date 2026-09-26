@@ -48,6 +48,21 @@ pub fn detect_signal(text: &str) -> Option<&'static str> {
         .find(|(needle, _)| {
             if needle.contains(' ') {
                 lower.contains(needle)
+            } else if needle.bytes().all(|b| b.is_ascii_digit()) {
+                // A bare numeric needle ("429") must not match inside a
+                // longer number — a port, PID, or build id containing the
+                // same digits would otherwise misclassify as a signal.
+                flat.match_indices(needle).any(|(i, _)| {
+                    let before_digit = flat[..i]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_ascii_digit());
+                    let after_digit = flat[i + needle.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_digit());
+                    !before_digit && !after_digit
+                })
             } else {
                 flat.contains(needle)
             }
@@ -272,6 +287,15 @@ mod tests {
         assert_eq!(
             detect_signal("RESOURCE_EXHAUSTED: quota it"),
             Some("rate_limit")
+        );
+        assert_eq!(
+            detect_signal("http 429 too many requests"),
+            Some("rate_limit")
+        );
+        assert_eq!(
+            detect_signal("connected to port 8429 ok, build #4290"),
+            None,
+            "429 embedded in an unrelated number must not misclassify"
         );
         assert_eq!(
             detect_signal("ProviderModelNotFoundError: opus"),

@@ -190,8 +190,9 @@ fn objective_of(session: &Session, turns: &[Turn]) -> String {
 
 fn files_touched_of(files: &[FileEvent]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for f in files {
-        if (f.kind == "write" || f.kind == "edit") && !out.contains(&f.path) {
+        if (f.kind == "write" || f.kind == "edit") && seen.insert(f.path.as_str()) {
             out.push(f.path.clone());
         }
     }
