@@ -941,7 +941,7 @@
 
     #[test]
     fn headless_full_args_adds_nothing_when_json_is_not_requested_or_unsupported() {
-        let extra = vec!["--full-auto".to_string()];
+        let extra = vec!["--dangerously-bypass-approvals-and-sandbox".to_string()];
         assert_eq!(headless_full_args(Agent::ClaudeCode, false, &extra), extra);
         assert_eq!(headless_full_args(Agent::Codex, true, &extra), extra);
     }

@@ -1594,9 +1594,9 @@ mod persona_tests {
             "caller's choice stands"
         );
 
-        let mut codex = vec!["--full-auto".to_string()];
+        let mut codex = vec!["--dangerously-bypass-approvals-and-sandbox".to_string()];
         assert!(!pin_stream_json("codex", &mut codex));
-        assert_eq!(codex, vec!["--full-auto"]);
+        assert_eq!(codex, vec!["--dangerously-bypass-approvals-and-sandbox"]);
     }
 
     #[test]
