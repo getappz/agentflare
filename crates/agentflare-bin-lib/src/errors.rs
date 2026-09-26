@@ -106,7 +106,10 @@ pub type Result<T> = std::result::Result<T, AgentflareError>;
 /// Converts the unified dispatch-layer error type once, at whichever `?`
 /// first needs an `ErrorData` -- lets internal MCP-server helpers chain
 /// heterogeneous fallible steps with `?` instead of mapping each one to
-/// `ErrorData` individually.
+/// `ErrorData` individually. Gated behind the `mcp` feature: pulling in the
+/// full MCP SDK is the root binary crate's business, not every consumer of
+/// `AgentflareError` (e.g. one that only wants `paths::home()`).
+#[cfg(feature = "mcp")]
 impl From<AgentflareError> for rmcp::ErrorData {
     fn from(e: AgentflareError) -> Self {
         match e {
@@ -118,6 +121,7 @@ impl From<AgentflareError> for rmcp::ErrorData {
 
 /// NotFound/Duplicate/InvalidTransition are caller-fixable -> invalid_params;
 /// a raw database error is ours to fix -> internal_error.
+#[cfg(feature = "mcp")]
 pub fn map_backend_err(e: agentflare_backend::Error) -> rmcp::ErrorData {
     match e {
         agentflare_backend::Error::NotFound(msg)

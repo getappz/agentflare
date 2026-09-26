@@ -145,15 +145,14 @@ pub fn skills_db_path() -> PathBuf {
 // each other or they'll stomp on one another under cargo's default
 // parallel test runner.
 //
-// Gated by the `test-support` feature rather than `#[cfg(test)]`: this crate
-// is consumed by the root `agentflare` binary, whose own `#[cfg(test)]` unit
-// tests call into `test_support` too -- `#[cfg(test)]` only applies within
-// the crate being compiled, so it would never be visible to a downstream
-// crate's test build. The root crate's `[dev-dependencies]` enables this
-// feature so `test_support` compiles in for its test builds only, matching
-// the original same-crate `#[cfg(test)]` behavior (absent from release
-// builds).
-#[cfg(feature = "test-support")]
+// `cfg(test)` covers this crate's own test build; `feature = "test-support"`
+// covers the root `agentflare` binary's `#[cfg(test)]` unit tests, which
+// also call into `test_support` -- `#[cfg(test)]` only applies within the
+// crate being compiled, so it would never be visible to a downstream
+// crate's test build on its own. The root crate's `[dev-dependencies]`
+// enables the feature for that case; this crate's own `cargo test` needs no
+// feature flag, matching the original same-crate `#[cfg(test)]` behavior.
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
     // The actual with_temp_home implementation now lives in
     // `agentflare-config`; re-exported here so the many existing

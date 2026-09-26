@@ -1,22 +1,27 @@
 //! Consecutive identical work-failure counting for the daemon's auto-redispatch
 //! ceiling (item #506). Comments are the source of truth — same pattern as
-//! `supervisor::CI_SELF_REPAIR_MARKER` / `quota::decide::SELF_REPAIR_CAP`.
+//! `supervisor::CI_SELF_REPAIR_MARKER` / `quota::decide::SELF_REPAIR_CAP`,
+//! both of which live in the root `agentflare` binary crate, not here: this
+//! crate has no dependency on it, so nothing below enforces that these
+//! marker strings stay in sync with the formatters that emit them — treat
+//! any change to a marker's text as a cross-crate rename.
 
-/// Prefix on every failure comment from `cli::work::release_and_comment` —
-/// keep in sync with that formatter.
+/// Prefix on every failure comment from `cli::work::release_and_comment`
+/// (root crate) — keep in sync with that formatter by hand.
 pub const WORK_FAILURE_MARKER: &str = "## agentflare work — failed";
 /// A successful run breaks a consecutive-identical-failure streak.
 pub const WORK_SUCCESS_MARKER: &str = "## agentflare work — complete";
 /// Prefix on a discovery-tick dispatch comment (see `dispatch_item` in
-/// `supervisor.rs`) — one marker per dispatch cycle; intra-job retries do
-/// not post another.
+/// `supervisor.rs`, root crate) — one marker per dispatch cycle; intra-job
+/// retries do not post another.
 pub const DISPATCH_MARKER: &str = "## supervisor — dispatched";
 /// Prefix on the supervisor comment posted when the ceiling trips.
 pub const DISPATCH_FAILURE_CAP_MARKER: &str = "## supervisor — identical failure cap reached";
 
-/// Prefix on the comment `cli::work` posts when it moved an item to another
-/// agent because the one running it ran out of credit/quota or hit a long
-/// rate limit. Neutral for both caps: the agent failed, not the item.
+/// Prefix on the comment `cli::work` (root crate) posts when it moved an
+/// item to another agent because the one running it ran out of
+/// credit/quota or hit a long rate limit. Neutral for both caps: the agent
+/// failed, not the item.
 pub const AGENT_FAILOVER_MARKER: &str = "## agentflare work — moved to another agent";
 /// Prefix on the comment posted when the agent ran out and no other agent was
 /// available, so the run waits for the agent's reset. Neutral, same reason.

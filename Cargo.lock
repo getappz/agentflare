@@ -68,8 +68,8 @@ dependencies = [
  "agentflare-apps",
  "agentflare-artifacts",
  "agentflare-backend",
+ "agentflare-bin-lib",
  "agentflare-config",
- "agentflare-core",
  "agentflare-db-kit",
  "agentflare-flare-code",
  "agentflare-flare-insights",
@@ -208,23 +208,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "agentflare-config"
-version = "0.1.0"
-dependencies = [
- "agentflare-agent-registry",
- "agentflare-workspace-hack",
- "dirs",
- "tempfile",
-]
-
-[[package]]
-name = "agentflare-core"
+name = "agentflare-bin-lib"
 version = "0.1.0"
 dependencies = [
  "agentflare-agent-registry",
  "agentflare-backend",
  "agentflare-config",
- "agentflare-core",
  "agentflare-skill-registry",
  "agentflare-store",
  "agentflare-workspace-hack",
@@ -236,6 +225,16 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "agentflare-config"
+version = "0.1.0"
+dependencies = [
+ "agentflare-agent-registry",
+ "agentflare-workspace-hack",
+ "dirs",
+ "tempfile",
 ]
 
 [[package]]
