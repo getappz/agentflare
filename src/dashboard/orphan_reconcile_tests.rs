@@ -1147,6 +1147,122 @@
         });
     }
 
+    /// Item #655: a self-repair claim on an item that already had an open
+    /// PR (`in_review`) flips its state to `started` as a side effect of
+    /// `item::claim` (see `mcp_server::AgentflareMcp::roll_back_claim`'s doc
+    /// comment). If the repair job then fails for any reason other than a
+    /// worktree-creation failure, nothing else restores the item to
+    /// `in_review` -- `handle_terminal_job_failure`'s own recovery must do
+    /// it, or `run_review_sweep`'s in_review-only scan loses the item (and
+    /// its still-open PR) forever, even once the PR goes green and gets
+    /// approved. Runs the cap path too (`NEEDS_MANUAL_LABEL` seeded) to
+    /// confirm the state restore isn't accidentally coupled to whether
+    /// auto-redispatch itself continues.
+    #[test]
+    fn handle_terminal_job_failure_restores_in_review_for_an_item_with_an_open_pr() {
+        crate::paths::test_support::with_temp_home(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo_root).unwrap();
+            init_test_repo(&repo_root);
+
+            let mcp = crate::mcp_server::AgentflareMcp::for_project_dir(repo_root.clone());
+            seed_labels(&mcp, &[crate::supervisor::NEEDS_MANUAL_LABEL]);
+
+            let item_id = mcp
+                .with_backend_db(|conn| {
+                    let project = mcp.resolve_project(conn).unwrap();
+                    let states =
+                        agentflare_backend::state::list_by_project(conn, &project.id).unwrap();
+                    let started = states
+                        .iter()
+                        .find(|s| s.group_name == "started")
+                        .unwrap()
+                        .id
+                        .clone();
+                    agentflare_backend::item::create(
+                        conn,
+                        agentflare_backend::item::CreateItem {
+                            project_id: project.id,
+                            state_id: started,
+                            name: "stray self-repair item".into(),
+                            description: None,
+                            priority: None,
+                            parent_id: None,
+                            assignee_agent: Some("claude-code".into()),
+                            sort_order: None,
+                            external_source: None,
+                            external_id: None,
+                            metadata: Some(
+                                serde_json::json!({"pr": {"number": 816, "branch": "task/655"}})
+                                    .to_string(),
+                            ),
+                            label_ids: vec![],
+                            assignee_ids: vec![],
+                            dependency_ids: vec![],
+                            start_date: None,
+                            due_date: None,
+                        },
+                    )
+                    .unwrap()
+                    .id
+                })
+                .unwrap();
+            // 6 identical failures trips the cap -- exercises the branch
+            // that also adds `NEEDS_MANUAL_LABEL`, to confirm that doesn't
+            // suppress the state restore.
+            seed_dispatch_cycle_failures(
+                &mcp,
+                &item_id,
+                crate::dispatch_failure_ceiling::DISPATCH_FAILURE_CAP,
+                "codex exited non-zero: token_revoked",
+            );
+
+            let job = agentflare_jobs::AgentJob::new("agentflare-work")
+                .args([
+                    item_id.clone(),
+                    "claude-code".to_string(),
+                    repo_root.to_string_lossy().to_string(),
+                ])
+                .in_process();
+
+            handle_terminal_job_failure(&job);
+
+            let (state_group, labels) = mcp
+                .with_backend_db(|conn| {
+                    let item = agentflare_backend::item::get(conn, &item_id).unwrap();
+                    let group = agentflare_backend::state::get(conn, &item.state_id)
+                        .unwrap()
+                        .group_name;
+                    let labels = agentflare_backend::item::list_labels(conn, &item_id).unwrap();
+                    (group, labels)
+                })
+                .unwrap();
+            assert_eq!(
+                state_group, "in_review",
+                "an item with an open PR must be restored to in_review even though this \
+                 dispatch failure had nothing to do with the PR itself"
+            );
+            assert!(
+                labels.contains(
+                    &mcp.with_backend_db(|conn| {
+                        let project = mcp.resolve_project(conn).unwrap();
+                        agentflare_backend::label::get_by_name(
+                            conn,
+                            &project.id,
+                            crate::supervisor::NEEDS_MANUAL_LABEL,
+                        )
+                        .unwrap()
+                        .id
+                    })
+                    .unwrap()
+                ),
+                "the cap gate (a human should look at the repeated dispatch failure) still \
+                 fires independently of the state restore"
+            );
+        });
+    }
+
     /// Item #506: default `max_retries = 3` posts four identical failure
     /// comments within one dispatch cycle. The cap must count that as one
     /// cycle — first terminal hook restores `ready-for-work`, not

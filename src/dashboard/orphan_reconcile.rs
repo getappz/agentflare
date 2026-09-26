@@ -462,6 +462,25 @@ fn restore_after_terminal_failure(
         if matches!(state.group_name.as_str(), "completed" | "cancelled") {
             return Ok(None);
         }
+        // Item #655: a repair/retry claim on an item that already had an
+        // open PR (`in_review`) unconditionally flips its state to
+        // "started" as a side effect of `item::claim` -- and unlike the
+        // worktree-creation-failure path (`AgentflareMcp::roll_back_claim`),
+        // nothing restores it once the job fails for any other reason.
+        // Left alone, `run_review_sweep`'s in_review-only scan permanently
+        // loses the item, and its PR sits unwatched no matter how green or
+        // approved it later becomes -- a broken dispatch loop (this
+        // function's own cap, below) and a stuck-but-fine PR are two
+        // unrelated problems, and fixing the human-visible one (the cap
+        // comment) must not require separately noticing the other by hand.
+        if state.group_name != "in_review"
+            && crate::worktree::pr_number_from_metadata(&item).is_some()
+            && let Ok(states) = agentflare_backend::state::list_by_project(conn, &project.id)
+            && let Some(in_review) = states.iter().find(|s| s.group_name == "in_review")
+        {
+            agentflare_backend::item::update_state(conn, item_id, &in_review.id)
+                .map_err(|e| e.to_string())?;
+        }
         let comments =
             agentflare_backend::comment::list_by_item(conn, item_id).map_err(|e| e.to_string())?;
         let identical_count =

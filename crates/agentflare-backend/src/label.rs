@@ -135,6 +135,23 @@ pub fn list_by_workspace(conn: &Connection, workspace_id: &str) -> Result<Vec<La
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
+/// Looks up a single project label by name instead of `list_by_project`ing
+/// every label in the project just to linear-scan for one -- names are
+/// unique per project (enforced by callers via `label create`, mirrored
+/// here by `LIMIT 1`), so there's no ambiguity to resolve.
+pub fn get_by_name(conn: &Connection, project_id: &str, name: &str) -> Result<Label> {
+    conn.query_row(
+        "SELECT id, project_id, workspace_id, name, color, parent_id, sort_order, external_source, external_id, created_at, updated_at, deleted_at
+         FROM labels WHERE project_id = ?1 AND name = ?2 AND deleted_at IS NULL LIMIT 1",
+        rusqlite::params![project_id, name],
+        row_to_label,
+    )
+    .map_err(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => crate::error::Error::NotFound(name.to_string()),
+        other => other.into(),
+    })
+}
+
 pub fn list_by_project(conn: &Connection, project_id: &str) -> Result<Vec<Label>> {
     let mut stmt = conn.prepare(
         "SELECT id, project_id, workspace_id, name, color, parent_id, sort_order, external_source, external_id, created_at, updated_at, deleted_at
