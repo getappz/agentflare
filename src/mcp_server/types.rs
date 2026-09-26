@@ -807,9 +807,16 @@ pub(crate) struct ItemRequest {
     #[schemars(description = "Item IDs this item depends on (create)")]
     #[serde(default)]
     pub(crate) dependency_ids: Option<Vec<String>>,
-    #[schemars(description = "Label ID (add_label, remove_label)")]
+    #[schemars(
+        description = "Label ID (add_label, remove_label) — mutually exclusive with label_name; use label_name instead if you don't know the id"
+    )]
     #[serde(default)]
     pub(crate) label_id: Option<String>,
+    #[schemars(
+        description = "Label name (add_label, remove_label) — an alternative to label_id when you don't know the opaque id; label names are unique per project so no lookup-then-list round trip is needed. Mutually exclusive with label_id."
+    )]
+    #[serde(default)]
+    pub(crate) label_name: Option<String>,
     #[schemars(
         description = "Relation type: blocks|duplicate|relates_to (add_relation, remove_relation; list_relations optional filter — omit to return all three types)"
     )]
