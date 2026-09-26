@@ -28,6 +28,14 @@ const QUOTA_WINDOW_MONTHLY_SECS: u64 = 30 * 24 * 60 * 60;
 /// Upper bound on any parsed wait: a garbled reset time must not park an
 /// agent for months.
 const MAX_UNAVAILABLE_SECS: u64 = 8 * 24 * 60 * 60;
+/// How long a broken CLI invocation (clap exit code 2 -- an argv the
+/// installed agent binary doesn't accept, see item #308) keeps the agent
+/// out of the failover rotation. There is no reset to wait for; this is
+/// only how often the daemon is willing to try the binary again in case an
+/// upgrade fixed it -- long enough that a repeatedly-broken agent (item
+/// #307's codex `--full-auto`) stops being re-selected as a failover
+/// target on every tick.
+pub(crate) const LAUNCH_ARGV_ERROR_SECS: u64 = 24 * 60 * 60;
 
 /// Which subscription usage window the agent's message named, when any.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +110,12 @@ pub(crate) enum AgentFailure {
     },
     /// The credential itself is dead -- see `AUTH_EXPIRED_PATTERNS`.
     AuthExpired,
+    /// The agent CLI rejected its own launch arguments (clap exit code 2:
+    /// "unexpected argument", "unrecognized subcommand", a bare `Usage:`
+    /// dump) -- a broken installed version or CLI-arg drift, not an
+    /// availability problem the binary will recover from on its own. See
+    /// `LAUNCH_ARGV_PATTERNS`.
+    LaunchArgvError,
     Other,
 }
 
@@ -117,17 +131,20 @@ impl AgentFailure {
             AgentFailure::QuotaWindowExhausted { resets_at, window } => resets_at
                 .map(|t| (t - now).max(60) as u64)
                 .unwrap_or_else(|| quota_window_fallback_secs(window)),
+            AgentFailure::LaunchArgvError => LAUNCH_ARGV_ERROR_SECS,
             AgentFailure::AuthExpired | AgentFailure::Other => return None,
         };
         Some(secs.clamp(1, MAX_UNAVAILABLE_SECS))
     }
 
     /// Whether the work should move to another agent rather than wait for
-    /// this one: an exhausted credit/quota, or a rate limit longer than
-    /// `SHORT_RATE_LIMIT_SECS`.
+    /// this one: an exhausted credit/quota, a broken launch invocation, or a
+    /// rate limit longer than `SHORT_RATE_LIMIT_SECS`.
     pub(crate) fn warrants_failover(&self, now: i64) -> bool {
         match self {
-            AgentFailure::CreditExhausted | AgentFailure::QuotaWindowExhausted { .. } => true,
+            AgentFailure::CreditExhausted
+            | AgentFailure::QuotaWindowExhausted { .. }
+            | AgentFailure::LaunchArgvError => true,
             AgentFailure::RateLimited { .. } => {
                 self.wait_secs(now).unwrap_or(0) > SHORT_RATE_LIMIT_SECS
             }
@@ -142,6 +159,7 @@ impl AgentFailure {
             AgentFailure::CreditExhausted => "out of credit",
             AgentFailure::QuotaWindowExhausted { .. } => "usage limit reached",
             AgentFailure::AuthExpired => "authentication expired",
+            AgentFailure::LaunchArgvError => "rejected its own launch arguments",
             AgentFailure::Other => "failed",
         }
     }
@@ -172,6 +190,19 @@ const CREDIT_PATTERNS: &[&str] = &[
     "billing hard limit",
     "spend limit",
     "spending limit",
+];
+
+/// Clap's own exit-code-2 wording for an argv the installed binary doesn't
+/// accept -- checked before every other pattern list since it is
+/// unambiguous and unrelated to availability (see item #307's codex
+/// `--full-auto`, item #308).
+const LAUNCH_ARGV_PATTERNS: &[&str] = &[
+    "unexpected argument",
+    "unrecognized argument",
+    "unrecognized subcommand",
+    "error: invalid value",
+    "required arguments were not provided",
+    "usage: ",
 ];
 
 /// A usage window used up (5-hour, daily, weekly, monthly plan limits).
@@ -280,7 +311,9 @@ pub(crate) fn classify_failure_at(text: &str, now: chrono::DateTime<chrono::Utc>
     let hint = retry_hint_secs(&lower);
     let has = |patterns: &[&str]| patterns.iter().any(|p| lower.contains(p));
 
-    let classified = if has(CREDIT_PATTERNS) || has_status_code(&lower, "402") {
+    let classified = if has(LAUNCH_ARGV_PATTERNS) {
+        AgentFailure::LaunchArgvError
+    } else if has(CREDIT_PATTERNS) || has_status_code(&lower, "402") {
         AgentFailure::CreditExhausted
     } else if has(QUOTA_WINDOW_PATTERNS) {
         AgentFailure::QuotaWindowExhausted {
@@ -340,6 +373,7 @@ pub(crate) fn skips_step_retry(text: &str) -> bool {
             AgentFailure::AuthExpired
                 | AgentFailure::CreditExhausted
                 | AgentFailure::QuotaWindowExhausted { .. }
+                | AgentFailure::LaunchArgvError
         )
         || (matches!(failure, AgentFailure::RateLimited { .. })
             && failure.warrants_failover(chrono::Utc::now().timestamp()))
@@ -763,6 +797,23 @@ mod classify_tests {
             );
             assert!(!got.warrants_failover(at().timestamp()), "{text}");
         }
+    }
+
+    #[test]
+    fn clap_style_launch_failures_are_launch_argv_errors() {
+        for text in [
+            "error: unexpected argument '--full-auto' found\n\nUsage: codex exec [OPTIONS]",
+            "error: unrecognized subcommand 'exec-full'",
+            "thor: error: the following required arguments were not provided:\n  <PROMPT>",
+        ] {
+            assert_eq!(classify(text), AgentFailure::LaunchArgvError, "{text}");
+        }
+        let now = at().timestamp();
+        assert!(AgentFailure::LaunchArgvError.warrants_failover(now));
+        assert_eq!(
+            AgentFailure::LaunchArgvError.wait_secs(now),
+            Some(LAUNCH_ARGV_ERROR_SECS)
+        );
     }
 
     #[test]

@@ -4,20 +4,38 @@
 use crate::registry::{Agent, REGISTRY, agent_by_name};
 use crate::router::{RouterConfig, TaskContext};
 
+/// Default `[failover] usage_threshold_percent` -- the fallback const used
+/// when the operator's config sets neither the blanket nor a per-window
+/// override. Matches the value every usage-threshold check has hardcoded
+/// since item #307/#308's predecessor.
+pub const DEFAULT_USAGE_THRESHOLD_PERCENT: f32 = 70.0;
+
 /// `~/.agentflare/config.toml`'s `[failover]` table:
 ///
 /// ```toml
 /// [failover]
 /// enabled = true                  # default true
 /// agents = ["codex", "opencode"]  # allow-list + preference order
+/// usage_threshold_percent = 70.0  # default 70.0; blanket usage-window gate
+/// five_hour_percent = 90.0        # optional override for Claude's 5h window
+/// seven_day_percent = 85.0        # optional override for Claude's 7d window
 /// ```
 ///
 /// An empty `agents` list allows any installed agent; a non-empty one is
 /// both an allow-list and a preference order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FailoverConfig {
     pub enabled: bool,
     pub agents: Vec<Agent>,
+    /// Blanket usage-window threshold, applied to every window that has no
+    /// more specific override below.
+    pub usage_threshold_percent: f32,
+    /// Override for Claude's 5-hour window; falls back to
+    /// `usage_threshold_percent` when unset.
+    pub five_hour_percent: Option<f32>,
+    /// Override for Claude's 7-day window; falls back to
+    /// `usage_threshold_percent` when unset.
+    pub seven_day_percent: Option<f32>,
 }
 
 impl Default for FailoverConfig {
@@ -25,7 +43,24 @@ impl Default for FailoverConfig {
         Self {
             enabled: true,
             agents: Vec::new(),
+            usage_threshold_percent: DEFAULT_USAGE_THRESHOLD_PERCENT,
+            five_hour_percent: None,
+            seven_day_percent: None,
         }
+    }
+}
+
+impl FailoverConfig {
+    /// The effective threshold for Claude's 5-hour window.
+    #[must_use]
+    pub fn five_hour_threshold(&self) -> f32 {
+        self.five_hour_percent.unwrap_or(self.usage_threshold_percent)
+    }
+
+    /// The effective threshold for Claude's 7-day window.
+    #[must_use]
+    pub fn seven_day_threshold(&self) -> f32 {
+        self.seven_day_percent.unwrap_or(self.usage_threshold_percent)
     }
 }
 
@@ -35,6 +70,12 @@ struct RawFailover {
     enabled: Option<bool>,
     #[serde(default)]
     agents: Vec<String>,
+    #[serde(default)]
+    usage_threshold_percent: Option<f32>,
+    #[serde(default)]
+    five_hour_percent: Option<f32>,
+    #[serde(default)]
+    seven_day_percent: Option<f32>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -59,6 +100,11 @@ pub fn parse_failover_config(text: &str) -> Result<FailoverConfig, String> {
     Ok(FailoverConfig {
         enabled: raw.enabled.unwrap_or(true) && !all_unknown,
         agents,
+        usage_threshold_percent: raw
+            .usage_threshold_percent
+            .unwrap_or(DEFAULT_USAGE_THRESHOLD_PERCENT),
+        five_hour_percent: raw.five_hour_percent,
+        seven_day_percent: raw.seven_day_percent,
     })
 }
 
@@ -164,6 +210,7 @@ mod tests {
         let failover = FailoverConfig {
             enabled: true,
             agents: vec![Agent::Opencode, Agent::Codex],
+            ..FailoverConfig::default()
         };
         let installed = [
             Agent::ClaudeCode,
@@ -205,6 +252,29 @@ mod tests {
             parse_failover_config("").unwrap(),
             FailoverConfig::default()
         );
+    }
+
+    #[test]
+    fn usage_threshold_defaults_to_the_const_when_config_omits_it() {
+        let config = parse_failover_config("[failover]\nenabled = true\n").unwrap();
+        assert_eq!(config.usage_threshold_percent, DEFAULT_USAGE_THRESHOLD_PERCENT);
+        assert_eq!(config.five_hour_threshold(), DEFAULT_USAGE_THRESHOLD_PERCENT);
+        assert_eq!(config.seven_day_threshold(), DEFAULT_USAGE_THRESHOLD_PERCENT);
+        assert_eq!(
+            FailoverConfig::default().usage_threshold_percent,
+            DEFAULT_USAGE_THRESHOLD_PERCENT
+        );
+    }
+
+    #[test]
+    fn per_window_thresholds_override_the_blanket_percentage() {
+        let config = parse_failover_config(
+            "[failover]\nusage_threshold_percent = 70.0\nfive_hour_percent = 90.0\nseven_day_percent = 85.0\n",
+        )
+        .unwrap();
+        assert_eq!(config.usage_threshold_percent, 70.0);
+        assert_eq!(config.five_hour_threshold(), 90.0);
+        assert_eq!(config.seven_day_threshold(), 85.0);
     }
 
     #[test]

@@ -22,7 +22,10 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 21_600;
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30 * 60;
 
 /// Claim a work item, run an agent on it in an isolated worktree, and
-/// report the result (comment + PR, or error) back onto the item.
+/// report the result (comment + PR, or error) back onto the item. See
+/// `Commands::Work`'s doc comment (`agentflare work --help`) for the
+/// `"failover"`/`"allowed_agents"` item-metadata keys that scope automatic
+/// failover.
 #[derive(Args)]
 pub struct WorkArgs {
     /// Item UUID or numeric sequence id.
@@ -1860,6 +1863,19 @@ rotate = true
             assert!(retry.is_none());
             let conn = crate::auth_db::open_or_rebuild();
             assert!(!crate::auth_db::is_cooling_down(&conn, "claude-code"));
+        });
+    }
+
+    #[test]
+    fn classify_and_cooldown_records_a_long_cooldown_on_a_broken_launch_invocation() {
+        crate::paths::test_support::with_temp_home(|| {
+            let wait = classify_and_cooldown(
+                "codex",
+                "error: unexpected argument '--full-auto' found\n\nUsage: codex exec [OPTIONS]",
+            );
+            assert_eq!(wait, Some(crate::auth_runner::LAUNCH_ARGV_ERROR_SECS));
+            let conn = crate::auth_db::open_or_rebuild();
+            assert!(crate::auth_db::is_cooling_down(&conn, "codex"));
         });
     }
 
