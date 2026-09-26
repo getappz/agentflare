@@ -144,13 +144,21 @@ pub fn skills_db_path() -> PathBuf {
 // process-global, so tests that touch either must run serialized against
 // each other or they'll stomp on one another under cargo's default
 // parallel test runner.
-#[cfg(test)]
-pub(crate) mod test_support {
+//
+// `cfg(test)` covers this crate's own test build; `feature = "test-support"`
+// covers the root `agentflare` binary's `#[cfg(test)]` unit tests, which
+// also call into `test_support` -- `#[cfg(test)]` only applies within the
+// crate being compiled, so it would never be visible to a downstream
+// crate's test build on its own. The root crate's `[dev-dependencies]`
+// enables the feature for that case; this crate's own `cargo test` needs no
+// feature flag, matching the original same-crate `#[cfg(test)]` behavior.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
     // The actual with_temp_home implementation now lives in
     // `agentflare-config`; re-exported here so the many existing
     // `crate::paths::test_support::with_temp_home` call sites don't need to
     // change.
-    pub(crate) use agentflare_config::test_support::with_temp_home;
+    pub use agentflare_config::test_support::with_temp_home;
 
     // Same GLOBAL_STATE_LOCK reasoning as agentflare_config::test_support's
     // with_temp_home -- cwd is also process-global.
@@ -166,7 +174,7 @@ pub(crate) mod test_support {
         }
     }
 
-    pub(crate) fn with_temp_cwd<T>(f: impl FnOnce() -> T) -> T {
+    pub fn with_temp_cwd<T>(f: impl FnOnce() -> T) -> T {
         let _guard = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Same reasoning as with_temp_home above: a unique dir per call
         // instead of a fixed shared name.

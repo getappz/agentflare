@@ -1,32 +1,36 @@
 //! Consecutive identical work-failure counting for the daemon's auto-redispatch
 //! ceiling (item #506). Comments are the source of truth — same pattern as
-//! `supervisor::CI_SELF_REPAIR_MARKER` / `quota::decide::SELF_REPAIR_CAP`.
+//! `supervisor::CI_SELF_REPAIR_MARKER` / `quota::decide::SELF_REPAIR_CAP`,
+//! both of which live in the root `agentflare` binary crate, not here: this
+//! crate has no dependency on it, so nothing below enforces that these
+//! marker strings stay in sync with the formatters that emit them — treat
+//! any change to a marker's text as a cross-crate rename.
 
-/// Prefix on every failure comment from `cli::work::release_and_comment` —
-/// keep in sync with that formatter.
-pub(crate) const WORK_FAILURE_MARKER: &str = "## agentflare work — failed";
+/// Prefix on every failure comment from `cli::work::release_and_comment`
+/// (root crate) — keep in sync with that formatter by hand.
+pub const WORK_FAILURE_MARKER: &str = "## agentflare work — failed";
 /// A successful run breaks a consecutive-identical-failure streak.
-pub(crate) const WORK_SUCCESS_MARKER: &str = "## agentflare work — complete";
+pub const WORK_SUCCESS_MARKER: &str = "## agentflare work — complete";
 /// Prefix on a discovery-tick dispatch comment (see `dispatch_item` in
-/// `supervisor.rs`) — one marker per dispatch cycle; intra-job retries do
-/// not post another.
-pub(crate) const DISPATCH_MARKER: &str = "## supervisor — dispatched";
+/// `supervisor.rs`, root crate) — one marker per dispatch cycle; intra-job
+/// retries do not post another.
+pub const DISPATCH_MARKER: &str = "## supervisor — dispatched";
 /// Prefix on the supervisor comment posted when the ceiling trips.
-pub(crate) const DISPATCH_FAILURE_CAP_MARKER: &str =
-    "## supervisor — identical failure cap reached";
+pub const DISPATCH_FAILURE_CAP_MARKER: &str = "## supervisor — identical failure cap reached";
 
-/// Prefix on the comment `cli::work` posts when it moved an item to another
-/// agent because the one running it ran out of credit/quota or hit a long
-/// rate limit. Neutral for both caps: the agent failed, not the item.
-pub(crate) const AGENT_FAILOVER_MARKER: &str = "## agentflare work — moved to another agent";
+/// Prefix on the comment `cli::work` (root crate) posts when it moved an
+/// item to another agent because the one running it ran out of
+/// credit/quota or hit a long rate limit. Neutral for both caps: the agent
+/// failed, not the item.
+pub const AGENT_FAILOVER_MARKER: &str = "## agentflare work — moved to another agent";
 /// Prefix on the comment posted when the agent ran out and no other agent was
 /// available, so the run waits for the agent's reset. Neutral, same reason.
-pub(crate) const AGENT_UNAVAILABLE_MARKER: &str = "## agentflare work — agent unavailable";
+pub const AGENT_UNAVAILABLE_MARKER: &str = "## agentflare work — agent unavailable";
 /// Prefix on the comment posted when a run was stopped on request (workflow
 /// cancelled, or paused). Neutral for both caps, and tells the terminal-job
 /// hook not to put the item back on `ready-for-work` (see
 /// [`stopped_on_request`]).
-pub(crate) const STOPPED_ON_REQUEST_MARKER: &str = "## agentflare work — stopped on request";
+pub const STOPPED_ON_REQUEST_MARKER: &str = "## agentflare work — stopped on request";
 
 /// Outcome comments that say nothing about whether the item itself is
 /// broken -- a cycle whose latest outcome is one of these is skipped by both
@@ -53,7 +57,7 @@ fn segment_ended_neutral(segment: &[agentflare_backend::comment::ItemComment]) -
 
 /// Whether the item's most recent outcome is a stop-on-request (cancel or
 /// pause) -- the terminal-job hook must then leave it off `ready-for-work`.
-pub(crate) fn stopped_on_request(comments: &[agentflare_backend::comment::ItemComment]) -> bool {
+pub fn stopped_on_request(comments: &[agentflare_backend::comment::ItemComment]) -> bool {
     comments
         .iter()
         .rev()
@@ -75,7 +79,7 @@ pub(crate) fn stopped_on_request(comments: &[agentflare_backend::comment::ItemCo
 /// After this many consecutive dispatch cycles whose terminal failure reason
 /// is identical/near-identical, the daemon stops swapping an item back to
 /// `ready-for-work` for auto-redispatch.
-pub(crate) const DISPATCH_FAILURE_CAP: u32 = 3;
+pub const DISPATCH_FAILURE_CAP: u32 = 3;
 
 /// Looser counterpart to `DISPATCH_FAILURE_CAP`: after this many consecutive
 /// dispatch cycles that each ended WITHOUT a clean success — regardless of
@@ -92,15 +96,15 @@ pub(crate) const DISPATCH_FAILURE_CAP: u32 = 3;
 /// Deliberately looser than `DISPATCH_FAILURE_CAP` — a single daemon death
 /// mid-job still isn't deterministic evidence of a real bug on its own, so
 /// this gives more room before giving up than the identical-reason cap does.
-pub(crate) const DISPATCH_FAILURE_CAP_ANY_REASON: u32 = 6;
+pub const DISPATCH_FAILURE_CAP_ANY_REASON: u32 = 6;
 
-pub(crate) fn failure_reason(body: &str) -> Option<&str> {
+pub fn failure_reason(body: &str) -> Option<&str> {
     let rest = body.strip_prefix(WORK_FAILURE_MARKER)?;
     rest.strip_prefix("\n\n").or(Some(""))
 }
 
 /// Near-identical: collapse whitespace so formatting-only diffs still match.
-pub(crate) fn normalize_failure_reason(reason: &str) -> String {
+pub fn normalize_failure_reason(reason: &str) -> String {
     reason.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -229,7 +233,7 @@ fn dispatch_cycle_coarse_outcomes(
 /// indefinitely. This one only stops at an actual success or a cycle that
 /// already reported the cap, so it still bounds the total no matter how
 /// varied (or unrecorded) the failures are.
-pub(crate) fn consecutive_failure_count_any_reason(
+pub fn consecutive_failure_count_any_reason(
     comments: &[agentflare_backend::comment::ItemComment],
 ) -> u32 {
     let mut count = 0u32;
@@ -254,7 +258,7 @@ pub(crate) fn consecutive_failure_count_any_reason(
 /// building the cycle list), or a cycle that already reported the cap (so a
 /// post-redispatch retry gets a fresh budget instead of re-tripping
 /// immediately).
-pub(crate) fn consecutive_identical_failure_count(
+pub fn consecutive_identical_failure_count(
     comments: &[agentflare_backend::comment::ItemComment],
 ) -> u32 {
     let cycles = dispatch_cycle_failure_reasons(comments);
@@ -282,7 +286,7 @@ pub(crate) fn consecutive_identical_failure_count(
     count
 }
 
-pub(crate) fn latest_failure_reason(
+pub fn latest_failure_reason(
     comments: &[agentflare_backend::comment::ItemComment],
 ) -> Option<String> {
     comments
