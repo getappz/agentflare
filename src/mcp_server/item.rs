@@ -2378,17 +2378,23 @@ impl AgentflareMcp {
             Self::require_label_id_or_name(req.label_id, req.label_name, "add_label")?;
         self.with_backend_db(|conn| {
             let item_id = self.resolve_item_id(conn, &raw)?;
+            let mut response = serde_json::json!({"attached": true, "item_id": item_id});
             if by_name {
                 agentflare_backend::item::add_label_by_name(conn, &item_id, &label)
                     .map_err(map_backend_err)?;
+                if let Ok(project) = self.resolve_project(conn)
+                    && let Ok(resolved) =
+                        agentflare_backend::label::get_by_name(conn, &project.id, &label)
+                {
+                    response["label_id"] = serde_json::json!(resolved.id);
+                }
+                response["label_name"] = serde_json::json!(label);
             } else {
                 agentflare_backend::item::add_label(conn, &item_id, &label)
                     .map_err(map_backend_err)?;
+                response["label_id"] = serde_json::json!(label);
             }
-            Ok(
-                serde_json::json!({"attached": true, "item_id": item_id, "label": label})
-                    .to_string(),
-            )
+            Ok(response.to_string())
         })?
     }
 
@@ -2403,17 +2409,23 @@ impl AgentflareMcp {
             Self::require_label_id_or_name(req.label_id, req.label_name, "remove_label")?;
         self.with_backend_db(|conn| {
             let item_id = self.resolve_item_id(conn, &raw)?;
+            let mut response = serde_json::json!({"removed": true, "item_id": item_id});
             if by_name {
                 agentflare_backend::item::remove_label_by_name(conn, &item_id, &label)
                     .map_err(map_backend_err)?;
+                if let Ok(project) = self.resolve_project(conn)
+                    && let Ok(resolved) =
+                        agentflare_backend::label::get_by_name(conn, &project.id, &label)
+                {
+                    response["label_id"] = serde_json::json!(resolved.id);
+                }
+                response["label_name"] = serde_json::json!(label);
             } else {
                 agentflare_backend::item::remove_label(conn, &item_id, &label)
                     .map_err(map_backend_err)?;
+                response["label_id"] = serde_json::json!(label);
             }
-            Ok(
-                serde_json::json!({"removed": true, "item_id": item_id, "label": label})
-                    .to_string(),
-            )
+            Ok(response.to_string())
         })?
     }
 

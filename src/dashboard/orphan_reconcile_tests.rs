@@ -1263,6 +1263,120 @@
         });
     }
 
+    /// PR #818 review finding: the in_review restore above must not fire
+    /// when the job was stopped on request (workflow cancelled/paused) --
+    /// otherwise the very next `run_review_sweep` tick can pick a
+    /// deliberately-stopped item back up (merge it, dispatch another
+    /// repair) despite the explicit stop request.
+    #[test]
+    fn handle_terminal_job_failure_does_not_restore_in_review_for_a_stopped_item_with_an_open_pr()
+    {
+        crate::paths::test_support::with_temp_home(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo_root).unwrap();
+            init_test_repo(&repo_root);
+
+            let mcp = crate::mcp_server::AgentflareMcp::for_project_dir(repo_root.clone());
+            seed_labels(&mcp, &[crate::supervisor::NEEDS_MANUAL_LABEL]);
+
+            let item_id = mcp
+                .with_backend_db(|conn| {
+                    let project = mcp.resolve_project(conn).unwrap();
+                    let states =
+                        agentflare_backend::state::list_by_project(conn, &project.id).unwrap();
+                    let started = states
+                        .iter()
+                        .find(|s| s.group_name == "started")
+                        .unwrap()
+                        .id
+                        .clone();
+                    agentflare_backend::item::create(
+                        conn,
+                        agentflare_backend::item::CreateItem {
+                            project_id: project.id,
+                            state_id: started,
+                            name: "stopped self-repair item with an open PR".into(),
+                            description: None,
+                            priority: None,
+                            parent_id: None,
+                            assignee_agent: Some("claude-code".into()),
+                            sort_order: None,
+                            external_source: None,
+                            external_id: None,
+                            metadata: Some(
+                                serde_json::json!({"pr": {"number": 818, "branch": "task/678"}})
+                                    .to_string(),
+                            ),
+                            label_ids: vec![],
+                            assignee_ids: vec![],
+                            dependency_ids: vec![],
+                            start_date: None,
+                            due_date: None,
+                        },
+                    )
+                    .unwrap()
+                    .id
+                })
+                .unwrap();
+
+            mcp.with_backend_db(|conn| {
+                agentflare_backend::comment::create(
+                    conn,
+                    &item_id,
+                    "test",
+                    &format!(
+                        "{}\n\njob: cycle-0",
+                        crate::dispatch_failure_ceiling::DISPATCH_MARKER
+                    ),
+                )
+                .unwrap();
+                agentflare_backend::comment::create(
+                    conn,
+                    &item_id,
+                    "test",
+                    &format!(
+                        "{}\n\nworkflow run cancelled on request -- not retrying.",
+                        crate::dispatch_failure_ceiling::STOPPED_ON_REQUEST_MARKER
+                    ),
+                )
+                .unwrap();
+                Some(())
+            })
+            .unwrap();
+
+            let job = agentflare_jobs::AgentJob::new("agentflare-work")
+                .args([
+                    item_id.clone(),
+                    "claude-code".to_string(),
+                    repo_root.to_string_lossy().to_string(),
+                ])
+                .in_process();
+
+            handle_terminal_job_failure(&job);
+
+            let (state_group, labels) = mcp
+                .with_backend_db(|conn| {
+                    let item = agentflare_backend::item::get(conn, &item_id).unwrap();
+                    let group = agentflare_backend::state::get(conn, &item.state_id)
+                        .unwrap()
+                        .group_name;
+                    let labels = agentflare_backend::item::list_labels(conn, &item_id).unwrap();
+                    (group, labels)
+                })
+                .unwrap();
+            assert_eq!(
+                state_group, "started",
+                "a stopped job must not be silently handed back to the review sweep by \
+                 restoring in_review, even though the item has an open PR tracked"
+            );
+            assert!(
+                labels.is_empty(),
+                "a stopped item gets no labels either way -- dispatched was never added here"
+            );
+        });
+    }
+
     /// Item #506: default `max_retries = 3` posts four identical failure
     /// comments within one dispatch cycle. The cap must count that as one
     /// cycle — first terminal hook restores `ready-for-work`, not
