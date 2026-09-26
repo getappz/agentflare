@@ -719,9 +719,7 @@ pub(crate) fn backend_claim_ttl_secs() -> i64 {
         .unwrap_or(14400) as i64
 }
 
-/// NotFound/Duplicate/InvalidTransition are caller-fixable → invalid_params;
-/// a raw database error is ours to fix → internal_error. Same split as
-/// `skill_load`'s NotFound/Ambiguous handling above.
+// Re-exported from agentflare_bin_lib (mcp feature); canonical docs live there.
 pub(crate) use agentflare_bin_lib::errors::map_backend_err;
 
 /// Maps a `GitHubError` to MCP `ErrorData`: client/auth mistakes become
