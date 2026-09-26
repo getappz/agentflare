@@ -57,6 +57,43 @@ fn post_failure(tmp: &tempfile::TempDir, item_id: &str) {
     .unwrap();
 }
 
+/// Literal text of the `push_or_pr_failed` comment `item_done` posts
+/// (item #649) — kept as a literal (not the shared constant) so this test
+/// fails if that formatter's text ever drifts from the marker.
+fn post_pr_failed(tmp: &tempfile::TempDir, item_id: &str) {
+    agentflare_backend::comment::create(
+        &backend_conn(tmp),
+        item_id,
+        "claude-code",
+        "## agentflare work — PR creation failed\n\nThe branch has real commits but no pull request resulted (no pull request resulted; check server logs) for item x. Left in place rather than completed.",
+    )
+    .unwrap();
+}
+
+/// Literal text of the auto-commit-failure comment `item_done` posts.
+fn post_commit_failed(tmp: &tempfile::TempDir, item_id: &str) {
+    agentflare_backend::comment::create(
+        &backend_conn(tmp),
+        item_id,
+        "claude-code",
+        "## agentflare work — commit failed\n\nAuto-commit of uncommitted changes failed:\n\n```\nboom\n```\n\nThe work is still sitting uncommitted in the item's worktree; it was left in place rather than reported as done.",
+    )
+    .unwrap();
+}
+
+/// Success comment finalize posts when a retry actually finishes the work
+/// (e.g. opens a PR after a transient PR-creation failure) — same literal
+/// prefix `format_success_comment` emits.
+fn post_success(tmp: &tempfile::TempDir, item_id: &str) {
+    agentflare_backend::comment::create(
+        &backend_conn(tmp),
+        item_id,
+        "claude-code",
+        "## agentflare work — complete\n\nAgent reply:\n\n```\nok\n```",
+    )
+    .unwrap();
+}
+
 fn force_req(action: &str, item_id: &str, reason: Option<&str>) -> ItemRequest {
     ItemRequest {
         action: action.into(),
@@ -234,6 +271,100 @@ fn auto_release_needs_both_a_dead_job_and_a_terminal_failure() {
         holder_of(&tmp, &item_id),
         Some(format!("claude-code:{job_id}"))
     );
+}
+
+#[test]
+fn pr_creation_failed_comment_counts_as_terminal_evidence() {
+    // Item #649: the `push_or_pr_failed` path posts a differently-worded
+    // comment that never went through `release_and_comment` — the sweep
+    // must still recognize it once the owner's job is confirmed dead.
+    let (tmp, s, item_id, job_id) = foreign_claim_harness();
+    post_pr_failed(&tmp, &item_id);
+    let queue = s.job_queue_override.clone().unwrap();
+    assert_eq!(auto_release_dead_claims(&s, &queue), 0);
+    kill_job(&s, &job_id);
+    assert_eq!(auto_release_dead_claims(&s, &queue), 1);
+    assert_eq!(holder_of(&tmp, &item_id), None);
+    assert!(
+        comments(&tmp, &item_id)
+            .iter()
+            .any(|c| c.starts_with(AUTO_RELEASE_MARKER))
+    );
+}
+
+#[test]
+fn commit_failed_comment_counts_as_terminal_evidence() {
+    let (tmp, s, item_id, job_id) = foreign_claim_harness();
+    post_commit_failed(&tmp, &item_id);
+    let queue = s.job_queue_override.clone().unwrap();
+    assert_eq!(auto_release_dead_claims(&s, &queue), 0);
+    kill_job(&s, &job_id);
+    assert_eq!(auto_release_dead_claims(&s, &queue), 1);
+    assert_eq!(holder_of(&tmp, &item_id), None);
+}
+
+#[test]
+fn pr_creation_failed_comment_alone_satisfies_the_force_gate() {
+    // Live job (not confirmed dead) — the PR-failed comment is the only
+    // evidence, mirroring `a_terminal_failure_comment_alone_satisfies_the_gate`.
+    let (tmp, s, item_id, _job_id) = foreign_claim_harness();
+    post_pr_failed(&tmp, &item_id);
+    let released: serde_json::Value = serde_json::from_str(
+        &crate::claims::with_owner_override(RESCUER, || {
+            s.item(Parameters(force_req(
+                "release",
+                &item_id,
+                Some("job vanished after PR failure"),
+            )))
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(released["released"], true, "{released}");
+    assert_eq!(holder_of(&tmp, &item_id), None);
+    assert!(
+        comments(&tmp, &item_id)
+            .iter()
+            .any(|c| c.starts_with(FORCE_OVERRIDE_MARKER))
+    );
+}
+
+#[test]
+fn success_after_failure_invalidates_the_stale_marker() {
+    // Item #649 follow-up (Codex P1): a finalize retry that opens a PR
+    // after a transient PR-creation failure posts a success comment while
+    // the original claim stays held for in-review. The sweep must not
+    // steal that live claim once the now-successful job goes terminal.
+    let (tmp, s, item_id, job_id) = foreign_claim_harness();
+    post_pr_failed(&tmp, &item_id);
+    post_success(&tmp, &item_id);
+    kill_job(&s, &job_id);
+    let queue = s.job_queue_override.clone().unwrap();
+    assert_eq!(auto_release_dead_claims(&s, &queue), 0);
+    assert_eq!(
+        holder_of(&tmp, &item_id),
+        Some(format!("claude-code:{job_id}"))
+    );
+}
+
+#[test]
+fn failure_after_success_still_counts_as_terminal_evidence() {
+    // Ordering matters both ways: a fresh failure posted after a success
+    // is new evidence, not invalidated history.
+    let (tmp, s, item_id, job_id) = foreign_claim_harness();
+    post_success(&tmp, &item_id);
+    // Backdate so ordering is deterministic regardless of clock granularity.
+    backend_conn(&tmp)
+        .execute(
+            "UPDATE item_comments SET created_at = created_at - 3600 WHERE item_id = ?1",
+            [&item_id],
+        )
+        .unwrap();
+    post_pr_failed(&tmp, &item_id);
+    kill_job(&s, &job_id);
+    let queue = s.job_queue_override.clone().unwrap();
+    assert_eq!(auto_release_dead_claims(&s, &queue), 1);
+    assert_eq!(holder_of(&tmp, &item_id), None);
 }
 
 #[test]

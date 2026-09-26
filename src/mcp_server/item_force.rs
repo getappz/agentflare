@@ -3,7 +3,8 @@
 //!
 //! - `auto_release_dead_claims`: supervisor sweep that releases a claim once
 //!   its owner's job is recorded terminal in the job queue AND a terminal
-//!   `agentflare work — failed` comment was posted since the claim was taken.
+//!   work-failure comment (`failed` / `PR creation failed` / `commit failed`)
+//!   was posted since the claim was taken.
 //! - `force_takeover`: `item(release|done|check_merge, force=true,
 //!   force_reason=...)` for cases the sweep can't reach, refused unless at
 //!   least one piece of dead-claim evidence holds. Every override is logged
@@ -14,7 +15,7 @@
 //! fixed-and-pushed item un-completable for ~2h45m of remaining TTL.
 
 use super::*;
-use crate::dispatch_failure_ceiling::WORK_FAILURE_MARKER;
+use crate::dispatch_failure_ceiling::{WORK_SUCCESS_MARKER, is_terminal_work_failure};
 
 /// Prefix on the audit comment `force_takeover` posts.
 pub(crate) const FORCE_OVERRIDE_MARKER: &str = "## agentflare — forced claim override";
@@ -79,12 +80,24 @@ fn owner_job_dead(queue: Option<&agentflare_jobs::Queue>, holder: &str) -> Optio
 
 /// A terminal work-failure comment posted at or after `since` (the current
 /// claim's acquisition) — an older failure from a previous dispatch cycle
-/// says nothing about the claim held now.
+/// says nothing about the claim held now. A later success comment
+/// (`WORK_SUCCESS_MARKER`, posted by finalize when a retry actually opened
+/// a PR) invalidates the stale marker: the claim may now be a live
+/// in-review hold rather than a wedged one, so it must not be stolen.
+/// Same-timestamp ties fail safe (no steal, worst case the TTL runs out).
 fn terminal_failure_since(conn: &rusqlite::Connection, item_id: &str, since: i64) -> bool {
     agentflare_backend::comment::list_by_item(conn, item_id).is_ok_and(|comments| {
-        comments
+        let Some(latest_failure) = comments
             .iter()
-            .any(|c| c.created_at >= since && c.body.starts_with(WORK_FAILURE_MARKER))
+            .filter(|c| c.created_at >= since && is_terminal_work_failure(&c.body))
+            .map(|c| c.created_at)
+            .max()
+        else {
+            return false;
+        };
+        !comments
+            .iter()
+            .any(|c| c.created_at >= latest_failure && c.body.starts_with(WORK_SUCCESS_MARKER))
     })
 }
 
@@ -185,7 +198,8 @@ impl AgentflareMcp {
         let evidence = owner_job_dead(queue.as_ref(), &holder)
             .or_else(|| {
                 failed.then(|| {
-                    "terminal `agentflare work — failed` comment posted since the claim was taken"
+                    "terminal work-failure comment (failed / PR creation failed / commit failed) \
+                     posted since the claim was taken"
                         .to_string()
                 })
             })

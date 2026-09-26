@@ -5,6 +5,7 @@
 //! verbatim; `item_inner` itself is now just the `match` dispatch.
 
 use super::*;
+use crate::dispatch_failure_ceiling::{COMMIT_FAILED_MARKER, PR_CREATION_FAILED_MARKER};
 use rusqlite::Connection;
 
 /// Default/max page size for `list` — omitting `limit` used to return every
@@ -1691,7 +1692,7 @@ impl AgentflareMcp {
                 // (item #92).
                 crate::worktree::CommitOutcome::Failed(err) => {
                     let comment_body = format!(
-                        "## agentflare work — commit failed\n\nAuto-commit of uncommitted \
+                        "{COMMIT_FAILED_MARKER}\n\nAuto-commit of uncommitted \
                          changes failed:\n\n```\n{err}\n```\n\nThe work is still sitting \
                          uncommitted in the item's worktree; it was left in place rather than \
                          reported as done."
@@ -1771,7 +1772,7 @@ impl AgentflareMcp {
             self.post_item_comment(
                 &item_id,
                 format!(
-                    "## agentflare work — PR creation failed\n\nThe branch has real commits but no pull request resulted ({detail}) for item {item_id}. Left in place rather than completed."
+                    "{PR_CREATION_FAILED_MARKER}\n\nThe branch has real commits but no pull request resulted ({detail}) for item {item_id}. Left in place rather than completed."
                 ),
             );
             return Err(ErrorData::internal_error(
