@@ -504,8 +504,20 @@ fn restore_after_terminal_failure(
         // `handle_terminal_job_failure_restores_in_review_for_an_item_with_an_open_pr`,
         // which asserts the restore happens against a plain local repo with
         // no GitHub remote configured).
+        //
+        // PR #818 review finding: a human can label the item
+        // `needs-decision` (a go/no-go gate held pending review, set
+        // independently of this job) while its repair job is still in
+        // flight. Restoring to `in_review` unconditionally would hand it
+        // back to the sweep -- which can merge it -- despite that gate.
+        // `needs-manual-dispatch` is deliberately NOT checked here: this
+        // function itself only adds that label further below, once the cap
+        // trips, so it can never already be set at this point for a job
+        // that fails below the cap, and the cap's own single trip must
+        // still restore `in_review` (see the comment above `at_cap` below).
         if state.group_name != "in_review"
             && crate::worktree::pr_number_from_metadata(&item).is_some()
+            && find(crate::supervisor::NEEDS_DECISION_LABEL).is_none()
         {
             let states = agentflare_backend::state::list_by_project(conn, &project.id)
                 .map_err(|e| e.to_string())?;

@@ -48,7 +48,7 @@ const NEEDS_HUMAN_GATE_LABEL: &str = "needs-human-gate";
 /// belt-and-suspenders check that survives that path too, cleared only once
 /// a human actually decides (remove the label, or `redispatch`
 /// after removing it).
-const NEEDS_DECISION_LABEL: &str = "needs-decision";
+pub(crate) const NEEDS_DECISION_LABEL: &str = "needs-decision";
 
 /// GitHub label a human applies to a CI-green PR to explicitly sign off on
 /// `run_review_sweep`'s `Passing` branch auto-merging it (item #194). CI
