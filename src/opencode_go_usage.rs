@@ -66,7 +66,12 @@ fn read_api_key() -> Result<String, String> {
 
 /// The first window (rolling, then weekly, then monthly) at/over
 /// `threshold`, or `None` when all three have headroom.
-fn detect_breach(rolling_percent: f32, weekly_percent: f32, monthly_percent: f32, threshold: f32) -> Option<UsageBreach> {
+fn detect_breach(
+    rolling_percent: f32,
+    weekly_percent: f32,
+    monthly_percent: f32,
+    threshold: f32,
+) -> Option<UsageBreach> {
     let windows = [
         ("rolling", rolling_percent),
         ("weekly", weekly_percent),
@@ -168,17 +173,26 @@ mod tests {
 
     #[test]
     fn detect_breach_true_when_rolling_at_seventy() {
-        assert_eq!(detect_breach(70.0, 10.0, 10.0, 70.0).unwrap().window, "rolling");
+        assert_eq!(
+            detect_breach(70.0, 10.0, 10.0, 70.0).unwrap().window,
+            "rolling"
+        );
     }
 
     #[test]
     fn detect_breach_true_when_weekly_at_seventy() {
-        assert_eq!(detect_breach(10.0, 70.0, 10.0, 70.0).unwrap().window, "weekly");
+        assert_eq!(
+            detect_breach(10.0, 70.0, 10.0, 70.0).unwrap().window,
+            "weekly"
+        );
     }
 
     #[test]
     fn detect_breach_true_when_monthly_at_seventy() {
-        assert_eq!(detect_breach(10.0, 10.0, 70.0, 70.0).unwrap().window, "monthly");
+        assert_eq!(
+            detect_breach(10.0, 10.0, 70.0, 70.0).unwrap().window,
+            "monthly"
+        );
     }
 
     #[test]

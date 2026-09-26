@@ -54,13 +54,15 @@ impl FailoverConfig {
     /// The effective threshold for Claude's 5-hour window.
     #[must_use]
     pub fn five_hour_threshold(&self) -> f32 {
-        self.five_hour_percent.unwrap_or(self.usage_threshold_percent)
+        self.five_hour_percent
+            .unwrap_or(self.usage_threshold_percent)
     }
 
     /// The effective threshold for Claude's 7-day window.
     #[must_use]
     pub fn seven_day_threshold(&self) -> f32 {
-        self.seven_day_percent.unwrap_or(self.usage_threshold_percent)
+        self.seven_day_percent
+            .unwrap_or(self.usage_threshold_percent)
     }
 }
 
@@ -257,9 +259,18 @@ mod tests {
     #[test]
     fn usage_threshold_defaults_to_the_const_when_config_omits_it() {
         let config = parse_failover_config("[failover]\nenabled = true\n").unwrap();
-        assert_eq!(config.usage_threshold_percent, DEFAULT_USAGE_THRESHOLD_PERCENT);
-        assert_eq!(config.five_hour_threshold(), DEFAULT_USAGE_THRESHOLD_PERCENT);
-        assert_eq!(config.seven_day_threshold(), DEFAULT_USAGE_THRESHOLD_PERCENT);
+        assert_eq!(
+            config.usage_threshold_percent,
+            DEFAULT_USAGE_THRESHOLD_PERCENT
+        );
+        assert_eq!(
+            config.five_hour_threshold(),
+            DEFAULT_USAGE_THRESHOLD_PERCENT
+        );
+        assert_eq!(
+            config.seven_day_threshold(),
+            DEFAULT_USAGE_THRESHOLD_PERCENT
+        );
         assert_eq!(
             FailoverConfig::default().usage_threshold_percent,
             DEFAULT_USAGE_THRESHOLD_PERCENT

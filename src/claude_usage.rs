@@ -222,7 +222,10 @@ mod tests {
     fn detect_breach_honors_per_window_thresholds() {
         // 74% seven-day trips a 70% threshold but not a 90% one; 10%
         // five-hour never trips either -- this is the item #308 scenario.
-        assert_eq!(detect_breach(10.0, 74.0, 90.0, 70.0).unwrap().window, "seven_day");
+        assert_eq!(
+            detect_breach(10.0, 74.0, 90.0, 70.0).unwrap().window,
+            "seven_day"
+        );
         assert_eq!(detect_breach(10.0, 74.0, 90.0, 85.0), None);
     }
 
