@@ -48,7 +48,7 @@ const NEEDS_HUMAN_GATE_LABEL: &str = "needs-human-gate";
 /// belt-and-suspenders check that survives that path too, cleared only once
 /// a human actually decides (remove the label, or `redispatch`
 /// after removing it).
-const NEEDS_DECISION_LABEL: &str = "needs-decision";
+pub(crate) const NEEDS_DECISION_LABEL: &str = "needs-decision";
 
 /// GitHub label a human applies to a CI-green PR to explicitly sign off on
 /// `run_review_sweep`'s `Passing` branch auto-merging it (item #194). CI
@@ -1799,13 +1799,23 @@ fn already_gated_or_in_flight(
     item: &agentflare_backend::item::Item,
     label_id_by_name: &std::collections::HashMap<String, String>,
 ) -> bool {
-    let already_gated = label_id_by_name
-        .get(NEEDS_HUMAN_GATE_LABEL)
-        .is_some_and(|gate_id| {
-            mcp.with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item.id))
-                .ok()
-                .and_then(Result::ok)
-                .is_some_and(|ids| ids.contains(gate_id))
+    let item_label_ids = mcp
+        .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item.id))
+        .ok()
+        .and_then(Result::ok);
+    // PR #818 review finding: `orphan_reconcile::restore_after_terminal_failure`
+    // adds NEEDS_MANUAL_LABEL once its own dispatch-failure cap trips, but
+    // this guard only checked NEEDS_HUMAN_GATE_LABEL -- a PR that just hit
+    // the cap could still enter self-repair on the very next sweep tick,
+    // defeating the cap. The stray-item recovery path already excludes both
+    // gates for the same reason (see `stray_candidates` above).
+    let already_gated = [NEEDS_HUMAN_GATE_LABEL, NEEDS_MANUAL_LABEL]
+        .iter()
+        .any(|name| {
+            label_id_by_name
+                .get(*name)
+                .zip(item_label_ids.as_ref())
+                .is_some_and(|(gate_id, ids)| ids.contains(gate_id))
         });
     already_gated || job_in_flight(queue, &item.id)
 }
