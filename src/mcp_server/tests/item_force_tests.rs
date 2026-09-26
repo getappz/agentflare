@@ -81,6 +81,19 @@ fn post_commit_failed(tmp: &tempfile::TempDir, item_id: &str) {
     .unwrap();
 }
 
+/// Success comment finalize posts when a retry actually finishes the work
+/// (e.g. opens a PR after a transient PR-creation failure) — same literal
+/// prefix `format_success_comment` emits.
+fn post_success(tmp: &tempfile::TempDir, item_id: &str) {
+    agentflare_backend::comment::create(
+        &backend_conn(tmp),
+        item_id,
+        "claude-code",
+        "## agentflare work — complete\n\nAgent reply:\n\n```\nok\n```",
+    )
+    .unwrap();
+}
+
 fn force_req(action: &str, item_id: &str, reason: Option<&str>) -> ItemRequest {
     ItemRequest {
         action: action.into(),
@@ -314,6 +327,44 @@ fn pr_creation_failed_comment_alone_satisfies_the_force_gate() {
             .iter()
             .any(|c| c.starts_with(FORCE_OVERRIDE_MARKER))
     );
+}
+
+#[test]
+fn success_after_failure_invalidates_the_stale_marker() {
+    // Item #649 follow-up (Codex P1): a finalize retry that opens a PR
+    // after a transient PR-creation failure posts a success comment while
+    // the original claim stays held for in-review. The sweep must not
+    // steal that live claim once the now-successful job goes terminal.
+    let (tmp, s, item_id, job_id) = foreign_claim_harness();
+    post_pr_failed(&tmp, &item_id);
+    post_success(&tmp, &item_id);
+    kill_job(&s, &job_id);
+    let queue = s.job_queue_override.clone().unwrap();
+    assert_eq!(auto_release_dead_claims(&s, &queue), 0);
+    assert_eq!(
+        holder_of(&tmp, &item_id),
+        Some(format!("claude-code:{job_id}"))
+    );
+}
+
+#[test]
+fn failure_after_success_still_counts_as_terminal_evidence() {
+    // Ordering matters both ways: a fresh failure posted after a success
+    // is new evidence, not invalidated history.
+    let (tmp, s, item_id, job_id) = foreign_claim_harness();
+    post_success(&tmp, &item_id);
+    // Backdate so ordering is deterministic regardless of clock granularity.
+    backend_conn(&tmp)
+        .execute(
+            "UPDATE item_comments SET created_at = created_at - 3600 WHERE item_id = ?1",
+            [&item_id],
+        )
+        .unwrap();
+    post_pr_failed(&tmp, &item_id);
+    kill_job(&s, &job_id);
+    let queue = s.job_queue_override.clone().unwrap();
+    assert_eq!(auto_release_dead_claims(&s, &queue), 1);
+    assert_eq!(holder_of(&tmp, &item_id), None);
 }
 
 #[test]
