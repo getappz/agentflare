@@ -9,6 +9,29 @@
 /// Prefix on every failure comment from `cli::work::release_and_comment`
 /// (root crate) — keep in sync with that formatter by hand.
 pub const WORK_FAILURE_MARKER: &str = "## agentflare work — failed";
+/// Prefix on the comment `mcp_server::item` (root crate) posts when a real
+/// commit's push/PR creation failed — keep in sync with that formatter by
+/// hand. Terminal for dead-claim auto-release (item #649), deliberately NOT
+/// part of `failure_reason`'s dispatch-ceiling counting.
+pub const PR_CREATION_FAILED_MARKER: &str = "## agentflare work — PR creation failed";
+/// Prefix on the comment `mcp_server::item` (root crate) posts when
+/// auto-commit itself failed — same sync/terminal notes as above.
+pub const COMMIT_FAILED_MARKER: &str = "## agentflare work — commit failed";
+
+/// Whether a comment body is any terminal work-failure marker: the generic
+/// `WORK_FAILURE_MARKER` plus the two hard-failure paths in
+/// `mcp_server::item` that never go through `release_and_comment`.
+/// Used by dead-claim auto-release / force-takeover evidence, NOT by the
+/// dispatch-ceiling counters (those key on `failure_reason` only).
+pub fn is_terminal_work_failure(body: &str) -> bool {
+    [
+        WORK_FAILURE_MARKER,
+        PR_CREATION_FAILED_MARKER,
+        COMMIT_FAILED_MARKER,
+    ]
+    .iter()
+    .any(|m| body.starts_with(m))
+}
 /// A successful run breaks a consecutive-identical-failure streak.
 pub const WORK_SUCCESS_MARKER: &str = "## agentflare work — complete";
 /// Prefix on a discovery-tick dispatch comment (see `dispatch_item` in

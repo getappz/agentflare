@@ -3,7 +3,8 @@
 //!
 //! - `auto_release_dead_claims`: supervisor sweep that releases a claim once
 //!   its owner's job is recorded terminal in the job queue AND a terminal
-//!   `agentflare work — failed` comment was posted since the claim was taken.
+//!   work-failure comment (`failed` / `PR creation failed` / `commit failed`)
+//!   was posted since the claim was taken.
 //! - `force_takeover`: `item(release|done|check_merge, force=true,
 //!   force_reason=...)` for cases the sweep can't reach, refused unless at
 //!   least one piece of dead-claim evidence holds. Every override is logged
@@ -14,7 +15,7 @@
 //! fixed-and-pushed item un-completable for ~2h45m of remaining TTL.
 
 use super::*;
-use crate::dispatch_failure_ceiling::WORK_FAILURE_MARKER;
+use crate::dispatch_failure_ceiling::is_terminal_work_failure;
 
 /// Prefix on the audit comment `force_takeover` posts.
 pub(crate) const FORCE_OVERRIDE_MARKER: &str = "## agentflare — forced claim override";
@@ -84,7 +85,7 @@ fn terminal_failure_since(conn: &rusqlite::Connection, item_id: &str, since: i64
     agentflare_backend::comment::list_by_item(conn, item_id).is_ok_and(|comments| {
         comments
             .iter()
-            .any(|c| c.created_at >= since && c.body.starts_with(WORK_FAILURE_MARKER))
+            .any(|c| c.created_at >= since && is_terminal_work_failure(&c.body))
     })
 }
 
@@ -185,7 +186,8 @@ impl AgentflareMcp {
         let evidence = owner_job_dead(queue.as_ref(), &holder)
             .or_else(|| {
                 failed.then(|| {
-                    "terminal `agentflare work — failed` comment posted since the claim was taken"
+                    "terminal work-failure comment (failed / PR creation failed / commit failed) \
+                     posted since the claim was taken"
                         .to_string()
                 })
             })
