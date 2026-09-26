@@ -464,7 +464,16 @@ fn restore_after_terminal_failure(
         }
         let comments =
             agentflare_backend::comment::list_by_item(conn, item_id).map_err(|e| e.to_string())?;
+        let item_label_ids =
+            agentflare_backend::item::list_labels(conn, item_id).map_err(|e| e.to_string())?;
         let find = |name: &str| labels.iter().find(|l| l.name == name).map(|l| &l.id);
+        // `find` resolves a label's id from the *project's* label set --
+        // whether this *item* currently carries that label is a separate
+        // question, answered against `item_label_ids` (PR #818 review
+        // finding: `find(...).is_none()` alone only tells you the project
+        // has never defined the label at all, which is true for almost
+        // every real project and would have blocked every future restore).
+        let item_has_label = |name: &str| find(name).is_some_and(|id| item_label_ids.contains(id));
         // Stopped on request (workflow cancelled, or paused): drop
         // `dispatched` but never re-arm `ready-for-work`, and never restore
         // `in_review` below either -- a deliberate stop must not be
@@ -517,7 +526,7 @@ fn restore_after_terminal_failure(
         // still restore `in_review` (see the comment above `at_cap` below).
         if state.group_name != "in_review"
             && crate::worktree::pr_number_from_metadata(&item).is_some()
-            && find(crate::supervisor::NEEDS_DECISION_LABEL).is_none()
+            && !item_has_label(crate::supervisor::NEEDS_DECISION_LABEL)
         {
             let states = agentflare_backend::state::list_by_project(conn, &project.id)
                 .map_err(|e| e.to_string())?;

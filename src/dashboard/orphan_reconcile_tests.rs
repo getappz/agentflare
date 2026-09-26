@@ -1473,6 +1473,105 @@
         });
     }
 
+    /// CodeRabbit review finding on this PR's own needs-decision fix: the
+    /// gate must be checked against this *item's* labels, not merely
+    /// whether the *project* has ever defined a needs-decision label at
+    /// all -- a project defining the label (true for almost every real
+    /// project) must not block restoration for every other, ungated item.
+    #[test]
+    fn handle_terminal_job_failure_restores_in_review_even_when_the_project_has_a_needs_decision_label_the_item_lacks()
+     {
+        crate::paths::test_support::with_temp_home(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo_root).unwrap();
+            init_test_repo(&repo_root);
+
+            let mcp = crate::mcp_server::AgentflareMcp::for_project_dir(repo_root.clone());
+            // The project has both gate labels defined, but the item below
+            // is never given either -- this is the common case, not the
+            // exception.
+            seed_labels(
+                &mcp,
+                &[
+                    crate::supervisor::NEEDS_MANUAL_LABEL,
+                    crate::supervisor::NEEDS_DECISION_LABEL,
+                ],
+            );
+
+            let item_id = mcp
+                .with_backend_db(|conn| {
+                    let project = mcp.resolve_project(conn).unwrap();
+                    let states =
+                        agentflare_backend::state::list_by_project(conn, &project.id).unwrap();
+                    let started = states
+                        .iter()
+                        .find(|s| s.group_name == "started")
+                        .unwrap()
+                        .id
+                        .clone();
+                    agentflare_backend::item::create(
+                        conn,
+                        agentflare_backend::item::CreateItem {
+                            project_id: project.id,
+                            state_id: started,
+                            name: "ungated self-repair item with an open PR".into(),
+                            description: None,
+                            priority: None,
+                            parent_id: None,
+                            assignee_agent: Some("claude-code".into()),
+                            sort_order: None,
+                            external_source: None,
+                            external_id: None,
+                            metadata: Some(
+                                serde_json::json!({"pr": {"number": 818, "branch": "task/678"}})
+                                    .to_string(),
+                            ),
+                            label_ids: vec![],
+                            assignee_ids: vec![],
+                            dependency_ids: vec![],
+                            start_date: None,
+                            due_date: None,
+                        },
+                    )
+                    .unwrap()
+                    .id
+                })
+                .unwrap();
+
+            seed_dispatch_cycle_failures(
+                &mcp,
+                &item_id,
+                crate::dispatch_failure_ceiling::DISPATCH_FAILURE_CAP,
+                "codex exited non-zero: token_revoked",
+            );
+
+            let job = agentflare_jobs::AgentJob::new("agentflare-work")
+                .args([
+                    item_id.clone(),
+                    "claude-code".to_string(),
+                    repo_root.to_string_lossy().to_string(),
+                ])
+                .in_process();
+
+            handle_terminal_job_failure(&job);
+
+            let state_group = mcp
+                .with_backend_db(|conn| {
+                    let item = agentflare_backend::item::get(conn, &item_id).unwrap();
+                    agentflare_backend::state::get(conn, &item.state_id)
+                        .unwrap()
+                        .group_name
+                })
+                .unwrap();
+            assert_eq!(
+                state_group, "in_review",
+                "the project merely having a needs-decision label defined must not block \
+                 restoration for an item that was never actually gated with it"
+            );
+        });
+    }
+
     /// Item #506: default `max_retries = 3` posts four identical failure
     /// comments within one dispatch cycle. The cap must count that as one
     /// cycle — first terminal hook restores `ready-for-work`, not
