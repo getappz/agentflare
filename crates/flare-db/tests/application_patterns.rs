@@ -55,7 +55,8 @@ async fn shared_pool_atomic_outbox_optimistic_updates_and_idempotency() {
     let options = EncryptedSqliteOptions {
         max_connections: 2,
         busy_timeout: Duration::from_millis(200),
-        acquire_timeout: Duration::from_millis(250),
+        // Initial native crypto startup also counts toward pool acquisition.
+        acquire_timeout: Duration::from_secs(5),
     };
     let pool = options
         .connect(dir.path().join("patterns.db"), &[42; 32], true)
