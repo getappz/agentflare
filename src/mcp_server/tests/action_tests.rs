@@ -873,6 +873,75 @@ fn item_add_label_rejects_foreign_project_label_via_mcp() {
     assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
 }
 
+/// PR #818 review finding: a caller that goes by `label_id` must still get
+/// `label_id` back in the response (existing clients read it), not the
+/// `label`/`label_name` field a name-based call gets instead.
+#[test]
+fn add_and_remove_label_response_shape_matches_the_caller_id_or_name() {
+    let (tmp, s) = harness();
+    let item: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let item_id = item["id"].as_str().unwrap().to_string();
+
+    let label_id = {
+        let conn = backend_conn(&tmp);
+        let project = agentflare_backend::project::list_by_workspace(
+            &conn,
+            &agentflare_backend::workspace::list(&conn).unwrap()[0].id,
+        )
+        .unwrap()[0]
+            .id
+            .clone();
+        agentflare_backend::label::create(
+            &conn,
+            agentflare_backend::label::CreateLabel {
+                project_id: Some(project.clone()),
+                workspace_id: agentflare_backend::project::get(&conn, &project)
+                    .unwrap()
+                    .workspace_id,
+                name: "triage".into(),
+                color: None,
+                parent_id: None,
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+            },
+        )
+        .unwrap()
+        .id
+    };
+
+    let by_id: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "add_label".into(),
+            id: Some(item_id.clone()),
+            label_id: Some(label_id.clone()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(by_id["label_id"], label_id);
+    assert!(by_id.get("label_name").is_none());
+    assert!(
+        by_id.get("label").is_none(),
+        "an id-based call must not lose label_id behind a generic \"label\" field"
+    );
+
+    let by_name: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "remove_label".into(),
+            id: Some(item_id),
+            label_name: Some("triage".into()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(by_name["label_name"], "triage");
+    assert_eq!(by_name["label_id"], label_id);
+}
+
 #[test]
 fn label_update_and_delete_reject_foreign_project_label() {
     let (tmp, s) = harness();

@@ -35,6 +35,32 @@ pub fn remove_label(conn: &Connection, item_id: &str, label_id: &str) -> Result<
     Ok(())
 }
 
+/// `add_label`, resolving `label_name` to an id via `label::get_by_name`
+/// instead of making the caller `list_by_project` every label in the
+/// project into a `HashMap` first just to look up one -- label names are
+/// unique per project, so a name is all a caller should ever need to hand
+/// over. Errors (including "no such label") the same way `add_label` would
+/// with a bad id; callers that want a soft no-op on a missing label already
+/// do `let _ = ...` at the call site, same as they do today.
+pub fn add_label_by_name(conn: &Connection, item_id: &str, label_name: &str) -> Result<()> {
+    let item = get(conn, item_id)?;
+    let label = crate::label::get_by_name(conn, &item.project_id, label_name)?;
+    add_label(conn, item_id, &label.id)
+}
+
+/// `remove_label`'s by-name counterpart. Unlike `add_label_by_name`, a
+/// missing label is a no-op, not an error -- removing a label the project
+/// doesn't even have is indistinguishable from removing one the item never
+/// carried, which `remove_label` itself already treats as a no-op.
+pub fn remove_label_by_name(conn: &Connection, item_id: &str, label_name: &str) -> Result<()> {
+    let item = get(conn, item_id)?;
+    match crate::label::get_by_name(conn, &item.project_id, label_name) {
+        Ok(label) => remove_label(conn, item_id, &label.id),
+        Err(crate::error::Error::NotFound(_)) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 pub fn list_labels(conn: &Connection, item_id: &str) -> Result<Vec<String>> {
     let mut stmt = conn.prepare("SELECT label_id FROM item_labels WHERE item_id = ?1")?;
     let rows = stmt.query_map(rusqlite::params![item_id], |row| row.get::<_, String>(0))?;

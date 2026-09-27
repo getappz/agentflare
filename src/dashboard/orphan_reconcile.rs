@@ -464,16 +464,23 @@ fn restore_after_terminal_failure(
         }
         let comments =
             agentflare_backend::comment::list_by_item(conn, item_id).map_err(|e| e.to_string())?;
-        let identical_count =
-            crate::dispatch_failure_ceiling::consecutive_identical_failure_count(&comments);
-        let any_reason_count =
-            crate::dispatch_failure_ceiling::consecutive_failure_count_any_reason(&comments);
-        let at_cap = identical_count >= crate::dispatch_failure_ceiling::DISPATCH_FAILURE_CAP
-            || any_reason_count >= crate::dispatch_failure_ceiling::DISPATCH_FAILURE_CAP_ANY_REASON;
+        let item_label_ids =
+            agentflare_backend::item::list_labels(conn, item_id).map_err(|e| e.to_string())?;
         let find = |name: &str| labels.iter().find(|l| l.name == name).map(|l| &l.id);
+        // `find` resolves a label's id from the *project's* label set --
+        // whether this *item* currently carries that label is a separate
+        // question, answered against `item_label_ids` (PR #818 review
+        // finding: `find(...).is_none()` alone only tells you the project
+        // has never defined the label at all, which is true for almost
+        // every real project and would have blocked every future restore).
+        let item_has_label = |name: &str| find(name).is_some_and(|id| item_label_ids.contains(id));
         // Stopped on request (workflow cancelled, or paused): drop
-        // `dispatched` but never re-arm `ready-for-work` -- a deliberate
-        // stop must not be auto-redispatched on the next tick.
+        // `dispatched` but never re-arm `ready-for-work`, and never restore
+        // `in_review` below either -- a deliberate stop must not be
+        // auto-redispatched, nor silently handed back to the review sweep,
+        // on the next tick. Must run before the in_review restore below
+        // (PR #818 review finding: this used to run after it, so a stop
+        // request could be overridden).
         if crate::dispatch_failure_ceiling::stopped_on_request(&comments) {
             if let Some(dispatched_id) = find(crate::supervisor::DISPATCHED_LABEL) {
                 agentflare_backend::item::remove_label(conn, item_id, dispatched_id)
@@ -481,6 +488,59 @@ fn restore_after_terminal_failure(
             }
             return Ok(None);
         }
+        // Item #655: a repair/retry claim on an item that already had an
+        // open PR (`in_review`) unconditionally flips its state to
+        // "started" as a side effect of `item::claim` -- and unlike the
+        // worktree-creation-failure path (`AgentflareMcp::roll_back_claim`),
+        // nothing restores it once the job fails for any other reason.
+        // Left alone, `run_review_sweep`'s in_review-only scan permanently
+        // loses the item, and its PR sits unwatched no matter how green or
+        // approved it later becomes -- a broken dispatch loop (this
+        // function's own cap, below) and a stuck-but-fine PR are two
+        // unrelated problems, and fixing the human-visible one (the cap
+        // comment) must not require separately noticing the other by hand.
+        //
+        // PR #818 review finding: a human closing the PR without merging
+        // while its repair job is in flight means this restores on stale
+        // `metadata.pr.number` alone. Left as-is deliberately -- the next
+        // `run_review_sweep` tick's per-item PR-status check already covers
+        // exactly this case once the item is back in `in_review`
+        // (`PrCiStatus::Closed` => `requeue_closed_pr_item`), so the window
+        // for an incorrect restore is bounded to one sweep tick. Verifying
+        // live here instead would mean a GitHub round trip inside this
+        // retried `BEGIN IMMEDIATE` transaction, and there's no test seam
+        // for mocking that in this function today (see this PR's own
+        // `handle_terminal_job_failure_restores_in_review_for_an_item_with_an_open_pr`,
+        // which asserts the restore happens against a plain local repo with
+        // no GitHub remote configured).
+        //
+        // PR #818 review finding: a human can label the item
+        // `needs-decision` (a go/no-go gate held pending review, set
+        // independently of this job) while its repair job is still in
+        // flight. Restoring to `in_review` unconditionally would hand it
+        // back to the sweep -- which can merge it -- despite that gate.
+        // `needs-manual-dispatch` is deliberately NOT checked here: this
+        // function itself only adds that label further below, once the cap
+        // trips, so it can never already be set at this point for a job
+        // that fails below the cap, and the cap's own single trip must
+        // still restore `in_review` (see the comment above `at_cap` below).
+        if state.group_name != "in_review"
+            && crate::worktree::pr_number_from_metadata(&item).is_some()
+            && !item_has_label(crate::supervisor::NEEDS_DECISION_LABEL)
+        {
+            let states = agentflare_backend::state::list_by_project(conn, &project.id)
+                .map_err(|e| e.to_string())?;
+            if let Some(in_review) = states.iter().find(|s| s.group_name == "in_review") {
+                agentflare_backend::item::update_state(conn, item_id, &in_review.id)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        let identical_count =
+            crate::dispatch_failure_ceiling::consecutive_identical_failure_count(&comments);
+        let any_reason_count =
+            crate::dispatch_failure_ceiling::consecutive_failure_count_any_reason(&comments);
+        let at_cap = identical_count >= crate::dispatch_failure_ceiling::DISPATCH_FAILURE_CAP
+            || any_reason_count >= crate::dispatch_failure_ceiling::DISPATCH_FAILURE_CAP_ANY_REASON;
         let ready_id = find(crate::supervisor::READY_LABEL);
         if !at_cap && ready_id.is_none() {
             // Below cap with no ready-for-work label to restore onto: the

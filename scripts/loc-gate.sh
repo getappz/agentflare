@@ -94,6 +94,18 @@ ALLOWLIST=(
   # pre-existing debt this one-flag bugfix shouldn't have to carry. Frozen
   # at <= FROZEN_LIMIT; a real split is separate work.
   src/workflow.rs
+  # Already 1497 lines on master before item #655's label_name field
+  # (an alternative to label_id on add_label/remove_label) pushed it to
+  # 1504 -- same situation as every other entry above: a small, scoped
+  # fix shouldn't have to carry a pre-existing near-limit file's split.
+  # Frozen at <= FROZEN_LIMIT; a real split is separate work.
+  src/mcp_server/types.rs
+  # Already 1402 lines on master before item #655's in_review self-heal
+  # regression test pushed it to 1518 -- same situation as
+  # item_tests_relations.rs above: a small, scoped fix's own test
+  # shouldn't have to carry a pre-existing test-module split. Frozen at
+  # <= FROZEN_LIMIT; a real split is separate work.
+  src/dashboard/orphan_reconcile_tests.rs
 )
 
 cd "$(dirname "$0")/.."

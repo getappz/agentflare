@@ -5,6 +5,7 @@
 //! verbatim; `item_inner` itself is now just the `match` dispatch.
 
 use super::*;
+use crate::dispatch_failure_ceiling::{COMMIT_FAILED_MARKER, PR_CREATION_FAILED_MARKER};
 use rusqlite::Connection;
 
 /// Default/max page size for `list` — omitting `limit` used to return every
@@ -1691,7 +1692,7 @@ impl AgentflareMcp {
                 // (item #92).
                 crate::worktree::CommitOutcome::Failed(err) => {
                     let comment_body = format!(
-                        "## agentflare work — commit failed\n\nAuto-commit of uncommitted \
+                        "{COMMIT_FAILED_MARKER}\n\nAuto-commit of uncommitted \
                          changes failed:\n\n```\n{err}\n```\n\nThe work is still sitting \
                          uncommitted in the item's worktree; it was left in place rather than \
                          reported as done."
@@ -1771,7 +1772,7 @@ impl AgentflareMcp {
             self.post_item_comment(
                 &item_id,
                 format!(
-                    "## agentflare work — PR creation failed\n\nThe branch has real commits but no pull request resulted ({detail}) for item {item_id}. Left in place rather than completed."
+                    "{PR_CREATION_FAILED_MARKER}\n\nThe branch has real commits but no pull request resulted ({detail}) for item {item_id}. Left in place rather than completed."
                 ),
             );
             return Err(ErrorData::internal_error(
@@ -2340,27 +2341,61 @@ impl AgentflareMcp {
         })?
     }
 
+    /// Both `label_id` and `label_name` resolve to the same `(bool, String)`
+    /// -- whether the caller went by name, and the value to echo back in the
+    /// response -- so `item_add_label`/`item_remove_label` don't each repeat
+    /// the mutual-exclusion check. Label names are unique per project (same
+    /// invariant `update_state`'s `state_name` already relies on for
+    /// states), so there's no ambiguity to resolve by going by name instead
+    /// of forcing every caller to `label action=list` the whole project
+    /// first just to find one id.
+    fn require_label_id_or_name(
+        label_id: Option<String>,
+        label_name: Option<String>,
+        action: &str,
+    ) -> Result<(bool, String), ErrorData> {
+        match (label_id, label_name) {
+            (Some(_), Some(_)) => Err(ErrorData::invalid_params(
+                format!("label_id and label_name are mutually exclusive for {action}"),
+                None,
+            )),
+            (Some(id), None) if !id.trim().is_empty() => Ok((false, id)),
+            (None, Some(name)) if !name.trim().is_empty() => Ok((true, name)),
+            _ => Err(ErrorData::invalid_params(
+                format!("one of label_id or label_name is required for {action}"),
+                None,
+            )),
+        }
+    }
+
     pub(crate) fn item_add_label(&self, req: ItemRequest) -> Result<String, ErrorData> {
         let raw = req
             .id
             .ok_or_else(|| ErrorData::invalid_params("id is required for add_label", None))?;
-        let label_id = req
-            .label_id
-            .ok_or_else(|| ErrorData::invalid_params("label_id is required for add_label", None))?;
-        if raw.trim().is_empty() || label_id.trim().is_empty() {
-            return Err(ErrorData::invalid_params(
-                "id and label_id are required",
-                None,
-            ));
+        if raw.trim().is_empty() {
+            return Err(ErrorData::invalid_params("id is required", None));
         }
+        let (by_name, label) =
+            Self::require_label_id_or_name(req.label_id, req.label_name, "add_label")?;
         self.with_backend_db(|conn| {
             let item_id = self.resolve_item_id(conn, &raw)?;
-            agentflare_backend::item::add_label(conn, &item_id, &label_id)
-                .map_err(map_backend_err)?;
-            Ok(
-                serde_json::json!({"attached": true, "item_id": item_id, "label_id": label_id})
-                    .to_string(),
-            )
+            let mut response = serde_json::json!({"attached": true, "item_id": item_id});
+            if by_name {
+                agentflare_backend::item::add_label_by_name(conn, &item_id, &label)
+                    .map_err(map_backend_err)?;
+                if let Ok(project) = self.resolve_project(conn)
+                    && let Ok(resolved) =
+                        agentflare_backend::label::get_by_name(conn, &project.id, &label)
+                {
+                    response["label_id"] = serde_json::json!(resolved.id);
+                }
+                response["label_name"] = serde_json::json!(label);
+            } else {
+                agentflare_backend::item::add_label(conn, &item_id, &label)
+                    .map_err(map_backend_err)?;
+                response["label_id"] = serde_json::json!(label);
+            }
+            Ok(response.to_string())
         })?
     }
 
@@ -2368,23 +2403,30 @@ impl AgentflareMcp {
         let raw = req
             .id
             .ok_or_else(|| ErrorData::invalid_params("id is required for remove_label", None))?;
-        let label_id = req.label_id.ok_or_else(|| {
-            ErrorData::invalid_params("label_id is required for remove_label", None)
-        })?;
-        if raw.trim().is_empty() || label_id.trim().is_empty() {
-            return Err(ErrorData::invalid_params(
-                "id and label_id are required",
-                None,
-            ));
+        if raw.trim().is_empty() {
+            return Err(ErrorData::invalid_params("id is required", None));
         }
+        let (by_name, label) =
+            Self::require_label_id_or_name(req.label_id, req.label_name, "remove_label")?;
         self.with_backend_db(|conn| {
             let item_id = self.resolve_item_id(conn, &raw)?;
-            agentflare_backend::item::remove_label(conn, &item_id, &label_id)
-                .map_err(map_backend_err)?;
-            Ok(
-                serde_json::json!({"removed": true, "item_id": item_id, "label_id": label_id})
-                    .to_string(),
-            )
+            let mut response = serde_json::json!({"removed": true, "item_id": item_id});
+            if by_name {
+                agentflare_backend::item::remove_label_by_name(conn, &item_id, &label)
+                    .map_err(map_backend_err)?;
+                if let Ok(project) = self.resolve_project(conn)
+                    && let Ok(resolved) =
+                        agentflare_backend::label::get_by_name(conn, &project.id, &label)
+                {
+                    response["label_id"] = serde_json::json!(resolved.id);
+                }
+                response["label_name"] = serde_json::json!(label);
+            } else {
+                agentflare_backend::item::remove_label(conn, &item_id, &label)
+                    .map_err(map_backend_err)?;
+                response["label_id"] = serde_json::json!(label);
+            }
+            Ok(response.to_string())
         })?
     }
 

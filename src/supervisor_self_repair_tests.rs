@@ -123,6 +123,68 @@ fn self_repair_or_gate_caps_after_a_bounded_number_of_silent_retries() {
     });
 }
 
+/// PR #818 review finding: `restore_after_terminal_failure` adds
+/// `NEEDS_MANUAL_LABEL` once its own dispatch-failure cap trips, but this
+/// guard used to only check `NEEDS_HUMAN_GATE_LABEL` -- so a PR that had
+/// just hit that cap could still enter self-repair on the very next sweep
+/// tick, defeating it.
+#[test]
+fn self_repair_or_gate_skips_when_needs_manual_dispatch_label_is_present() {
+    crate::paths::test_support::with_temp_home(|| {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
+        let mut label_id_by_name = seed_gate_label(&mcp);
+        let auth_conn = test_auth_conn();
+        let checks = vec!["clippy".to_string()];
+
+        let manual_id = mcp
+            .with_backend_db(|conn| {
+                let project = mcp.resolve_project(conn).unwrap();
+                agentflare_backend::label::create(
+                    conn,
+                    agentflare_backend::label::CreateLabel {
+                        project_id: Some(project.id.clone()),
+                        workspace_id: project.workspace_id.clone(),
+                        name: NEEDS_MANUAL_LABEL.into(),
+                        color: None,
+                        parent_id: None,
+                        sort_order: None,
+                        external_source: None,
+                        external_id: None,
+                    },
+                )
+                .unwrap()
+                .id
+            })
+            .unwrap();
+        label_id_by_name.insert(NEEDS_MANUAL_LABEL.to_string(), manual_id.clone());
+        mcp.with_backend_db(|conn| {
+            agentflare_backend::item::add_label(conn, &item_id, &manual_id).unwrap()
+        })
+        .unwrap();
+
+        let item = current_item(&mcp, &item_id);
+        let outcome = self_repair_or_gate(
+            &mcp,
+            &queue,
+            &auth_conn,
+            agentflare_resource_gate::Policy::Normal,
+            &item,
+            1,
+            RepairTrigger::FailingChecks(&checks),
+            &[],
+            &label_id_by_name,
+            "/repo",
+        );
+        assert!(
+            matches!(outcome, SelfRepairOutcome::Skipped),
+            "a PR that just hit the dispatch-failure cap (needs-manual-dispatch) must not \
+             re-enter self-repair on the next sweep tick"
+        );
+    });
+}
+
 #[test]
 fn self_repair_or_gate_redispatches_silently_for_identical_failing_checks() {
     let mcp = test_mcp();
