@@ -9,7 +9,7 @@ mod page;
 
 pub use backend::{Database, Pool, QUERY_BUILDER};
 #[cfg(feature = "sqlite")]
-pub use encrypted::connect_encrypted_sqlite;
+pub use encrypted::{EncryptedSqliteOptions, connect_encrypted_sqlite};
 pub use filter::FilterOp;
 pub use migrate::run_migrations;
 pub use page::Page;

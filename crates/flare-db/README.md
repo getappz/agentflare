@@ -35,6 +35,11 @@ not an acceptable production default: the connector rejects versions before
 
 Build or obtain a vetted SQLCipher 4.19+ native SDK for your platform, following
 the [upstream build instructions](https://github.com/sqlcipher/sqlcipher/tree/v4.19.0).
+Enable `SQLITE_ENABLE_COLUMN_METADATA` and `SQLITE_ENABLE_UNLOCK_NOTIFY` in
+that SDK for SQLx. SQLCipher 4.7+ defaults to the `libsqlite3` output name;
+this binding's cipher feature expects `libsqlcipher`. In a private Linux SDK
+prefix, link `libsqlcipher.so` to the built `libsqlite3.so` (as CI does).
+Do not point this alias at the system's ordinary SQLite.
 For a custom prefix set `SQLCIPHER_LIB_DIR` and `SQLCIPHER_INCLUDE_DIR`; on Unix
 also point `PKG_CONFIG_PATH` at its `lib/pkgconfig` directory. Ship the matching
 SQLCipher and crypto shared libraries with the app and configure its runtime
@@ -78,9 +83,30 @@ databases are rejected; they are not overwritten or converted.
 The helper preflights the native cipher/version, sets the key before SQLx's other
 PRAGMAs on **every** new connection, selects SQLCipher 4 format with no plaintext
 header, and validates a schema read before a connection can enter the pool.
-It uses WAL, foreign-key enforcement, memory temporary storage, and SQLx's
-FULL synchronous default. The pool allows five connections with a five-second
-acquisition timeout. Wrong-key failures may surface as a database error or pool
+It explicitly uses WAL, foreign-key enforcement, memory temporary storage, and
+FULL synchronous durability on each physical connection. Defaults are five
+connections and five-second acquisition/busy timeouts. `EncryptedSqliteOptions`
+allows 1..=32 connections, acquisition waits in (0, 60s], and busy waits in
+[0, 60s]; invalid settings fail before file access:
+
+```rust,no_run
+# #[cfg(feature = "sqlite")]
+# async fn configured(path: &std::path::Path, key: &[u8]) -> flare_db::sqlx::Result<()> {
+let pool = flare_db::EncryptedSqliteOptions {
+    max_connections: 4,
+    busy_timeout: std::time::Duration::from_secs(2),
+    ..Default::default()
+}.connect(path, key, false).await?;
+let desktop_service_pool = pool.clone();
+let host_service_pool = pool.clone(); // Same validated pool, no new database.
+// Pass these typed SqlitePool handles to services; never let a framework reopen a URL.
+pool.close().await; // Graceful shutdown waits for checked-out connections.
+assert!(desktop_service_pool.is_closed() && host_service_pool.is_closed());
+# Ok(())
+# }
+```
+
+Wrong-key failures may surface as a database error or pool
 timeout; neither path returns a usable pool.
 
 Run your own `sqlx::migrate!` migrator using `run_migrations(&pool, &MIGRATOR)`
@@ -88,6 +114,8 @@ only after the helper succeeds. The packaged migrations are **test fixtures**,
 not an application schema. Keep SQLx migration checksums intact.
 
 Statement logging is disabled on these connections to avoid exposing the key.
+`SqlitePool`, public tuning options, and connector errors can be debug-printed
+without the raw key (covered by regression tests).
 **Never debug-print `pool.connect_options()`**: SQLx stores the key in its
 connection options to open replacement connections. This API does not promise
 key-memory zeroization, protection from an already-compromised process, or
@@ -129,6 +157,21 @@ batch; committing a nested savepoint never commits the caller's transaction.
 On error, propagate it or roll back explicitly; dropping a SQLx transaction
 also schedules rollback. Do not catch an error and then commit a business
 transaction that should have been cancelled.
+
+Use bound SQLx queries on the same transaction for audit/outbox records.
+For optimistic writes, bind tenant scope, primary key, and expected version in
+`WHERE tenant_id = ? AND id = ? AND row_version = ?`, increment the version,
+and inspect `execute(...).await?.rows_affected()`: zero means no matching
+version/scope. Enforce request idempotency with a database UNIQUE constraint
+inside that transaction. Concurrent integration checks demonstrate one winner
+and no partial audit/outbox writes. This crate does not retry business
+transactions or deliver outbox events; callers decide how to handle contention.
+
+SQLx migrations are atomic **per migration**, not across an entire batch.
+If a transactional migration fails, its schema/data and tracking entry roll
+back; previously committed migrations remain applied. Stop application startup
+on any migration error. Migrations explicitly marked `no_tx` do not offer
+this rollback guarantee. Encrypted failure/reopen behaviour is tested.
 
 `list_and_count` uses the caller/backend isolation level. PostgreSQL's default
 READ COMMITTED is not a repeatable snapshot; use a caller transaction with

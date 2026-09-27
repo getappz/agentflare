@@ -10,6 +10,27 @@ async fn missing_or_malformed_keys_never_create_a_file() {
         assert!(connect_encrypted_sqlite(&path, &key, true).await.is_err());
         assert!(!path.exists());
     }
+    for options in [
+        flare_db::EncryptedSqliteOptions {
+            max_connections: 0,
+            ..Default::default()
+        },
+        flare_db::EncryptedSqliteOptions {
+            max_connections: 33,
+            ..Default::default()
+        },
+        flare_db::EncryptedSqliteOptions {
+            acquire_timeout: std::time::Duration::ZERO,
+            ..Default::default()
+        },
+        flare_db::EncryptedSqliteOptions {
+            busy_timeout: std::time::Duration::from_secs(61),
+            ..Default::default()
+        },
+    ] {
+        assert!(options.connect(&path, &[42; 32], true).await.is_err());
+        assert!(!path.exists());
+    }
 }
 
 #[cfg(not(feature = "sqlcipher"))]
@@ -82,11 +103,10 @@ async fn encrypted_pool_reopen_wrong_key_plaintext_rejection_and_offline_backup(
             .any(|bytes| bytes == marker.as_bytes())
     );
 
-    assert!(
-        connect_encrypted_sqlite(&path, &[99; 32], false)
-            .await
-            .is_err()
-    );
+    let error = connect_encrypted_sqlite(&path, &[99; 32], false)
+        .await
+        .unwrap_err();
+    assert!(!format!("{error:?} {error}").contains(&"63".repeat(32)));
     assert!(
         std::fs::read(&path).unwrap() == bytes,
         "wrong-key open changed checkpointed database bytes"

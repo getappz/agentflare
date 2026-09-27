@@ -38,10 +38,12 @@ jobs:
           cd "$RUNNER_TEMP/sqlcipher-source"
           test "$(git rev-parse HEAD)" = c4b275a47932888216bade83aff2bbc73df0ff85
           ./configure --prefix="$RUNNER_TEMP/sqlcipher-install" --with-tempstore=yes \
-            CFLAGS="-DSQLITE_HAS_CODEC -DSQLITE_EXTRA_INIT=sqlcipher_extra_init -DSQLITE_EXTRA_SHUTDOWN=sqlcipher_extra_shutdown" \
+            CFLAGS="-DSQLITE_HAS_CODEC -DSQLITE_EXTRA_INIT=sqlcipher_extra_init -DSQLITE_EXTRA_SHUTDOWN=sqlcipher_extra_shutdown -DSQLITE_ENABLE_COLUMN_METADATA -DSQLITE_ENABLE_UNLOCK_NOTIFY" \
             LDFLAGS="-lcrypto"
           make -j2
           make install
+          # SQLCipher 4.7+ installs as libsqlite3; the Rust sqlcipher feature links -lsqlcipher.
+          ln -s libsqlite3.so "$RUNNER_TEMP/sqlcipher-install/lib/libsqlcipher.so"
           echo "SQLCIPHER_LIB_DIR=$RUNNER_TEMP/sqlcipher-install/lib" >> "$GITHUB_ENV"
           echo "SQLCIPHER_INCLUDE_DIR=$RUNNER_TEMP/sqlcipher-install/include" >> "$GITHUB_ENV"
           echo "PKG_CONFIG_PATH=$RUNNER_TEMP/sqlcipher-install/lib/pkgconfig" >> "$GITHUB_ENV"

@@ -2,8 +2,29 @@ use std::{fmt::Write as _, path::Path, time::Duration};
 
 use sqlx::{
     ConnectOptions, Connection, SqliteConnection, SqlitePool,
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
 };
+
+/// Bounded pool/lock waits. Contains no path or key and is safe to debug-print.
+#[derive(Clone, Copy, Debug)]
+pub struct EncryptedSqliteOptions {
+    /// 1..=32 physical connections; default 5.
+    pub max_connections: u32,
+    /// Greater than zero and at most 60 seconds; default 5 seconds.
+    pub acquire_timeout: Duration,
+    /// Zero (fail immediately on contention) through 60 seconds; default 5 seconds.
+    pub busy_timeout: Duration,
+}
+
+impl Default for EncryptedSqliteOptions {
+    fn default() -> Self {
+        Self {
+            max_connections: 5,
+            acquire_timeout: Duration::from_secs(5),
+            busy_timeout: Duration::from_secs(5),
+        }
+    }
+}
 
 /// Opens a SQLCipher 4 database using a caller-owned, random 32-byte raw key.
 ///
@@ -23,51 +44,77 @@ pub async fn connect_encrypted_sqlite(
     key: &[u8],
     create_if_missing: bool,
 ) -> sqlx::Result<SqlitePool> {
-    if key.len() != 32 {
-        return Err(sqlx::Error::Configuration(
-            "SQLCipher requires a random 32-byte raw key".into(),
-        ));
-    }
-
-    // SQLite silently ignores unknown PRAGMAs. Detect that before a target
-    // file can be created by an ordinary, unencrypted SQLite build.
-    let mut probe = SqliteConnection::connect("sqlite::memory:").await?;
-    require_cipher(&mut probe).await?;
-    probe.close().await?;
-
-    // Only hex-encoded bytes enter SQL: never interpolate a passphrase or path.
-    let mut literal = String::with_capacity(69);
-    literal.push_str("\"x'");
-    for byte in key {
-        write!(literal, "{byte:02x}").expect("writing to String cannot fail");
-    }
-    literal.push_str("'\"");
-    let options = SqliteConnectOptions::new()
-        .filename(path)
-        .create_if_missing(create_if_missing)
-        // SQLx reserves the key and cipher PRAGMAs ahead of all page access.
-        .pragma("key", literal)
-        .pragma("cipher_compatibility", "4")
-        .pragma("cipher_plaintext_header_size", "0")
-        .pragma("temp_store", "MEMORY")
-        .journal_mode(SqliteJournalMode::Wal)
-        .disable_statement_logging();
-
-    SqlitePoolOptions::new()
-        .max_connections(5)
-        .acquire_timeout(Duration::from_secs(5))
-        .after_connect(|connection, _| {
-            Box::pin(async move {
-                require_cipher(connection).await?;
-                // Setting a key alone does not authenticate an existing file.
-                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sqlite_master")
-                    .fetch_one(connection)
-                    .await?;
-                Ok(())
-            })
-        })
-        .connect_with(options)
+    EncryptedSqliteOptions::default()
+        .connect(path, key, create_if_missing)
         .await
+}
+
+impl EncryptedSqliteOptions {
+    /// Opens the same validated pool as `connect_encrypted_sqlite` with bounded waits.
+    pub async fn connect(
+        self,
+        path: impl AsRef<Path>,
+        key: &[u8],
+        create_if_missing: bool,
+    ) -> sqlx::Result<SqlitePool> {
+        if !(1..=32).contains(&self.max_connections)
+            || self.acquire_timeout.is_zero()
+            || self.acquire_timeout > Duration::from_secs(60)
+            || self.busy_timeout > Duration::from_secs(60)
+        {
+            return Err(sqlx::Error::Configuration(
+            "pool requires 1..=32 connections, acquisition timeout in (0, 60s], and busy timeout in [0, 60s]".into(),
+        ));
+        }
+        if key.len() != 32 {
+            return Err(sqlx::Error::Configuration(
+                "SQLCipher requires a random 32-byte raw key".into(),
+            ));
+        }
+
+        // SQLite silently ignores unknown PRAGMAs. Detect that before a target
+        // file can be created by an ordinary, unencrypted SQLite build.
+        let mut probe = SqliteConnection::connect("sqlite::memory:").await?;
+        require_cipher(&mut probe).await?;
+        probe.close().await?;
+
+        // Only hex-encoded bytes enter SQL: never interpolate a passphrase or path.
+        let mut literal = String::with_capacity(69);
+        literal.push_str("\"x'");
+        for byte in key {
+            write!(literal, "{byte:02x}").expect("writing to String cannot fail");
+        }
+        literal.push_str("'\"");
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(create_if_missing)
+            // SQLx reserves the key and cipher PRAGMAs ahead of all page access.
+            .pragma("key", literal)
+            .pragma("cipher_compatibility", "4")
+            .pragma("cipher_plaintext_header_size", "0")
+            .pragma("temp_store", "MEMORY")
+            .foreign_keys(true)
+            .synchronous(SqliteSynchronous::Full)
+            .busy_timeout(self.busy_timeout)
+            .journal_mode(SqliteJournalMode::Wal)
+            .disable_statement_logging();
+
+        SqlitePoolOptions::new()
+            .max_connections(self.max_connections)
+            .acquire_timeout(self.acquire_timeout)
+            .after_connect(|connection, _| {
+                Box::pin(async move {
+                    require_cipher(connection).await?;
+                    // Setting a key alone does not authenticate an existing file.
+                    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sqlite_master")
+                        .fetch_one(connection)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect_with(options)
+            .await
+    }
 }
 
 async fn require_cipher(connection: &mut SqliteConnection) -> sqlx::Result<()> {
