@@ -331,7 +331,7 @@ From `crates/agent-registry/src/registry.rs`, `src/init.rs`,
 | Capability | Claude Code | Codex | Cursor | OpenCode | Gemini | Cline | Windsurf / VS Code Copilot / Continue | Aider, Cody, Goose, Amp, Kiro, Antigravity, Grok, Kimi, Openclaw, Droid, GitHub Copilot CLI |
 |---|---|---|---|---|---|---|---|---|
 | Headless mode | `-p` | `exec` | `-p` | `run` | `-p` | stdin | — | — |
-| Autonomy flag | skip-perms | `--full-auto` | `--force` | `--auto` | `--yolo` | `--auto-approve true` | — | — |
+| Autonomy flag | skip-perms | `--sandbox workspace-write -c 'approval_policy="never"'` | `--force` | `--auto` | `--yolo` | `--auto-approve true` | — | — |
 | JSON output parsed | yes | no | yes | no | no | no | — | — |
 | Resume by id | yes | no | yes | no | no | no | — | — |
 | Turn / budget caps | yes | no | no | no | no | no | — | — |
@@ -357,8 +357,10 @@ Gaps in the universal layer:
    carry the completion gate and messaging; only three events are wired.
 4. Turn/budget caps: Claude only. `hard_cap`/`idle_timeout` is the universal
    cap, but a cap hit is not surfaced as a typed outcome.
-5. Permission postures are not equivalent (Codex `--full-auto` keeps its
-   sandbox; Claude skip-permissions removes every gate). Prefer each agent's
+5. Permission postures are not equivalent (Codex workspace-write keeps its
+   sandbox with approval prompts disabled; Claude skip-permissions removes
+   its permission gates). External bwrap isolation is not available on
+   every platform. Prefer each agent's
    sandboxed-auto mode where one exists and document the difference.
 6. Only Claude gets hook-pushed messages (`host_injects_context`); other
    hosts see messages only when they happen to call an agentflare tool.

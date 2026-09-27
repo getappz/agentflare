@@ -1594,9 +1594,9 @@ mod persona_tests {
             "caller's choice stands"
         );
 
-        let mut codex = vec!["--full-auto".to_string()];
+        let mut codex = vec!["--sandbox".to_string(), "workspace-write".to_string()];
         assert!(!pin_stream_json("codex", &mut codex));
-        assert_eq!(codex, vec!["--full-auto"]);
+        assert_eq!(codex, vec!["--sandbox", "workspace-write"]);
     }
 
     #[test]

@@ -88,6 +88,12 @@ ALLOWLIST=(
   # logic into submodules is worth doing but is a separate, larger
   # refactor. Frozen at <= FROZEN_LIMIT; a real split is separate work.
   src/supervisor.rs
+  # Already 1660 lines on master before item #307's codex argv fix touched
+  # it (two test-vector lines swapped the removed Codex autonomy flag for
+  # explicit sandbox options, net zero lines) --
+  # pre-existing debt this one-flag bugfix shouldn't have to carry. Frozen
+  # at <= FROZEN_LIMIT; a real split is separate work.
+  src/workflow.rs
   # Already 1497 lines on master before item #655's label_name field
   # (an alternative to label_id on add_label/remove_label) pushed it to
   # 1504 -- same situation as every other entry above: a small, scoped

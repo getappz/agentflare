@@ -226,12 +226,12 @@ fn stage_and_attach_asset(
 }
 
 /// Per-agent extra argv inserted before the prompt: the confirmed
-/// permission-bypass flag, plus — for Claude Code and cursor-agent, the
+/// autonomy flags, plus — for Claude Code and cursor-agent, the
 /// only agents with a confirmed `--output-format stream-json` headless mode
 /// — that flag (Claude Code also needs `--verbose`, confirmed by hand:
 /// omitting it errors with "--print with stream-json output requires
 /// --verbose", plus any `--max-turns`/`--max-cost-usd` asked for). Others
-/// get only their bypass flag; a caller-supplied cap is dropped with a
+/// get only their autonomy flags; a caller-supplied cap is dropped with a
 /// warning rather than guessed at. NOT plain `--output-format json`: it
 /// writes nothing until the run finishes (confirmed by hand: 0 bytes for
 /// 54s+ on a trivial task), so `run_captured`'s idle-timeout (300s default)
