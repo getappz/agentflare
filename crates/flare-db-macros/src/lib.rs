@@ -211,62 +211,75 @@ pub fn derive_crud(input: TokenStream) -> TokenStream {
     } else {
         quote! {}
     };
-    let soft_delete_read_guard_count = soft_delete_read_guard.clone();
+    let soft_delete_read_guard_count = if config.soft_delete {
+        quote! { cq.and_where(flare_db::sea_query::Expr::col("deleted_at").is_null()); }
+    } else {
+        quote! {}
+    };
+
+    // SQLx 0.9 requires an explicit audit of dynamic SQL. Every query below is built
+    // by SeaQuery: identifiers are quoted and all runtime values are bound separately.
+    // Do not replace these builders with interpolated SQL or custom expressions.
 
     let delete_methods = if config.soft_delete {
         let deleted_inner_ty = deleted_at_inner_ty.expect("checked above");
         quote! {
-            pub async fn soft_delete(pool: &flare_db::Pool, #pk_ident: #pk_ty) -> flare_db::sqlx::Result<()> {
+            pub async fn soft_delete<'e>(pool: impl flare_db::sqlx::Executor<'e, Database = flare_db::Database>, #pk_ident: #pk_ty) -> flare_db::sqlx::Result<()> {
                 use flare_db::sea_query_binder::SqlxBinder as _;
+                use flare_db::sea_query::ExprTrait as _;
                 let mut q = flare_db::sea_query::Query::update();
                 q.table(#table_lit)
                     .value("deleted_at", flare_db::sea_query::Expr::current_timestamp())
                     .and_where(flare_db::sea_query::Expr::col(#pk_col).eq(#pk_ident));
                 let (sql, values) = q.build_sqlx(flare_db::QUERY_BUILDER);
-                flare_db::sqlx::query_with(&sql, values).execute(pool).await?;
+                flare_db::sqlx::query_with(flare_db::sqlx::AssertSqlSafe(sql), values).execute(pool).await?;
                 Ok(())
             }
 
-            pub async fn restore(pool: &flare_db::Pool, #pk_ident: #pk_ty) -> flare_db::sqlx::Result<()> {
+            pub async fn restore<'e>(pool: impl flare_db::sqlx::Executor<'e, Database = flare_db::Database>, #pk_ident: #pk_ty) -> flare_db::sqlx::Result<()> {
                 use flare_db::sea_query_binder::SqlxBinder as _;
+                use flare_db::sea_query::ExprTrait as _;
                 let mut q = flare_db::sea_query::Query::update();
                 q.table(#table_lit)
                     .value("deleted_at", flare_db::sea_query::Value::from(None::<#deleted_inner_ty>))
                     .and_where(flare_db::sea_query::Expr::col(#pk_col).eq(#pk_ident));
                 let (sql, values) = q.build_sqlx(flare_db::QUERY_BUILDER);
-                flare_db::sqlx::query_with(&sql, values).execute(pool).await?;
+                flare_db::sqlx::query_with(flare_db::sqlx::AssertSqlSafe(sql), values).execute(pool).await?;
                 Ok(())
             }
 
-            pub async fn soft_delete_where(pool: &flare_db::Pool, filter: #filter_ident) -> flare_db::sqlx::Result<u64> {
+            pub async fn soft_delete_where<'e>(pool: impl flare_db::sqlx::Executor<'e, Database = flare_db::Database>, filter: #filter_ident) -> flare_db::sqlx::Result<u64> {
                 use flare_db::sea_query_binder::SqlxBinder as _;
+                use flare_db::sea_query::ExprTrait as _;
                 let mut q = flare_db::sea_query::Query::update();
                 q.table(#table_lit).value("deleted_at", flare_db::sea_query::Expr::current_timestamp());
                 #(q.and_where_option(filter.#all_field_idents.map(|op| flare_db::FilterOp::into_expr(op, #all_col_lits)));)*
                 let (sql, values) = q.build_sqlx(flare_db::QUERY_BUILDER);
-                let result = flare_db::sqlx::query_with(&sql, values).execute(pool).await?;
+                let result = flare_db::sqlx::query_with(flare_db::sqlx::AssertSqlSafe(sql), values).execute(pool).await?;
                 Ok(result.rows_affected())
             }
 
-            pub async fn restore_where(pool: &flare_db::Pool, filter: #filter_ident) -> flare_db::sqlx::Result<u64> {
+            pub async fn restore_where<'e>(pool: impl flare_db::sqlx::Executor<'e, Database = flare_db::Database>, filter: #filter_ident) -> flare_db::sqlx::Result<u64> {
                 use flare_db::sea_query_binder::SqlxBinder as _;
+                use flare_db::sea_query::ExprTrait as _;
                 let mut q = flare_db::sea_query::Query::update();
                 q.table(#table_lit).value("deleted_at", flare_db::sea_query::Value::from(None::<#deleted_inner_ty>));
                 #(q.and_where_option(filter.#all_field_idents.map(|op| flare_db::FilterOp::into_expr(op, #all_col_lits)));)*
                 let (sql, values) = q.build_sqlx(flare_db::QUERY_BUILDER);
-                let result = flare_db::sqlx::query_with(&sql, values).execute(pool).await?;
+                let result = flare_db::sqlx::query_with(flare_db::sqlx::AssertSqlSafe(sql), values).execute(pool).await?;
                 Ok(result.rows_affected())
             }
         }
     } else {
         quote! {
-            pub async fn delete(pool: &flare_db::Pool, #pk_ident: #pk_ty) -> flare_db::sqlx::Result<()> {
+            pub async fn delete<'e>(pool: impl flare_db::sqlx::Executor<'e, Database = flare_db::Database>, #pk_ident: #pk_ty) -> flare_db::sqlx::Result<()> {
                 use flare_db::sea_query_binder::SqlxBinder as _;
+                use flare_db::sea_query::ExprTrait as _;
                 let mut q = flare_db::sea_query::Query::delete();
                 q.from_table(#table_lit)
                     .and_where(flare_db::sea_query::Expr::col(#pk_col).eq(#pk_ident));
                 let (sql, values) = q.build_sqlx(flare_db::QUERY_BUILDER);
-                flare_db::sqlx::query_with(&sql, values).execute(pool).await?;
+                flare_db::sqlx::query_with(flare_db::sqlx::AssertSqlSafe(sql), values).execute(pool).await?;
                 Ok(())
             }
         }
@@ -278,29 +291,32 @@ pub fn derive_crud(input: TokenStream) -> TokenStream {
         #filter_struct
 
         impl #struct_name {
-            pub async fn get(pool: &flare_db::Pool, #pk_ident: #pk_ty) -> flare_db::sqlx::Result<Option<Self>> {
+            pub async fn get<'e>(pool: impl flare_db::sqlx::Executor<'e, Database = flare_db::Database>, #pk_ident: #pk_ty) -> flare_db::sqlx::Result<Option<Self>> {
                 use flare_db::sea_query_binder::SqlxBinder as _;
+                use flare_db::sea_query::ExprTrait as _;
                 let mut q = flare_db::sea_query::Query::select();
                 q.columns([#(#all_col_lits),*])
                     .from(#table_lit)
                     .and_where(flare_db::sea_query::Expr::col(#pk_col).eq(#pk_ident));
                 #soft_delete_read_guard
                 let (sql, values) = q.build_sqlx(flare_db::QUERY_BUILDER);
-                flare_db::sqlx::query_as_with::<_, Self, _>(&sql, values).fetch_optional(pool).await
+                flare_db::sqlx::query_as_with::<_, Self, _>(flare_db::sqlx::AssertSqlSafe(sql), values).fetch_optional(pool).await
             }
 
-            pub async fn list(pool: &flare_db::Pool, page: flare_db::Page) -> flare_db::sqlx::Result<Vec<Self>> {
+            pub async fn list<'e>(pool: impl flare_db::sqlx::Executor<'e, Database = flare_db::Database>, page: flare_db::Page) -> flare_db::sqlx::Result<Vec<Self>> {
                 use flare_db::sea_query_binder::SqlxBinder as _;
+                use flare_db::sea_query::ExprTrait as _;
                 let mut q = flare_db::sea_query::Query::select();
                 q.columns([#(#all_col_lits),*]).from(#table_lit);
                 #soft_delete_read_guard
                 page.apply(&mut q);
                 let (sql, values) = q.build_sqlx(flare_db::QUERY_BUILDER);
-                flare_db::sqlx::query_as_with::<_, Self, _>(&sql, values).fetch_all(pool).await
+                flare_db::sqlx::query_as_with::<_, Self, _>(flare_db::sqlx::AssertSqlSafe(sql), values).fetch_all(pool).await
             }
 
-            pub async fn list_and_count(pool: &flare_db::Pool, page: flare_db::Page) -> flare_db::sqlx::Result<(Vec<Self>, i64)> {
+            pub async fn list_and_count<'e>(pool: impl flare_db::sqlx::Acquire<'e, Database = flare_db::Database>, page: flare_db::Page) -> flare_db::sqlx::Result<(Vec<Self>, i64)> {
                 use flare_db::sea_query_binder::SqlxBinder as _;
+                use flare_db::sea_query::ExprTrait as _;
                 let mut tx = pool.begin().await?;
 
                 let mut q = flare_db::sea_query::Query::select();
@@ -308,7 +324,7 @@ pub fn derive_crud(input: TokenStream) -> TokenStream {
                 #soft_delete_read_guard
                 page.apply(&mut q);
                 let (sql, values) = q.build_sqlx(flare_db::QUERY_BUILDER);
-                let rows = flare_db::sqlx::query_as_with::<_, Self, _>(&sql, values)
+                let rows = flare_db::sqlx::query_as_with::<_, Self, _>(flare_db::sqlx::AssertSqlSafe(sql), values)
                     .fetch_all(&mut *tx)
                     .await?;
 
@@ -317,7 +333,7 @@ pub fn derive_crud(input: TokenStream) -> TokenStream {
                     .from(#table_lit);
                 #soft_delete_read_guard_count
                 let (csql, cvalues) = cq.build_sqlx(flare_db::QUERY_BUILDER);
-                let count: i64 = flare_db::sqlx::query_scalar_with(&csql, cvalues)
+                let count: i64 = flare_db::sqlx::query_scalar_with(flare_db::sqlx::AssertSqlSafe(csql), cvalues)
                     .fetch_one(&mut *tx)
                     .await?;
 
@@ -325,28 +341,31 @@ pub fn derive_crud(input: TokenStream) -> TokenStream {
                 Ok((rows, count))
             }
 
-            pub async fn count(pool: &flare_db::Pool) -> flare_db::sqlx::Result<i64> {
+            pub async fn count<'e>(pool: impl flare_db::sqlx::Executor<'e, Database = flare_db::Database>) -> flare_db::sqlx::Result<i64> {
                 use flare_db::sea_query_binder::SqlxBinder as _;
+                use flare_db::sea_query::ExprTrait as _;
                 let mut q = flare_db::sea_query::Query::select();
                 q.expr(flare_db::sea_query::Func::count(flare_db::sea_query::Expr::col(#pk_col)))
                     .from(#table_lit);
                 #soft_delete_read_guard
                 let (sql, values) = q.build_sqlx(flare_db::QUERY_BUILDER);
-                flare_db::sqlx::query_scalar_with(&sql, values).fetch_one(pool).await
+                flare_db::sqlx::query_scalar_with(flare_db::sqlx::AssertSqlSafe(sql), values).fetch_one(pool).await
             }
 
-            pub async fn create_one(pool: &flare_db::Pool, new: #new_ident) -> flare_db::sqlx::Result<Self> {
+            pub async fn create_one<'e>(pool: impl flare_db::sqlx::Executor<'e, Database = flare_db::Database>, new: #new_ident) -> flare_db::sqlx::Result<Self> {
                 use flare_db::sea_query_binder::SqlxBinder as _;
+                use flare_db::sea_query::ExprTrait as _;
                 let mut q = flare_db::sea_query::Query::insert();
                 q.into_table(#table_lit).columns([#(#other_col_lits),*]);
                 q.values_panic([#(flare_db::sea_query::SimpleExpr::from(new.#other_field_idents)),*]);
                 q.returning_all();
                 let (sql, values) = q.build_sqlx(flare_db::QUERY_BUILDER);
-                flare_db::sqlx::query_as_with::<_, Self, _>(&sql, values).fetch_one(pool).await
+                flare_db::sqlx::query_as_with::<_, Self, _>(flare_db::sqlx::AssertSqlSafe(sql), values).fetch_one(pool).await
             }
 
-            pub async fn create_many(pool: &flare_db::Pool, news: Vec<#new_ident>) -> flare_db::sqlx::Result<Vec<Self>> {
+            pub async fn create_many<'e>(pool: impl flare_db::sqlx::Executor<'e, Database = flare_db::Database>, news: Vec<#new_ident>) -> flare_db::sqlx::Result<Vec<Self>> {
                 use flare_db::sea_query_binder::SqlxBinder as _;
+                use flare_db::sea_query::ExprTrait as _;
                 if news.is_empty() {
                     return Ok(Vec::new());
                 }
@@ -357,11 +376,12 @@ pub fn derive_crud(input: TokenStream) -> TokenStream {
                 }
                 q.returning_all();
                 let (sql, values) = q.build_sqlx(flare_db::QUERY_BUILDER);
-                flare_db::sqlx::query_as_with::<_, Self, _>(&sql, values).fetch_all(pool).await
+                flare_db::sqlx::query_as_with::<_, Self, _>(flare_db::sqlx::AssertSqlSafe(sql), values).fetch_all(pool).await
             }
 
-            pub async fn update_one(pool: &flare_db::Pool, #pk_ident: #pk_ty, patch: #patch_ident) -> flare_db::sqlx::Result<Self> {
+            pub async fn update_one<'e>(pool: impl flare_db::sqlx::Executor<'e, Database = flare_db::Database>, #pk_ident: #pk_ty, patch: #patch_ident) -> flare_db::sqlx::Result<Self> {
                 use flare_db::sea_query_binder::SqlxBinder as _;
+                use flare_db::sea_query::ExprTrait as _;
                 let mut q = flare_db::sea_query::Query::update();
                 q.table(#table_lit);
                 let mut has_set = false;
@@ -379,40 +399,44 @@ pub fn derive_crud(input: TokenStream) -> TokenStream {
                 q.and_where(flare_db::sea_query::Expr::col(#pk_col).eq(#pk_ident));
                 q.returning_all();
                 let (sql, values) = q.build_sqlx(flare_db::QUERY_BUILDER);
-                flare_db::sqlx::query_as_with::<_, Self, _>(&sql, values).fetch_one(pool).await
+                flare_db::sqlx::query_as_with::<_, Self, _>(flare_db::sqlx::AssertSqlSafe(sql), values).fetch_one(pool).await
             }
 
-            pub async fn update_many(
-                pool: &flare_db::Pool,
+            pub async fn update_many<'e>(
+                pool: impl flare_db::sqlx::Acquire<'e, Database = flare_db::Database>,
                 patches: Vec<(#pk_ty, #patch_ident)>,
             ) -> flare_db::sqlx::Result<Vec<Self>> {
+                let mut tx = pool.begin().await?;
                 let mut out = Vec::with_capacity(patches.len());
                 for (id, patch) in patches {
-                    out.push(Self::update_one(pool, id, patch).await?);
+                    out.push(Self::update_one(&mut *tx, id, patch).await?);
                 }
+                tx.commit().await?;
                 Ok(out)
             }
 
-            pub async fn list_where(
-                pool: &flare_db::Pool,
+            pub async fn list_where<'e>(
+                pool: impl flare_db::sqlx::Executor<'e, Database = flare_db::Database>,
                 filter: #filter_ident,
                 page: flare_db::Page,
             ) -> flare_db::sqlx::Result<Vec<Self>> {
                 use flare_db::sea_query_binder::SqlxBinder as _;
+                use flare_db::sea_query::ExprTrait as _;
                 let mut q = flare_db::sea_query::Query::select();
                 q.columns([#(#all_col_lits),*]).from(#table_lit);
                 #(q.and_where_option(filter.#all_field_idents.map(|op| flare_db::FilterOp::into_expr(op, #all_col_lits)));)*
                 page.apply(&mut q);
                 let (sql, values) = q.build_sqlx(flare_db::QUERY_BUILDER);
-                flare_db::sqlx::query_as_with::<_, Self, _>(&sql, values).fetch_all(pool).await
+                flare_db::sqlx::query_as_with::<_, Self, _>(flare_db::sqlx::AssertSqlSafe(sql), values).fetch_all(pool).await
             }
 
-            pub async fn update_where(
-                pool: &flare_db::Pool,
+            pub async fn update_where<'e>(
+                pool: impl flare_db::sqlx::Executor<'e, Database = flare_db::Database>,
                 filter: #filter_ident,
                 patch: #patch_ident,
             ) -> flare_db::sqlx::Result<u64> {
                 use flare_db::sea_query_binder::SqlxBinder as _;
+                use flare_db::sea_query::ExprTrait as _;
                 let mut q = flare_db::sea_query::Query::update();
                 q.table(#table_lit);
                 let mut has_set = false;
@@ -427,7 +451,7 @@ pub fn derive_crud(input: TokenStream) -> TokenStream {
                 }
                 #(q.and_where_option(filter.#all_field_idents.map(|op| flare_db::FilterOp::into_expr(op, #all_col_lits)));)*
                 let (sql, values) = q.build_sqlx(flare_db::QUERY_BUILDER);
-                let result = flare_db::sqlx::query_with(&sql, values).execute(pool).await?;
+                let result = flare_db::sqlx::query_with(flare_db::sqlx::AssertSqlSafe(sql), values).execute(pool).await?;
                 Ok(result.rows_affected())
             }
 

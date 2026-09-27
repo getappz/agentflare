@@ -1,0 +1,99 @@
+name: flare-db
+
+on:
+  pull_request:
+    paths: ['crates/flare-db/**', 'crates/flare-db-macros/**', '.github/workflows/flare-db.yml']
+  push:
+    branches: [master]
+    paths: ['crates/flare-db/**', 'crates/flare-db-macros/**', '.github/workflows/flare-db.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  bundled:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - run: rustup toolchain install 1.94.0 --profile minimal
+      - name: Select full Windows Perl
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (!(Test-Path C:\Strawberry\perl\bin\perl.exe)) { throw 'Strawberry Perl is required' }
+          'OPENSSL_SRC_PERL=C:\Strawberry\perl\bin\perl.exe' >> $env:GITHUB_ENV
+      - run: cargo +1.94.0 test --manifest-path crates/flare-db/Cargo.toml --locked --no-default-features --features sqlcipher-bundled
+      - name: Verify Linux runtime linkage
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          binary=$(find crates/flare-db/target/debug/deps -maxdepth 1 -type f -name 'encryption-*' -executable | head -1)
+          test -n "$binary"
+          ldd "$binary" > "$RUNNER_TEMP/flare-db-libraries.txt"
+          cat "$RUNNER_TEMP/flare-db-libraries.txt"
+          ! grep -Ei '(sqlcipher|sqlite3|libcrypto|libssl)' "$RUNNER_TEMP/flare-db-libraries.txt"
+      - name: Verify Windows runtime linkage
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products '*' -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -Last 1
+          $binary = Get-ChildItem crates/flare-db/target/debug/deps/encryption-*.exe | Select-Object -First 1
+          if (!$dumpbin -or !$binary) { throw 'Missing native dependency inspection inputs' }
+          $imports = & $dumpbin.FullName /DEPENDENTS $binary.FullName
+          $imports
+          if ($LASTEXITCODE -ne 0 -or ($imports -match '(?i)(sqlcipher|sqlite3|libcrypto|libssl).*\.dll')) { throw 'Unexpected native DLL dependency' }
+      - name: Reject conflicting cipher modes
+        shell: bash
+        run: |
+          if cargo +1.94.0 check --manifest-path crates/flare-db/Cargo.toml --locked --features sqlcipher-bundled,sqlcipher-external > "$RUNNER_TEMP/flare-db-conflict.txt" 2>&1; then
+            echo 'Conflicting cipher modes unexpectedly compiled'
+            exit 1
+          fi
+          grep -F 'choose either sqlcipher-bundled or sqlcipher-external' "$RUNNER_TEMP/flare-db-conflict.txt"
+      - run: cargo +1.94.0 package --manifest-path crates/flare-db/Cargo.toml --locked --no-default-features --features sqlcipher-bundled
+  standalone:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: flare-db-test-only
+          POSTGRES_DB: flare_db_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 10s
+          --health-timeout 5s --health-retries 5
+    env:
+      DATABASE_URL: postgres://postgres:flare-db-test-only@localhost:5432/flare_db_test
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - run: rustup toolchain install 1.94.0 --profile minimal
+      - run: cargo +1.94.0 test --manifest-path crates/flare-db/Cargo.toml --locked
+      - name: Build supported SQLCipher 4.19.0
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev tcl-dev
+          git clone --depth 1 --branch v4.19.0 https://github.com/sqlcipher/sqlcipher.git "$RUNNER_TEMP/sqlcipher-source"
+          cd "$RUNNER_TEMP/sqlcipher-source"
+          test "$(git rev-parse HEAD)" = c4b275a47932888216bade83aff2bbc73df0ff85
+          ./configure --prefix="$RUNNER_TEMP/sqlcipher-install" --with-tempstore=yes \
+            CFLAGS="-DSQLITE_HAS_CODEC -DSQLITE_EXTRA_INIT=sqlcipher_extra_init -DSQLITE_EXTRA_SHUTDOWN=sqlcipher_extra_shutdown -DSQLITE_ENABLE_COLUMN_METADATA -DSQLITE_ENABLE_UNLOCK_NOTIFY" \
+            LDFLAGS="-lcrypto"
+          make -j2
+          make install
+          # SQLCipher 4.7+ installs as libsqlite3; the Rust sqlcipher feature links -lsqlcipher.
+          ln -s libsqlite3.so "$RUNNER_TEMP/sqlcipher-install/lib/libsqlcipher.so"
+          echo "SQLCIPHER_LIB_DIR=$RUNNER_TEMP/sqlcipher-install/lib" >> "$GITHUB_ENV"
+          echo "SQLCIPHER_INCLUDE_DIR=$RUNNER_TEMP/sqlcipher-install/include" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$RUNNER_TEMP/sqlcipher-install/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/sqlcipher-install/lib" >> "$GITHUB_ENV"
+      - run: cargo +1.94.0 test --manifest-path crates/flare-db/Cargo.toml --locked --features sqlcipher
+      - run: cargo +1.94.0 test --manifest-path crates/flare-db/Cargo.toml --locked --features sqlcipher-external
+      - run: cargo +1.94.0 test --manifest-path crates/flare-db/Cargo.toml --locked --no-default-features --features integration-postgres
+      - run: cargo +1.94.0 package --manifest-path crates/flare-db-macros/Cargo.toml --locked
