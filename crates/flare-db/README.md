@@ -80,8 +80,10 @@ Do not derive a raw key by padding/truncating a password. Missing or incorrectly
 sized keys fail before opening the file. Wrong keys and existing plaintext
 databases are rejected; they are not overwritten or converted.
 
-The helper preflights the native cipher/version, sets the key before SQLx's other
-PRAGMAs on **every** new connection, selects SQLCipher 4 format with no plaintext
+The helper preflights the native cipher/version and sets the key on **every**
+new connection before schema/page access. SQLx's initial foreign-key flag does
+not access pages; cipher format and all page-dependent PRAGMAs run in the private
+connection hook after keying. It selects SQLCipher 4 format with no plaintext
 header, and validates a schema read before a connection can enter the pool.
 It explicitly uses WAL, foreign-key enforcement, memory temporary storage, and
 FULL synchronous durability on each physical connection. Defaults are five
@@ -114,10 +116,14 @@ only after the helper succeeds. The packaged migrations are **test fixtures**,
 not an application schema. Keep SQLx migration checksums intact.
 
 Statement logging is disabled on these connections to avoid exposing the key.
-`SqlitePool`, public tuning options, and connector errors can be debug-printed
-without the raw key (covered by regression tests).
-**Never debug-print `pool.connect_options()`**: SQLx stores the key in its
-connection options to open replacement connections. This API does not promise
+`SqlitePool`, its connection/pool options, public tuning options, and connector
+errors omit the raw key (covered by regression tests). The key is retained in
+a private callback for replacement connections, outside debug-visible options,
+and its initialization statement is not cached. Paths may still appear in
+connection options; treat filesystem paths as application metadata.
+Connection options alone intentionally contain no key: share/clone the returned
+pool, never reopen a connection from those options or let a framework rebuild it.
+This API does not promise
 key-memory zeroization, protection from an already-compromised process, or
 encryption of exports/logs. The app owns access controls, OS-keychain lifetime,
 file permissions, disk/swap protection, and redaction of business data.

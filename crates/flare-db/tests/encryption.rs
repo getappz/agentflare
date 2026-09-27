@@ -61,6 +61,9 @@ async fn encrypted_pool_reopen_wrong_key_plaintext_rejection_and_offline_backup(
         .unwrap();
     eprintln!("SQLCipher version: {cipher_version}");
     assert!(!format!("{pool:?}").contains(&"2a".repeat(32)));
+    assert!(
+        !format!("{:?} {:?}", pool.connect_options(), pool.options()).contains(&"2a".repeat(32))
+    );
     static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
     flare_db::run_migrations(&pool, &MIGRATOR).await.unwrap();
     let marker = "CONFIDENTIAL-FLARE-DB-ENCRYPTION-TEST";

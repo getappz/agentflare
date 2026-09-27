@@ -1,8 +1,8 @@
-use std::{fmt::Write as _, path::Path, time::Duration};
+use std::{fmt::Write as _, path::Path, sync::Arc, time::Duration};
 
 use sqlx::{
     ConnectOptions, Connection, SqliteConnection, SqlitePool,
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 
 /// Bounded pool/lock waits. Contains no path or key and is safe to debug-print.
@@ -33,10 +33,10 @@ impl Default for EncryptedSqliteOptions {
 /// `create_if_missing` must be explicitly enabled for first-time setup.
 /// Existing plaintext databases are rejected, never converted in place.
 ///
-/// Every connection is keyed before SQLx's other PRAGMAs and checked before
+/// Every connection is keyed before schema/page access and checked before
 /// entering the pool (at most five connections). Migrations are a separate step
 /// after this function succeeds. Statement logging is disabled to avoid logging
-/// the key. Do not log `pool.connect_options()`: SQLx retains the key there.
+/// the key. The key is held in a private callback, outside debug-visible options.
 /// Key generation, OS-keychain storage, permissions and backup policy belong to
 /// the application. See the README for offline backup/restore requirements.
 pub async fn connect_encrypted_sqlite(
@@ -79,36 +79,57 @@ impl EncryptedSqliteOptions {
         probe.close().await?;
 
         // Only hex-encoded bytes enter SQL: never interpolate a passphrase or path.
-        let mut literal = String::with_capacity(69);
-        literal.push_str("\"x'");
+        let mut key_sql = String::from("PRAGMA key = \"x'");
         for byte in key {
-            write!(literal, "{byte:02x}").expect("writing to String cannot fail");
+            write!(key_sql, "{byte:02x}").expect("writing to String cannot fail");
         }
-        literal.push_str("'\"");
+        key_sql.push_str("'\"");
+        let key_sql = Arc::new(key_sql);
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(create_if_missing)
-            // SQLx reserves the key and cipher PRAGMAs ahead of all page access.
-            .pragma("key", literal)
-            .pragma("cipher_compatibility", "4")
-            .pragma("cipher_plaintext_header_size", "0")
-            .pragma("temp_store", "MEMORY")
+            // SQLx 0.9's only initial SQL is foreign_keys=ON, a connection-local
+            // flag with no schema/page access. Defer ALL page-dependent PRAGMAs
+            // until after keying; never store the key in debug-visible options.
             .foreign_keys(true)
-            .synchronous(SqliteSynchronous::Full)
             .busy_timeout(self.busy_timeout)
-            .journal_mode(SqliteJournalMode::Wal)
             .disable_statement_logging();
 
         SqlitePoolOptions::new()
             .max_connections(self.max_connections)
             .acquire_timeout(self.acquire_timeout)
-            .after_connect(|connection, _| {
+            .after_connect(move |connection, _| {
+                let key_sql = Arc::clone(&key_sql);
                 Box::pin(async move {
+                    // Audited: only fixed SQL and 64 hex digits. Do not cache this
+                    // secret-bearing statement or propagate its error text.
+                    sqlx::query(sqlx::AssertSqlSafe(key_sql))
+                        .persistent(false)
+                        .execute(&mut *connection)
+                        .await
+                        .map_err(|_| {
+                            sqlx::Error::Configuration(
+                                "encrypted connection key initialization failed".into(),
+                            )
+                        })?;
+                    sqlx::raw_sql(
+                        "PRAGMA cipher_compatibility = 4;
+                         PRAGMA cipher_plaintext_header_size = 0;",
+                    )
+                    .execute(&mut *connection)
+                    .await?;
                     require_cipher(connection).await?;
                     // Setting a key alone does not authenticate an existing file.
                     sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sqlite_master")
-                        .fetch_one(connection)
+                        .fetch_one(&mut *connection)
                         .await?;
+                    sqlx::raw_sql(
+                        "PRAGMA journal_mode = WAL;
+                         PRAGMA synchronous = FULL;
+                         PRAGMA temp_store = MEMORY;",
+                    )
+                    .execute(connection)
+                    .await?;
                     Ok(())
                 })
             })
