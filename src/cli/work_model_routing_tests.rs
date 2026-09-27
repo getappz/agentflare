@@ -57,9 +57,12 @@ fn build_extra_args_passes_through_max_turns_and_cost_for_claude() {
 }
 
 #[test]
-fn build_extra_args_for_codex_uses_supported_sandbox_flags() {
+fn build_extra_args_for_codex_keeps_sandbox_and_disables_prompts() {
     let args = build_extra_args(agent_registry::Agent::Codex, None, None, None);
-    assert_eq!(args, vec!["--sandbox", "workspace-write"]);
+    assert_eq!(
+        args,
+        vec!["--sandbox", "workspace-write", "-c", "approval_policy=\"never\""]
+    );
 }
 
 #[test]

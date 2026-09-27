@@ -354,7 +354,15 @@ pub fn headless_args(agent: Agent) -> Option<&'static [&'static str]> {
 pub fn autonomous_args(agent: Agent) -> Option<&'static [&'static str]> {
     match agent {
         Agent::ClaudeCode => Some(&["--dangerously-skip-permissions"]),
-        Agent::Codex => Some(&["--sandbox", "workspace-write"]),
+        // Keep Codex's sandbox even when bwrap is unavailable (including
+        // Windows/macOS). Explicit exec options replace `--full-auto` without
+        // granting unrestricted host access or waiting for approval prompts.
+        Agent::Codex => Some(&[
+            "--sandbox",
+            "workspace-write",
+            "-c",
+            "approval_policy=\"never\"",
+        ]),
         Agent::GeminiCli => Some(&["--yolo"]),
         // `opencode run --auto`: "auto-approve permissions that are not
         // explicitly denied" — confirmed via `opencode run --help`.
@@ -524,6 +532,21 @@ mod tests {
     #[test]
     fn autonomous_args_maps_cursor_to_force() {
         assert_eq!(autonomous_args(Agent::Cursor), Some(&["--force"][..]));
+    }
+
+    #[test]
+    fn autonomous_args_keeps_codex_sandbox_without_approval_prompts() {
+        assert_eq!(
+            autonomous_args(Agent::Codex),
+            Some(
+                &[
+                    "--sandbox",
+                    "workspace-write",
+                    "-c",
+                    "approval_policy=\"never\""
+                ][..]
+            )
+        );
     }
 
     #[test]
