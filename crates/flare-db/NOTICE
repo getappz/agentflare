@@ -17,3 +17,8 @@ The sqlcipher-external feature (also named sqlcipher for compatibility) links
 an application-supplied native SDK; retain that SDK's actual cipher and
 crypto-provider notices. Neither mode confers commercial SQLCipher licensing
 or FIPS validation.
+
+The sqlcipher-bundled-external-openssl feature builds the vendored SQLCipher
+but dynamically links an application-supplied OpenSSL SDK. Its runtime binaries
+are not included in this package. Retain the SQLCipher/SQLite notices above
+and the licenses/notices from the actual OpenSSL SDK distributed with the app.

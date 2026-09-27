@@ -11,6 +11,81 @@ permissions:
   contents: read
 
 jobs:
+  external-openssl:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      OPENSSL_STATIC: '0'
+      OPENSSL_SRC_PERL: nonexistent-perl
+      PERL: nonexistent-perl
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - run: rustup toolchain install 1.94.0 --profile minimal
+      - name: Linux OpenSSL SDK
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev
+          echo 'OPENSSL_INCLUDE_DIR=/usr/include' >> "$GITHUB_ENV"
+          echo "OPENSSL_LIB_DIR=$(pkg-config --variable=libdir libcrypto)" >> "$GITHUB_ENV"
+      - name: Windows OpenSSL 4 SDK
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco upgrade openssl --version=4.0.2 --allow-downgrade -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'OpenSSL installation failed' }
+          $sdk = Get-ChildItem 'C:\Program Files\OpenSSL*' -Directory | Where-Object { Test-Path "$($_.FullName)\bin\libcrypto-4-x64.dll" }
+          if (@($sdk).Count -ne 1) { throw 'Expected exactly one OpenSSL 4 x64 SDK' }
+          $root = $sdk.FullName
+          $lib = if (Test-Path "$root\lib\VC\x64\MD\libcrypto.lib") { "$root\lib\VC\x64\MD" } else { "$root\lib" }
+          "OPENSSL_DIR=$root" >> $env:GITHUB_ENV
+          "OPENSSL_INCLUDE_DIR=$root\include" >> $env:GITHUB_ENV
+          "OPENSSL_LIB_DIR=$lib" >> $env:GITHUB_ENV
+          $version = & "$root\bin\openssl.exe" version
+          $version
+          if ($LASTEXITCODE -ne 0 -or $version -notmatch '^OpenSSL 4\.0\.2 ') { throw 'Unexpected OpenSSL version' }
+      - run: cargo +1.94.0 test --manifest-path crates/flare-db/Cargo.toml --locked --no-default-features --features sqlcipher-bundled-external-openssl --no-run
+      - name: Stage exact Windows crypto DLL and test isolated runtime
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products '*' -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -Last 1
+          $binary = Get-ChildItem crates/flare-db/target/debug/deps/encryption-*.exe | Select-Object -First 1
+          $imports = & $dumpbin.FullName /DEPENDENTS $binary.FullName
+          if ($LASTEXITCODE -ne 0) { throw 'Import inspection failed' }
+          $crypto = @($imports | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^libcrypto[^\\/]*\.dll$' })
+          if ($crypto.Count -ne 1 -or ($imports -match '(?i)(sqlcipher|libssl).*\.dll')) { throw 'Unexpected crypto linkage' }
+          $source = Join-Path "$env:OPENSSL_DIR\bin" $crypto[0]
+          $stage = New-Item -ItemType Directory "$env:RUNNER_TEMP\flare-db-runtime"
+          Copy-Item $source $stage
+          Copy-Item $binary.FullName "$stage\encryption.exe"
+          Copy-Item $source $binary.DirectoryName
+          if ((Get-FileHash $source).Hash -ne (Get-FileHash (Join-Path $stage $crypto[0])).Hash) { throw 'DLL mismatch' }
+          $oldPath = $env:PATH
+          try {
+            $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+            $env:OPENSSL_MODULES = "$stage\no-provider-modules"
+            $env:OPENSSL_CONF = "$stage\empty.cnf"
+            Set-Content $env:OPENSSL_CONF ''
+            & "$stage\encryption.exe" --nocapture
+            if ($LASTEXITCODE -ne 0) { throw 'Staged encryption test failed' }
+          } finally { $env:PATH = $oldPath }
+      - run: cargo +1.94.0 test --manifest-path crates/flare-db/Cargo.toml --locked --no-default-features --features sqlcipher-bundled-external-openssl
+      - name: Reject conflicting modes and static crypto requests
+        shell: bash
+        run: |
+          for other in sqlcipher-bundled sqlcipher-external; do
+            if cargo +1.94.0 check --manifest-path crates/flare-db/Cargo.toml --locked --features "sqlcipher-bundled-external-openssl,$other" > "$RUNNER_TEMP/flare-db-conflict.txt" 2>&1; then exit 1; fi
+            grep -F 'choose exactly one SQLCipher mode' "$RUNNER_TEMP/flare-db-conflict.txt"
+          done
+          if OPENSSL_STATIC=1 cargo +1.94.0 check --manifest-path crates/flare-db/Cargo.toml --locked --features sqlcipher-bundled-external-openssl > "$RUNNER_TEMP/flare-db-static.txt" 2>&1; then exit 1; fi
+          grep -F 'requires dynamic OpenSSL' "$RUNNER_TEMP/flare-db-static.txt"
+      - run: cargo +1.94.0 package --manifest-path crates/flare-db/Cargo.toml --locked --no-default-features --features sqlcipher-bundled-external-openssl
   bundled:
     strategy:
       matrix:
@@ -54,7 +129,7 @@ jobs:
             echo 'Conflicting cipher modes unexpectedly compiled'
             exit 1
           fi
-          grep -F 'choose either sqlcipher-bundled or sqlcipher-external' "$RUNNER_TEMP/flare-db-conflict.txt"
+          grep -F 'choose exactly one SQLCipher mode' "$RUNNER_TEMP/flare-db-conflict.txt"
       - run: cargo +1.94.0 package --manifest-path crates/flare-db/Cargo.toml --locked --no-default-features --features sqlcipher-bundled
   standalone:
     runs-on: ubuntu-latest

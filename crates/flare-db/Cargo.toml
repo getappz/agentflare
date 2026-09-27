@@ -3,7 +3,7 @@
 
 [package]
 name = "flare-db"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.94"
 license = "Apache-2.0 AND BSD-3-Clause"
@@ -37,6 +37,8 @@ sqlcipher = ["sqlcipher-external"]
 sqlcipher-external = ["sqlite", "dep:libsqlite3-sys", "libsqlite3-sys/sqlcipher"]
 # in_gecko supplies bindings only; build.rs supplies the native engine.
 sqlcipher-bundled = ["sqlite", "dep:libsqlite3-sys", "libsqlite3-sys/in_gecko", "dep:cc", "dep:openssl-src"]
+# Compile the same cipher source, but link a prebuilt dynamic OpenSSL SDK.
+sqlcipher-bundled-external-openssl = ["sqlite", "dep:libsqlite3-sys", "libsqlite3-sys/in_gecko", "dep:cc"]
 # Gates the Postgres integration test in tests/postgres_integration.rs, which requires a live
 # DATABASE_URL and is not run by default.
 integration-postgres = ["postgres"]
