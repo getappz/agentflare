@@ -63,6 +63,13 @@ pub fn list_prompts() -> Vec<Prompt> {
             )]),
         ),
         Prompt::new(
+            "resume",
+            Some("Resume a stopped foreign-agent session here (e.g. Claude Code hit its usage limit)"),
+            Some(vec![PromptArgument::new("command").with_description(
+                "`<session-id>` to resume explicitly, `latest [--from <agent>]` for the newest stopped session (omit for usage)",
+            )]),
+        ),
+        Prompt::new(
             "git",
             Some("Recovery snapshots, worktree audit, and health checks from the agentflare git shim"),
             Some(vec![PromptArgument::new("command").with_description(
@@ -94,6 +101,9 @@ pub fn get_prompt(
     }
     if request.name == "handoff" {
         return Some(get_handoff_command(request, agent));
+    }
+    if request.name == "resume" {
+        return Some(get_resume_command(request, agent));
     }
     if request.name == "git" {
         return Some(get_git_command(request));
@@ -252,8 +262,42 @@ fn get_handoff_command(request: &GetPromptRequestParams, agent: Option<&str>) ->
          - `thread <id>` → call `item` (action=list), filter client-side to items whose \
          metadata.thread matches <id>, then pull each item's assets (asset tool) for content; \
          present in chronological order with reply lineage.\n\
-         Report the resulting listing afterwards. Work products only — facts/decisions go to \
-         memory (memory_remember), not items."
+          Report the resulting listing afterwards. Work products only — facts/decisions go to \
+          memory (memory_remember), not items."
+    ))
+}
+
+fn get_resume_command(request: &GetPromptRequestParams, agent: Option<&str>) -> GetPromptResult {
+    // Identity comes from AGENTFLARE_AGENT baked into the MCP entry by
+    // `agentflare init --agent <name>`; claude-code is the legacy default.
+    let me = agent.unwrap_or("claude-code");
+    let command = request
+        .arguments
+        .as_ref()
+        .and_then(|a| a.get("command"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if command.is_empty() {
+        return assistant_text(
+            "Resume a stopped foreign-agent session here — pass a session id or `latest`.\n\
+             Usage: /resume <session-id> [--from <agent>] | /resume latest [--from <agent>] [--dry-run]\n\
+             Find ids with `agentflare insights list` (after `agentflare insights sync` for auto mode).\n\
+             Explicit ids resume immediately; `latest` is confirm-gated (the tool names its pick first).",
+        );
+    }
+
+    assistant_text(format!(
+        "Resume command: `{command}` (you are {me})\n\n\
+         Parse `<session-id>` (explicit) vs `latest` (auto-pick; honor an optional `--from <agent>` \
+         and `--dry-run` flag), then call the `resume` tool: explicit id → session=<id>; \
+         `latest` → omit session (pass from= when --from is given); --dry-run → dry_run=true. \
+         If the tool returns needs_confirm, show the picked session (id, source, title, updated_at) \
+         and ask the user to confirm before re-calling with session=<picked id>. On resumed, read \
+         the returned artifact (artifact tool, action=get) or `/handoff inbox`, then continue the \
+         work from where the stopped session left off — state what was carried over and what is next."
     ))
 }
 
@@ -436,8 +480,8 @@ mod tests {
         assert!(names.contains(&"optimize"));
         assert!(names.contains(&"optimize-review"));
         assert!(names.contains(&"optimize-no-hallucination"));
-        // optimize + artifact + handoff + git + pm + one per sub-skill
-        assert_eq!(names.len(), 5 + SUB_SKILLS.len());
+        // optimize + artifact + handoff + resume + git + pm + one per sub-skill
+        assert_eq!(names.len(), 6 + SUB_SKILLS.len());
     }
 
     #[test]
@@ -571,6 +615,37 @@ mod tests {
     fn lists_git_prompt() {
         let prompts = list_prompts();
         assert!(prompts.iter().any(|p| p.name == "git"));
+    }
+
+    #[test]
+    fn lists_resume_prompt() {
+        let prompts = list_prompts();
+        assert!(prompts.iter().any(|p| p.name == "resume"));
+    }
+
+    #[test]
+    fn bare_resume_prompt_returns_usage() {
+        let result = get_prompt(&GetPromptRequestParams::new("resume"), None).unwrap();
+        let text = format!("{:?}", result.messages[0].content);
+        assert!(text.contains("latest"), "{text}");
+        assert!(text.contains("insights list"), "{text}");
+    }
+
+    #[test]
+    fn resume_prompt_embeds_command_and_tool_mapping() {
+        use rmcp::model::JsonObject;
+        let mut args = JsonObject::new();
+        args.insert(
+            "command".to_string(),
+            serde_json::json!("ses-abc123 --from claude_code"),
+        );
+        let params = GetPromptRequestParams::new("resume").with_arguments(args);
+        let result = get_prompt(&params, Some("opencode")).unwrap();
+        let text = format!("{:?}", result.messages[0].content);
+        assert!(text.contains("ses-abc123 --from claude_code"), "{text}");
+        assert!(text.contains("`resume` tool"), "{text}");
+        assert!(text.contains("needs_confirm"), "{text}");
+        assert!(text.contains("opencode"), "{text}");
     }
 
     #[test]

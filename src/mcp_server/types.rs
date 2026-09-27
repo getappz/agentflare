@@ -300,6 +300,43 @@ pub(crate) struct HandoffRequest {
     pub(crate) allow_secrets: Option<bool>,
 }
 
+/// Resume a stopped foreign-agent session in this runtime: one-shot
+/// "pick up that session here". Explicit `session` sends immediately via a
+/// live foreign-store scan (no `insights sync` needed); omitting it picks
+/// the latest session from the insights DB (needs a prior sync) and returns
+/// `needs_confirm` until the pick is echoed back via `confirm_session`.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub(crate) struct ResumeRequest {
+    #[schemars(
+        description = "Foreign session id (see `agentflare insights list`). Omit to auto-pick the latest session from the exhausted agent (needs a prior `insights sync`; confirm-gated)."
+    )]
+    #[serde(default)]
+    pub(crate) session: Option<String>,
+    #[schemars(
+        description = "Exhausted agent source: auto|claude_code|codex|opencode (aliases cc/claude/oc accepted). Default auto."
+    )]
+    #[serde(default)]
+    pub(crate) from: Option<String>,
+    #[schemars(
+        description = "Receiving agent/runtime (default: this runtime's own identity, else opencode)"
+    )]
+    #[serde(default)]
+    pub(crate) to: Option<String>,
+    #[schemars(description = "minimal|standard|verbose|full (default standard)")]
+    #[serde(default)]
+    pub(crate) verbosity: Option<String>,
+    #[schemars(
+        description = "Echo of the auto-picked session id — confirms the pick so the send runs (no-op when session is explicit)"
+    )]
+    #[serde(default)]
+    pub(crate) confirm_session: Option<String>,
+    #[schemars(
+        description = "Render the handoff markdown without publishing anything (default false)"
+    )]
+    #[serde(default)]
+    pub(crate) dry_run: Option<bool>,
+}
+
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ArtifactRequest {
     #[schemars(description = "Action: delete|diff|get|list|publish|search")]

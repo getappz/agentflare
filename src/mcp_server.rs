@@ -22,6 +22,7 @@ mod memory_tool;
 mod message;
 mod pm;
 mod project_resolution;
+mod resume;
 mod review;
 pub(crate) mod search;
 mod secret_scan;
@@ -684,6 +685,12 @@ impl AgentflareMcp {
     )]
     fn handoff(&self, Parameters(req): Parameters<HandoffRequest>) -> Result<String, ErrorData> {
         self.handoff_impl(req)
+    }
+    #[tool(
+        description = "Resume a stopped foreign-agent session here (e.g. Claude Code hit its usage limit, continue in this CLI): explicit `session` sends immediately via a live foreign-store scan (no insights sync needed); omit `session` to auto-pick the latest session from the exhausted agent (needs a prior `agentflare insights sync`) — the first auto call returns needs_confirm with zero writes, re-call with session/confirm_session set to that id to publish. `from` selects the exhausted agent (default auto), `to` the receiver (default this runtime), `dry_run` previews without publishing."
+    )]
+    fn resume(&self, Parameters(req): Parameters<ResumeRequest>) -> Result<String, ErrorData> {
+        self.resume_impl(req)
     }
 
     /// Runs `git` in the current cwd; None on any failure (not a repo, git
