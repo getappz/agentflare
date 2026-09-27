@@ -280,10 +280,12 @@ checksum = "d45db016d36b838f563236e9193d0ee6ce38f3f68b6c94e914b4929c96bbb890"
 
 [[package]]
 name = "flare-db"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
+ "cc",
  "flare-db-macros",
  "libsqlite3-sys",
+ "openssl-src",
  "sea-query",
  "sea-query-sqlx",
  "sqlx",
@@ -707,6 +709,15 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+
+[[package]]
+name = "openssl-src"
+version = "400.0.1+4.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8700cc16d48035d75a7907f8ebbaec59a350ea87d8d3181041ae8b6dd23a1b05"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "parking"

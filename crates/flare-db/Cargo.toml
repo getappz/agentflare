@@ -3,14 +3,14 @@
 
 [package]
 name = "flare-db"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.94"
-license = "Apache-2.0"
+license = "Apache-2.0 AND BSD-3-Clause"
 description = "Async, sqlx-backed repository derive macro (list/get/create/update/delete/count, soft-delete, pagination, sea-query-based filtering) for Postgres and SQLite — not a full ORM."
 repository = "https://github.com/getappz/agentflare"
 readme = "README.md"
-include = ["src/**", "tests/**", "migrations/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "NOTICE"]
+include = ["src/**", "tests/**", "migrations/**", "vendor/**", "build.rs", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "NOTICE"]
 
 [dependencies]
 flare-db-macros = { version = "=0.1.0", path = "../flare-db-macros" }
@@ -18,9 +18,11 @@ sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio",
 sea-query = { version = "1", default-features = false, features = ["backend-postgres", "backend-sqlite", "with-time"] }
 sea-query-binder = { package = "sea-query-sqlx", version = "0.9.1", default-features = false, features = ["with-time"] }
 time = "0.3"
-# Use a maintained external SQLCipher; SQLx's supported bundles contain older engines.
-# This feature overrides SQLx's ordinary bundled SQLite in libsqlite3-sys.
-libsqlite3-sys = { version = "0.37", optional = true, features = ["sqlcipher"] }
+libsqlite3-sys = { version = "=0.37.0", optional = true }
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+openssl-src = { version = "400.0.1", features = ["no-dso"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
@@ -30,7 +32,11 @@ tempfile = "3"
 default = ["sqlite"]
 postgres = ["sqlx/postgres", "sea-query-binder/sqlx-postgres"]
 sqlite = ["sqlx/sqlite", "sea-query-binder/sqlx-sqlite"]
-sqlcipher = ["sqlite", "dep:libsqlite3-sys"]
+# Backwards-compatible spelling for the external SDK mode.
+sqlcipher = ["sqlcipher-external"]
+sqlcipher-external = ["sqlite", "dep:libsqlite3-sys", "libsqlite3-sys/sqlcipher"]
+# in_gecko supplies bindings only; build.rs supplies the native engine.
+sqlcipher-bundled = ["sqlite", "dep:libsqlite3-sys", "libsqlite3-sys/in_gecko", "dep:cc", "dep:openssl-src"]
 # Gates the Postgres integration test in tests/postgres_integration.rs, which requires a live
 # DATABASE_URL and is not run by default.
 integration-postgres = ["postgres"]

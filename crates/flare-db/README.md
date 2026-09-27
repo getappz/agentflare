@@ -1,6 +1,7 @@
 # flare-db
 
-Async CRUD derives for SQLx 0.9 and SQLite or PostgreSQL. Apache-2.0.
+Async CRUD derives for SQLx 0.9 and SQLite or PostgreSQL. Rust code: Apache-2.0;
+vendored SQLCipher: BSD-3-Clause.
 Requires Rust 1.94 or later. SQL is generated at runtime; entities must match
 your migrations. This is not an ORM, an authorization layer, or a key vault.
 
@@ -8,7 +9,7 @@ your migrations. This is not an ORM, an authorization layer, or a key vault.
 
 ```toml
 [dependencies]
-flare-db = { version = "0.1.0", default-features = false, features = ["sqlcipher"] }
+flare-db = { version = "0.1.1", default-features = false, features = ["sqlcipher-bundled"] }
 sqlx = { version = "0.9", default-features = false, features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
@@ -18,20 +19,49 @@ Select exactly one backend:
 | Features | Storage |
 | --- | --- |
 | `sqlite` (default) | Ordinary SQLite; **not encrypted** |
-| `sqlcipher` | External SQLCipher 4.19+ (major version 4), maintained by the application |
+| `sqlcipher-bundled` | Build and statically link vendored SQLCipher 4.19.0 and OpenSSL |
+| `sqlcipher-external` | Link an application-supplied SQLCipher 4.19+ SDK (major version 4) |
+| `sqlcipher` | Backwards-compatible alias for `sqlcipher-external` |
 | `postgres`, with defaults disabled | PostgreSQL; server encryption is the operator's responsibility |
 
-`postgres` plus `sqlite`/`sqlcipher`, and no backend, are compile errors.
+Select only one SQLCipher mode. Enabling both is a build error.
+`postgres` plus any SQLite mode, and no backend, are compile errors.
 The SQLCipher helper is available under `sqlite` as well, but refuses to open
 the target when the linked library lacks supported SQLCipher 4.19+. It never falls back to
 plaintext. Enabling a feature alone does not encrypt ordinary `Pool::connect`
 calls: encrypted consumers must use `connect_encrypted_sqlite` exclusively.
 
-SQLx 0.9 supports native bindings below 0.38; this crate selects
-`libsqlite3-sys` 0.37 with its **external** `sqlcipher` feature. That feature
-overrides SQLx's ordinary bundled SQLite. Older bundled SQLCipher versions are
-not an acceptable production default: the connector rejects versions before
-4.19.0 and unknown/new major formats. There is no vendored cipher fallback.
+### Bundled native build
+
+`sqlcipher-bundled` builds the pinned source in `vendor/sqlcipher` using `cc`
+and OpenSSL from `openssl-src`. It uses `libsqlite3-sys` 0.37.0's bindings-only
+mode (`in_gecko`) so SQLx does not build a second SQLite engine. Native source
+is included in the Cargo package; the build script does not download an SDK.
+
+On Windows, build for `x86_64-pc-windows-msvc` with Visual Studio C++ Build
+Tools and a full Perl installation, such as Strawberry Perl. If Perl is not
+on PATH, set `OPENSSL_SRC_PERL` to its `perl.exe`. Git for Windows' minimal
+Perl is insufficient. On Linux, install a C compiler, make, and Perl.
+These are **developer/CI requirements only**. The bundled build statically
+links SQLCipher and OpenSSL; end users need neither SDK nor Perl. A Tauri
+installer still needs its normal platform prerequisites and third-party notices.
+
+```powershell
+$env:OPENSSL_SRC_PERL = 'C:\Strawberry\perl\bin\perl.exe'
+cargo build --release
+```
+
+Keep the application's Cargo.lock committed and update dependencies for native
+security fixes. Include this crate's `NOTICE`, `vendor/sqlcipher/LICENSE.md`,
+`vendor/sqlcipher/SQLITE_LICENSE.md`, and `vendor/OPENSSL-LICENSE.txt` with
+distributed applications. This does not confer FIPS validation.
+
+### External native SDK
+
+Use `features = ["sqlcipher-external"]` instead to maintain the SDK yourself.
+That mode uses `libsqlite3-sys`'s external `sqlcipher` linkage, overriding
+SQLx's ordinary bundled SQLite. The connector rejects versions before 4.19.0
+and unknown/new major formats in either mode.
 
 Build or obtain a vetted SQLCipher 4.19+ native SDK for your platform, following
 the [upstream build instructions](https://github.com/sqlcipher/sqlcipher/tree/v4.19.0).
@@ -46,8 +76,8 @@ SQLCipher and crypto shared libraries with the app and configure its runtime
 loader paths. On Windows use an MSVC-compatible `sqlcipher.lib` import library
 and its DLLs. Static linking (`SQLCIPHER_STATIC=1`) also requires the native
 crypto and platform dependencies to be linked. CI builds the pinned 4.19.0
-source commit and tests against it; the crate archive does not contain native
-code or download/build a cipher for the consumer. The application must keep
+source commit and tests against it. External mode does not build the vendored
+cipher. The application must keep
 its native SDK patched; check `PRAGMA cipher_version` during release testing.
 
 Cargo allows one native `sqlite3` provider per binary. Other SQLite users

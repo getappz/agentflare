@@ -33,7 +33,7 @@ async fn missing_or_malformed_keys_never_create_a_file() {
     }
 }
 
-#[cfg(not(feature = "sqlcipher"))]
+#[cfg(not(any(feature = "sqlcipher-external", feature = "sqlcipher-bundled")))]
 #[tokio::test]
 async fn missing_cipher_fails_before_opening_target() {
     let dir = tempfile::tempdir().unwrap();
@@ -45,7 +45,7 @@ async fn missing_cipher_fails_before_opening_target() {
     assert!(!path.exists());
 }
 
-#[cfg(feature = "sqlcipher")]
+#[cfg(any(feature = "sqlcipher-external", feature = "sqlcipher-bundled"))]
 #[tokio::test]
 async fn encrypted_pool_reopen_wrong_key_plaintext_rejection_and_offline_backup() {
     use sqlx::{Connection, sqlite::SqliteConnectOptions};
@@ -60,6 +60,8 @@ async fn encrypted_pool_reopen_wrong_key_plaintext_rejection_and_offline_backup(
         .await
         .unwrap();
     eprintln!("SQLCipher version: {cipher_version}");
+    #[cfg(feature = "sqlcipher-bundled")]
+    assert!(cipher_version.starts_with("4.19.0 "), "{cipher_version}");
     assert!(!format!("{pool:?}").contains(&"2a".repeat(32)));
     assert!(
         !format!("{:?} {:?}", pool.connect_options(), pool.options()).contains(&"2a".repeat(32))

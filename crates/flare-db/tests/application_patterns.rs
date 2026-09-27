@@ -1,5 +1,5 @@
 //! Reuse one encrypted pool; keep application rules in the caller.
-#![cfg(feature = "sqlcipher")]
+#![cfg(any(feature = "sqlcipher-external", feature = "sqlcipher-bundled"))]
 
 use flare_db::{Crud, EncryptedSqliteOptions, Pool, sqlx};
 use sqlx::{

@@ -11,6 +11,23 @@ permissions:
   contents: read
 
 jobs:
+  bundled:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - run: rustup toolchain install 1.94.0 --profile minimal
+      - name: Select full Windows Perl
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (!(Test-Path C:\Strawberry\perl\bin\perl.exe)) { throw 'Strawberry Perl is required' }
+          'OPENSSL_SRC_PERL=C:\Strawberry\perl\bin\perl.exe' >> $env:GITHUB_ENV
+      - run: cargo +1.94.0 test --manifest-path crates/flare-db/Cargo.toml --locked --no-default-features --features sqlcipher-bundled
+      - run: cargo +1.94.0 package --manifest-path crates/flare-db/Cargo.toml --locked --no-default-features --features sqlcipher-bundled
   standalone:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -49,5 +66,6 @@ jobs:
           echo "PKG_CONFIG_PATH=$RUNNER_TEMP/sqlcipher-install/lib/pkgconfig" >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=$RUNNER_TEMP/sqlcipher-install/lib" >> "$GITHUB_ENV"
       - run: cargo +1.94.0 test --manifest-path crates/flare-db/Cargo.toml --locked --features sqlcipher
+      - run: cargo +1.94.0 test --manifest-path crates/flare-db/Cargo.toml --locked --features sqlcipher-external
       - run: cargo +1.94.0 test --manifest-path crates/flare-db/Cargo.toml --locked --no-default-features --features integration-postgres
       - run: cargo +1.94.0 package --manifest-path crates/flare-db-macros/Cargo.toml --locked
