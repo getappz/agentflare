@@ -78,6 +78,19 @@ asset — the recommended path for agent-to-agent work products (prefer this ove
 mcp__flare__handoff(recipient="opencode", name="review-notes", content="please check the API design above")
 ```
 
+### `resume`
+
+Resume a stopped foreign-agent session here (e.g. Claude Code hit its usage limit,
+continue in this CLI). Explicit `session` sends immediately via a live foreign-store
+scan (no `insights sync` needed); omitting it auto-picks the latest session from the
+exhausted agent (needs a prior `agentflare insights sync`) and returns `needs_confirm`
+until the pick is echoed back via `confirm_session`/`session`. `dry_run` previews only.
+
+```text
+mcp__flare__resume(session="ses-abc123")
+mcp__flare__resume(from="claude_code")
+```
+
 ### `webhook`
 
 Register, list, or delete webhooks on the repo's linked workspace.
@@ -321,6 +334,8 @@ MCP Prompts, routed through the same tools above:
   `ultra`, `off`, `status`).
 - `/artifact <command>` — `publish`, `update`, `list`, `get`, `delete`.
 - `/handoff <command>` — `<recipient> <brief>` to send, `inbox [me]`, or `thread <id>`.
+- `/resume <session-id> | latest [--from <agent>]` — resume a stopped session here;
+  explicit ids send immediately, `latest` is confirm-gated (needs a prior `insights sync`).
 - `/git <command>` — `install-hooks`, `install-shim`, `uninstall-shim`, `snapshot
   {list,restore,prune}`, `audit {preview,prune}`, `doctor`.
 - `/pm [command]` — bare enables PM mode and runs the daily kickoff; or `standup`,
