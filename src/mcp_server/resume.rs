@@ -20,6 +20,10 @@ use rmcp::model::ErrorData;
 /// Env override for the insights DB path (tests point it at a temp file).
 pub(crate) const INSIGHTS_DB_ENV: &str = "AGENTFLARE_INSIGHTS_DB";
 
+/// Env override for the artifact store dir (tests point it at a temp dir so
+/// a confirmed send never publishes outside the test).
+pub(crate) const ARTIFACTS_DIR_ENV: &str = "AGENTFLARE_ARTIFACTS_DIR";
+
 pub(crate) fn resume_insights_db() -> std::path::PathBuf {
     match std::env::var(INSIGHTS_DB_ENV) {
         Ok(p) if !p.trim().is_empty() => std::path::PathBuf::from(p),
@@ -72,19 +76,31 @@ impl super::AgentflareMcp {
                 db_path.display()
             ))
         })?;
-        let sessions = store
-            .list_sessions(50, 0)
-            .map_err(|e| internal(format!("session list failed: {e}")))?;
         let target_canon = target.replace('-', "_");
-        let picked = sessions
-            .into_iter()
-            .filter(|s| from == "auto" || s.source.as_str() == from)
-            .find(|s| s.source.as_str() != target_canon)
-            .ok_or_else(|| {
-                invalid(format!(
-                    "no resumable session from '{from_raw}' — run `agentflare insights sync` then `insights list` to find ids, or pass session explicitly"
-                ))
-            })?;
+        // Paginated: filters run per page so an eligible session past the
+        // first page isn't hidden by newer ineligible rows.
+        let picked = {
+            let mut offset = 0usize;
+            loop {
+                let page = store
+                    .list_sessions(50, offset)
+                    .map_err(|e| internal(format!("session list failed: {e}")))?;
+                let page_len = page.len();
+                let found = page
+                    .into_iter()
+                    .filter(|s| from == "auto" || s.source.as_str() == from)
+                    .find(|s| s.source.as_str() != target_canon);
+                if found.is_some() || page_len < 50 {
+                    break found;
+                }
+                offset += page_len;
+            }
+        };
+        let picked = picked.ok_or_else(|| {
+            invalid(format!(
+                "no resumable session from '{from_raw}' — run `agentflare insights sync` then `insights list` to find ids, or pass session explicitly"
+            ))
+        })?;
 
         if dry_run {
             let md = crate::handoff::preview(Some(db_path), &picked.id, &target, &verbosity)
@@ -161,6 +177,10 @@ impl super::AgentflareMcp {
             }))
             .unwrap_or_default());
         }
+        let artifact_dir = std::env::var(ARTIFACTS_DIR_ENV)
+            .ok()
+            .filter(|p| !p.trim().is_empty())
+            .map(std::path::PathBuf::from);
         let out = crate::handoff::send(crate::handoff::SendRequest {
             source: source.to_string(),
             session_id: session_id.to_string(),
@@ -169,7 +189,7 @@ impl super::AgentflareMcp {
             thread: None,
             reply_to: None,
             name: None,
-            artifact_dir: None,
+            artifact_dir,
             depth: 0,
         })
         .map_err(internal)?;
@@ -199,11 +219,43 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
-    fn seed_db(path: &std::path::Path) {
-        let store = flare_insights::store::InsightsStore::open(path).unwrap();
+    /// RAII env override: restores the previous value on drop, including panics.
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvGuard {
+        /// SAFETY: caller must hold `env_lock`; no other thread may read the var.
+        fn set(key: &'static str, val: &std::path::Path) -> Self {
+            let prev = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, val);
+            }
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    fn seed_session(
+        store: &flare_insights::store::InsightsStore,
+        id: &str,
+        source: flare_insights::model::SessionSource,
+        updated_at: chrono::DateTime<chrono::Utc>,
+    ) {
         let session = flare_insights::model::Session {
-            id: "ses-resume-1".into(),
-            source: flare_insights::model::SessionSource::ClaudeCode,
+            id: id.into(),
+            source,
             project: "demo".into(),
             project_path: None,
             title: Some("fix login".into()),
@@ -211,7 +263,7 @@ mod tests {
             status: flare_insights::model::SessionStatus::Abandoned,
             awaiting_reason: None,
             started_at: None,
-            updated_at: chrono::Utc::now(),
+            updated_at,
             ended_at: None,
             duration_secs: None,
             tokens: flare_insights::model::TokenUsage {
@@ -233,6 +285,29 @@ mod tests {
         store.upsert_session(&session).unwrap();
     }
 
+    fn seed_db(path: &std::path::Path) {
+        let store = flare_insights::store::InsightsStore::open(path).unwrap();
+        seed_session(
+            &store,
+            "ses-resume-1",
+            flare_insights::model::SessionSource::ClaudeCode,
+            chrono::Utc::now(),
+        );
+    }
+
+    /// Foreign-store fixture mirroring `handoff::sources` tests: a live
+    /// Claude session the send path can scan without touching real stores.
+    fn seed_foreign_session(root: &std::path::Path) {
+        let proj = root.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("ses-1.jsonl"),
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"fix login\"},\"timestamp\":\"2026-09-25T10:00:00.000Z\"}\n\
+             {\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"on it\",\"model\":\"claude-opus-4\"},\"timestamp\":\"2026-09-25T10:01:00.000Z\"}\n",
+        )
+        .unwrap();
+    }
+
     #[test]
     fn unknown_from_is_rejected() {
         let server = crate::mcp_server::AgentflareMcp::default();
@@ -247,33 +322,28 @@ mod tests {
 
     #[test]
     fn auto_without_db_points_at_insights_sync() {
-        let _guard = env_lock().lock().unwrap();
+        let _lock = env_lock().lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("nope").join("observatory.db");
-        // SAFETY: serialized by env_lock; no other thread reads this var.
-        unsafe {
-            std::env::set_var(INSIGHTS_DB_ENV, &missing);
-        }
+        let _db = EnvGuard::set(INSIGHTS_DB_ENV, &missing);
         let server = crate::mcp_server::AgentflareMcp::default();
         let err = server
             .resume_impl(crate::mcp_server::types::ResumeRequest::default())
             .unwrap_err();
-        unsafe {
-            std::env::remove_var(INSIGHTS_DB_ENV);
-        }
         assert!(format!("{err:?}").contains("insights sync"), "{err:?}");
     }
 
     #[test]
     fn auto_pick_needs_confirm_before_sending() {
-        let _guard = env_lock().lock().unwrap();
+        let _lock = env_lock().lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let db = tmp.path().join("observatory.db");
         seed_db(&db);
-        // SAFETY: serialized by env_lock.
-        unsafe {
-            std::env::set_var(INSIGHTS_DB_ENV, &db);
-        }
+        let _db = EnvGuard::set(INSIGHTS_DB_ENV, &db);
+        // Hermetic publish target: a confirmed send must never reach the
+        // shared artifact store.
+        let artifacts = tmp.path().join("artifacts");
+        let _art = EnvGuard::set(ARTIFACTS_DIR_ENV, &artifacts);
         let server = crate::mcp_server::AgentflareMcp::default();
 
         // First call: zero writes, names the picked session.
@@ -288,7 +358,7 @@ mod tests {
         assert!(first.contains("ses-resume-1"), "{first}");
 
         // Confirming proceeds past the gate (then fails on the live foreign
-        // store, which the fixture doesn't populate — the gate passed).
+        // store, which this test doesn't populate — the gate passed).
         let second = server.resume_impl(crate::mcp_server::types::ResumeRequest {
             from: Some("claude_code".into()),
             to: Some("opencode".into()),
@@ -303,8 +373,83 @@ mod tests {
                 "{e:?}"
             ),
         }
-        unsafe {
-            std::env::remove_var(INSIGHTS_DB_ENV);
+    }
+
+    #[test]
+    fn confirmed_send_publishes_hermetically() {
+        let _lock = env_lock().lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let foreign = tmp.path().join("claude");
+        seed_foreign_session(&foreign);
+        let db = tmp.path().join("observatory.db");
+        let store = flare_insights::store::InsightsStore::open(&db).unwrap();
+        seed_session(
+            &store,
+            "ses-1",
+            flare_insights::model::SessionSource::ClaudeCode,
+            chrono::Utc::now(),
+        );
+        let artifacts = tmp.path().join("artifacts");
+        let _db = EnvGuard::set(INSIGHTS_DB_ENV, &db);
+        let _art = EnvGuard::set(ARTIFACTS_DIR_ENV, &artifacts);
+        // SAFETY: `env_lock` serializes all env-mutating tests in this module.
+        let _claude = EnvGuard::set("CLAUDE_PROJECTS_DIR", &foreign);
+        let server = crate::mcp_server::AgentflareMcp::default();
+
+        let out = server
+            .resume_impl(crate::mcp_server::types::ResumeRequest {
+                from: Some("claude_code".into()),
+                to: Some("opencode".into()),
+                confirm_session: Some("ses-1".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(out.contains("\"status\": \"resumed\""), "{out}");
+        let id = serde_json::from_str::<serde_json::Value>(&out).unwrap()["artifact"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let art = agentflare_artifacts::ArtifactStore::new(artifacts)
+            .get(&id)
+            .unwrap();
+        assert_eq!(art.recipient.as_deref(), Some("opencode"));
+        assert!(art.content.contains("fix login"), "handoff carries context");
+    }
+
+    #[test]
+    fn auto_pick_searches_past_the_first_page() {
+        let _lock = env_lock().lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("observatory.db");
+        let store = flare_insights::store::InsightsStore::open(&db).unwrap();
+        let now = chrono::Utc::now();
+        // 50 newer ineligible rows (receiver's own source) push the one
+        // eligible session past the first page.
+        for i in 0..50 {
+            seed_session(
+                &store,
+                &format!("ses-opencode-{i}"),
+                flare_insights::model::SessionSource::OpenCode,
+                now - chrono::Duration::seconds(i as i64),
+            );
         }
+        seed_session(
+            &store,
+            "ses-old-claude",
+            flare_insights::model::SessionSource::ClaudeCode,
+            now - chrono::Duration::seconds(3600),
+        );
+        let _db = EnvGuard::set(INSIGHTS_DB_ENV, &db);
+        let server = crate::mcp_server::AgentflareMcp::default();
+
+        let out = server
+            .resume_impl(crate::mcp_server::types::ResumeRequest {
+                from: Some("claude_code".into()),
+                to: Some("opencode".into()),
+                dry_run: Some(true),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(out.contains("ses-old-claude"), "{out}");
     }
 }
