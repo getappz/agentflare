@@ -252,13 +252,15 @@ pub fn has_fresh_diagnosis_evidence(record: &SessionRecord) -> bool {
 /// free-text scan on `Task`/`Agent` prompts/descriptions could be satisfied
 /// by a prompt that merely *mentions* review in passing.
 ///
-/// `ReportFindings` is the one structural, harness-provided signal that
+/// `ReportFindings` is a structural, harness-provided signal that
 /// doesn't have either problem: it's the tool this session's code-review
 /// flow calls once (and only once) it has actually examined the diff and
 /// ranked its findings -- calling it, even with an empty findings list,
 /// requires the review work to have already happened. This narrows
 /// automatic detection to review flows that report through this tool (this
-/// session's `/code-review` skill does); a subagent dispatched per
+/// session's `/code-review` skill does). The PostToolUse hook also recognizes
+/// a confirmed `mcp__flare__review(action="submit")` call, which gives Codex
+/// an explicit completion signal. A subagent dispatched per
 /// superpowers' `requesting-code-review` pattern that only returns prose
 /// won't be picked up automatically -- there is no tool call visible to this
 /// hook that reliably marks "the dispatching agent read and acted on that

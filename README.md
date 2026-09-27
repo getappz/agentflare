@@ -255,7 +255,12 @@ agentflare init --agent continue
 Codex loads hooks from `~/.codex/hooks.json`; `init` wires the supported
 agentflare lifecycle hooks there. The `.codex-plugin/` compatibility manifest
 also supports packaging those hooks in a Codex plugin. Use one hook installation
-path per machine so events do not run twice.
+path per machine so events do not run twice. In Codex, review the installed
+hooks with `/hooks` and trust them before relying on them in interactive or
+headless runs. Codex requires trust for non-managed hooks. After reviewing a
+work item, `mcp__flare__review(action="submit", findings=[...])` records review
+completion for the item gate; an empty findings list is valid when the review
+found no issues.
 
 Each run: writes rule files (if absent), installs lean-ctx (native `curl | sh`
 or Homebrew installer) if missing, wires hooks/MCP where the host supports

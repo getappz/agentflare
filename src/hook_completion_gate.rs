@@ -11,6 +11,7 @@ struct PostToolUseInput {
     tool_name: String,
     command: Option<String>,
     exit_code: Option<i32>,
+    is_error: bool,
     output_text: String,
     item_action: Option<String>,
     /// Whether the `item` call's own response says the action actually took
@@ -19,6 +20,7 @@ struct PostToolUseInput {
     /// response shape couldn't be read at all (unparseable/missing), so
     /// callers should treat `None` as "unknown", not "failed".
     item_success: Option<bool>,
+    review_submitted: bool,
 }
 
 /// Best-effort parse of a `tool_response` value into a JSON object,
@@ -29,6 +31,12 @@ struct PostToolUseInput {
 /// these parse -- same "unknown, not false" spirit as the rest of this
 /// module's defensive field lookups.
 fn response_as_json(response: &Value) -> Option<Value> {
+    if response.get("isError").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    if let Some(structured) = response.get("structuredContent") {
+        return Some(structured.clone());
+    }
     if response.is_object() && response.get("content").is_none() {
         return Some(response.clone());
     }
@@ -42,6 +50,23 @@ fn response_as_json(response: &Value) -> Option<Value> {
         .and_then(|block| block.get("text"))
         .and_then(Value::as_str)
         .and_then(|text| serde_json::from_str(text).ok())
+}
+
+/// Codex's shell response puts `Process exited with code N` in its header,
+/// while apply_patch uses `Exit code: N`. Inspect only header lines so test
+/// output mentioning an exit code cannot change the command's result.
+fn exit_code_from_text(response: &Value) -> Option<i32> {
+    response
+        .as_str()?
+        .lines()
+        .take_while(|line| line.trim() != "Output:")
+        .take(6)
+        .find_map(|line| {
+            let line = line.trim();
+            line.strip_prefix("Process exited with code ")
+                .or_else(|| line.strip_prefix("Exit code: "))
+                .and_then(|code| code.parse().ok())
+        })
 }
 
 /// Reads whether an `item done`/`check_merge` call's response says the
@@ -103,7 +128,12 @@ fn parse_post_tool_use(input: &str) -> Option<PostToolUseInput> {
                 .find_map(|key| r.get(key))
         })
         .and_then(Value::as_i64)
-        .map(|n| n as i32);
+        .and_then(|n| i32::try_from(n).ok())
+        .or_else(|| response.and_then(exit_code_from_text));
+    let is_error = response
+        .and_then(|r| r.get("isError"))
+        .and_then(Value::as_bool)
+        == Some(true);
     let output_text = response
         .map(|r| {
             let stdout = r.get("stdout").and_then(Value::as_str).unwrap_or("");
@@ -133,14 +163,22 @@ fn parse_post_tool_use(input: &str) -> Option<PostToolUseInput> {
     let item_success = item_action
         .as_deref()
         .and_then(|action| item_action_succeeded(action, response));
+    let review_submitted = tool_name == "mcp__flare__review"
+        && item_action.as_deref() == Some("submit")
+        && response
+            .and_then(response_as_json)
+            .and_then(|r| r.get("submitted").and_then(Value::as_u64))
+            .is_some();
     Some(PostToolUseInput {
         session_id,
         tool_name,
         command,
         exit_code,
+        is_error,
         output_text,
         item_action,
         item_success,
+        review_submitted,
     })
 }
 
@@ -214,10 +252,10 @@ fn shows_finishing_branch_menu(tool_name: &str, action: &str, item_success: Opti
 /// matches `optimize::is_verification_command`; (2) records diagnosis
 /// evidence the same way when it matches `optimize::is_diagnosis_command`
 /// (both checks run off the same parsed command -- not mutually exclusive);
-/// (3) records review evidence when the `ReportFindings` tool call succeeds
-/// (`optimize::is_review_completion` -- see its doc comment for why this,
-/// specifically, is the trigger rather than a `Skill`/`Task`/`Agent`
-/// dispatch) -- these are the ONLY places their respective evidence is ever
+/// (3) records review evidence when `ReportFindings` succeeds or the flare
+/// review tool confirms a submission (see `optimize::is_review_completion`
+/// for why a `Skill`/`Task`/`Agent` dispatch alone is insufficient) -- these
+/// are the ONLY places their respective evidence is ever
 /// recorded, so `hook_redirect::completion_gate_reason` has something to
 /// check; (4) surfaces the finishing-a-development-branch decision menu once
 /// `item done`/`check_merge` actually succeeds; (5) invalidates recorded
@@ -232,6 +270,20 @@ pub fn post_tool_use(agent: &str) {
     let Some(parsed) = parse_post_tool_use(&input) else {
         return;
     };
+
+    // Codex has no PostToolUseFailure event. Its shell tool reports nonzero
+    // exits through PostToolUse, so classify those here. Codex does not run
+    // PostToolUse for failed MCP results.
+    if agent == "codex"
+        && (parsed.exit_code.is_some_and(|code| code != 0) || parsed.is_error)
+        && let Some(out) =
+            crate::hook::failure_nudge(agent, &parsed.tool_name, &parsed.output_text, false)
+    {
+        println!("{out}");
+    }
+    if parsed.is_error {
+        return;
+    }
 
     if let Some(action) = &parsed.item_action
         && shows_finishing_branch_menu(&parsed.tool_name, action, parsed.item_success)
@@ -265,7 +317,7 @@ pub fn post_tool_use(agent: &str) {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    if crate::optimize::is_review_completion(&parsed.tool_name) {
+    if crate::optimize::is_review_completion(&parsed.tool_name) || parsed.review_submitted {
         let mut runtime = crate::optimize::load_runtime();
         crate::optimize::prune_stale_sessions(&mut runtime, now);
         let record = runtime
@@ -341,6 +393,26 @@ mod tests {
         assert_eq!(parsed.command.as_deref(), Some("cargo test"));
         assert_eq!(parsed.exit_code, Some(0));
         assert!(parsed.item_action.is_none());
+    }
+
+    #[test]
+    fn codex_failed_shell_result_does_not_count_as_passing_verification() {
+        let input = r#"{"session_id":"s1","tool_name":"exec_command","tool_input":{"cmd":"cargo test"},"tool_response":"Chunk ID: abc\nWall time: 0.1 seconds\nProcess exited with code 1\nOutput:\nerror: test failed"}"#;
+        let parsed = parse_post_tool_use(input).unwrap();
+        assert_eq!(parsed.exit_code, Some(1));
+        assert!(!verification_passed(parsed.exit_code, &parsed.output_text));
+        let mentioned_in_output = serde_json::json!(
+            "Wall time: 0.1 seconds\nProcess exited with code 0\nOutput:\nExit code: 1"
+        );
+        assert_eq!(exit_code_from_text(&mentioned_in_output), Some(0));
+    }
+
+    #[test]
+    fn codex_review_submission_requires_a_successful_result() {
+        let input = r#"{"session_id":"s1","tool_name":"mcp__flare__review","tool_input":{"action":"submit","findings":[]},"tool_response":{"content":[{"type":"text","text":"{\"submitted\":0}"}],"isError":false}}"#;
+        assert!(parse_post_tool_use(input).unwrap().review_submitted);
+        let failed = r#"{"session_id":"s1","tool_name":"mcp__flare__review","tool_input":{"action":"submit","findings":[]},"tool_response":{"content":[{"type":"text","text":"{\"submitted\":0}"}],"isError":true}}"#;
+        assert!(!parse_post_tool_use(failed).unwrap().review_submitted);
     }
 
     #[test]

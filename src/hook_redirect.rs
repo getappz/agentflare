@@ -36,6 +36,8 @@ pub(crate) const MUTATING_TOOLS: &[&str] = &[
     "apply_patch",
     "mcp__lean-ctx__ctx_patch",
     "mcp__lean-ctx__ctx_edit",
+    "mcp__lean_ctx__ctx_patch",
+    "mcp__lean_ctx__ctx_edit",
 ];
 
 /// Run `work` under a hard timeout, returning `None` (allow-passthrough) if
@@ -280,7 +282,8 @@ pub(crate) const GATED_ITEM_ACTIONS: &[&str] = &["done", "check_merge"];
 /// passing verification-evidence record (`crate::optimize::VerificationEvidence`,
 /// captured by the `PostToolUse` success hook when a test/build/lint command
 /// runs) AND a fresh review-evidence record (`crate::optimize::ReviewEvidence`,
-/// captured the same way when the `ReportFindings` tool call succeeds --
+/// captured when `ReportFindings` succeeds or a `review(action=submit)`
+/// result confirms submission --
 /// see `optimize::is_review_completion`'s doc comment for why review
 /// *completion*, not a `/code-review` skill or reviewer-subagent *dispatch*,
 /// is the trigger). Closes both the `verification-before-completion` gap
@@ -333,7 +336,7 @@ pub(crate) fn completion_gate_reason(
     }
     if !has_fresh_review {
         return Some(format!(
-            "no fresh code review evidence for this session -- run a review that reports through the `ReportFindings` tool (this session's `/code-review` skill does) before calling `item` action={action}; a review more than {}m ago doesn't count, and dispatching a reviewer subagent isn't enough on its own -- its findings have to actually come back and get reported.",
+            "no fresh code review evidence for this session -- report the completed review through `ReportFindings` or `mcp__flare__review(action=\"submit\", findings=[...])` before calling `item` action={action}; an empty findings list is valid after reviewing, but a reviewer dispatch alone does not count. A review more than {}m ago doesn't count.",
             crate::optimize::VERIFICATION_FRESHNESS_SECS / 60
         ));
     }
