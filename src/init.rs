@@ -207,11 +207,21 @@ fn add_hook_entry(
         .or_insert_with(|| json!([]))
         .as_array_mut()
         .unwrap();
-    if let Some(existing) = arr
-        .iter_mut()
-        .find(|v| v.to_string().contains(marker))
-        .and_then(Value::as_object_mut)
-    {
+    let matching_handler = arr.iter().enumerate().find_map(|(entry_idx, entry)| {
+        entry
+            .get("hooks")?
+            .as_array()?
+            .iter()
+            .position(|handler| {
+                handler
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(|existing_command| existing_command.contains(marker))
+            })
+            .map(|handler_idx| (entry_idx, handler_idx))
+    });
+    if let Some((entry_idx, handler_idx)) = matching_handler {
+        let existing = arr[entry_idx].as_object_mut().unwrap();
         let mut changed = false;
         if let Some(m) = matcher
             && existing.get("matcher").and_then(Value::as_str) != Some(m)
@@ -222,7 +232,7 @@ fn add_hook_entry(
         if let Some(handler) = existing
             .get_mut("hooks")
             .and_then(Value::as_array_mut)
-            .and_then(|hooks| hooks.first_mut())
+            .and_then(|hooks| hooks.get_mut(handler_idx))
             .and_then(Value::as_object_mut)
         {
             if handler.get("command").and_then(Value::as_str) != Some(command.as_str()) {
@@ -1249,6 +1259,35 @@ mod tests {
             wire_codex_hooks();
             assert_eq!(fs::read_to_string(&hooks_path).unwrap(), first);
         });
+    }
+
+    #[test]
+    fn updating_hook_keeps_other_commands_in_the_same_entry() {
+        let mut hooks = json!({
+            "PreToolUse": [{
+                "hooks": [
+                    {"type": "command", "command": "user-hook", "timeout": 7},
+                    {"type": "command", "command": "old-agentflare hook pre-tool-use", "timeout": 5}
+                ]
+            }]
+        });
+        let changed = add_hook_entry(
+            hooks.as_object_mut().unwrap(),
+            "PreToolUse",
+            "hook pre-tool-use",
+            None,
+            "new-agentflare hook pre-tool-use --agent codex".to_string(),
+            6,
+        );
+        assert!(changed);
+        let handlers = hooks["PreToolUse"][0]["hooks"].as_array().unwrap();
+        assert_eq!(handlers[0]["command"], "user-hook");
+        assert_eq!(handlers[0]["timeout"], 7);
+        assert_eq!(
+            handlers[1]["command"],
+            "new-agentflare hook pre-tool-use --agent codex"
+        );
+        assert_eq!(handlers[1]["timeout"], 6);
     }
 
     #[test]

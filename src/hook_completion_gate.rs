@@ -12,6 +12,7 @@ struct PostToolUseInput {
     command: Option<String>,
     exit_code: Option<i32>,
     is_error: bool,
+    is_running: bool,
     output_text: String,
     item_action: Option<String>,
     /// Whether the `item` call's own response says the action actually took
@@ -67,6 +68,13 @@ fn exit_code_from_text(response: &Value) -> Option<i32> {
                 .or_else(|| line.strip_prefix("Exit code: "))
                 .and_then(|code| code.parse().ok())
         })
+}
+
+/// lean-ctx appends this status to failed shell output; successful calls may
+/// omit it. Check the final line so command output cannot impersonate status.
+fn ctx_shell_exit_code(output_text: &str) -> Option<i32> {
+    let last = output_text.lines().last()?.trim();
+    last.strip_prefix("[exit:")?.strip_suffix(']')?.parse().ok()
 }
 
 /// Reads whether an `item done`/`check_merge` call's response says the
@@ -160,6 +168,20 @@ fn parse_post_tool_use(input: &str) -> Option<PostToolUseInput> {
                 .to_string()
         })
         .unwrap_or_default();
+    let exit_code = exit_code.or_else(|| {
+        tool_name
+            .ends_with("__ctx_shell")
+            .then(|| ctx_shell_exit_code(&output_text))
+            .flatten()
+    });
+    let is_running = output_text.contains("Process running with session ID")
+        || output_text.starts_with("[background:")
+        || output_text.starts_with("[auto-background:")
+        || response
+            .and_then(|r| r.get("structuredContent"))
+            .and_then(|r| r.get("state"))
+            .and_then(Value::as_str)
+            == Some("running");
     let item_success = item_action
         .as_deref()
         .and_then(|action| item_action_succeeded(action, response));
@@ -175,6 +197,7 @@ fn parse_post_tool_use(input: &str) -> Option<PostToolUseInput> {
         command,
         exit_code,
         is_error,
+        is_running,
         output_text,
         item_action,
         item_success,
@@ -211,6 +234,20 @@ fn verification_passed(exit_code: Option<i32>, output_text: &str) -> bool {
     !VERIFICATION_FAILURE_MARKERS
         .iter()
         .any(|marker| lower.contains(marker))
+}
+
+fn verification_passed_for_hook(
+    agent: &str,
+    tool_name: &str,
+    exit_code: Option<i32>,
+    output_text: &str,
+) -> bool {
+    // Codex's native Bash hook response contains raw stdout only, even when
+    // the process exited nonzero. An unknown exit status cannot prove a pass.
+    if agent == "codex" && matches!(tool_name, "Bash" | "exec_command") && exit_code.is_none() {
+        return false;
+    }
+    verification_passed(exit_code, output_text)
 }
 
 /// Agentflare-flavored port of superpowers' `finishing-a-development-branch`
@@ -281,7 +318,7 @@ pub fn post_tool_use(agent: &str) {
     {
         println!("{out}");
     }
-    if parsed.is_error {
+    if parsed.is_error || parsed.is_running {
         return;
     }
 
@@ -348,7 +385,12 @@ pub fn post_tool_use(agent: &str) {
         return;
     }
 
-    let passed = verification_passed(parsed.exit_code, &parsed.output_text);
+    let passed = verification_passed_for_hook(
+        agent,
+        &parsed.tool_name,
+        parsed.exit_code,
+        &parsed.output_text,
+    );
 
     let mut runtime = crate::optimize::load_runtime();
     crate::optimize::prune_stale_sessions(&mut runtime, now);
@@ -405,6 +447,39 @@ mod tests {
             "Wall time: 0.1 seconds\nProcess exited with code 0\nOutput:\nExit code: 1"
         );
         assert_eq!(exit_code_from_text(&mentioned_in_output), Some(0));
+    }
+
+    #[test]
+    fn codex_native_bash_needs_explicit_exit_status_for_verification() {
+        assert!(!verification_passed_for_hook("codex", "Bash", None, ""));
+        assert!(!verification_passed_for_hook(
+            "codex",
+            "Bash",
+            None,
+            "test result: ok"
+        ));
+        assert!(verification_passed_for_hook("codex", "Bash", Some(0), ""));
+        assert!(verification_passed_for_hook(
+            "claude-code",
+            "Bash",
+            None,
+            ""
+        ));
+    }
+
+    #[test]
+    fn running_shell_result_and_lean_ctx_failure_are_parsed() {
+        let running = r#"{"session_id":"s1","tool_name":"Bash","tool_input":{"command":"cargo test"},"tool_response":"Process running with session ID 42\nOutput:"}"#;
+        assert!(parse_post_tool_use(running).unwrap().is_running);
+        let failed = r#"{"session_id":"s1","tool_name":"mcp__lean_ctx__ctx_shell","tool_input":{"command":"cargo test"},"tool_response":{"content":[{"type":"text","text":"test failed\n[exit:1]"}],"isError":false}}"#;
+        let parsed = parse_post_tool_use(failed).unwrap();
+        assert_eq!(parsed.exit_code, Some(1));
+        assert!(!verification_passed_for_hook(
+            "codex",
+            &parsed.tool_name,
+            parsed.exit_code,
+            &parsed.output_text
+        ));
     }
 
     #[test]

@@ -260,7 +260,9 @@ hooks with `/hooks` and trust them before relying on them in interactive or
 headless runs. Codex requires trust for non-managed hooks. After reviewing a
 work item, `mcp__flare__review(action="submit", findings=[...])` records review
 completion for the item gate; an empty findings list is valid when the review
-found no issues.
+found no issues. For verification, run tests through `mcp__lean_ctx__ctx_shell`:
+Codex's native Bash hook omits the process exit status, so its result cannot
+prove that a test passed.
 
 Each run: writes rule files (if absent), installs lean-ctx (native `curl | sh`
 or Homebrew installer) if missing, wires hooks/MCP where the host supports
