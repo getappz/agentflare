@@ -128,11 +128,19 @@ async fn crud_roundtrip_against_in_memory_sqlite() {
 #[tokio::test]
 async fn caller_transaction_and_failed_batch_roll_back() {
     let dir = tempfile::tempdir().unwrap();
-    #[cfg(any(feature = "sqlcipher-external", feature = "sqlcipher-bundled"))]
+    #[cfg(any(
+        feature = "sqlcipher-external",
+        feature = "sqlcipher-bundled",
+        feature = "sqlcipher-bundled-external-openssl"
+    ))]
     let pool = flare_db::connect_encrypted_sqlite(dir.path().join("atomic.db"), &[42; 32], true)
         .await
         .unwrap();
-    #[cfg(not(any(feature = "sqlcipher-external", feature = "sqlcipher-bundled")))]
+    #[cfg(not(any(
+        feature = "sqlcipher-external",
+        feature = "sqlcipher-bundled",
+        feature = "sqlcipher-bundled-external-openssl"
+    )))]
     let pool = {
         let _ = &dir;
         flare_db::Pool::connect("sqlite::memory:").await.unwrap()

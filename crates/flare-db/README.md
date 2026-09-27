@@ -9,7 +9,7 @@ your migrations. This is not an ORM, an authorization layer, or a key vault.
 
 ```toml
 [dependencies]
-flare-db = { version = "0.1.1", default-features = false, features = ["sqlcipher-bundled"] }
+flare-db = { version = "0.1.2", default-features = false, features = ["sqlcipher-bundled"] }
 sqlx = { version = "0.9", default-features = false, features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
@@ -20,11 +20,12 @@ Select exactly one backend:
 | --- | --- |
 | `sqlite` (default) | Ordinary SQLite; **not encrypted** |
 | `sqlcipher-bundled` | Build and statically link vendored SQLCipher 4.19.0 and OpenSSL |
+| `sqlcipher-bundled-external-openssl` | Build SQLCipher 4.19.0; dynamically link a prebuilt OpenSSL SDK (no Perl) |
 | `sqlcipher-external` | Link an application-supplied SQLCipher 4.19+ SDK (major version 4) |
 | `sqlcipher` | Backwards-compatible alias for `sqlcipher-external` |
 | `postgres`, with defaults disabled | PostgreSQL; server encryption is the operator's responsibility |
 
-Select only one SQLCipher mode. Enabling both is a build error.
+Select only one SQLCipher mode. Combining modes is a build error.
 `postgres` plus any SQLite mode, and no backend, are compile errors.
 The SQLCipher helper is available under `sqlite` as well, but refuses to open
 the target when the linked library lacks supported SQLCipher 4.19+. It never falls back to
@@ -57,6 +58,53 @@ security fixes. Include this crate's `NOTICE`, `vendor/sqlcipher/LICENSE.md`,
 distributed applications. This does not confer FIPS validation.
 
 ### External native SDK
+
+To compile SQLCipher locally **without building OpenSSL or requiring Perl**,
+select `sqlcipher-bundled-external-openssl`. This mode supports Windows MSVC
+and Linux with a prebuilt OpenSSL 3 or 4 development SDK. It adds no Rust
+OpenSSL dependency and does not download or discover an SDK automatically.
+You still need a C compiler (MSVC C++ Build Tools on Windows).
+
+```toml
+flare-db = { version = "0.1.2", default-features = false, features = ["sqlcipher-bundled-external-openssl"] }
+```
+
+```powershell
+$env:OPENSSL_DIR = "$env:USERPROFILE\scoop\apps\openssl\current"
+$env:OPENSSL_INCLUDE_DIR = "$env:OPENSSL_DIR\include"
+$env:OPENSSL_LIB_DIR = "$env:OPENSSL_DIR\lib"
+$env:OPENSSL_STATIC = '0'
+cargo build --release
+```
+
+Supply absolute paths. Explicit include/lib directories override `OPENSSL_DIR`;
+otherwise its `include` and `lib` subdirectories are used. On Windows the library
+directory must contain the matching architecture's **import** `libcrypto.lib`
+(some installers use `lib\VC\x64\MD`). On Linux use the directory containing
+`libcrypto.so` and set the runtime loader path if it is outside system locations.
+This feature always requests dynamic crypto linkage; `OPENSSL_STATIC=1` is
+rejected. For fully static crypto, use the original `sqlcipher-bundled` mode.
+
+For a Windows installer, inspect the final executable with `dumpbin /DEPENDENTS`
+and copy the **exact imported crypto DLL from the same SDK** beside that
+executable (for the tested OpenSSL 4 x64 SDK, `libcrypto-4-x64.dll`). Do not rename
+an OpenSSL 3 DLL to an OpenSSL 4 name or pick the first recursive match. If the
+database lives in a Tauri sidecar, stage the DLL beside that sidecar as well;
+putting it in an unrelated resources subdirectory is insufficient. A Tauri
+resource mapping can place the explicitly selected DLL at the install root:
+
+```json
+"resources": { "binaries/libcrypto-4-x64.dll": "./" }
+```
+
+Verify the installed executable with a restricted PATH, including an encrypted
+create/reopen operation. SQLCipher and `libssl` DLLs are not required by this
+mode; the OpenSSL SDK's own runtime dependencies and Windows/MSVC runtime still
+apply. Include the actual SDK's licenses/notices and keep it patched. SDKs,
+headers, import libraries, C compilers and Perl are not end-user prerequisites.
+The library does not edit application installer settings or copy DLLs for you.
+
+### Fully external SQLCipher SDK
 
 Use `features = ["sqlcipher-external"]` instead to maintain the SDK yourself.
 That mode uses `libsqlite3-sys`'s external `sqlcipher` linkage, overriding
