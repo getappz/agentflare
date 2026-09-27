@@ -964,10 +964,14 @@
     }
 
     #[test]
-    fn headless_full_args_adds_nothing_when_json_is_not_requested_or_unsupported() {
-        let extra = vec!["--full-auto".to_string()];
+    fn headless_full_args_adds_codex_json_only_when_requested() {
+        let extra = vec!["--sandbox".to_string(), "workspace-write".to_string()];
         assert_eq!(headless_full_args(Agent::ClaudeCode, false, &extra), extra);
-        assert_eq!(headless_full_args(Agent::Codex, true, &extra), extra);
+        assert_eq!(headless_full_args(Agent::Codex, false, &extra), extra);
+        assert_eq!(
+            headless_full_args(Agent::Codex, true, &extra),
+            vec!["--json", "--sandbox", "workspace-write"]
+        );
     }
 
     #[cfg(unix)]
