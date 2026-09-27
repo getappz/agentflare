@@ -1185,9 +1185,9 @@ mod tests {
             // Backfilled fresh, so it's the new flagless form...
             assert!(content.contains("hook pre-tool-use"));
             assert!(!content.contains("hook pre-tool-use --agent"));
-            // ...while the pre-existing old-format entries are left as-is,
-            // not duplicated or rewritten.
-            assert!(content.contains("hook session-start --agent claude-code"));
+            // Existing agentflare entries are refreshed without duplication.
+            assert!(content.contains("hook session-start"));
+            assert!(!content.contains("hook session-start --agent claude-code"));
             assert_eq!(parsed["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
         });
     }
