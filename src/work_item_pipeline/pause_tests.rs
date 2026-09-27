@@ -193,7 +193,7 @@ fn pause_then_resume_continues_the_same_run_in_the_same_worktree() {
         // driver itself hadn't let go yet at the 60s mark under that run's
         // load. 150s gives real margin over the observed ~62s without
         // approaching the 300s nextest override's own ceiling.
-        cancel.store(false, Ordering::SeqCst);
+        // Keep the in-flight send cancelled until its driver releases the run.
         let mut resumed = None;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(150);
         while std::time::Instant::now() < deadline {
