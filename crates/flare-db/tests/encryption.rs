@@ -33,7 +33,11 @@ async fn missing_or_malformed_keys_never_create_a_file() {
     }
 }
 
-#[cfg(not(any(feature = "sqlcipher-external", feature = "sqlcipher-bundled")))]
+#[cfg(not(any(
+    feature = "sqlcipher-external",
+    feature = "sqlcipher-bundled",
+    feature = "sqlcipher-bundled-external-openssl"
+)))]
 #[tokio::test]
 async fn missing_cipher_fails_before_opening_target() {
     let dir = tempfile::tempdir().unwrap();
@@ -45,7 +49,11 @@ async fn missing_cipher_fails_before_opening_target() {
     assert!(!path.exists());
 }
 
-#[cfg(any(feature = "sqlcipher-external", feature = "sqlcipher-bundled"))]
+#[cfg(any(
+    feature = "sqlcipher-external",
+    feature = "sqlcipher-bundled",
+    feature = "sqlcipher-bundled-external-openssl"
+))]
 #[tokio::test]
 async fn encrypted_pool_reopen_wrong_key_plaintext_rejection_and_offline_backup() {
     use sqlx::{Connection, sqlite::SqliteConnectOptions};
@@ -60,8 +68,23 @@ async fn encrypted_pool_reopen_wrong_key_plaintext_rejection_and_offline_backup(
         .await
         .unwrap();
     eprintln!("SQLCipher version: {cipher_version}");
-    #[cfg(feature = "sqlcipher-bundled")]
+    #[cfg(any(
+        feature = "sqlcipher-bundled",
+        feature = "sqlcipher-bundled-external-openssl"
+    ))]
     assert!(cipher_version.starts_with("4.19.0 "), "{cipher_version}");
+    #[cfg(feature = "sqlcipher-bundled-external-openssl")]
+    {
+        let provider: String = sqlx::query_scalar("PRAGMA cipher_provider_version")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        eprintln!("Crypto provider: {provider}");
+        assert!(
+            provider.starts_with("OpenSSL 3.") || provider.starts_with("OpenSSL 4."),
+            "{provider}"
+        );
+    }
     assert!(!format!("{pool:?}").contains(&"2a".repeat(32)));
     assert!(
         !format!("{:?} {:?}", pool.connect_options(), pool.options()).contains(&"2a".repeat(32))
