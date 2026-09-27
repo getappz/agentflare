@@ -1,0 +1,19 @@
+flare-db
+Copyright 2026 getappz
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+The unrelated code covered by the repository-wide NOTICE (pricing, coaching,
+embedding, output compression and code-review rules) is not included here.
+
+The sqlcipher-bundled feature builds SQLCipher 4.19.0 from the vendored
+amalgamation and statically links OpenSSL built by openssl-src. SQLCipher is
+Copyright (c) 2025, ZETETIC LLC, all rights reserved, under BSD-3-Clause:
+see vendor/sqlcipher/LICENSE.md. SQLite's public-domain notice is in
+vendor/sqlcipher/SQLITE_LICENSE.md. OpenSSL 4.0.2 is Copyright 1998-2026 The
+OpenSSL Project Authors, licensed under Apache-2.0: see vendor/OPENSSL-LICENSE.txt.
+Retain these notices and licenses when distributing linked applications.
+
+The sqlcipher-external feature (also named sqlcipher for compatibility) links
+an application-supplied native SDK; retain that SDK's actual cipher and
+crypto-provider notices. Neither mode confers commercial SQLCipher licensing
+or FIPS validation.

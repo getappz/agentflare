@@ -1,4 +1,4 @@
-use sea_query::{Expr, SimpleExpr};
+use sea_query::{Expr, ExprTrait, SimpleExpr};
 
 /// One filter condition on a single column, generated per-field on `{Entity}Filter`
 /// structs by the `Crud` derive. Mirrors Medusa's dynamic filter operator set.

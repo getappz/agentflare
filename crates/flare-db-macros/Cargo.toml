@@ -5,10 +5,12 @@
 name = "flare-db-macros"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.91"
+rust-version = "1.94"
 license = "Apache-2.0"
 description = "Proc-macro crate for flare-db: derives the Crud impl (list/get/create/update/delete/count) for sqlx-backed entities. Not meant to be depended on directly — use flare-db."
-publish = false
+repository = "https://github.com/getappz/agentflare"
+readme = "README.md"
+include = ["src/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "NOTICE"]
 
 [lib]
 proc-macro = true

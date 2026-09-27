@@ -13,6 +13,12 @@ pub type Pool = sqlx::PgPool;
 #[cfg(feature = "sqlite")]
 pub type Pool = sqlx::SqlitePool;
 
+/// SQLx database type for the selected backend, used by generated executors.
+#[cfg(feature = "postgres")]
+pub type Database = sqlx::Postgres;
+#[cfg(feature = "sqlite")]
+pub type Database = sqlx::Sqlite;
+
 /// The sea-query builder for the active backend — used by generated code to render
 /// dialect-correct SQL (placeholder syntax, quoting) for either backend uniformly.
 #[cfg(feature = "postgres")]
