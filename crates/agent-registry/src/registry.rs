@@ -355,16 +355,15 @@ pub fn headless_args(agent: Agent) -> Option<&'static [&'static str]> {
 pub fn autonomous_args(agent: Agent) -> Option<&'static [&'static str]> {
     match agent {
         Agent::ClaudeCode => Some(&["--dangerously-skip-permissions"]),
-        // `codex exec --dangerously-bypass-approvals-and-sandbox`: "Skip all
-        // confirmation prompts and execute commands without sandboxing.
-        // [...] Intended solely for running in environments that are
-        // externally sandboxed" — confirmed via `codex exec --help`
-        // (codex-cli 0.157.0). The direct analogue of claude-code's
-        // `--dangerously-skip-permissions`; agentflare-jobs already wraps
-        // every dispatch in bwrap, which is the external sandbox codex
-        // expects. `--full-auto` no longer exists (item #307): codex rejected
-        // it at argv parse time before the model ever ran.
-        Agent::Codex => Some(&["--dangerously-bypass-approvals-and-sandbox"]),
+        // Keep Codex's sandbox even when bwrap is unavailable (including
+        // Windows/macOS). Explicit exec options replace `--full-auto` without
+        // granting unrestricted host access or waiting for approval prompts.
+        Agent::Codex => Some(&[
+            "--sandbox",
+            "workspace-write",
+            "-c",
+            "approval_policy=\"never\"",
+        ]),
         Agent::GeminiCli => Some(&["--yolo"]),
         // `opencode run --auto`: "auto-approve permissions that are not
         // explicitly denied" — confirmed via `opencode run --help`.
@@ -537,10 +536,17 @@ mod tests {
     }
 
     #[test]
-    fn autonomous_args_maps_codex_to_bypass_approvals_and_sandbox() {
+    fn autonomous_args_keeps_codex_sandbox_without_approval_prompts() {
         assert_eq!(
             autonomous_args(Agent::Codex),
-            Some(&["--dangerously-bypass-approvals-and-sandbox"][..])
+            Some(
+                &[
+                    "--sandbox",
+                    "workspace-write",
+                    "-c",
+                    "approval_policy=\"never\""
+                ][..]
+            )
         );
     }
 

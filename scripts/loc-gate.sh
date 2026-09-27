@@ -89,8 +89,8 @@ ALLOWLIST=(
   # refactor. Frozen at <= FROZEN_LIMIT; a real split is separate work.
   src/supervisor.rs
   # Already 1660 lines on master before item #307's codex argv fix touched
-  # it (two test-vector lines swapped `--full-auto` for
-  # `--dangerously-bypass-approvals-and-sandbox`, net zero lines) --
+  # it (two test-vector lines swapped the removed Codex autonomy flag for
+  # explicit sandbox options, net zero lines) --
   # pre-existing debt this one-flag bugfix shouldn't have to carry. Frozen
   # at <= FROZEN_LIMIT; a real split is separate work.
   src/workflow.rs
