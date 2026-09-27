@@ -1,0 +1,51 @@
+name: flare-db
+
+on:
+  pull_request:
+    paths: ['crates/flare-db/**', 'crates/flare-db-macros/**', '.github/workflows/flare-db.yml']
+  push:
+    branches: [master]
+    paths: ['crates/flare-db/**', 'crates/flare-db-macros/**', '.github/workflows/flare-db.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  standalone:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: flare-db-test-only
+          POSTGRES_DB: flare_db_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 10s
+          --health-timeout 5s --health-retries 5
+    env:
+      DATABASE_URL: postgres://postgres:flare-db-test-only@localhost:5432/flare_db_test
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - run: rustup toolchain install 1.94.0 --profile minimal
+      - run: cargo +1.94.0 test --manifest-path crates/flare-db/Cargo.toml --locked
+      - name: Build supported SQLCipher 4.19.0
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev tcl-dev
+          git clone --depth 1 --branch v4.19.0 https://github.com/sqlcipher/sqlcipher.git "$RUNNER_TEMP/sqlcipher-source"
+          cd "$RUNNER_TEMP/sqlcipher-source"
+          test "$(git rev-parse HEAD)" = c4b275a47932888216bade83aff2bbc73df0ff85
+          ./configure --prefix="$RUNNER_TEMP/sqlcipher-install" --with-tempstore=yes \
+            CFLAGS="-DSQLITE_HAS_CODEC -DSQLITE_EXTRA_INIT=sqlcipher_extra_init -DSQLITE_EXTRA_SHUTDOWN=sqlcipher_extra_shutdown" \
+            LDFLAGS="-lcrypto"
+          make -j2
+          make install
+          echo "SQLCIPHER_LIB_DIR=$RUNNER_TEMP/sqlcipher-install/lib" >> "$GITHUB_ENV"
+          echo "SQLCIPHER_INCLUDE_DIR=$RUNNER_TEMP/sqlcipher-install/include" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$RUNNER_TEMP/sqlcipher-install/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/sqlcipher-install/lib" >> "$GITHUB_ENV"
+      - run: cargo +1.94.0 test --manifest-path crates/flare-db/Cargo.toml --locked --features sqlcipher
+      - run: cargo +1.94.0 test --manifest-path crates/flare-db/Cargo.toml --locked --no-default-features --features integration-postgres
+      - run: cargo +1.94.0 package --manifest-path crates/flare-db-macros/Cargo.toml --locked

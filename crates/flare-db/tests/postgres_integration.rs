@@ -78,12 +78,83 @@ async fn crud_roundtrip_against_live_postgres() {
     assert!(Post::get(&pool, created.id).await.unwrap().is_none());
     // soft-deleted rows are excluded from reads but not physically removed
     assert_eq!(Post::count(&pool).await.unwrap(), 0);
+    assert_eq!(
+        Post::list_and_count(&pool, flare_db::Page::default())
+            .await
+            .unwrap()
+            .1,
+        0
+    );
 
     Post::restore(&pool, created.id).await.unwrap();
     assert!(Post::get(&pool, created.id).await.unwrap().is_some());
+
+    let mut tx = pool.begin().await.unwrap();
+    Post::create_one(
+        &mut *tx,
+        PostNew {
+            title: "rollback".into(),
+            body: "body".into(),
+        },
+    )
+    .await
+    .unwrap();
+    Post::update_many(
+        &mut *tx,
+        vec![(
+            created.id,
+            PostPatch {
+                title: Some("nested".into()),
+                ..Default::default()
+            },
+        )],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        Post::list_and_count(&mut *tx, flare_db::Page::default())
+            .await
+            .unwrap()
+            .1,
+        2
+    );
+    tx.rollback().await.unwrap();
+    assert_eq!(Post::count(&pool).await.unwrap(), 1);
+    assert_eq!(
+        Post::get(&pool, created.id).await.unwrap().unwrap().title,
+        "bye"
+    );
+    assert!(
+        Post::update_many(
+            &pool,
+            vec![
+                (
+                    created.id,
+                    PostPatch {
+                        title: Some("partial".into()),
+                        ..Default::default()
+                    }
+                ),
+                (
+                    -1,
+                    PostPatch {
+                        title: Some("missing".into()),
+                        ..Default::default()
+                    }
+                ),
+            ]
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        Post::get(&pool, created.id).await.unwrap().unwrap().title,
+        "bye"
+    );
 
     sqlx::query("DROP TABLE postgres_integration_posts")
         .execute(&pool)
         .await
         .unwrap();
+    pool.close().await;
 }

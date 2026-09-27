@@ -1,0 +1,13 @@
+flare-db
+Copyright 2026 getappz
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+The unrelated code covered by the repository-wide NOTICE (pricing, coaching,
+embedding, output compression and code-review rules) is not included here.
+
+The optional sqlcipher feature links an externally supplied SQLCipher library
+through libsqlite3-sys. No SQLCipher or crypto implementation is vendored in
+this crate archive. Applications distributing native binaries must retain the
+applicable SQLCipher BSD-style and crypto-provider license notices alongside
+their other third-party notices. This crate does not confer commercial
+SQLCipher licensing or FIPS validation.
