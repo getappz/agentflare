@@ -311,10 +311,10 @@ fn build_failure_message(tool_name: &str, failure_text: &str) -> String {
 /// its only event-specific output field is `additionalContext` -- NOT
 /// `permissionDecision`/`permissionDecisionReason`, which the hooks
 /// reference assigns exclusively to PreToolUse.
-fn build_failure_decision(message: &str, severity: &str) -> serde_json::Value {
+fn build_failure_decision(message: &str, severity: &str, event: &str) -> serde_json::Value {
     json!({
         "hookSpecificOutput": {
-            "hookEventName": "PostToolUseFailure",
+            "hookEventName": event,
             "additionalContext": format!(
                 "Possible friction: {message}. If this is genuine friction (not an ordinary expected failure), call mcp__flare__vent with a concise, specific message and severity={severity}."
             ),
@@ -335,14 +335,28 @@ pub fn post_tool_failure(agent: &str) {
     let Some(parsed) = parse_post_tool_failure(&input) else {
         return;
     };
-    // A user-initiated interrupt (e.g. Esc during a long Bash call) is not
-    // friction -- nudging on it would also burn the topic's cooldown for a
-    // real failure later.
-    if parsed.is_interrupt {
-        return;
+    if let Some(out) = failure_nudge(
+        agent,
+        &parsed.tool_name,
+        &parsed.failure_text,
+        parsed.is_interrupt,
+    ) {
+        println!("{out}");
     }
+}
 
-    let message = build_failure_message(&parsed.tool_name, &parsed.failure_text);
+/// Shared by Claude's failure event and Codex's failed `PostToolUse` result.
+pub(crate) fn failure_nudge(
+    agent: &str,
+    tool_name: &str,
+    failure_text: &str,
+    is_interrupt: bool,
+) -> Option<serde_json::Value> {
+    // A user-initiated interrupt must not burn the cooldown for a real failure.
+    if is_interrupt {
+        return None;
+    }
+    let message = build_failure_message(tool_name, failure_text);
     let topic_key = crate::vent::classify::topic_key(&message);
     let severity = if crate::vent::classify::origin(&message) == "agentflare-core" {
         "high"
@@ -352,7 +366,7 @@ pub fn post_tool_failure(agent: &str) {
     let seen_count = crate::vent::capture::recent_count_for_topic(&topic_key);
 
     if !crate::vent::classify::classify(severity, seen_count, &message) {
-        return;
+        return None;
     }
 
     // Scoped by agent (item #220) so two agents/hosts sharing a topic don't
@@ -360,11 +374,18 @@ pub fn post_tool_failure(agent: &str) {
     // other's.
     let pace_key = format!("vent-nudge:{agent}:{topic_key}");
     if !crate::nudge_pace::should_fire(&pace_key, crate::nudge_pace::DEFAULT_COOLDOWN) {
-        return;
+        return None;
     }
     crate::nudge_pace::mark_fired(&pace_key);
-
-    println!("{}", build_failure_decision(&message, severity));
+    Some(build_failure_decision(
+        &message,
+        severity,
+        if agent == "codex" {
+            "PostToolUse"
+        } else {
+            "PostToolUseFailure"
+        },
+    ))
 }
 
 // PostToolUse (success) command hook lives in `hook_completion_gate` (item
@@ -960,7 +981,7 @@ mod tests {
 
     #[test]
     fn failure_decision_uses_additional_context_for_post_tool_use_failure() {
-        let d = build_failure_decision("Bash failed: boom", "medium");
+        let d = build_failure_decision("Bash failed: boom", "medium", "PostToolUseFailure");
         assert_eq!(
             d["hookSpecificOutput"]["hookEventName"],
             "PostToolUseFailure"

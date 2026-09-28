@@ -28,6 +28,9 @@ FROZEN_LIMIT=2750
 ALLOWLIST=(
   src/mcp_server.rs
   src/components.rs
+  # Already 1546 lines before the Codex session-resume error fix touched it;
+  # freeze this pre-existing debt at FROZEN_LIMIT until a separate split.
+  src/work_item_pipeline.rs
   # Already 1790 lines on master before this fix touched it -- pre-existing
   # debt, not something a security patch should take on splitting. Frozen
   # at <= FROZEN_LIMIT like the others; a real split is separate work.
@@ -88,12 +91,6 @@ ALLOWLIST=(
   # logic into submodules is worth doing but is a separate, larger
   # refactor. Frozen at <= FROZEN_LIMIT; a real split is separate work.
   src/supervisor.rs
-  # Already 1660 lines on master before item #307's codex argv fix touched
-  # it (two test-vector lines swapped the removed Codex autonomy flag for
-  # explicit sandbox options, net zero lines) --
-  # pre-existing debt this one-flag bugfix shouldn't have to carry. Frozen
-  # at <= FROZEN_LIMIT; a real split is separate work.
-  src/workflow.rs
   # Already 1497 lines on master before item #655's label_name field
   # (an alternative to label_id on add_label/remove_label) pushed it to
   # 1504 -- same situation as every other entry above: a small, scoped
@@ -106,6 +103,13 @@ ALLOWLIST=(
   # shouldn't have to carry a pre-existing test-module split. Frozen at
   # <= FROZEN_LIMIT; a real split is separate work.
   src/dashboard/orphan_reconcile_tests.rs
+  # Already 1498 lines before the Codex hook upgrade fix. The targeted
+  # regression test and handler selection change bring it to 1537 lines;
+  # a separate test-module split should handle this pre-existing size debt.
+  src/init.rs
+  # Already 1660 lines before this branch; keep the full-repo LOC gate green
+  # until workflow tests are split into a separate module.
+  src/workflow.rs
 )
 
 cd "$(dirname "$0")/.."

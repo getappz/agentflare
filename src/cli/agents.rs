@@ -35,6 +35,7 @@ pub enum AgentsAction {
         agent: String,
         #[arg(long)]
         model: Option<String>,
+        /// Codex: sandbox policy (read-only, workspace-write, danger-full-access).
         #[arg(long)]
         mode: Option<String>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]

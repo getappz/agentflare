@@ -342,11 +342,10 @@ pub fn headless_args(agent: Agent) -> Option<&'static [&'static str]> {
     }
 }
 
-/// Permission-bypass / autonomy flags for agents in headless mode, appended
-/// after the print-mode flags and before the prompt (e.g., `claude -p
-/// --dangerously-skip-permissions "<prompt>"`). These let the agent proceed
-/// without interactive approval gates — intended exclusively for `agentflare
-/// work`'s autonomous code path, never for `agentflare run --print`.
+/// Autonomy flags for headless work dispatch, appended after print-mode flags.
+/// Codex uses its workspace-write sandbox; other agents use their supported
+/// unattended-mode flags. These are exclusive to `agentflare work`, never
+/// `agentflare run --print`.
 /// `None` (or empty) means the agent has no known bypass flag (the user
 /// must acknowledge via `--timeout` that any hang on missing permission is
 /// acceptable, or the run will stall).
@@ -416,7 +415,7 @@ pub fn clinepass_model_for_claude(model: &str) -> Option<&'static str> {
 }
 
 /// CLI flags that switch an agent's headless print mode to structured JSON
-/// output (`{"type":"result","result":"...","session_id":"...",...}`),
+/// output (a result object for Claude/Cursor, JSONL events for Codex),
 /// letting `agent_launch::run_headless` capture a provider session id and
 /// (where the provider reports it) a cost instead of treating stdout as an
 /// opaque text reply. `None` for every agent whose JSON schema hasn't been
@@ -427,32 +426,32 @@ pub fn clinepass_model_for_claude(model: &str) -> Option<&'static str> {
 pub fn json_output_args(agent: Agent) -> Option<&'static [&'static str]> {
     match agent {
         Agent::ClaudeCode | Agent::Cursor => Some(&["--output-format", "json"]),
+        Agent::Codex => Some(&["--json"]),
         _ => None,
     }
 }
 
 /// The flag that carries `agentflare run --mode <m>` / `agents launch --mode
 /// <m>` to an interactive launch. Claude Code spells it `--permission-mode`
-/// (confirmed via `claude --help`; a bare `--mode` is rejected as an unknown
-/// option). Every other agent keeps the historical pass-through `--mode`
-/// until its own spelling is confirmed.
+/// (confirmed via `claude --help`). Codex maps mode to `--sandbox`.
+/// Other agents keep the historical pass-through `--mode` until confirmed.
 #[must_use]
 pub fn mode_flag(agent: Agent) -> &'static str {
     match agent {
         Agent::ClaudeCode => "--permission-mode",
+        Agent::Codex => "--sandbox",
         _ => "--mode",
     }
 }
 
-/// The flag that resumes a prior session by id (e.g. `claude --resume
-/// <session_id>`, `cursor-agent --resume <chatId>`), appended after
-/// print-mode flags and before the prompt. `None` for agents with no known
-/// resume flag.
+/// Flag or subcommand that resumes a prior session by id (for Codex,
+/// `codex exec resume <id>`), appended before the id and prompt.
 #[allow(dead_code)]
 #[must_use]
 pub fn resume_arg(agent: Agent) -> Option<&'static str> {
     match agent {
         Agent::ClaudeCode | Agent::Cursor => Some("--resume"),
+        Agent::Codex => Some("resume"),
         _ => None,
     }
 }
@@ -585,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn json_output_args_maps_claude_and_cursor_only() {
+    fn json_output_args_maps_structured_cli_output() {
         assert_eq!(
             json_output_args(Agent::ClaudeCode),
             Some(&["--output-format", "json"][..])
@@ -595,22 +594,22 @@ mod tests {
             Some(&["--output-format", "json"][..])
         );
         assert_eq!(json_output_args(Agent::Opencode), None);
-        assert_eq!(json_output_args(Agent::Codex), None);
+        assert_eq!(json_output_args(Agent::Codex), Some(&["--json"][..]));
     }
 
     #[test]
-    fn mode_flag_is_permission_mode_for_claude_code_and_mode_elsewhere() {
+    fn mode_flag_maps_codex_sandbox_and_claude_permissions() {
         assert_eq!(mode_flag(Agent::ClaudeCode), "--permission-mode");
-        assert_eq!(mode_flag(Agent::Codex), "--mode");
+        assert_eq!(mode_flag(Agent::Codex), "--sandbox");
         assert_eq!(mode_flag(Agent::Cursor), "--mode");
     }
 
     #[test]
-    fn resume_arg_maps_claude_and_cursor_only() {
+    fn resume_arg_maps_supported_cli_modes() {
         assert_eq!(resume_arg(Agent::ClaudeCode), Some("--resume"));
         assert_eq!(resume_arg(Agent::Cursor), Some("--resume"));
         assert_eq!(resume_arg(Agent::Opencode), None);
-        assert_eq!(resume_arg(Agent::Codex), None);
+        assert_eq!(resume_arg(Agent::Codex), Some("resume"));
     }
 
     #[test]

@@ -270,13 +270,13 @@ fn resume_args_for(
 /// True when a `send` failure means the resumed provider session no longer
 /// exists — e.g. it was born under a daemon process that crashed/restarted
 /// mid-run (item #159) — rather than a transient failure worth retrying
-/// as-is. Matches Claude Code's `claude --resume <dead-id>` stderr; other
-/// `resume_arg` agents (Cursor) are expected to fail the same recognizable
-/// way, but none has been observed yet to confirm the exact text. Also
+/// as-is. Matches Claude Code's `no conversation found` and Codex's
+/// `Session not found` responses. Also
 /// reused by `crate::chat_channel` to retry a chat turn fresh (no
 /// `--resume`) when the per-chat session it had on file has gone stale.
 pub(crate) fn is_stale_session_error(message: &str) -> bool {
-    message.to_lowercase().contains("no conversation found")
+    let message = message.to_lowercase();
+    message.contains("no conversation found") || message.contains("session not found")
 }
 
 /// Cap on fix rounds for a single SDD task before the loop gives up on it —

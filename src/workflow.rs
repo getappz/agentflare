@@ -147,6 +147,12 @@ fn pin_stream_json(agent: &str, extra_args: &mut Vec<String>) -> bool {
     if agent_registry::json_output_args(agent).is_none() {
         return false;
     }
+    if agent == agent_registry::Agent::Codex {
+        if !extra_args.iter().any(|a| a == "--json") {
+            extra_args.push("--json".to_string());
+        }
+        return true;
+    }
     let pinned = extra_args.iter().any(|a| {
         a == "--output-format" || a.starts_with("--output-format=") || a == "--stream-json"
     });
@@ -1595,8 +1601,10 @@ mod persona_tests {
         );
 
         let mut codex = vec!["--sandbox".to_string(), "workspace-write".to_string()];
-        assert!(!pin_stream_json("codex", &mut codex));
-        assert_eq!(codex, vec!["--sandbox", "workspace-write"]);
+        assert!(pin_stream_json("codex", &mut codex));
+        assert_eq!(codex, vec!["--sandbox", "workspace-write", "--json"]);
+        assert!(pin_stream_json("codex", &mut codex));
+        assert_eq!(codex, vec!["--sandbox", "workspace-write", "--json"]);
     }
 
     #[test]

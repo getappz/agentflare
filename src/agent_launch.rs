@@ -713,7 +713,7 @@ pub enum HeadlessOutcome {
 /// `cli::work::build_extra_args` pins `stream-json` for liveness. Emitting
 /// `--output-format json` ahead of it made the CLI (last flag wins) stream
 /// multi-line output that `parse_json_reply` then failed to parse as one
-/// object, so every `agentflare work` dispatch silently lost its
+/// object, so every Claude Code `agentflare work` dispatch silently lost its
 /// `session_id` and `total_cost_usd` — the SDD loop's `--resume` between fix
 /// rounds never fired in real dispatch (audit 2026-09-24, finding #1).
 pub(crate) fn headless_full_args(
@@ -722,7 +722,10 @@ pub(crate) fn headless_full_args(
     extra_args: &[String],
 ) -> Vec<String> {
     let pins_output_format = extra_args.iter().any(|a| {
-        a == "--output-format" || a.starts_with("--output-format=") || a == "--stream-json"
+        a == "--output-format"
+            || a.starts_with("--output-format=")
+            || a == "--stream-json"
+            || a == "--json"
     });
     let mut full_args: Vec<String> = Vec::with_capacity(extra_args.len() + 2);
     if request_json
@@ -749,6 +752,60 @@ fn parse_json_reply(stdout: &str) -> HeadlessReply {
             ..HeadlessReply::default()
         },
     }
+}
+
+/// Codex `exec --json` emits JSONL events rather than a final `result` object.
+/// Keep the thread id from the first event and the last completed agent message.
+fn parse_codex_reply(stdout: &str) -> HeadlessReply {
+    use serde_json::Value;
+    let mut reply = HeadlessReply::default();
+    let mut saw_event = false;
+    for line in stdout.lines() {
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        saw_event = true;
+        match event.get("type").and_then(Value::as_str) {
+            Some("thread.started") => {
+                reply.session_id = event
+                    .get("thread_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
+            Some("item.completed")
+                if event.pointer("/item/type").and_then(Value::as_str) == Some("agent_message") =>
+            {
+                if let Some(text) = event.pointer("/item/text").and_then(Value::as_str) {
+                    reply.text = text.to_string();
+                }
+            }
+            Some("turn.completed") => {
+                reply.input_tokens = event.pointer("/usage/input_tokens").and_then(Value::as_u64);
+                reply.output_tokens = event
+                    .pointer("/usage/output_tokens")
+                    .and_then(Value::as_u64);
+            }
+            Some("turn.failed" | "error") => {
+                reply.is_error = true;
+                reply.subtype = event
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                if let Some(message) = event
+                    .pointer("/error/message")
+                    .or_else(|| event.get("message"))
+                    .and_then(Value::as_str)
+                {
+                    reply.text = message.to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    if !saw_event {
+        reply.text = stdout.to_string();
+    }
+    reply
 }
 
 /// The one JSON object a structured reply carries: the whole stdout for
@@ -1138,7 +1195,12 @@ fn run_headless_impl(
     match result {
         Ok(c) if c.success => {
             if request_json && json_output_args(spec.id).is_some() {
-                classify_result_reply(spec.display_name, parse_json_reply(&c.stdout))
+                let reply = if spec.id == Agent::Codex {
+                    parse_codex_reply(&c.stdout)
+                } else {
+                    parse_json_reply(&c.stdout)
+                };
+                classify_result_reply(spec.display_name, reply)
             } else {
                 HeadlessOutcome::Ok(HeadlessReply {
                     text: c.stdout,
