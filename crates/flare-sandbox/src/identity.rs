@@ -17,7 +17,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 /// Bound on pinned identities per process, matching OpenShell's 4,096
-/// executable-identity-pin ceiling.
+/// executable-identity-pin ceiling. Exhaustion is terminal for the process
+/// lifetime (no eviction): further identities degrade to name-only matching
+/// with an `identity_pins_exhausted` event.
 pub const MAX_IDENTITY_PINS: usize = 4096;
 
 /// Resolved binary identity: basename plus best-effort canonical path.
@@ -105,13 +107,6 @@ pub fn pin_identity(identity: &BinaryIdentity) -> PinOutcome {
     }
 }
 
-/// Pure name comparison shared by the mount matcher: true when `command`'s
-/// basename equals the profile's `binary_name`.
-#[must_use]
-pub fn names_match(command: &str, expected: &str) -> bool {
-    binary_name(command).as_deref() == Some(expected)
-}
-
 /// Number of pinned identities (for tests and diagnostics).
 #[must_use]
 pub fn pin_count() -> usize {
@@ -162,12 +157,6 @@ mod tests {
         );
         assert_eq!(binary_name("cursor-agent").as_deref(), Some("cursor-agent"));
         assert!(binary_name("").is_none());
-    }
-
-    #[test]
-    fn names_match_compares_basenames() {
-        assert!(names_match("/usr/bin/opencode", "opencode"));
-        assert!(!names_match("/usr/bin/opencode", "claude"));
     }
 
     #[test]

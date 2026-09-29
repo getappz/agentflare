@@ -26,8 +26,6 @@ pub enum DenialKind {
     ReadOnlyFs,
     /// Missing file/dir the agent creates on demand: needs a tmpfs or mount.
     NotFound,
-    /// Permission denied on an existing path.
-    Permission,
 }
 
 /// One observed sandbox denial.
@@ -90,8 +88,16 @@ const WELL_KNOWN_DIRS: &[&str] = &[
 ];
 
 /// Dirs that host long-lived secrets: proposing them gets a security note
-/// (prefer an ephemeral overlay, as agent state mounts already do).
-const SECRET_DIRS: &[&str] = &[".ssh", ".aws", ".gnupg", ".pki"];
+/// and requires explicit human approval (never auto-applied).
+const SECRET_DIRS: &[&str] = &[
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".pki",
+    ".config/gh",
+    ".config/gcloud",
+    ".docker",
+];
 
 /// A `$HOME`-relative candidate is valid when it is non-empty, relative, and
 /// has no empty/`.`/`..` components (same rule as `paths::is_valid_relative`,
@@ -273,7 +279,7 @@ pub fn render_advice(proposals: &[Proposal], boundary: &[String]) -> String {
             "auto-appliable"
         };
         out.push_str(&format!(
-            "- {}: add `${}` to writable_home_dirs (confidence {:.2}, {containment}, {approval})\n  {}\n",
+            "- {}: add `{}` to writable_home_dirs (confidence {:.2}, {containment}, {approval})\n  {}\n",
             proposal.rule_name,
             proposal.suggested_dir,
             proposal.confidence,

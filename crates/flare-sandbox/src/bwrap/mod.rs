@@ -158,21 +158,31 @@ fn build_bwrap_args_with_home(
     }
 
     if let Some(home) = home {
+        let home_path = Path::new(home);
+        // Cache dirs are read-only binds: resolve symlink escapes so a
+        // `~/.cargo -> /elsewhere` symlink cannot smuggle an unintended
+        // host path into the sandbox under a trusted name. A
+        // rejected-but-present path is skipped with an event instead of
+        // being bound (the old lexical-join + `exists()` fallback followed
+        // symlinks).
         for cache in HOME_CACHE_DIRS {
-            // Cache dirs are read-only binds: resolve symlink escapes so a
-            // `~/.cargo -> /elsewhere` symlink cannot smuggle an unintended
-            // host path into the sandbox under a trusted name.
-            let home_path = Path::new(home);
-            let resolved = paths::resolve_existing_home_dir(home_path, cache)
-                .map(|p| path_to_string(&p))
-                .or_else(|| {
-                    paths::join_validated_home_dir(home_path, cache)
-                        .and_then(|joined| joined.exists().then(|| path_to_string(&joined)))
-                });
-            if let Some(path_str) = resolved {
-                bwrap_args.push("--ro-bind-try".to_string());
-                bwrap_args.push(path_str.clone());
-                bwrap_args.push(path_str);
+            match paths::resolve_existing_home_dir(home_path, cache) {
+                Some(resolved) => {
+                    let path_str = path_to_string(&resolved);
+                    bwrap_args.push("--ro-bind-try".to_string());
+                    bwrap_args.push(path_str.clone());
+                    bwrap_args.push(path_str);
+                }
+                None if paths::join_validated_home_dir(home_path, cache)
+                    .is_some_and(|p| std::fs::symlink_metadata(&p).is_ok()) =>
+                {
+                    events::emit(&events::SandboxEvent::skipped_mount(
+                        command,
+                        cache,
+                        "symlink-or-escape",
+                    ));
+                }
+                None => {}
             }
         }
 
@@ -183,7 +193,6 @@ fn build_bwrap_args_with_home(
                 ));
                 continue;
             }
-            let home_path = Path::new(home);
             match paths::resolve_existing_home_dir(home_path, relative) {
                 Some(resolved) => {
                     let dir_str = path_to_string(&resolved);
@@ -192,10 +201,13 @@ fn build_bwrap_args_with_home(
                     bwrap_args.push(dir_str);
                 }
                 None if paths::join_validated_home_dir(home_path, relative)
-                    .is_some_and(|p| p.exists()) =>
+                    .is_some_and(|p| std::fs::symlink_metadata(&p).is_ok()) =>
                 {
-                    // Exists but rejected (symlink or escape above $HOME):
-                    // skip instead of binding the wrong directory.
+                    // Exists but rejected (symlink, dangling symlink, or
+                    // escape above $HOME): skip instead of binding the wrong
+                    // directory. `symlink_metadata` (not `exists`) so a
+                    // dangling symlink takes this loud branch instead of
+                    // silently falling through.
                     events::emit(&events::SandboxEvent::skipped_mount(
                         command,
                         relative,
@@ -283,6 +295,16 @@ fn push_agent_state_mount(
     match mount.policy {
         MountPolicy::EphemeralEmpty => {
             match paths::join_validated_home_dir(home_path, mount.relative_path) {
+                Some(joined) if std::fs::symlink_metadata(&joined).is_ok() => {
+                    // Present on the host (file, dir, or symlink, dangling
+                    // included) yet unresolvable: never tmpfs over it --
+                    // mounting on a symlink masks whatever it points at.
+                    events::emit(&events::SandboxEvent::skipped_mount(
+                        command,
+                        mount.relative_path,
+                        "symlink-or-escape",
+                    ));
+                }
                 Some(joined) => {
                     bwrap_args.push("--tmpfs".to_string());
                     bwrap_args.push(path_to_string(&joined));
@@ -299,7 +321,6 @@ fn push_agent_state_mount(
         }
         MountPolicy::OverlayEphemeral => {}
     }
-    let home_path = Path::new(home);
     if let Some(resolved) = paths::resolve_existing_home_dir(home_path, mount.relative_path) {
         let dir_str = path_to_string(&resolved);
         bwrap_args.push("--overlay-src".to_string());
@@ -307,9 +328,11 @@ fn push_agent_state_mount(
         bwrap_args.push("--tmp-overlay".to_string());
         bwrap_args.push(dir_str);
     } else if let Some(joined) = paths::join_validated_home_dir(home_path, mount.relative_path) {
-        if joined.exists() {
-            // Exists but rejected (symlink or escape): skip instead of
-            // overlaying the wrong directory.
+        if std::fs::symlink_metadata(&joined).is_ok() {
+            // Exists but rejected (symlink, dangling symlink, or escape):
+            // skip instead of overlaying the wrong directory.
+            // `symlink_metadata` (not `exists`) so a dangling symlink takes
+            // this loud branch instead of a silent tmpfs below.
             events::emit(&events::SandboxEvent::skipped_mount(
                 command,
                 mount.relative_path,

@@ -126,6 +126,11 @@ pub struct JobOutput {
     pub timed_out: bool,
     pub stdout_path: PathBuf,
     pub stderr_path: PathBuf,
+    /// Bytes retained in the log file. Capped at 64 MiB per stream
+    /// (`supervisor::MAX_LOG_STREAM_BYTES`): a total exactly at the cap
+    /// means the log was truncated -- confirm via the trailing
+    /// `[job log truncated …]` marker line, since `JobOutput` carries no
+    /// separate truncated flag (the DB row has no such column).
     pub stdout_total_bytes: u64,
     pub stderr_total_bytes: u64,
 }

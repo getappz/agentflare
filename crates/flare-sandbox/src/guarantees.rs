@@ -49,16 +49,26 @@ pub struct OuterFenceGuarantees {
 
 impl OuterFenceGuarantees {
     /// Project the bwrap backend's guarantees for a resolved cwd.
+    ///
+    /// `fail_closed` must be the same decision's
+    /// [`is_fail_closed`] value: losing the boundary (bwrap missing,
+    /// unresolvable cwd) only fails closed when the switch is on, so
+    /// `ControllerLossFailsClosed` is established only then. A fail-open
+    /// projection is therefore never [`is_complete`](Self::is_complete)
+    /// -- by design, not by omission.
     #[must_use]
-    pub fn from_bwrap_enforcement(cwd: Option<&str>) -> Self {
+    pub fn from_bwrap_enforcement(cwd: Option<&str>, fail_closed: bool) -> Self {
+        let mut established = vec![
+            OuterFenceGuarantee::DefaultDenyWrites,
+            OuterFenceGuarantee::NoUnmanagedWritePath,
+            OuterFenceGuarantee::RevocationVerified,
+        ];
+        if fail_closed {
+            established.push(OuterFenceGuarantee::ControllerLossFailsClosed);
+        }
         Self {
             generation: cwd.map(str::to_string),
-            established: vec![
-                OuterFenceGuarantee::DefaultDenyWrites,
-                OuterFenceGuarantee::NoUnmanagedWritePath,
-                OuterFenceGuarantee::RevocationVerified,
-                OuterFenceGuarantee::ControllerLossFailsClosed,
-            ],
+            established,
         }
     }
 
@@ -133,11 +143,17 @@ impl std::error::Error for SandboxError {}
 #[must_use]
 pub fn is_fail_closed() -> bool {
     std::env::var("FLARE_SANDBOX_FAIL_CLOSED")
-        .map(|v| {
-            let v = v.trim().to_ascii_lowercase();
-            v == "1" || v == "true" || v == "yes"
-        })
+        .map(|v| parse_fail_closed(&v))
         .unwrap_or(false)
+}
+
+/// Pure truthy parser behind [`is_fail_closed`]: unit-tested directly so no
+/// test has to mutate the process-global environment (cargo runs tests in
+/// one binary on parallel threads).
+#[must_use]
+pub fn parse_fail_closed(raw: &str) -> bool {
+    let v = raw.trim().to_ascii_lowercase();
+    v == "1" || v == "true" || v == "yes"
 }
 
 #[cfg(test)]
@@ -145,10 +161,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bwrap_projection_is_complete() {
-        let g = OuterFenceGuarantees::from_bwrap_enforcement(Some("/work/tree"));
+    fn bwrap_projection_is_complete_only_when_fail_closed() {
+        let g = OuterFenceGuarantees::from_bwrap_enforcement(Some("/work/tree"), true);
         assert!(g.is_complete());
         assert_eq!(g.generation.as_deref(), Some("/work/tree"));
+
+        // Fail-open keeps three guarantees and is incomplete by design:
+        // losing the boundary falls back instead of erroring.
+        let g = OuterFenceGuarantees::from_bwrap_enforcement(Some("/work/tree"), false);
+        assert!(!g.is_complete());
+        assert!(
+            g.established
+                .contains(&OuterFenceGuarantee::DefaultDenyWrites)
+        );
+        assert!(
+            !g.established
+                .contains(&OuterFenceGuarantee::ControllerLossFailsClosed)
+        );
     }
 
     #[test]
@@ -157,21 +186,12 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_defaults_off_and_parses_truthy() {
-        let saved = std::env::var("FLARE_SANDBOX_FAIL_CLOSED").ok();
-        unsafe { std::env::remove_var("FLARE_SANDBOX_FAIL_CLOSED") };
-        assert!(!is_fail_closed());
+    fn fail_closed_parser_accepts_truthy_only() {
         for v in ["1", "true", "TRUE", " yes "] {
-            unsafe { std::env::set_var("FLARE_SANDBOX_FAIL_CLOSED", v) };
-            assert!(is_fail_closed(), "{v} should enable fail-closed");
+            assert!(parse_fail_closed(v), "{v} should enable fail-closed");
         }
         for v in ["0", "false", "", "maybe"] {
-            unsafe { std::env::set_var("FLARE_SANDBOX_FAIL_CLOSED", v) };
-            assert!(!is_fail_closed(), "{v} should not enable fail-closed");
-        }
-        match saved {
-            Some(v) => unsafe { std::env::set_var("FLARE_SANDBOX_FAIL_CLOSED", v) },
-            None => unsafe { std::env::remove_var("FLARE_SANDBOX_FAIL_CLOSED") },
+            assert!(!parse_fail_closed(v), "{v} should not enable fail-closed");
         }
     }
 }

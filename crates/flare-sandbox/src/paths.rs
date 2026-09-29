@@ -1,4 +1,4 @@
-//! Race-resistant `$HOME` joins, ported from OpenShell's
+//! Race-aware `$HOME` joins, ported from OpenShell's
 //! `open_root_allowlist` (`openshell-isolation-interface/src/linux/landlock.rs`).
 //!
 //! OpenShell never trusts a blind listing of `/`: it opens exactly the named
@@ -7,7 +7,13 @@
 //! comparison). bwrap takes bind source paths literally, so a `$HOME` mount
 //! that resolves through a symlink (or a `..` that walks above `$HOME`) would
 //! bind the wrong directory into the sandbox. These helpers apply the same
-//! discipline at the join level:
+//! discipline at the join level -- with one honest limitation: validation
+//! and binding are separate operations (no open file descriptor is held
+//! across to the bwrap exec, unlike OpenShell's fd-pinned rules), so a
+//! same-user adversary swapping an ancestor between check and bind is not
+//! prevented -- only detected as a wrong-directory bind, which the canonical-
+//! starts-with-home check turns into a skip. In this threat model (the job
+//! runner's own user) that fail-closed skip is the whole mitigation.
 //!
 //! 1. every `relative` component is validated (no `/`-in-component, `.`,
 //!    `..`, empty, or NUL),

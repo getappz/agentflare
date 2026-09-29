@@ -9,7 +9,10 @@
 //! This crate has one backend today (bwrap on Linux) plus the identity
 //! passthrough everywhere else. The trait keeps that selection explicit and
 //! gives future backends (direct Landlock, Docker, macOS Seatbelt) a seam
-//! to plug into without rewriting [`crate::wrap`] callers:
+//! to plug into without rewriting [`crate::wrap`] callers. Deliberately a
+//! seam ahead of its consumers: nothing outside this module's tests calls
+//! the trait yet; [`crate::try_wrap`] drives `bwrap` directly until a second
+//! enforcing backend exists.
 //!
 //! ```text
 //! resolve backend -> check guarantees -> build argv or fall back
@@ -83,7 +86,10 @@ impl IsolationBackend for BwrapBackend {
 
 /// Identity backend: never enforces, always falls back. Exists so the
 /// registry (and `try_wrap`'s fail-closed branch) can name the fallback
-/// instead of scattering `None` handling across callers.
+/// instead of scattering `None` handling across callers. It is selectable
+/// but not enforcing: [`is_available`](IsolationBackend::is_available)
+/// reports whether a backend can enforce a boundary, so this returns
+/// `false` here (a fallback must never satisfy an isolation requirement).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PassthroughBackend;
 
@@ -93,7 +99,7 @@ impl IsolationBackend for PassthroughBackend {
     }
 
     fn is_available(&self) -> bool {
-        true
+        false
     }
 
     fn wrap(
@@ -159,7 +165,8 @@ mod tests {
     #[test]
     fn passthrough_never_wraps() {
         let backend = PassthroughBackend;
-        assert!(backend.is_available());
+        // Selectable as the named fallback, but not an enforcing backend.
+        assert!(!backend.is_available());
         assert!(
             backend
                 .wrap("true", &[], None, false, &SandboxConfig::default(), None)

@@ -162,29 +162,49 @@ fn pump_capped_with<R: Read, W: Write>(mut reader: R, mut file: W, cap: u64) -> 
     let mut buf = [0u8; 65536];
     let mut total = 0u64;
     let mut truncated = false;
+    // Once storing stops (cap reached or the log file failed), the pump
+    // keeps draining so the child never blocks on a full pipe.
+    let mut storing = true;
     loop {
         let n = match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => n,
+            // EINTR is non-fatal per `Read`'s contract (`read_to_end` also
+            // retries it); anything else ends the pump.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         };
-        if !truncated {
-            // A single read can overshoot the cap: persist the head up to
-            // the cap so the retained prefix is always the true prefix.
-            let room = cap.saturating_sub(total) as usize;
-            let take = room.min(n);
-            if take > 0 && file.write_all(&buf[..take]).is_err() {
-                break;
+        if !storing {
+            continue;
+        }
+        // A single read can overshoot the cap: persist the head up to the
+        // cap so the retained prefix is always the true prefix.
+        let room = cap.saturating_sub(total) as usize;
+        let take = room.min(n);
+        let mut written = 0;
+        let mut failed = false;
+        while written < take {
+            match file.write(&buf[written..take]) {
+                Ok(0) => {
+                    failed = true;
+                    break;
+                }
+                Ok(m) => written += m,
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
             }
-            total += take as u64;
-            if take < n {
-                truncated = true;
+        }
+        total += written as u64;
+        if failed || take < n {
+            truncated = true;
+            storing = false;
+            if !failed {
                 let _ = writeln!(file, "\n[job log truncated at {cap} bytes]");
                 total = cap;
             }
         }
-        // Past the cap: keep draining so the child never blocks on a full
-        // pipe; nothing more is stored.
     }
     (total, truncated)
 }
@@ -336,6 +356,81 @@ mod tests {
             1
         );
         assert!(out.len() < input.len());
+    }
+
+    /// A reader that reports one `Interrupted` error before yielding data,
+    /// modelling an EINTR-hit pipe read.
+    struct InterruptOnce<R> {
+        inner: R,
+        interrupted: bool,
+    }
+
+    impl<R: std::io::Read> std::io::Read for InterruptOnce<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "test interrupt",
+                ));
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    #[test]
+    fn pump_retries_interrupted_reads() {
+        let input = b"after interrupt";
+        let mut out = Vec::new();
+        let reader = InterruptOnce {
+            inner: &input[..],
+            interrupted: false,
+        };
+        let (total, truncated) = pump_capped_with(reader, &mut out, u64::MAX);
+        assert!(!truncated);
+        assert_eq!(total, input.len() as u64);
+        assert_eq!(out, input);
+    }
+
+    /// A writer that accepts `limit` bytes then fails every write, modelling
+    /// a full disk.
+    struct FailAfter {
+        remaining: usize,
+        stored: Vec<u8>,
+    }
+
+    impl std::io::Write for FailAfter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    "test disk full",
+                ));
+            }
+            let take = self.remaining.min(buf.len());
+            self.stored.extend_from_slice(&buf[..take]);
+            self.remaining -= take;
+            Ok(take)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn pump_keeps_draining_after_write_failure() {
+        let input = vec![b'y'; 300];
+        let mut file = FailAfter {
+            remaining: 100,
+            stored: Vec::new(),
+        };
+        let (total, truncated) = pump_capped_with(&input[..], &mut file, u64::MAX);
+        // Marked truncated (log incomplete) but the whole 300-byte input was
+        // consumed, so a real child would never block on a full pipe.
+        assert!(truncated);
+        assert_eq!(file.stored, vec![b'y'; 100]);
+        assert_eq!(total, 100);
     }
 
     // `setsid` moves the grandchild into a brand-new session/process group of
