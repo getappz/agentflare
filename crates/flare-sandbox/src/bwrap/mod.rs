@@ -982,7 +982,10 @@ mod tests {
     #[test]
     fn ephemeral_empty_skips_symlink_destination() {
         // Tmpfs over a symlink would mask the link target: skip with an
-        // event instead, whether the link is live or dangling.
+        // event instead, whether the link is live or dangling. Both cases
+        // spell their mount inline (not via Box::leak in a loop) so the
+        // `&[...]` array const-promotes to `&'static` -- a leaked runtime
+        // string would pin a temporary here (E0716).
         let dir = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(outside.path(), dir.path().join(".live")).unwrap();
@@ -992,15 +995,25 @@ mod tests {
         )
         .unwrap();
         let home = std::ffi::OsString::from(dir.path());
-        for relative in [".live", ".dangling"] {
-            let config = agent(
-                "testagent",
+        for (relative, mounts) in [
+            (
+                ".live",
                 &[AgentStateMount {
-                    relative_path: Box::leak(relative.to_string().into_boxed_str()),
+                    relative_path: ".live",
                     policy: MountPolicy::EphemeralEmpty,
                     diagnostic_log: None,
-                }],
-            );
+                }] as &'static [AgentStateMount],
+            ),
+            (
+                ".dangling",
+                &[AgentStateMount {
+                    relative_path: ".dangling",
+                    policy: MountPolicy::EphemeralEmpty,
+                    diagnostic_log: None,
+                }] as &'static [AgentStateMount],
+            ),
+        ] {
+            let config = agent("testagent", mounts);
             let args = build_bwrap_args_with_home(
                 None,
                 "/usr/local/bin/testagent",
