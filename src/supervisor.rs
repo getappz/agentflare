@@ -358,6 +358,65 @@ pub(crate) fn run_discovery_tick(
             let Some(ready_id) = label_id_by_name.get(READY_LABEL).cloned() else {
                 continue;
             };
+            // Self-heal (item #635): nothing provisions `DISPATCHED_LABEL` by
+            // default -- only a human calling the `label` MCP tool, or test
+            // fixtures, ever create it. `dispatch_item` used to just log and
+            // return `NotDispatched` forever when it was missing, silently
+            // stalling every dispatch on the project with nothing but an
+            // eprintln nobody watches to show for it. Create it lazily here,
+            // once per project per tick, so a project reaching this point
+            // (it has `READY_LABEL`, so there's real work to dispatch) is
+            // never permanently stuck just because this one label row never
+            // got seeded.
+            if !label_id_by_name.contains_key(DISPATCHED_LABEL) {
+                let workspace_id = agentflare_backend::project::get(conn, &dir.project_id)
+                    .ok()
+                    .map(|p| p.workspace_id);
+                let created = workspace_id.map(|workspace_id| {
+                    agentflare_backend::label::create(
+                        conn,
+                        agentflare_backend::label::CreateLabel {
+                            project_id: Some(dir.project_id.clone()),
+                            workspace_id,
+                            name: DISPATCHED_LABEL.to_string(),
+                            color: None,
+                            parent_id: None,
+                            sort_order: None,
+                            external_source: None,
+                            external_id: None,
+                        },
+                    )
+                });
+                match created {
+                    Some(Ok(label)) => {
+                        label_id_by_name.insert(label.name, label.id);
+                    }
+                    Some(Err(agentflare_backend::error::Error::Duplicate(_))) => {
+                        // Lost a create race (another tick/process got there
+                        // first) -- re-read rather than leaving the map
+                        // stale for this whole tick.
+                        if let Ok(refreshed) =
+                            agentflare_backend::label::list_by_project(conn, &dir.project_id)
+                            && let Some(l) =
+                                refreshed.iter().find(|l| l.name == DISPATCHED_LABEL)
+                        {
+                            label_id_by_name.insert(l.name.clone(), l.id.clone());
+                        }
+                    }
+                    Some(Err(e)) => {
+                        eprintln!(
+                            "agentflare-supervisor: failed to auto-create {DISPATCHED_LABEL} label for project {}: {e}",
+                            dir.project_id
+                        );
+                    }
+                    None => {
+                        eprintln!(
+                            "agentflare-supervisor: failed to resolve workspace for project {} — cannot auto-create {DISPATCHED_LABEL} label",
+                            dir.project_id
+                        );
+                    }
+                }
+            }
             let items =
                 match agentflare_backend::item::list_by_label(conn, &dir.project_id, &ready_id) {
                     Ok(items) => items,

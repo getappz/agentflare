@@ -120,17 +120,20 @@ fn dispatch_bookkeeping_lands_on_items_of_projects_other_than_the_daemons_own() 
     );
 }
 
-/// CodeRabbit finding on this PR: `run_discovery_tick` only requires
-/// `READY_LABEL` to exist before batching a project (see `DISPATCHED_LABEL`'s
-/// doc comment) -- a project that never got the `dispatched` label seeded
-/// could otherwise enqueue a real job, remove `ready-for-work`, and leave the
-/// item wearing neither label: invisible to the dashboard and to the next
-/// discovery query, with no way back onto `ready-for-work` short of a human
-/// relabeling it by hand. `dispatch_item` must resolve `DISPATCHED_LABEL`
-/// before enqueueing, not merely at label-swap time, and leave the item
-/// exactly as it found it when that label is missing.
+/// Item #635 (image-qc, 2026-09-23): nothing in production ever provisioned
+/// `DISPATCHED_LABEL` for a project -- only a human calling the `label` MCP
+/// tool, or a test fixture, ever created it -- so a project that never had it
+/// seeded stalled 100% of dispatch forever, with nothing but a repeated
+/// eprintln nobody watches to show for it. `run_discovery_tick` now
+/// self-heals: it creates `DISPATCHED_LABEL` lazily, per project per tick,
+/// the first time it's missing, so the very tick that notices the gap also
+/// dispatches through it. This supersedes the previous regression guard here
+/// (`dispatch_item_declines_when_the_project_has_no_dispatched_label`), which
+/// asserted the old silent-stall behavior was at least *safe* (no orphaned
+/// item, no phantom job) -- that safety property still holds, it just no
+/// longer means "never dispatches".
 #[test]
-fn dispatch_item_declines_when_the_project_has_no_dispatched_label() {
+fn dispatch_item_auto_creates_the_dispatched_label_and_dispatches() {
     let mcp = test_mcp();
     let queue = test_queue();
     let item_id = mcp
@@ -188,32 +191,44 @@ fn dispatch_item_declines_when_the_project_has_no_dispatched_label() {
         agentflare_resource_gate::Policy::Normal,
     );
     assert_eq!(
-        result.dispatched, 0,
-        "must not dispatch without a dispatched label to swap to"
+        result.dispatched, 1,
+        "a missing dispatched label must be self-healed, not a permanent stall"
     );
     assert!(
-        queue.list(None).unwrap().is_empty(),
-        "no job should be enqueued when the label swap can never complete"
+        !queue.list(None).unwrap().is_empty(),
+        "the auto-created label must let the job actually enqueue"
     );
 
     let labels = mcp
         .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id).unwrap())
         .unwrap();
-    let ready_id = mcp
+    let (ready_id, dispatched_id) = mcp
         .with_backend_db(|conn| {
             let project = mcp.resolve_project(conn).unwrap();
-            agentflare_backend::label::list_by_project(conn, &project.id)
-                .unwrap()
-                .into_iter()
-                .find(|l| l.name == "ready-for-work")
-                .unwrap()
-                .id
+            let by_project = agentflare_backend::label::list_by_project(conn, &project.id).unwrap();
+            (
+                by_project
+                    .iter()
+                    .find(|l| l.name == "ready-for-work")
+                    .unwrap()
+                    .id
+                    .clone(),
+                by_project
+                    .iter()
+                    .find(|l| l.name == "dispatched")
+                    .unwrap()
+                    .id
+                    .clone(),
+            )
         })
         .unwrap();
     assert!(
-        labels.contains(&ready_id),
-        "ready-for-work must stay on so a human fixing the missing label sees the item again \
-         on the very next tick"
+        !labels.contains(&ready_id),
+        "ready-for-work must come off once dispatched, or the next tick re-dispatches forever"
+    );
+    assert!(
+        labels.contains(&dispatched_id),
+        "the item must land on the label that was just auto-created"
     );
 }
 
