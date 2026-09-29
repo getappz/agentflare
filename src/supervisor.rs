@@ -302,6 +302,78 @@ fn per_project_work_cap() -> u64 {
     (workers / 2).max(1)
 }
 
+/// Self-heal (item #635): ensures `DISPATCHED_LABEL` exists for `project_id`,
+/// recording its id in `label_id_by_name`. Returns whether the label is
+/// usable afterwards. Nothing provisions this label by default -- only a
+/// human calling the `label` MCP tool, or test fixtures, ever create it --
+/// so without this, a project that never had it seeded stalls 100% of
+/// dispatch forever. Called only for projects that already have `READY_LABEL`
+/// (real work to dispatch), once per project per tick; a `false` return
+/// leaves the project to `dispatch_item`'s defensive guard, which declines
+/// safely (item stays `ready-for-work`) instead of orphaning anything.
+fn ensure_dispatched_label(
+    conn: &rusqlite::Connection,
+    project_id: &str,
+    label_id_by_name: &mut std::collections::HashMap<String, String>,
+) -> bool {
+    let workspace_id = match agentflare_backend::project::get(conn, project_id) {
+        Ok(project) => project.workspace_id,
+        Err(e) => {
+            eprintln!(
+                "agentflare-supervisor: failed to resolve workspace for project {project_id} \
+                 — cannot auto-create {DISPATCHED_LABEL} label: {e}"
+            );
+            return false;
+        }
+    };
+    match agentflare_backend::label::create(
+        conn,
+        agentflare_backend::label::CreateLabel {
+            project_id: Some(project_id.to_string()),
+            workspace_id,
+            name: DISPATCHED_LABEL.to_string(),
+            color: None,
+            parent_id: None,
+            sort_order: None,
+            external_source: None,
+            external_id: None,
+        },
+    ) {
+        Ok(label) => {
+            eprintln!(
+                "agentflare-supervisor: auto-created missing {DISPATCHED_LABEL} label for \
+                 project {project_id}"
+            );
+            label_id_by_name.insert(label.name, label.id);
+            true
+        }
+        Err(agentflare_backend::error::Error::Duplicate(detail)) => {
+            // Lost a create race (another tick/process got there first) --
+            // re-read rather than leaving the map stale for this whole tick.
+            match agentflare_backend::label::get_by_name(conn, project_id, DISPATCHED_LABEL) {
+                Ok(label) => {
+                    label_id_by_name.insert(label.name, label.id);
+                    true
+                }
+                Err(e) => {
+                    eprintln!(
+                        "agentflare-supervisor: {DISPATCHED_LABEL} label creation raced \
+                         ({detail}) but re-read failed for project {project_id}: {e}"
+                    );
+                    false
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "agentflare-supervisor: failed to auto-create {DISPATCHED_LABEL} label for \
+                 project {project_id}: {e}"
+            );
+            false
+        }
+    }
+}
+
 /// One pass: across every project registered in `project_dirs` (see
 /// `AgentflareMcp::register_project_dir`, called wherever an agentflare
 /// CLI/MCP call runs inside a linked repo) — not just whichever project
@@ -358,6 +430,15 @@ pub(crate) fn run_discovery_tick(
             let Some(ready_id) = label_id_by_name.get(READY_LABEL).cloned() else {
                 continue;
             };
+            // Self-heal (item #635): create `DISPATCHED_LABEL` lazily the
+            // first time it's missing, so a project reaching this point
+            // (it has `READY_LABEL`, so there's real work to dispatch) is
+            // never permanently stuck just because this one label row never
+            // got seeded. A `false` return leaves the item to
+            // `dispatch_item`'s guard, which declines safely.
+            if !label_id_by_name.contains_key(DISPATCHED_LABEL) {
+                ensure_dispatched_label(conn, &dir.project_id, &mut label_id_by_name);
+            }
             let items =
                 match agentflare_backend::item::list_by_label(conn, &dir.project_id, &ready_id) {
                     Ok(items) => items,
@@ -793,13 +874,14 @@ fn dispatch_item(
         }
         return DispatchOutcome::WaitingOnPlan;
     }
-    // Resolved before enqueueing, not merely at label-swap time: discovery
-    // only requires `READY_LABEL` to exist on a project (see
-    // `run_discovery_tick`), so a project that never got `DISPATCHED_LABEL`
-    // seeded would otherwise enqueue a real job, remove `ready-for-work`, and
-    // leave the item wearing neither label -- invisible to the dashboard and
-    // to the next discovery query, with no way back onto `ready-for-work`
-    // short of a human relabeling it by hand.
+    // Defensive fallback, not the normal path: `run_discovery_tick`
+    // self-heals a missing `DISPATCHED_LABEL` via `ensure_dispatched_label`
+    // before batching, so reaching here means that self-heal failed (DB
+    // error, unresolvable workspace). Decline with the item untouched --
+    // still wearing `ready-for-work`, so the next tick retries -- rather
+    // than enqueueing a job whose label swap can never complete (which
+    // would leave the item wearing neither label, invisible to the
+    // dashboard and to the next discovery query).
     let Some(dispatched_id) = label_id_by_name.get(DISPATCHED_LABEL) else {
         eprintln!(
             "agentflare-supervisor: item #{} ({}) not dispatched — project has no {DISPATCHED_LABEL} label",

@@ -120,17 +120,20 @@ fn dispatch_bookkeeping_lands_on_items_of_projects_other_than_the_daemons_own() 
     );
 }
 
-/// CodeRabbit finding on this PR: `run_discovery_tick` only requires
-/// `READY_LABEL` to exist before batching a project (see `DISPATCHED_LABEL`'s
-/// doc comment) -- a project that never got the `dispatched` label seeded
-/// could otherwise enqueue a real job, remove `ready-for-work`, and leave the
-/// item wearing neither label: invisible to the dashboard and to the next
-/// discovery query, with no way back onto `ready-for-work` short of a human
-/// relabeling it by hand. `dispatch_item` must resolve `DISPATCHED_LABEL`
-/// before enqueueing, not merely at label-swap time, and leave the item
-/// exactly as it found it when that label is missing.
+/// Item #635 (image-qc, 2026-09-23): nothing in production ever provisioned
+/// `DISPATCHED_LABEL` for a project -- only a human calling the `label` MCP
+/// tool, or a test fixture, ever created it -- so a project that never had it
+/// seeded stalled 100% of dispatch forever, with nothing but a repeated
+/// eprintln nobody watches to show for it. `run_discovery_tick` now
+/// self-heals: it creates `DISPATCHED_LABEL` lazily, per project per tick,
+/// the first time it's missing, so the very tick that notices the gap also
+/// dispatches through it. This supersedes the previous regression guard here
+/// (`dispatch_item_declines_when_the_project_has_no_dispatched_label`), which
+/// asserted the old silent-stall behavior was at least *safe* (no orphaned
+/// item, no phantom job) -- that safety property still holds, it just no
+/// longer means "never dispatches".
 #[test]
-fn dispatch_item_declines_when_the_project_has_no_dispatched_label() {
+fn dispatch_item_auto_creates_the_dispatched_label_and_dispatches() {
     let mcp = test_mcp();
     let queue = test_queue();
     let item_id = mcp
@@ -188,32 +191,44 @@ fn dispatch_item_declines_when_the_project_has_no_dispatched_label() {
         agentflare_resource_gate::Policy::Normal,
     );
     assert_eq!(
-        result.dispatched, 0,
-        "must not dispatch without a dispatched label to swap to"
+        result.dispatched, 1,
+        "a missing dispatched label must be self-healed, not a permanent stall"
     );
     assert!(
-        queue.list(None).unwrap().is_empty(),
-        "no job should be enqueued when the label swap can never complete"
+        !queue.list(None).unwrap().is_empty(),
+        "the auto-created label must let the job actually enqueue"
     );
 
     let labels = mcp
         .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id).unwrap())
         .unwrap();
-    let ready_id = mcp
+    let (ready_id, dispatched_id) = mcp
         .with_backend_db(|conn| {
             let project = mcp.resolve_project(conn).unwrap();
-            agentflare_backend::label::list_by_project(conn, &project.id)
-                .unwrap()
-                .into_iter()
-                .find(|l| l.name == "ready-for-work")
-                .unwrap()
-                .id
+            let by_project = agentflare_backend::label::list_by_project(conn, &project.id).unwrap();
+            (
+                by_project
+                    .iter()
+                    .find(|l| l.name == "ready-for-work")
+                    .unwrap()
+                    .id
+                    .clone(),
+                by_project
+                    .iter()
+                    .find(|l| l.name == "dispatched")
+                    .unwrap()
+                    .id
+                    .clone(),
+            )
         })
         .unwrap();
     assert!(
-        labels.contains(&ready_id),
-        "ready-for-work must stay on so a human fixing the missing label sees the item again \
-         on the very next tick"
+        !labels.contains(&ready_id),
+        "ready-for-work must come off once dispatched, or the next tick re-dispatches forever"
+    );
+    assert!(
+        labels.contains(&dispatched_id),
+        "the item must land on the label that was just auto-created"
     );
 }
 
@@ -268,4 +283,66 @@ fn reassignment_holds_the_new_dispatch_until_the_old_job_stops_then_dispatches_t
     let fresh: Vec<_> = queue.list(Some(agentflare_jobs::JobState::Queued)).unwrap();
     assert_eq!(fresh.len(), 1);
     assert_eq!(fresh[0].args.get(1).map(String::as_str), Some("opencode"));
+}
+
+/// The `Duplicate` arm of `ensure_dispatched_label`: seed the label first so
+/// the helper's own create is guaranteed to race-lose, then assert the
+/// get_by_name re-read still recovers the id into the map.
+#[test]
+fn ensure_dispatched_label_recovers_when_create_races() {
+    let mcp = test_mcp();
+    let (ok, recovered_id, seeded_id) = mcp
+        .with_backend_db(|conn| {
+            let project = mcp.resolve_project(conn).unwrap();
+            let new_label = || agentflare_backend::label::CreateLabel {
+                project_id: Some(project.id.clone()),
+                workspace_id: project.workspace_id.clone(),
+                name: DISPATCHED_LABEL.to_string(),
+                color: None,
+                parent_id: None,
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+            };
+            // Tolerate a fixture that already seeds it: either way the label
+            // exists afterwards, so the helper below must take the
+            // `Duplicate` path, not the `Ok` path.
+            let seeded_id = match agentflare_backend::label::create(conn, new_label()) {
+                Ok(label) => label.id,
+                Err(_) => {
+                    agentflare_backend::label::get_by_name(conn, &project.id, DISPATCHED_LABEL)
+                        .unwrap()
+                        .id
+                }
+            };
+            let mut map = std::collections::HashMap::new();
+            let ok = ensure_dispatched_label(conn, &project.id, &mut map);
+            (ok, map.get(DISPATCHED_LABEL).cloned(), seeded_id)
+        })
+        .unwrap();
+    assert!(ok, "a lost create race must still recover the label");
+    assert_eq!(
+        recovered_id.as_deref(),
+        Some(seeded_id.as_str()),
+        "the re-read must recover the raced label's id, not a stale map"
+    );
+}
+
+/// The unresolvable-workspace arm: an unknown project declines safely with
+/// nothing recorded, leaving the caller to `dispatch_item`'s guard.
+#[test]
+fn ensure_dispatched_label_declines_safely_for_an_unknown_project() {
+    let mcp = test_mcp();
+    let (ok, recorded) = mcp
+        .with_backend_db(|conn| {
+            let mut map = std::collections::HashMap::new();
+            let ok = ensure_dispatched_label(conn, "project-that-does-not-exist", &mut map);
+            (ok, map.len())
+        })
+        .unwrap();
+    assert!(
+        !ok,
+        "no label can be ensured for a project that does not resolve"
+    );
+    assert_eq!(recorded, 0, "a failed ensure must not record anything");
 }
