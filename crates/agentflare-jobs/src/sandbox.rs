@@ -252,10 +252,48 @@ pub fn wrap(
     flare_sandbox::wrap(command, args, cwd, git_writable, &config(), diagnostic_out)
 }
 
+/// Fail-closed variant of [`wrap`]: returns `Err` instead of silently running
+/// unsandboxed when no boundary can be enforced and
+/// `FLARE_SANDBOX_FAIL_CLOSED` is set (see `flare_sandbox::try_wrap`).
+/// Prefer this for dispatches that must not lose their boundary unnoticed.
+pub fn try_wrap(
+    command: &str,
+    args: &[String],
+    cwd: Option<&Path>,
+    git_writable: bool,
+    diagnostic_out: Option<&Path>,
+) -> Result<(String, Vec<String>), flare_sandbox::SandboxError> {
+    flare_sandbox::try_wrap(command, args, cwd, git_writable, &config(), diagnostic_out)
+}
+
+/// `$HOME`-relative entries in the active config that fail validation
+/// (absolute, `..`, empty components): the bwrap layer already skips these
+/// with a `skipped_mount`/`invalid_writable_dir` event instead of binding
+/// them, so surfacing them here lets callers quarantine a bad
+/// `AGENTFLARE_SANDBOX_WRITABLE_HOME_DIRS` value before dispatching.
+#[must_use]
+pub fn invalid_writable_dirs() -> Vec<String> {
+    config()
+        .writable_home_dirs
+        .iter()
+        .filter(|d| !flare_sandbox::advisor::is_valid_writable_dir(d))
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Serializes the tests that mutate the process-global
+    /// `AGENTFLARE_SANDBOX_WRITABLE_HOME_DIRS`: cargo runs tests in one
+    /// binary on parallel threads, so unguarded set/remove pairs race.
+    fn writable_dirs_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn agent_profiles_have_unique_binary_names() {
@@ -282,10 +320,9 @@ mod tests {
 
     #[test]
     fn config_appends_env_var_dirs_to_writable_home_dirs() {
-        // Unique to this test -- no other test in the binary touches this
-        // var, so no cross-test race despite the missing global lock other
-        // env-var tests in this codebase rely on (e.g. asset_tests.rs's
-        // GLOBAL_STATE_LOCK).
+        let _guard = writable_dirs_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AGENTFLARE_SANDBOX_WRITABLE_HOME_DIRS").ok();
         unsafe {
             std::env::set_var("AGENTFLARE_SANDBOX_WRITABLE_HOME_DIRS", " .foo, .bar ,,");
@@ -309,6 +346,9 @@ mod tests {
 
     #[test]
     fn config_has_no_extra_dirs_when_env_var_unset() {
+        let _guard = writable_dirs_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AGENTFLARE_SANDBOX_WRITABLE_HOME_DIRS").ok();
         unsafe { std::env::remove_var("AGENTFLARE_SANDBOX_WRITABLE_HOME_DIRS") };
         let dirs = config().writable_home_dirs;
@@ -353,5 +393,44 @@ mod tests {
             .find(|m| m.relative_path == ".local/share/opencode")
             .expect(".local/share/opencode mount present");
         assert_eq!(data_dir_mount.diagnostic_log, Some("log/opencode.log"));
+    }
+
+    #[test]
+    fn try_wrap_honors_fail_closed() {
+        // One sequential test (not two parallel ones): both branches mutate
+        // the process-global `FLARE_SANDBOX_FAIL_CLOSED`, and cargo runs
+        // tests in this binary on parallel threads.
+        let saved = std::env::var("FLARE_SANDBOX_FAIL_CLOSED").ok();
+        let bogus_cwd = Path::new("/definitely-does-not-exist-agentflare-sandbox-test");
+        let args = vec!["--help".to_string()];
+
+        unsafe { std::env::remove_var("FLARE_SANDBOX_FAIL_CLOSED") };
+        let (command, out_args) =
+            try_wrap("cursor-agent", &args, Some(bogus_cwd), true, None).unwrap();
+        assert_eq!(command, "cursor-agent");
+        assert_eq!(out_args, args);
+
+        unsafe { std::env::set_var("FLARE_SANDBOX_FAIL_CLOSED", "1") };
+        let err = try_wrap("cursor-agent", &[], Some(bogus_cwd), true, None).unwrap_err();
+        assert!(!err.message.is_empty());
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var("FLARE_SANDBOX_FAIL_CLOSED", v) },
+            None => unsafe { std::env::remove_var("FLARE_SANDBOX_FAIL_CLOSED") },
+        }
+    }
+
+    #[test]
+    fn invalid_writable_dirs_is_empty_for_default_config() {
+        let _guard = writable_dirs_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var("AGENTFLARE_SANDBOX_WRITABLE_HOME_DIRS").ok();
+        unsafe { std::env::remove_var("AGENTFLARE_SANDBOX_WRITABLE_HOME_DIRS") };
+        let invalid = invalid_writable_dirs();
+        if let Some(v) = saved {
+            unsafe { std::env::set_var("AGENTFLARE_SANDBOX_WRITABLE_HOME_DIRS", v) };
+        }
+        assert!(invalid.is_empty());
     }
 }

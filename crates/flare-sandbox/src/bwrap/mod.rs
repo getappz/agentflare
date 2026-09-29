@@ -263,21 +263,42 @@ fn matching_profile<'a>(command: &str, config: &'a SandboxConfig) -> Option<&'a 
 }
 
 /// Applies one agent's `$HOME` state-directory mount per its [`MountPolicy`].
-/// The only policy today, `OverlayEphemeral`, mirrors claude-code/opencode's
-/// original treatment (item #127): reads pass through to the real directory
-/// (existing config/credentials), writes -- including anything the agent
-/// creates on demand, like cursor-agent's per-project tracking dir (item
-/// #130) -- go to the implicit tmpfs `--tmp-overlay` adds on top, discarded
-/// on exit, never touching the host. A directory that's never existed under
-/// this `$HOME` gets a plain writable tmpfs instead (nothing to read, but
-/// the agent still needs somewhere to create its own state).
+/// `OverlayEphemeral` mirrors claude-code/opencode's original treatment
+/// (item #127): reads pass through to the real directory (existing
+/// config/credentials), writes -- including anything the agent creates on
+/// demand, like cursor-agent's per-project tracking dir (item #130) -- go to
+/// the implicit tmpfs `--tmp-overlay` adds on top, discarded on exit, never
+/// touching the host. A directory that's never existed under this `$HOME`
+/// gets a plain writable tmpfs instead (nothing to read, but the agent still
+/// needs somewhere to create its own state). `EphemeralEmpty` always mounts
+/// an empty tmpfs: nothing readable, nothing persisted -- the credential
+/// posture OpenShell enforces by never handing agents real credentials.
 fn push_agent_state_mount(
     bwrap_args: &mut Vec<String>,
     command: &str,
     home: &std::ffi::OsStr,
     mount: &AgentStateMount,
 ) {
-    let MountPolicy::OverlayEphemeral = mount.policy;
+    let home_path = Path::new(home);
+    match mount.policy {
+        MountPolicy::EphemeralEmpty => {
+            match paths::join_validated_home_dir(home_path, mount.relative_path) {
+                Some(joined) => {
+                    bwrap_args.push("--tmpfs".to_string());
+                    bwrap_args.push(path_to_string(&joined));
+                }
+                None => {
+                    events::emit(&events::SandboxEvent::skipped_mount(
+                        command,
+                        mount.relative_path,
+                        "invalid-relative-path",
+                    ));
+                }
+            }
+            return;
+        }
+        MountPolicy::OverlayEphemeral => {}
+    }
     let home_path = Path::new(home);
     if let Some(resolved) = paths::resolve_existing_home_dir(home_path, mount.relative_path) {
         let dir_str = path_to_string(&resolved);
@@ -892,6 +913,40 @@ mod tests {
                 .iter()
                 .any(|a| a == "--overlay-src" || a == "--tmp-overlay")
         );
+    }
+
+    #[test]
+    fn ephemeral_empty_mount_never_reads_through() {
+        // Credential posture: even when the host dir exists and holds
+        // secrets, the sandbox sees an empty tmpfs -- no `--overlay-src`,
+        // no host path bound read-only or otherwise.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".secrets")).unwrap();
+        std::fs::write(dir.path().join(".secrets").join("token"), b"real").unwrap();
+        let home = std::ffi::OsString::from(dir.path());
+        let config = agent(
+            "testagent",
+            &[AgentStateMount {
+                relative_path: ".secrets",
+                policy: MountPolicy::EphemeralEmpty,
+                diagnostic_log: None,
+            }],
+        );
+        let args = build_bwrap_args_with_home(
+            None,
+            "/usr/local/bin/testagent",
+            &[],
+            Some(&home),
+            false,
+            &config,
+        );
+        let data_str = path_to_string(&dir.path().join(".secrets"));
+        let idx = args
+            .iter()
+            .position(|a| a == &data_str)
+            .expect("secret dir tmpfs-mounted");
+        assert_eq!(args[idx - 1], "--tmpfs");
+        assert!(!args.iter().any(|a| a == "--overlay-src"));
     }
 
     #[test]

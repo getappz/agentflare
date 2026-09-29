@@ -33,6 +33,14 @@ pub enum MountPolicy {
     /// policy for agent auth/session state -- a sandboxed job's oauth
     /// refresh or per-project tracking file shouldn't outlive that one job.
     OverlayEphemeral,
+    /// No read-through at all: the sandbox sees an empty writable tmpfs,
+    /// never the host directory's contents. For credential-dense state the
+    /// agent must not be able to exfiltrate (OpenShell never hands agents
+    /// real credentials; it injects them at approved endpoints instead).
+    /// Only use once the caller injects whatever credential the agent needs
+    /// another way (env, proxy) -- flipping a mount the agent must *read*
+    /// (existing tokens, MCP config) breaks it outright.
+    EphemeralEmpty,
 }
 
 /// One `$HOME`-relative directory an agent CLI needs mounted into the
