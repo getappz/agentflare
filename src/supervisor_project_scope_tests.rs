@@ -284,3 +284,65 @@ fn reassignment_holds_the_new_dispatch_until_the_old_job_stops_then_dispatches_t
     assert_eq!(fresh.len(), 1);
     assert_eq!(fresh[0].args.get(1).map(String::as_str), Some("opencode"));
 }
+
+/// The `Duplicate` arm of `ensure_dispatched_label`: seed the label first so
+/// the helper's own create is guaranteed to race-lose, then assert the
+/// get_by_name re-read still recovers the id into the map.
+#[test]
+fn ensure_dispatched_label_recovers_when_create_races() {
+    let mcp = test_mcp();
+    let (ok, recovered_id, seeded_id) = mcp
+        .with_backend_db(|conn| {
+            let project = mcp.resolve_project(conn).unwrap();
+            let new_label = || agentflare_backend::label::CreateLabel {
+                project_id: Some(project.id.clone()),
+                workspace_id: project.workspace_id.clone(),
+                name: DISPATCHED_LABEL.to_string(),
+                color: None,
+                parent_id: None,
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+            };
+            // Tolerate a fixture that already seeds it: either way the label
+            // exists afterwards, so the helper below must take the
+            // `Duplicate` path, not the `Ok` path.
+            let seeded_id = match agentflare_backend::label::create(conn, new_label()) {
+                Ok(label) => label.id,
+                Err(_) => {
+                    agentflare_backend::label::get_by_name(conn, &project.id, DISPATCHED_LABEL)
+                        .unwrap()
+                        .id
+                }
+            };
+            let mut map = std::collections::HashMap::new();
+            let ok = ensure_dispatched_label(conn, &project.id, &mut map);
+            (ok, map.get(DISPATCHED_LABEL).cloned(), seeded_id)
+        })
+        .unwrap();
+    assert!(ok, "a lost create race must still recover the label");
+    assert_eq!(
+        recovered_id.as_deref(),
+        Some(seeded_id.as_str()),
+        "the re-read must recover the raced label's id, not a stale map"
+    );
+}
+
+/// The unresolvable-workspace arm: an unknown project declines safely with
+/// nothing recorded, leaving the caller to `dispatch_item`'s guard.
+#[test]
+fn ensure_dispatched_label_declines_safely_for_an_unknown_project() {
+    let mcp = test_mcp();
+    let (ok, recorded) = mcp
+        .with_backend_db(|conn| {
+            let mut map = std::collections::HashMap::new();
+            let ok = ensure_dispatched_label(conn, "project-that-does-not-exist", &mut map);
+            (ok, map.len())
+        })
+        .unwrap();
+    assert!(
+        !ok,
+        "no label can be ensured for a project that does not resolve"
+    );
+    assert_eq!(recorded, 0, "a failed ensure must not record anything");
+}
