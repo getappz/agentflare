@@ -13,6 +13,7 @@
 mod bwrap_install;
 
 use crate::{AgentProfile, AgentStateMount, MountPolicy, SandboxConfig};
+use crate::{events, identity, paths};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -31,7 +32,7 @@ const HOME_CACHE_DIRS: &[&str] = &[".cargo", ".rustup", ".cache", ".npm"];
 /// `--bind` as the rest of `cwd` (`true` -- required by the headless
 /// coding-agent CLI itself, whose entire job is `git add`/`git commit`/
 /// `git push`; see `agent_launch::run_headless`'s call site).
-pub(super) fn wrap(
+pub(crate) fn wrap(
     command: &str,
     args: &[String],
     cwd: Option<&Path>,
@@ -157,29 +158,69 @@ fn build_bwrap_args_with_home(
     }
 
     if let Some(home) = home {
+        let home_path = Path::new(home);
+        // Cache dirs are read-only binds: resolve symlink escapes so a
+        // `~/.cargo -> /elsewhere` symlink cannot smuggle an unintended
+        // host path into the sandbox under a trusted name. A
+        // rejected-but-present path is skipped with an event instead of
+        // being bound (the old lexical-join + `exists()` fallback followed
+        // symlinks).
         for cache in HOME_CACHE_DIRS {
-            let path = Path::new(home).join(cache);
-            if path.exists() {
-                let path_str = path_to_string(&path);
-                bwrap_args.push("--ro-bind-try".to_string());
-                bwrap_args.push(path_str.clone());
-                bwrap_args.push(path_str);
+            match paths::resolve_existing_home_dir(home_path, cache) {
+                Some(resolved) => {
+                    let path_str = path_to_string(&resolved);
+                    bwrap_args.push("--ro-bind-try".to_string());
+                    bwrap_args.push(path_str.clone());
+                    bwrap_args.push(path_str);
+                }
+                None if paths::join_validated_home_dir(home_path, cache)
+                    .is_some_and(|p| std::fs::symlink_metadata(&p).is_ok()) =>
+                {
+                    events::emit(&events::SandboxEvent::skipped_mount(
+                        command,
+                        cache,
+                        "symlink-or-escape",
+                    ));
+                }
+                None => {}
             }
         }
 
         for relative in &config.writable_home_dirs {
-            let dir = Path::new(home).join(relative);
-            if dir.exists() {
-                let dir_str = path_to_string(&dir);
-                bwrap_args.push("--bind-try".to_string());
-                bwrap_args.push(dir_str.clone());
-                bwrap_args.push(dir_str);
+            if !crate::advisor::is_valid_writable_dir(relative) {
+                events::emit(&events::SandboxEvent::invalid_writable_dir(
+                    command, relative,
+                ));
+                continue;
+            }
+            match paths::resolve_existing_home_dir(home_path, relative) {
+                Some(resolved) => {
+                    let dir_str = path_to_string(&resolved);
+                    bwrap_args.push("--bind-try".to_string());
+                    bwrap_args.push(dir_str.clone());
+                    bwrap_args.push(dir_str);
+                }
+                None if paths::join_validated_home_dir(home_path, relative)
+                    .is_some_and(|p| std::fs::symlink_metadata(&p).is_ok()) =>
+                {
+                    // Exists but rejected (symlink, dangling symlink, or
+                    // escape above $HOME): skip instead of binding the wrong
+                    // directory. `symlink_metadata` (not `exists`) so a
+                    // dangling symlink takes this loud branch instead of
+                    // silently falling through.
+                    events::emit(&events::SandboxEvent::skipped_mount(
+                        command,
+                        relative,
+                        "symlink-or-escape",
+                    ));
+                }
+                None => {}
             }
         }
 
         if let Some(profile) = matching_profile(command, config) {
             for mount in profile.state_mounts {
-                push_agent_state_mount(&mut bwrap_args, home, mount);
+                push_agent_state_mount(&mut bwrap_args, command, home, mount);
             }
         }
     }
@@ -194,39 +235,125 @@ fn build_bwrap_args_with_home(
 /// The agent profile (if any) whose `binary_name` matches `command`'s final
 /// path component -- shared by the state-mount loop above and the
 /// diagnostic-log wrapper below so both agree on which profile applies.
+///
+/// Matching stays basename-based (fail-open for legitimate multi-install
+/// boxes), but the resolved canonical path is pinned per binary name (see
+/// `identity`): a later different canonical path with the same basename
+/// still matches yet emits an `identity_mismatch` event so `PATH` shadowing
+/// is visible instead of silent.
 fn matching_profile<'a>(command: &str, config: &'a SandboxConfig) -> Option<&'a AgentProfile> {
-    let command_file_name = Path::new(command).file_name()?;
+    if let Some(id) = identity::resolve(command) {
+        let outcome = identity::pin_identity(&id);
+        if outcome.mismatch {
+            events::emit(&events::SandboxEvent::identity_mismatch(
+                command,
+                &id.name,
+                &id.canonical
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            ));
+        } else if outcome.exhausted {
+            events::emit(&events::SandboxEvent::identity_pins_exhausted(command));
+        }
+        if let Some(profile) = config
+            .agent_profiles
+            .iter()
+            .find(|profile| profile.binary_name == id.name)
+        {
+            return Some(profile);
+        }
+    }
+    // Fallback: pure basename match for binaries that are not installed or
+    // otherwise unresolvable on this machine -- profile selection must not
+    // depend on the binary being on PATH (tests, dry runs).
+    let name = identity::binary_name(command)?;
     config
         .agent_profiles
         .iter()
-        .find(|profile| std::ffi::OsStr::new(profile.binary_name) == command_file_name)
+        .find(|profile| profile.binary_name == name)
 }
 
 /// Applies one agent's `$HOME` state-directory mount per its [`MountPolicy`].
-/// The only policy today, `OverlayEphemeral`, mirrors claude-code/opencode's
-/// original treatment (item #127): reads pass through to the real directory
-/// (existing config/credentials), writes -- including anything the agent
-/// creates on demand, like cursor-agent's per-project tracking dir (item
-/// #130) -- go to the implicit tmpfs `--tmp-overlay` adds on top, discarded
-/// on exit, never touching the host. A directory that's never existed under
-/// this `$HOME` gets a plain writable tmpfs instead (nothing to read, but
-/// the agent still needs somewhere to create its own state).
+/// `OverlayEphemeral` mirrors claude-code/opencode's original treatment
+/// (item #127): reads pass through to the real directory (existing
+/// config/credentials), writes -- including anything the agent creates on
+/// demand, like cursor-agent's per-project tracking dir (item #130) -- go to
+/// the implicit tmpfs `--tmp-overlay` adds on top, discarded on exit, never
+/// touching the host. A directory that's never existed under this `$HOME`
+/// gets a plain writable tmpfs instead (nothing to read, but the agent still
+/// needs somewhere to create its own state). `EphemeralEmpty` always mounts
+/// an empty tmpfs: nothing readable, nothing persisted -- the credential
+/// posture OpenShell enforces by never handing agents real credentials.
 fn push_agent_state_mount(
     bwrap_args: &mut Vec<String>,
+    command: &str,
     home: &std::ffi::OsStr,
     mount: &AgentStateMount,
 ) {
-    let MountPolicy::OverlayEphemeral = mount.policy;
-    let dir = Path::new(home).join(mount.relative_path);
-    let dir_str = path_to_string(&dir);
-    if dir.exists() {
+    let home_path = Path::new(home);
+    match mount.policy {
+        MountPolicy::EphemeralEmpty => {
+            match paths::join_validated_home_dir(home_path, mount.relative_path) {
+                Some(joined)
+                    if std::fs::symlink_metadata(&joined).is_ok()
+                        && paths::resolve_existing_home_dir(home_path, mount.relative_path)
+                            .is_none() =>
+                {
+                    // Present on the host yet unresolvable (symlink,
+                    // dangling symlink, or escape above $HOME): never tmpfs
+                    // over it -- mounting on a symlink masks whatever it
+                    // points at. A present *real* dir falls through to the
+                    // tmpfs below: masking its contents is the point.
+                    events::emit(&events::SandboxEvent::skipped_mount(
+                        command,
+                        mount.relative_path,
+                        "symlink-or-escape",
+                    ));
+                }
+                Some(joined) => {
+                    bwrap_args.push("--tmpfs".to_string());
+                    bwrap_args.push(path_to_string(&joined));
+                }
+                None => {
+                    events::emit(&events::SandboxEvent::skipped_mount(
+                        command,
+                        mount.relative_path,
+                        "invalid-relative-path",
+                    ));
+                }
+            }
+            return;
+        }
+        MountPolicy::OverlayEphemeral => {}
+    }
+    if let Some(resolved) = paths::resolve_existing_home_dir(home_path, mount.relative_path) {
+        let dir_str = path_to_string(&resolved);
         bwrap_args.push("--overlay-src".to_string());
         bwrap_args.push(dir_str.clone());
         bwrap_args.push("--tmp-overlay".to_string());
         bwrap_args.push(dir_str);
+    } else if let Some(joined) = paths::join_validated_home_dir(home_path, mount.relative_path) {
+        if std::fs::symlink_metadata(&joined).is_ok() {
+            // Exists but rejected (symlink, dangling symlink, or escape):
+            // skip instead of overlaying the wrong directory.
+            // `symlink_metadata` (not `exists`) so a dangling symlink takes
+            // this loud branch instead of a silent tmpfs below.
+            events::emit(&events::SandboxEvent::skipped_mount(
+                command,
+                mount.relative_path,
+                "symlink-or-escape",
+            ));
+        } else {
+            bwrap_args.push("--tmpfs".to_string());
+            bwrap_args.push(path_to_string(&joined));
+        }
     } else {
-        bwrap_args.push("--tmpfs".to_string());
-        bwrap_args.push(dir_str);
+        events::emit(&events::SandboxEvent::skipped_mount(
+            command,
+            mount.relative_path,
+            "invalid-relative-path",
+        ));
     }
 }
 
@@ -408,6 +535,12 @@ fn find_or_install_bwrap() -> Option<PathBuf> {
 fn which_bwrap() -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     find_on_path(&path, "bwrap")
+}
+
+/// Side-effect-free availability probe for `backend::BwrapBackend`: PATH
+/// lookup only, no `mise` install attempt (unlike `find_or_install_bwrap`).
+pub(crate) fn probe_available() -> bool {
+    which_bwrap().is_some()
 }
 
 /// Pure PATH search, factored out so tests can exercise it without mutating
@@ -672,7 +805,7 @@ mod tests {
             false,
             &SandboxConfig::default(),
         );
-        let cargo_path = path_to_string(&dir.path().join(".cargo"));
+        let cargo_path = path_to_string(&std::fs::canonicalize(dir.path().join(".cargo")).unwrap());
         let idx = args
             .iter()
             .position(|a| a == &cargo_path)
@@ -695,7 +828,7 @@ mod tests {
             writable_home_dirs: vec![".agentflare".to_string()],
         };
         let args = build_bwrap_args_with_home(None, "true", &[], Some(&home), false, &config);
-        let path = path_to_string(&dir.path().join(".agentflare"));
+        let path = path_to_string(&std::fs::canonicalize(dir.path().join(".agentflare")).unwrap());
         let idx = args
             .iter()
             .position(|a| a == &path)
@@ -721,6 +854,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().join(".testagent");
         std::fs::create_dir_all(&data_dir).unwrap();
+        let data_dir = std::fs::canonicalize(&data_dir).unwrap();
         let home = std::ffi::OsString::from(dir.path());
         let config = agent(
             "testagent",
@@ -808,6 +942,92 @@ mod tests {
                 .iter()
                 .any(|a| a == "--overlay-src" || a == "--tmp-overlay")
         );
+    }
+
+    #[test]
+    fn ephemeral_empty_mount_never_reads_through() {
+        // Credential posture: even when the host dir exists and holds
+        // secrets, the sandbox sees an empty tmpfs -- no `--overlay-src`,
+        // no host path bound read-only or otherwise.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".secrets")).unwrap();
+        std::fs::write(dir.path().join(".secrets").join("token"), b"real").unwrap();
+        let home = std::ffi::OsString::from(dir.path());
+        let config = agent(
+            "testagent",
+            &[AgentStateMount {
+                relative_path: ".secrets",
+                policy: MountPolicy::EphemeralEmpty,
+                diagnostic_log: None,
+            }],
+        );
+        let args = build_bwrap_args_with_home(
+            None,
+            "/usr/local/bin/testagent",
+            &[],
+            Some(&home),
+            false,
+            &config,
+        );
+        let data_str = path_to_string(&dir.path().join(".secrets"));
+        let idx = args
+            .iter()
+            .position(|a| a == &data_str)
+            .expect("secret dir tmpfs-mounted");
+        assert_eq!(args[idx - 1], "--tmpfs");
+        assert!(!args.iter().any(|a| a == "--overlay-src"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ephemeral_empty_skips_symlink_destination() {
+        // Tmpfs over a symlink would mask the link target: skip with an
+        // event instead, whether the link is live or dangling. Both cases
+        // spell their mount inline (not via Box::leak in a loop) so the
+        // `&[...]` array const-promotes to `&'static` -- a leaked runtime
+        // string would pin a temporary here (E0716).
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join(".live")).unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("does-not-exist"),
+            dir.path().join(".dangling"),
+        )
+        .unwrap();
+        let home = std::ffi::OsString::from(dir.path());
+        for (relative, mounts) in [
+            (
+                ".live",
+                &[AgentStateMount {
+                    relative_path: ".live",
+                    policy: MountPolicy::EphemeralEmpty,
+                    diagnostic_log: None,
+                }] as &'static [AgentStateMount],
+            ),
+            (
+                ".dangling",
+                &[AgentStateMount {
+                    relative_path: ".dangling",
+                    policy: MountPolicy::EphemeralEmpty,
+                    diagnostic_log: None,
+                }] as &'static [AgentStateMount],
+            ),
+        ] {
+            let config = agent("testagent", mounts);
+            let args = build_bwrap_args_with_home(
+                None,
+                "/usr/local/bin/testagent",
+                &[],
+                Some(&home),
+                false,
+                &config,
+            );
+            let data_str = path_to_string(&dir.path().join(relative));
+            assert!(
+                !args.iter().any(|a| a == &data_str),
+                "{relative} symlink must not be mounted: {args:?}"
+            );
+        }
     }
 
     #[test]

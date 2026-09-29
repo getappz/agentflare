@@ -98,35 +98,15 @@ impl Supervisor {
         let stdout_path = self.stdout_path.clone();
         let stderr_path = self.stderr_path.clone();
         let stdout_handle = std::thread::spawn(move || -> std::io::Result<u64> {
-            let mut file = std::fs::File::create(&stdout_path)?;
-            let mut buf = [0u8; 65536];
-            let mut total = 0u64;
-            let mut reader = std::io::BufReader::new(stdout_pipe);
-            loop {
-                let n = reader.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                file.write_all(&buf[..n])?;
-                total += n as u64;
-            }
-            Ok(total)
+            let file = std::fs::File::create(&stdout_path)?;
+            let reader = std::io::BufReader::new(stdout_pipe);
+            Ok(pump_capped(reader, file).0)
         });
 
         let stderr_handle = std::thread::spawn(move || -> std::io::Result<u64> {
-            let mut file = std::fs::File::create(&stderr_path)?;
-            let mut buf = [0u8; 65536];
-            let mut total = 0u64;
-            let mut reader = std::io::BufReader::new(stderr_pipe);
-            loop {
-                let n = reader.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                file.write_all(&buf[..n])?;
-                total += n as u64;
-            }
-            Ok(total)
+            let file = std::fs::File::create(&stderr_path)?;
+            let reader = std::io::BufReader::new(stderr_pipe);
+            Ok(pump_capped(reader, file).0)
         });
 
         let start = Instant::now();
@@ -162,6 +142,71 @@ impl Supervisor {
 
         Ok((output, final_state))
     }
+}
+
+/// Per-stream cap on bytes written to a job's log file (64 MiB): a runaway
+/// job spewing output must not fill the disk. Past the cap the pump keeps
+/// *draining* the pipe (so the child never blocks on a full pipe) but stops
+/// writing, appending one truncation marker instead -- the same bounded-queue
+/// discipline as OpenShell's exec output (`sandbox-limits.md`).
+pub const MAX_LOG_STREAM_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Pumps `reader` into `file` up to [`MAX_LOG_STREAM_BYTES`], continuing to
+/// drain past the cap so the child never blocks. Returns
+/// `(bytes_written, truncated)`.
+fn pump_capped<R: Read, W: Write>(reader: R, file: W) -> (u64, bool) {
+    pump_capped_with(reader, file, MAX_LOG_STREAM_BYTES)
+}
+
+fn pump_capped_with<R: Read, W: Write>(mut reader: R, mut file: W, cap: u64) -> (u64, bool) {
+    let mut buf = [0u8; 65536];
+    let mut total = 0u64;
+    let mut truncated = false;
+    // Once storing stops (cap reached or the log file failed), the pump
+    // keeps draining so the child never blocks on a full pipe.
+    let mut storing = true;
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            // EINTR is non-fatal per `Read`'s contract (`read_to_end` also
+            // retries it); anything else ends the pump.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        if !storing {
+            continue;
+        }
+        // A single read can overshoot the cap: persist the head up to the
+        // cap so the retained prefix is always the true prefix.
+        let room = cap.saturating_sub(total) as usize;
+        let take = room.min(n);
+        let mut written = 0;
+        let mut failed = false;
+        while written < take {
+            match file.write(&buf[written..take]) {
+                Ok(0) => {
+                    failed = true;
+                    break;
+                }
+                Ok(m) => written += m,
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        total += written as u64;
+        if failed || take < n {
+            truncated = true;
+            storing = false;
+            if !failed {
+                let _ = writeln!(file, "\n[job log truncated at {cap} bytes]");
+                total = cap;
+            }
+        }
+    }
+    (total, truncated)
 }
 
 /// PIDs of every live descendant of `pid` (children, grandchildren, ...),
@@ -280,8 +325,113 @@ mod tests {
     // Only `#[cfg(target_os = "linux")]` tests live in this module today, so
     // this glob import is unused (and fails `-D unused-imports`) on every
     // other platform.
+    use super::pump_capped;
+    use super::pump_capped_with;
     #[cfg(target_os = "linux")]
     use super::*;
+
+    #[test]
+    fn pump_capped_passes_small_output_through() {
+        let input = b"hello job output\n";
+        let mut out = Vec::new();
+        let (total, truncated) = pump_capped(&input[..], &mut out);
+        assert!(!truncated);
+        assert_eq!(total, input.len() as u64);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn pump_capped_truncates_marker_and_drains_rest() {
+        let input = vec![b'x'; 300];
+        let mut out = Vec::new();
+        let (total, truncated) = pump_capped_with(&input[..], &mut out, 100);
+        assert!(truncated);
+        assert_eq!(total, 100);
+        // First 100 bytes verbatim, then exactly one marker; the remaining
+        // 200 input bytes were consumed (drained) without being stored.
+        assert!(out.starts_with(&[b'x'; 100]));
+        let marker = b"[job log truncated at 100 bytes]";
+        assert_eq!(
+            out.windows(marker.len()).filter(|w| *w == marker).count(),
+            1
+        );
+        assert!(out.len() < input.len());
+    }
+
+    /// A reader that reports one `Interrupted` error before yielding data,
+    /// modelling an EINTR-hit pipe read.
+    struct InterruptOnce<R> {
+        inner: R,
+        interrupted: bool,
+    }
+
+    impl<R: std::io::Read> std::io::Read for InterruptOnce<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "test interrupt",
+                ));
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    #[test]
+    fn pump_retries_interrupted_reads() {
+        let input = b"after interrupt";
+        let mut out = Vec::new();
+        let reader = InterruptOnce {
+            inner: &input[..],
+            interrupted: false,
+        };
+        let (total, truncated) = pump_capped_with(reader, &mut out, u64::MAX);
+        assert!(!truncated);
+        assert_eq!(total, input.len() as u64);
+        assert_eq!(out, input);
+    }
+
+    /// A writer that accepts `limit` bytes then fails every write, modelling
+    /// a full disk.
+    struct FailAfter {
+        remaining: usize,
+        stored: Vec<u8>,
+    }
+
+    impl std::io::Write for FailAfter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    "test disk full",
+                ));
+            }
+            let take = self.remaining.min(buf.len());
+            self.stored.extend_from_slice(&buf[..take]);
+            self.remaining -= take;
+            Ok(take)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn pump_keeps_draining_after_write_failure() {
+        let input = vec![b'y'; 300];
+        let mut file = FailAfter {
+            remaining: 100,
+            stored: Vec::new(),
+        };
+        let (total, truncated) = pump_capped_with(&input[..], &mut file, u64::MAX);
+        // Marked truncated (log incomplete) but the whole 300-byte input was
+        // consumed, so a real child would never block on a full pipe.
+        assert!(truncated);
+        assert_eq!(file.stored, vec![b'y'; 100]);
+        assert_eq!(total, 100);
+    }
 
     // `setsid` moves the grandchild into a brand-new session/process group of
     // its own -- exactly what `agent_launch::run_captured` does to its own

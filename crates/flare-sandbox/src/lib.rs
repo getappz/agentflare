@@ -11,7 +11,16 @@
 //! agent is running.
 
 #[cfg(target_os = "linux")]
-mod bwrap;
+pub(crate) mod bwrap;
+
+pub mod advisor;
+pub mod backend;
+pub mod events;
+pub mod guarantees;
+pub mod identity;
+pub mod paths;
+
+pub use guarantees::SandboxError;
 
 use std::path::Path;
 
@@ -24,6 +33,14 @@ pub enum MountPolicy {
     /// policy for agent auth/session state -- a sandboxed job's oauth
     /// refresh or per-project tracking file shouldn't outlive that one job.
     OverlayEphemeral,
+    /// No read-through at all: the sandbox sees an empty writable tmpfs,
+    /// never the host directory's contents. For credential-dense state the
+    /// agent must not be able to exfiltrate (OpenShell never hands agents
+    /// real credentials; it injects them at approved endpoints instead).
+    /// Only use once the caller injects whatever credential the agent needs
+    /// another way (env, proxy) -- flipping a mount the agent must *read*
+    /// (existing tokens, MCP config) breaks it outright.
+    EphemeralEmpty,
 }
 
 /// One `$HOME`-relative directory an agent CLI needs mounted into the
@@ -61,6 +78,75 @@ pub struct AgentProfile {
 pub struct SandboxConfig {
     pub agent_profiles: &'static [AgentProfile],
     pub writable_home_dirs: Vec<String>,
+}
+
+/// Fail-closed wrapper: `Ok` with the sandboxed argv when a backend can
+/// enforce the boundary, `Err` when it cannot *and* `FLARE_SANDBOX_FAIL_CLOSED`
+/// is set (see [`guarantees::is_fail_closed`]). Without fail-closed, an
+/// unenforceable invocation falls back to the plain command (with a
+/// `fallback_unsandboxed` event on stderr) instead of erroring.
+///
+/// Prefer this over [`wrap`] for job runners that must not silently lose
+/// their boundary.
+#[cfg(target_os = "linux")]
+pub fn try_wrap(
+    command: &str,
+    args: &[String],
+    cwd: Option<&Path>,
+    git_writable: bool,
+    config: &SandboxConfig,
+    diagnostic_out: Option<&Path>,
+) -> Result<(String, Vec<String>), SandboxError> {
+    match bwrap::wrap(command, args, cwd, git_writable, config, diagnostic_out) {
+        Some(wrapped) => Ok(wrapped),
+        None if bwrap::probe_available() => {
+            // bwrap exists but this invocation cannot be sandboxed: the cwd
+            // did not resolve, so there is no safe directory to bind.
+            events::emit(&events::SandboxEvent::fallback_unsandboxed(
+                command,
+                "unresolvable-cwd",
+            ));
+            if guarantees::is_fail_closed() {
+                Err(SandboxError::unresolvable_cwd(command))
+            } else {
+                Ok((command.to_string(), args.to_vec()))
+            }
+        }
+        None => {
+            events::emit(&events::SandboxEvent::fallback_unsandboxed(
+                command,
+                "bwrap-not-found",
+            ));
+            if guarantees::is_fail_closed() {
+                Err(SandboxError::unavailable(command, "bwrap-not-found"))
+            } else {
+                Ok((command.to_string(), args.to_vec()))
+            }
+        }
+    }
+}
+
+/// Fail-closed wrapper for non-Linux platforms: there is no enforcing
+/// backend, so this always falls back (with an event) unless fail-closed is
+/// set, in which case it errors.
+#[cfg(not(target_os = "linux"))]
+pub fn try_wrap(
+    command: &str,
+    args: &[String],
+    _cwd: Option<&Path>,
+    _git_writable: bool,
+    _config: &SandboxConfig,
+    _diagnostic_out: Option<&Path>,
+) -> Result<(String, Vec<String>), SandboxError> {
+    events::emit(&events::SandboxEvent::fallback_unsandboxed(
+        command,
+        "non-linux-platform",
+    ));
+    if guarantees::is_fail_closed() {
+        Err(SandboxError::unavailable(command, "non-linux-platform"))
+    } else {
+        Ok((command.to_string(), args.to_vec()))
+    }
 }
 
 /// Returns the command/args that should actually be spawned for a job:
