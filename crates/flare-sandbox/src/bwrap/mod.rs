@@ -295,10 +295,16 @@ fn push_agent_state_mount(
     match mount.policy {
         MountPolicy::EphemeralEmpty => {
             match paths::join_validated_home_dir(home_path, mount.relative_path) {
-                Some(joined) if std::fs::symlink_metadata(&joined).is_ok() => {
-                    // Present on the host (file, dir, or symlink, dangling
-                    // included) yet unresolvable: never tmpfs over it --
-                    // mounting on a symlink masks whatever it points at.
+                Some(joined)
+                    if std::fs::symlink_metadata(&joined).is_ok()
+                        && paths::resolve_existing_home_dir(home_path, mount.relative_path)
+                            .is_none() =>
+                {
+                    // Present on the host yet unresolvable (symlink,
+                    // dangling symlink, or escape above $HOME): never tmpfs
+                    // over it -- mounting on a symlink masks whatever it
+                    // points at. A present *real* dir falls through to the
+                    // tmpfs below: masking its contents is the point.
                     events::emit(&events::SandboxEvent::skipped_mount(
                         command,
                         mount.relative_path,
@@ -970,6 +976,45 @@ mod tests {
             .expect("secret dir tmpfs-mounted");
         assert_eq!(args[idx - 1], "--tmpfs");
         assert!(!args.iter().any(|a| a == "--overlay-src"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ephemeral_empty_skips_symlink_destination() {
+        // Tmpfs over a symlink would mask the link target: skip with an
+        // event instead, whether the link is live or dangling.
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join(".live")).unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("does-not-exist"),
+            dir.path().join(".dangling"),
+        )
+        .unwrap();
+        let home = std::ffi::OsString::from(dir.path());
+        for relative in [".live", ".dangling"] {
+            let config = agent(
+                "testagent",
+                &[AgentStateMount {
+                    relative_path: Box::leak(relative.to_string().into_boxed_str()),
+                    policy: MountPolicy::EphemeralEmpty,
+                    diagnostic_log: None,
+                }],
+            );
+            let args = build_bwrap_args_with_home(
+                None,
+                "/usr/local/bin/testagent",
+                &[],
+                Some(&home),
+                false,
+                &config,
+            );
+            let data_str = path_to_string(&dir.path().join(relative));
+            assert!(
+                !args.iter().any(|a| a == &data_str),
+                "{relative} symlink must not be mounted: {args:?}"
+            );
+        }
     }
 
     #[test]
