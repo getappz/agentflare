@@ -13,6 +13,7 @@
 mod bwrap_install;
 
 use crate::{AgentProfile, AgentStateMount, MountPolicy, SandboxConfig};
+use crate::{events, identity, paths};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -31,7 +32,7 @@ const HOME_CACHE_DIRS: &[&str] = &[".cargo", ".rustup", ".cache", ".npm"];
 /// `--bind` as the rest of `cwd` (`true` -- required by the headless
 /// coding-agent CLI itself, whose entire job is `git add`/`git commit`/
 /// `git push`; see `agent_launch::run_headless`'s call site).
-pub(super) fn wrap(
+pub(crate) fn wrap(
     command: &str,
     args: &[String],
     cwd: Option<&Path>,
@@ -158,9 +159,17 @@ fn build_bwrap_args_with_home(
 
     if let Some(home) = home {
         for cache in HOME_CACHE_DIRS {
-            let path = Path::new(home).join(cache);
-            if path.exists() {
-                let path_str = path_to_string(&path);
+            // Cache dirs are read-only binds: resolve symlink escapes so a
+            // `~/.cargo -> /elsewhere` symlink cannot smuggle an unintended
+            // host path into the sandbox under a trusted name.
+            let home_path = Path::new(home);
+            let resolved = paths::resolve_existing_home_dir(home_path, cache)
+                .map(|p| path_to_string(&p))
+                .or_else(|| {
+                    paths::join_validated_home_dir(home_path, cache)
+                        .and_then(|joined| joined.exists().then(|| path_to_string(&joined)))
+                });
+            if let Some(path_str) = resolved {
                 bwrap_args.push("--ro-bind-try".to_string());
                 bwrap_args.push(path_str.clone());
                 bwrap_args.push(path_str);
@@ -168,18 +177,38 @@ fn build_bwrap_args_with_home(
         }
 
         for relative in &config.writable_home_dirs {
-            let dir = Path::new(home).join(relative);
-            if dir.exists() {
-                let dir_str = path_to_string(&dir);
-                bwrap_args.push("--bind-try".to_string());
-                bwrap_args.push(dir_str.clone());
-                bwrap_args.push(dir_str);
+            if !crate::advisor::is_valid_writable_dir(relative) {
+                events::emit(&events::SandboxEvent::invalid_writable_dir(
+                    command, relative,
+                ));
+                continue;
+            }
+            let home_path = Path::new(home);
+            match paths::resolve_existing_home_dir(home_path, relative) {
+                Some(resolved) => {
+                    let dir_str = path_to_string(&resolved);
+                    bwrap_args.push("--bind-try".to_string());
+                    bwrap_args.push(dir_str.clone());
+                    bwrap_args.push(dir_str);
+                }
+                None if paths::join_validated_home_dir(home_path, relative)
+                    .is_some_and(|p| p.exists()) =>
+                {
+                    // Exists but rejected (symlink or escape above $HOME):
+                    // skip instead of binding the wrong directory.
+                    events::emit(&events::SandboxEvent::skipped_mount(
+                        command,
+                        relative,
+                        "symlink-or-escape",
+                    ));
+                }
+                None => {}
             }
         }
 
         if let Some(profile) = matching_profile(command, config) {
             for mount in profile.state_mounts {
-                push_agent_state_mount(&mut bwrap_args, home, mount);
+                push_agent_state_mount(&mut bwrap_args, command, home, mount);
             }
         }
     }
@@ -194,12 +223,43 @@ fn build_bwrap_args_with_home(
 /// The agent profile (if any) whose `binary_name` matches `command`'s final
 /// path component -- shared by the state-mount loop above and the
 /// diagnostic-log wrapper below so both agree on which profile applies.
+///
+/// Matching stays basename-based (fail-open for legitimate multi-install
+/// boxes), but the resolved canonical path is pinned per binary name (see
+/// `identity`): a later different canonical path with the same basename
+/// still matches yet emits an `identity_mismatch` event so `PATH` shadowing
+/// is visible instead of silent.
 fn matching_profile<'a>(command: &str, config: &'a SandboxConfig) -> Option<&'a AgentProfile> {
-    let command_file_name = Path::new(command).file_name()?;
+    if let Some(id) = identity::resolve(command) {
+        let outcome = identity::pin_identity(&id);
+        if outcome.mismatch {
+            events::emit(&events::SandboxEvent::identity_mismatch(
+                command,
+                &id.name,
+                &id.canonical
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            ));
+        } else if outcome.exhausted {
+            events::emit(&events::SandboxEvent::identity_pins_exhausted(command));
+        }
+        if let Some(profile) = config
+            .agent_profiles
+            .iter()
+            .find(|profile| profile.binary_name == id.name)
+        {
+            return Some(profile);
+        }
+    }
+    // Fallback: pure basename match for binaries that are not installed or
+    // otherwise unresolvable on this machine -- profile selection must not
+    // depend on the binary being on PATH (tests, dry runs).
+    let name = identity::binary_name(command)?;
     config
         .agent_profiles
         .iter()
-        .find(|profile| std::ffi::OsStr::new(profile.binary_name) == command_file_name)
+        .find(|profile| profile.binary_name == name)
 }
 
 /// Applies one agent's `$HOME` state-directory mount per its [`MountPolicy`].
@@ -213,20 +273,37 @@ fn matching_profile<'a>(command: &str, config: &'a SandboxConfig) -> Option<&'a 
 /// the agent still needs somewhere to create its own state).
 fn push_agent_state_mount(
     bwrap_args: &mut Vec<String>,
+    command: &str,
     home: &std::ffi::OsStr,
     mount: &AgentStateMount,
 ) {
     let MountPolicy::OverlayEphemeral = mount.policy;
-    let dir = Path::new(home).join(mount.relative_path);
-    let dir_str = path_to_string(&dir);
-    if dir.exists() {
+    let home_path = Path::new(home);
+    if let Some(resolved) = paths::resolve_existing_home_dir(home_path, mount.relative_path) {
+        let dir_str = path_to_string(&resolved);
         bwrap_args.push("--overlay-src".to_string());
         bwrap_args.push(dir_str.clone());
         bwrap_args.push("--tmp-overlay".to_string());
         bwrap_args.push(dir_str);
+    } else if let Some(joined) = paths::join_validated_home_dir(home_path, mount.relative_path) {
+        if joined.exists() {
+            // Exists but rejected (symlink or escape): skip instead of
+            // overlaying the wrong directory.
+            events::emit(&events::SandboxEvent::skipped_mount(
+                command,
+                mount.relative_path,
+                "symlink-or-escape",
+            ));
+        } else {
+            bwrap_args.push("--tmpfs".to_string());
+            bwrap_args.push(path_to_string(&joined));
+        }
     } else {
-        bwrap_args.push("--tmpfs".to_string());
-        bwrap_args.push(dir_str);
+        events::emit(&events::SandboxEvent::skipped_mount(
+            command,
+            mount.relative_path,
+            "invalid-relative-path",
+        ));
     }
 }
 
@@ -408,6 +485,12 @@ fn find_or_install_bwrap() -> Option<PathBuf> {
 fn which_bwrap() -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     find_on_path(&path, "bwrap")
+}
+
+/// Side-effect-free availability probe for `backend::BwrapBackend`: PATH
+/// lookup only, no `mise` install attempt (unlike `find_or_install_bwrap`).
+pub(crate) fn probe_available() -> bool {
+    which_bwrap().is_some()
 }
 
 /// Pure PATH search, factored out so tests can exercise it without mutating
@@ -672,7 +755,7 @@ mod tests {
             false,
             &SandboxConfig::default(),
         );
-        let cargo_path = path_to_string(&dir.path().join(".cargo"));
+        let cargo_path = path_to_string(&std::fs::canonicalize(dir.path().join(".cargo")).unwrap());
         let idx = args
             .iter()
             .position(|a| a == &cargo_path)
@@ -695,7 +778,7 @@ mod tests {
             writable_home_dirs: vec![".agentflare".to_string()],
         };
         let args = build_bwrap_args_with_home(None, "true", &[], Some(&home), false, &config);
-        let path = path_to_string(&dir.path().join(".agentflare"));
+        let path = path_to_string(&std::fs::canonicalize(dir.path().join(".agentflare")).unwrap());
         let idx = args
             .iter()
             .position(|a| a == &path)
@@ -721,6 +804,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().join(".testagent");
         std::fs::create_dir_all(&data_dir).unwrap();
+        let data_dir = std::fs::canonicalize(&data_dir).unwrap();
         let home = std::ffi::OsString::from(dir.path());
         let config = agent(
             "testagent",
