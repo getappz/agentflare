@@ -202,7 +202,10 @@ pub(crate) fn resolve_mutating_target_repo(tool_input: Option<&Value>) -> Target
 /// `AgentflareMcp` carries a `worktree_repo_root_override` for its own git
 /// operations). `branch` is `None` outside a git repo (git missing, not a
 /// repo) — never blocked, since "on the default branch" doesn't apply.
-fn branch_guard_reason_for(branch: Option<&str>, default: Option<&str>) -> Option<String> {
+pub(crate) fn branch_guard_reason_for(
+    branch: Option<&str>,
+    default: Option<&str>,
+) -> Option<String> {
     let branch = branch?;
     let is_protected = match default {
         Some(default) => branch == default,

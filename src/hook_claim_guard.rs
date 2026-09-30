@@ -199,6 +199,83 @@ fn deny_reason(
     ))
 }
 
+/// Pure core for the mirror case (item #641): writes in the shared main
+/// checkout while it sits on a non-default branch. The default branch is
+/// already denied by the branch guard, so only feature branches reach here.
+/// Denies when other sessions hold live claims and `caller` owns none.
+fn main_checkout_deny_reason(
+    is_linked_worktree: bool,
+    branch: Option<&str>,
+    default: Option<&str>,
+    caller: &str,
+    all_claims: impl FnOnce() -> Vec<(String, String, i64)>,
+) -> Option<String> {
+    let branch = branch?;
+    if is_linked_worktree
+        || crate::hook_redirect::branch_guard_reason_for(Some(branch), default).is_some()
+    {
+        return None;
+    }
+    let claims = all_claims();
+    if claims.is_empty() || claims.iter().any(|(_, o, _)| caller_is_owner(caller, o)) {
+        return None;
+    }
+    let (seq, owner, age_secs) = claims.into_iter().next()?;
+    Some(format!(
+        "the shared main checkout (on '{branch}') is not yours to edit: item {seq} is claimed by \
+         {owner} (active {age_secs}s ago) and {caller} holds no claim, so uncommitted changes here \
+         may belong to another session. Claim an item (item action=claim) and work in its \
+         worktree instead."
+    ))
+}
+
+/// Main-checkout guard for one write target, resolving git state for it.
+fn main_checkout_deny(path: &Path, caller: &str) -> Option<String> {
+    if item_seq_for_path(path).is_some() {
+        return None;
+    }
+    let start = path.ancestors().find(|a| a.is_dir())?;
+    let repo = flare_git_core::branch::repo_toplevel(start)?;
+    main_checkout_deny_reason(
+        flare_git_core::branch::is_linked_worktree(&repo),
+        flare_git_core::branch::current_branch(&repo).as_deref(),
+        Some(flare_git_core::branch::resolve_default_branch(&repo)).as_deref(),
+        caller,
+        all_live_claims_from_db,
+    )
+}
+
+/// `(item seq, owner, age_secs)` for every live claim. Empty on any lookup
+/// error, so a broken DB never blocks edits.
+fn all_live_claims_in(conn: &rusqlite::Connection) -> Vec<(String, String, i64)> {
+    let ttl = crate::mcp_server::types::backend_claim_ttl_secs();
+    let now = db_kit::ids::now();
+    let ids = agentflare_backend::claim::list_active(conn, now, ttl).unwrap_or_default();
+    ids.iter()
+        .filter_map(|id| {
+            let c = agentflare_backend::claim::live_claim_on_item(conn, id, now, ttl)
+                .ok()
+                .flatten()?;
+            let seq: i64 = conn
+                .query_row("SELECT sequence_id FROM items WHERE id = ?1", [id], |r| {
+                    r.get(0)
+                })
+                .ok()?;
+            Some((seq.to_string(), c.owner, c.age_secs))
+        })
+        .collect()
+}
+
+fn all_live_claims_from_db() -> Vec<(String, String, i64)> {
+    let db_path = crate::paths::agentflare_dir().join("backend.db");
+    if !db_path.exists() {
+        return Vec::new();
+    }
+    agentflare_backend::db::open_db(&db_path)
+        .map(|conn| all_live_claims_in(&conn))
+        .unwrap_or_default()
+}
+
 /// Live claims on every non-deleted item with sequence number `seq`. Empty
 /// on a lookup error, so a broken DB never blocks edits.
 fn live_claims_in(conn: &rusqlite::Connection, seq: &str) -> Vec<LiveClaim> {
@@ -238,7 +315,10 @@ pub fn claim_guard_decision(tool_name: &str, tool_input: Option<&Value>) -> Opti
     let caller = crate::claims::owner_id();
     let reason = write_targets(tool_name, tool_input)
         .iter()
-        .find_map(|path| deny_reason(path, &caller, live_claims_from_db))?;
+        .find_map(|path| {
+            deny_reason(path, &caller, live_claims_from_db)
+                .or_else(|| main_checkout_deny(path, &caller))
+        })?;
     Some(json!({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -327,6 +407,38 @@ mod tests {
         let two = |_: &str| vec![(JOB.to_string(), 5), ("other:job".to_string(), 9)];
         assert!(deny_reason(Path::new(WT), INTERACTIVE_A, two).is_some());
         assert_eq!(deny_reason(Path::new(WT), "other:job", two), None);
+    }
+
+    #[test]
+    fn main_checkout_on_feature_branch_is_denied_when_others_hold_claims() {
+        let others = || vec![("607".to_string(), JOB.to_string(), 9)];
+        let r =
+            main_checkout_deny_reason(false, Some("feat/x"), Some("master"), INTERACTIVE_A, others)
+                .expect("deny");
+        assert!(r.contains("feat/x") && r.contains(JOB), "{r}");
+        // caller owns a claim, no claims at all, linked worktree, default branch
+        // (branch guard's job), or no branch -> allowed.
+        let mine = || vec![("1".to_string(), JOB.to_string(), 9)];
+        assert_eq!(
+            main_checkout_deny_reason(false, Some("feat/x"), Some("master"), JOB, mine),
+            None
+        );
+        assert_eq!(
+            main_checkout_deny_reason(false, Some("feat/x"), Some("master"), "me", Vec::new),
+            None
+        );
+        assert_eq!(
+            main_checkout_deny_reason(true, Some("feat/x"), Some("master"), "me", others),
+            None
+        );
+        assert_eq!(
+            main_checkout_deny_reason(false, Some("master"), Some("master"), "me", others),
+            None
+        );
+        assert_eq!(
+            main_checkout_deny_reason(false, None, Some("master"), "me", others),
+            None
+        );
     }
 
     #[test]
