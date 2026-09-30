@@ -273,8 +273,16 @@ mod tests {
         assert!(got.iter().all(|m| m.marker == "status"));
         // FYI still waiting for a turn start.
         assert_eq!(messages::count_undelivered(&c, key).unwrap(), 2);
-        let got =
-            sync_with(&c, "claude-code", key, None, false, Delivery::TurnStart, 202).unwrap();
+        let got = sync_with(
+            &c,
+            "claude-code",
+            key,
+            None,
+            false,
+            Delivery::TurnStart,
+            202,
+        )
+        .unwrap();
         assert_eq!(got.len(), 2);
     }
 
@@ -423,7 +431,10 @@ mod tests {
         assert!(out.starts_with("agentflare: last 1 message(s) sent to team:alpha"));
         assert!(out.contains("history, already seen by the team; do not reply"));
         assert!(out.contains("<agentflare-message from=\"codex:x\""));
-        assert!(!out.contains("NOT from your user"), "delivery header dropped");
+        assert!(
+            !out.contains("NOT from your user"),
+            "delivery header dropped"
+        );
     }
 
     #[test]

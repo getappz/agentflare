@@ -1181,6 +1181,9 @@
         assert_eq!(echoed.exhausted(), None);
     }
 
+    // Only the unix-gated stall tests below use it; ungated it is dead code
+    // on Windows and fails clippy's `-D warnings` there.
+    #[cfg(unix)]
     fn fast_stall() -> StallConfig {
         StallConfig {
             window: std::time::Duration::from_secs(2),

@@ -178,7 +178,10 @@ pub fn cli_uninstall(agent: &str, dry_run: bool) {
 pub fn team_env(team: Option<&str>, name: Option<&str>) -> Vec<(String, String)> {
     let mut env = Vec::new();
     if let Some(t) = team.map(str::trim).filter(|t| !t.is_empty()) {
-        env.push((crate::messages::identity::TEAM_ENV.to_string(), t.to_string()));
+        env.push((
+            crate::messages::identity::TEAM_ENV.to_string(),
+            t.to_string(),
+        ));
     }
     if let Some(n) = name.map(str::trim).filter(|n| !n.is_empty()) {
         env.push(("AGENTFLARE_SESSION_NAME".to_string(), n.to_string()));

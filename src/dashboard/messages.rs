@@ -299,7 +299,10 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(sent.status(), StatusCode::OK);
-                assert_eq!(sent.json::<serde_json::Value>().await.unwrap()["marker"], "status");
+                assert_eq!(
+                    sent.json::<serde_json::Value>().await.unwrap()["marker"],
+                    "status"
+                );
 
                 let mut stream = resp.bytes_stream();
                 let mut seen = String::new();

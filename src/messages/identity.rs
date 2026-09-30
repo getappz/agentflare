@@ -321,7 +321,11 @@ mod tests {
         sessions::migrate(&c).unwrap();
         touch_hook_session_with(&c, "codex:t9", None, Some("alpha"), true, 100).unwrap();
         assert_eq!(
-            sessions::get(&c, "codex:t9").unwrap().unwrap().team.as_deref(),
+            sessions::get(&c, "codex:t9")
+                .unwrap()
+                .unwrap()
+                .team
+                .as_deref(),
             Some("alpha")
         );
     }

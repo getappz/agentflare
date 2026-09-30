@@ -268,10 +268,14 @@ pub fn resolve_recipients(
     Ok((keys, item_id))
 }
 
-/// Sends `body` from `from` to `to`, writing one row per resolved recipient
-/// in one transaction, and publishes each on [`bus`]. An `item:` address with
-/// no one working the item yields no rows -- the caller still records it as
-/// an item comment.
+/// Sends `body` from `from` to `to` with the default marker, writing one row
+/// per resolved recipient in one transaction, and publishes each on [`bus`].
+/// An `item:` address with no one working the item yields no rows -- the
+/// caller still records it as an item comment.
+///
+/// Every production surface lets the caller pick a marker and goes through
+/// [`send_marked`]; this stays the marker-less entry point.
+#[allow(dead_code)]
 pub fn send(
     conn: &Connection,
     from: &str,
@@ -781,7 +785,10 @@ mod tests {
         let c = conn();
         live_in_team(&c, "claude-code:a", Some("alpha"));
         let err = send(&c, "claude-code:a", "team:alpha", "hi", None, 100, no_item).unwrap_err();
-        assert!(err.contains("no live session matches 'team:alpha'"), "{err}");
+        assert!(
+            err.contains("no live session matches 'team:alpha'"),
+            "{err}"
+        );
         assert!(send(&c, "claude-code:a", "team:", "hi", None, 100, no_item).is_err());
     }
 
