@@ -120,11 +120,21 @@ pub(crate) fn sync_with(
     now: i64,
 ) -> rusqlite::Result<Vec<Message>> {
     identity::touch_hook_session(conn, key, cwd, register, now)?;
-    if !host_injects_context(agent) || !messages::has_undelivered(conn, key)? {
-        return Ok(vec![]);
+    if policy == Delivery::TurnStart {
+        crate::sessions::set_busy(conn, key, true, now)?;
     }
-    let markers = markers_for(conn, key, policy)?;
-    messages::take_undelivered_where(conn, key, messages::MAX_BATCH, now, &markers)
+    let taken = if !host_injects_context(agent) || !messages::has_undelivered(conn, key)? {
+        vec![]
+    } else {
+        let markers = markers_for(conn, key, policy)?;
+        messages::take_undelivered_where(conn, key, messages::MAX_BATCH, now, &markers)?
+    };
+    // A Stop that delivers mail blocks the stop, so the turn goes on; only a
+    // Stop with nothing to deliver really ends it.
+    if policy == Delivery::TurnEnd && taken.is_empty() {
+        crate::sessions::set_busy(conn, key, false, now)?;
+    }
+    Ok(taken)
 }
 
 /// Ends the hook's session (SessionEnd). A dispatched job's session is
@@ -233,6 +243,24 @@ mod tests {
         let got =
             sync_with(&c, "claude-code", key, None, false, Delivery::TurnStart, 202).unwrap();
         assert_eq!(got.len(), 2);
+    }
+
+    #[test]
+    fn busy_clears_on_the_stop_that_delivers_nothing() {
+        let c = conn();
+        let key = "claude-code:s3";
+        let busy = |c: &rusqlite::Connection| crate::sessions::get(c, key).unwrap().unwrap().busy;
+        sync_with(&c, "claude-code", key, None, true, Delivery::TurnStart, 100).unwrap();
+        assert!(busy(&c), "a turn start marks the session busy");
+        sync_with(&c, "claude-code", key, None, false, Delivery::MidTurn, 101).unwrap();
+        assert!(busy(&c));
+        seed(&c, key, "important", 1);
+        let got = sync_with(&c, "claude-code", key, None, false, Delivery::TurnEnd, 102).unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(busy(&c), "a blocked stop keeps the turn running");
+        let got = sync_with(&c, "claude-code", key, None, false, Delivery::TurnEnd, 103).unwrap();
+        assert!(got.is_empty());
+        assert!(!busy(&c), "a clean stop clears busy");
     }
 
     #[test]
