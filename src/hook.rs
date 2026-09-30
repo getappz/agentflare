@@ -442,6 +442,13 @@ pub fn pre_tool_use(agent: &str) {
         return;
     }
 
+    if let Some(decision) =
+        crate::hook_claim_guard::claim_guard_decision(&parsed.tool_name, parsed.tool_input.as_ref())
+    {
+        println!("{decision}");
+        return;
+    }
+
     if let Some(reason) = crate::coaching::enforced_rule_reason_for_tool(
         &parsed.tool_name,
         parsed.tool_input.as_ref(),
