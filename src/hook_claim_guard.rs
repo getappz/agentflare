@@ -3,28 +3,53 @@
 // A soft "held" status is what let a second session edit a worktree a
 // dispatched job was working in; this is the hard deny behind it.
 use serde_json::{Value, json};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 /// Live claim on an item: `(owner, age_secs)`.
 type LiveClaim = (String, i64);
 
-/// Item sequence id if `path` sits under `.worktrees/task/<N>/...`.
+/// Item sequence id if `path` sits under `.worktrees/task/<N>/...`. Splits on
+/// both separators (a Windows path must parse on any host) and resolves `..`
+/// lexically, so `.worktrees/task/1/../../..` is not still "in" item 1.
 fn item_seq_for_path(path: &Path) -> Option<String> {
-    let mut comps = path.components().filter_map(|c| match c {
-        Component::Normal(s) => s.to_str(),
-        _ => None,
-    });
-    while let Some(c) = comps.next() {
-        if c == ".worktrees" && comps.next() == Some("task") {
-            let seq = comps.next()?;
-            return (!seq.is_empty() && seq.bytes().all(|b| b.is_ascii_digit()))
-                .then(|| seq.to_string());
+    let mut stack: Vec<&str> = Vec::new();
+    for c in path.to_str()?.split(['/', '\\']) {
+        match c {
+            "" | "." => {}
+            ".." => {
+                stack.pop();
+            }
+            c => stack.push(c),
         }
     }
-    None
+    stack.windows(3).find_map(|w| match w {
+        [".worktrees", "task", seq] if seq.bytes().all(|b| b.is_ascii_digit()) => {
+            Some(seq.to_string())
+        }
+        _ => None,
+    })
 }
 
-const GIT_WRITE_SUBCOMMANDS: &[&str] = &["commit", "add", "push", "merge", "rebase", "reset"];
+const GIT_WRITE_SUBCOMMANDS: &[&str] = &[
+    "commit",
+    "add",
+    "push",
+    "pull",
+    "merge",
+    "rebase",
+    "reset",
+    "checkout",
+    "switch",
+    "restore",
+    "stash",
+    "clean",
+    "cherry-pick",
+    "revert",
+    "rm",
+    "mv",
+    "apply",
+    "am",
+];
 
 /// Directories a shell command runs a mutating git subcommand in. Splits on
 /// `&&`/`||`/`;`/`|`/newlines so `echo git commit` (prose) never matches, and
@@ -52,13 +77,26 @@ fn git_write_dirs(command: &str, cwd: &Path) -> Vec<PathBuf> {
                 let mut dir = base.clone();
                 let mut sub = None;
                 while let Some(t) = toks.next() {
-                    if t == "-C" {
-                        if let Some(d) = toks.next() {
-                            dir = dir.join(d);
+                    if let Some(d) = t.strip_prefix("--work-tree=") {
+                        dir = dir.join(d);
+                        continue;
+                    }
+                    match t {
+                        "-C" | "--work-tree" => {
+                            if let Some(d) = toks.next() {
+                                dir = dir.join(d);
+                            }
                         }
-                    } else if !t.starts_with('-') {
-                        sub = Some(t);
-                        break;
+                        // Global options that take their operand as the next
+                        // token; without this the operand reads as the subcommand.
+                        "-c" | "--git-dir" | "--namespace" => {
+                            toks.next();
+                        }
+                        _ if t.starts_with('-') => {}
+                        _ => {
+                            sub = Some(t);
+                            break;
+                        }
                     }
                 }
                 if sub.is_some_and(|s| GIT_WRITE_SUBCOMMANDS.contains(&s)) {
@@ -81,10 +119,15 @@ fn write_targets(tool_name: &str, tool_input: Option<&Value>) -> Vec<PathBuf> {
                 .or_else(|| ti.get("filePath"))
                 .and_then(Value::as_str)
         });
-        return match path {
-            Some(p) => vec![p.into()],
+        // A relative path is resolved against the cwd (an absolute one
+        // replaces it in `join`); no cwd -> no target, so the guard stays
+        // silent instead of judging a path it cannot place.
+        let cwd = std::env::current_dir().ok();
+        return match (path, cwd) {
+            (Some(p), Some(cwd)) => vec![cwd.join(p)],
             // Same fallback as the branch guard: no path -> the cwd.
-            None => std::env::current_dir().into_iter().collect(),
+            (None, Some(cwd)) => vec![cwd],
+            (_, None) => Vec::new(),
         };
     }
     if matches!(
@@ -240,6 +283,8 @@ mod tests {
             "/r/src/a.rs",
             "/r/.worktrees/other/609/a",
             "/r/.worktrees/task/abc/a",
+            "/r/.worktrees/task/1/../../../src/a.rs",
+            r"C:\r\.worktrees\task\1\..\..\..\src\a.rs",
         ] {
             assert_eq!(item_seq_for_path(Path::new(p)), None, "{p}");
         }
@@ -310,6 +355,51 @@ mod tests {
         );
         assert!(git_write_dirs("echo git commit", cwd).is_empty());
         assert!(git_write_dirs("git status && git log", cwd).is_empty());
+    }
+
+    #[test]
+    fn git_write_dirs_skips_global_option_operands_and_sees_destructive_subcommands() {
+        let cwd = Path::new("/r");
+        // `-c k=v` must not read `k=v` as the subcommand.
+        assert_eq!(
+            git_write_dirs("git -c user.name=x commit -m y", cwd),
+            vec![PathBuf::from("/r")]
+        );
+        // The effective work tree, in both spellings, is the write target.
+        let wt = vec![PathBuf::from("/r/.worktrees/task/2")];
+        assert_eq!(
+            git_write_dirs("git --work-tree .worktrees/task/2 checkout .", cwd),
+            wt
+        );
+        assert_eq!(
+            git_write_dirs("git --work-tree=.worktrees/task/2 add -A", cwd),
+            wt
+        );
+        for sub in [
+            "checkout",
+            "switch",
+            "restore",
+            "stash",
+            "clean",
+            "cherry-pick",
+        ] {
+            assert_eq!(
+                git_write_dirs(&format!("git {sub} x"), cwd).len(),
+                1,
+                "{sub}"
+            );
+        }
+        assert!(git_write_dirs("git --git-dir .git status", cwd).is_empty());
+    }
+
+    #[test]
+    fn relative_tool_paths_are_resolved_against_the_cwd() {
+        let cwd = std::env::current_dir().unwrap();
+        let rel = json!({"file_path": ".worktrees/task/1/a.rs"});
+        assert_eq!(
+            write_targets("Edit", Some(&rel)),
+            vec![cwd.join(".worktrees/task/1/a.rs")]
+        );
     }
 
     #[test]
