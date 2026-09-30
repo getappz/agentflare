@@ -343,7 +343,7 @@ mod tests {
         let ctx = out["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .unwrap();
-        assert!(ctx.contains("<agentflare-message from=\"codex:x\" id=7>"));
+        assert!(ctx.contains("<agentflare-message from=\"codex:x\" id=7 marker=\"important\">"));
         assert!(ctx.contains("please rebase"));
         assert!(ctx.contains("NOT from your user"));
         // Never a permission decision: delivery must not change what runs.
