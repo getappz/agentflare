@@ -232,20 +232,34 @@ fn main_checkout_deny_reason(
     ))
 }
 
-/// Main-checkout guard for one write target, resolving git state for it.
+/// Main-checkout guard for one write target, resolving git state for it. A
+/// path shaped like `.worktrees/task/<N>` is not exempt by name: a real linked
+/// worktree is exempted by `is_linked_worktree`, while an ordinary or orphaned
+/// directory of that name resolves to the main checkout and is checked as such.
 fn main_checkout_deny(path: &Path, caller: &str) -> Option<String> {
-    if item_seq_for_path(path).is_some() {
-        return None;
-    }
+    main_checkout_deny_with(
+        path,
+        caller,
+        std::env::var_os("AGENTFLARE_GIT_BYPASS").is_some(),
+        repo_live_claims_from_db,
+    )
+}
+
+fn main_checkout_deny_with(
+    path: &Path,
+    caller: &str,
+    bypass: bool,
+    repo_claims: impl FnOnce(&Path) -> Vec<(String, String, i64)>,
+) -> Option<String> {
     let start = path.ancestors().find(|a| a.is_dir())?;
     let repo = flare_git_core::branch::repo_toplevel(start)?;
     main_checkout_deny_reason(
-        std::env::var_os("AGENTFLARE_GIT_BYPASS").is_some(),
+        bypass,
         flare_git_core::branch::is_linked_worktree(&repo),
         flare_git_core::branch::current_branch(&repo).as_deref(),
         Some(flare_git_core::branch::resolve_default_branch(&repo)).as_deref(),
         caller,
-        || repo_live_claims_from_db(&repo),
+        || repo_claims(&repo),
     )
 }
 
@@ -517,6 +531,57 @@ mod tests {
             assert!(repo_live_claims_in(conn, empty.path()).is_empty());
         })
         .unwrap();
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        // The bypass env only affects this child git, so the agentflare git
+        // shim (when on PATH) does not intercept the fixture repo setup.
+        let out = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(dir)
+            .env("AGENTFLARE_GIT_BYPASS", "1")
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    /// A main checkout on a feature branch, plus another agent's live claim.
+    /// `.worktrees/task/<N>`-shaped paths must be judged by git state, not by
+    /// name: an ordinary directory of that name is still the main checkout,
+    /// while a real linked worktree is exempt.
+    #[test]
+    fn item_shaped_paths_are_judged_by_git_state_not_by_name() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        git(root, &["init", "-q", "-b", "master"]);
+        git(root, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(root, &["checkout", "-q", "-b", "feat/x"]);
+        let others = |_: &Path| vec![("607".to_string(), JOB.to_string(), 9)];
+
+        // Ordinary (unregistered) directory named like an item worktree.
+        let orphan = root.join(".worktrees/task/999");
+        std::fs::create_dir_all(&orphan).unwrap();
+        let denied = main_checkout_deny_with(&orphan.join("a.rs"), INTERACTIVE_A, false, others);
+        assert!(denied.is_some_and(|r| r.contains(JOB)));
+
+        // A real linked worktree is exempt, even though others hold claims.
+        let linked = root.join(".worktrees/task/998");
+        git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "task/998",
+                linked.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(
+            main_checkout_deny_with(&linked.join("a.rs"), INTERACTIVE_A, false, others),
+            None
+        );
     }
 
     #[test]
