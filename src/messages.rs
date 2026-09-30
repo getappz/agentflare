@@ -132,6 +132,9 @@ pub enum Address<'a> {
     Item(&'a str),
     /// Every live session of one agent (`claude-code`, `codex`, ...).
     Agent(&'a str),
+    /// Every live session registered with this team (`AGENTFLARE_TEAM`),
+    /// except the sender.
+    Team(&'a str),
     /// Every live session.
     All,
 }
@@ -144,6 +147,8 @@ pub fn parse_address(address: &str) -> Address<'_> {
         Address::Item(item.trim())
     } else if let Some(agent) = address.strip_prefix("agent:") {
         Address::Agent(agent.trim())
+    } else if let Some(team) = address.strip_prefix("team:") {
+        Address::Team(team.trim())
     } else {
         Address::Session(address)
     }
@@ -230,6 +235,18 @@ pub fn resolve_recipients(
                     .map_err(db)?
                     .into_iter()
                     .filter(|s| s.agent == agent && s.key != from)
+                    .map(|s| s.key),
+            );
+        }
+        Address::Team(team) => {
+            if team.is_empty() {
+                return Err("team address needs a name: team:<name>".into());
+            }
+            keys.extend(
+                crate::sessions::list_live(conn, now)
+                    .map_err(db)?
+                    .into_iter()
+                    .filter(|s| s.team.as_deref() == Some(team) && s.key != from)
                     .map(|s| s.key),
             );
         }
@@ -639,6 +656,41 @@ mod tests {
 
     fn no_item(_: &str) -> Result<ItemRoute, String> {
         Err("no items here".into())
+    }
+
+    fn live_in_team(c: &Connection, key: &str, team: Option<&str>) {
+        sessions::touch(
+            c,
+            &Touch {
+                key,
+                team,
+                pid: Some(std::process::id()),
+                ..Default::default()
+            },
+            100,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn team_fanout_reaches_members_only_and_skips_the_sender() {
+        let c = conn();
+        live_in_team(&c, "claude-code:a", Some("alpha"));
+        live_in_team(&c, "codex:b", Some("alpha"));
+        live_in_team(&c, "codex:c", Some("beta"));
+        live_in_team(&c, "codex:d", None);
+        let sent = send(&c, "claude-code:a", "team:alpha", "hi", None, 100, no_item).unwrap();
+        assert_eq!(sent.recipients, vec!["codex:b".to_string()]);
+        assert_eq!(parse_address(" team: alpha "), Address::Team("alpha"));
+    }
+
+    #[test]
+    fn team_with_no_live_member_is_an_error() {
+        let c = conn();
+        live_in_team(&c, "claude-code:a", Some("alpha"));
+        let err = send(&c, "claude-code:a", "team:alpha", "hi", None, 100, no_item).unwrap_err();
+        assert!(err.contains("no live session matches 'team:alpha'"), "{err}");
+        assert!(send(&c, "claude-code:a", "team:", "hi", None, 100, no_item).is_err());
     }
 
     #[test]

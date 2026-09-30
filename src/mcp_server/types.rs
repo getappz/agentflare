@@ -1256,7 +1256,7 @@ pub(crate) struct MessageRequest {
     #[schemars(description = "Action: send|list|inbox|read|whoami")]
     pub(crate) action: String,
     #[schemars(
-        description = "Recipient (send): a session key from action=list, a unique session name, item:<id> (whoever is working that item; also recorded as an item comment), agent:<name> (every live session of that agent), or * (every live session)"
+        description = "Recipient (send): a session key from action=list, a unique session name, item:<id> (whoever is working that item; also recorded as an item comment), agent:<name> (every live session of that agent), team:<name> (every live session launched with --team <name>, except you), or * (every live session)"
     )]
     #[serde(default)]
     pub(crate) to: Option<String>,

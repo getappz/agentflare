@@ -18,10 +18,12 @@ pub struct MessageArgs {
 
 #[derive(Subcommand)]
 pub enum MessageCommand {
-    /// Send a message to a session key/name, item:<id>, agent:<name>, or *.
+    /// Send a message to a session key/name, item:<id>, agent:<name>,
+    /// team:<name>, or *.
     Send {
         /// Recipient: a session key or unique name (see `message list`),
-        /// item:<id>, agent:<name>, or * for every live session.
+        /// item:<id>, agent:<name>, team:<name> (sessions launched with
+        /// --team <name>, except you), or * for every live session.
         to: String,
         /// Message text (joined with spaces).
         #[arg(required = true, num_args = 1..)]
