@@ -226,6 +226,7 @@ mod tests {
             created_at: 1,
             delivered_at: Some(2),
             read_at: None,
+            marker: "important".into(),
         }
     }
 

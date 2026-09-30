@@ -33,6 +33,35 @@ const KEEP_UNDELIVERED_SECS: i64 = 30 * 24 * 3600;
 /// these -- the run already got the message itself.
 pub const ITEM_COMMENT_PREFIX: &str = "[agent message ";
 
+/// Message priority. Changes *when* hooks push a message, never whether it
+/// is stored (see `hook_messages::Delivery`).
+pub const MARKERS: [&str; 3] = ["important", "status", "fyi"];
+pub const DEFAULT_MARKER: &str = "important";
+
+pub fn validate_marker(marker: &str) -> Result<&'static str, String> {
+    let m = marker.trim();
+    MARKERS
+        .iter()
+        .copied()
+        .find(|k| k.eq_ignore_ascii_case(m))
+        .ok_or_else(|| format!("unknown marker '{marker}'; expected important|status|fyi"))
+}
+
+/// Additive migration for DBs created before `marker` existed; same
+/// idempotency pattern as `claims::add_scope_column_if_missing`.
+fn add_marker_column_if_missing(conn: &Connection) -> rusqlite::Result<()> {
+    let has: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('agent_messages') WHERE name = 'marker'")?
+        .exists([])?;
+    if !has {
+        conn.execute(
+            "ALTER TABLE agent_messages ADD COLUMN marker TEXT NOT NULL DEFAULT 'important'",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS agent_messages (
@@ -44,11 +73,13 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             reply_to INTEGER,
             created_at INTEGER NOT NULL,
             delivered_at INTEGER,
-            read_at INTEGER
+            read_at INTEGER,
+            marker TEXT NOT NULL DEFAULT 'important'
         );
         CREATE INDEX IF NOT EXISTS idx_agent_messages_inbox
             ON agent_messages(to_key, delivered_at);",
-    )
+    )?;
+    add_marker_column_if_missing(conn)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -64,10 +95,17 @@ pub struct Message {
     pub created_at: i64,
     pub delivered_at: Option<i64>,
     pub read_at: Option<i64>,
+    /// One of [`MARKERS`]; decides at which hook the message is pushed.
+    #[serde(default = "default_marker")]
+    pub marker: String,
+}
+
+fn default_marker() -> String {
+    DEFAULT_MARKER.to_string()
 }
 
 const COLUMNS: &str =
-    "id, from_key, to_key, to_address, body, reply_to, created_at, delivered_at, read_at";
+    "id, from_key, to_key, to_address, body, reply_to, created_at, delivered_at, read_at, marker";
 
 fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
     Ok(Message {
@@ -80,6 +118,7 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         created_at: r.get(6)?,
         delivered_at: r.get(7)?,
         read_at: r.get(8)?,
+        marker: r.get(9)?,
     })
 }
 
@@ -225,7 +264,32 @@ pub fn send(
     now: i64,
     resolve_item: impl FnOnce(&str) -> Result<ItemRoute, String>,
 ) -> Result<Sent, String> {
+    send_marked(
+        conn,
+        from,
+        to,
+        body,
+        reply_to,
+        DEFAULT_MARKER,
+        now,
+        resolve_item,
+    )
+}
+
+/// [`send`] with an explicit `marker` (one of [`MARKERS`], any case).
+#[allow(clippy::too_many_arguments)]
+pub fn send_marked(
+    conn: &Connection,
+    from: &str,
+    to: &str,
+    body: &str,
+    reply_to: Option<i64>,
+    marker: &str,
+    now: i64,
+    resolve_item: impl FnOnce(&str) -> Result<ItemRoute, String>,
+) -> Result<Sent, String> {
     validate_body(body)?;
+    let marker = validate_marker(marker)?;
     if from.trim().is_empty() {
         return Err("sender key must not be empty".into());
     }
@@ -237,10 +301,11 @@ pub fn send(
         let msg = tx
             .query_row(
                 &format!(
-                    "INSERT INTO agent_messages (from_key, to_key, to_address, body, reply_to, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6) RETURNING {COLUMNS}"
+                    "INSERT INTO agent_messages
+                        (from_key, to_key, to_address, body, reply_to, created_at, marker)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) RETURNING {COLUMNS}"
                 ),
-                params![from, key, to.trim(), body, reply_to, now],
+                params![from, key, to.trim(), body, reply_to, now, marker],
                 row,
             )
             .map_err(db)?;
@@ -750,6 +815,7 @@ mod tests {
             created_at: 1,
             delivered_at: None,
             read_at: None,
+            marker: "important".into(),
         };
         let text = format_delivery(std::slice::from_ref(&m));
         assert!(text.contains("NOT from your user"));
@@ -809,5 +875,45 @@ mod tests {
         assert_eq!(take_undelivered(&c, "real:1", 5, 3).unwrap()[0].id, id);
         assert_eq!(since(&c, Some("real:1"), 0, 10).unwrap().len(), 1);
         assert!(since(&c, None, id, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn migrate_twice_and_old_rows_read_back_with_defaults() {
+        let c = Connection::open_in_memory().unwrap();
+        sessions::migrate(&c).unwrap();
+        // An "old" table without the marker column.
+        c.execute_batch(
+            "CREATE TABLE agent_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, from_key TEXT NOT NULL,
+                to_key TEXT NOT NULL, to_address TEXT NOT NULL, body TEXT NOT NULL,
+                reply_to INTEGER, created_at INTEGER NOT NULL, delivered_at INTEGER, read_at INTEGER);
+             INSERT INTO agent_messages (from_key,to_key,to_address,body,created_at)
+                VALUES ('a:1','b:1','b:1','old',1);",
+        )
+        .unwrap();
+        migrate(&c).unwrap();
+        migrate(&c).unwrap(); // idempotent
+        let m = inbox(&c, "b:1", true, 10).unwrap().pop().unwrap();
+        assert_eq!(m.marker, "important");
+    }
+
+    #[test]
+    fn validate_marker_accepts_case_insensitive_and_rejects_unknown() {
+        assert_eq!(validate_marker(" FYI ").unwrap(), "fyi");
+        assert_eq!(validate_marker("Status").unwrap(), "status");
+        assert!(validate_marker("urgent").is_err());
+        assert!(validate_marker("").is_err());
+    }
+
+    #[test]
+    fn send_marked_stores_the_marker_and_send_defaults_to_important() {
+        let c = conn();
+        send(&c, "a:1", "b:1", "plain", None, 100, no_item).unwrap();
+        send_marked(&c, "a:1", "b:1", "note", None, "fyi", 101, no_item).unwrap();
+        assert!(send_marked(&c, "a:1", "b:1", "x", None, "urgent", 102, no_item).is_err());
+        let got = inbox(&c, "b:1", true, 10).unwrap();
+        let markers: Vec<&str> = got.iter().map(|m| m.marker.as_str()).collect();
+        // inbox is newest-first
+        assert_eq!(markers, vec!["fyi", "important"]);
     }
 }
