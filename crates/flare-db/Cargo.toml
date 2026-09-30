@@ -18,6 +18,7 @@ sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio",
 sea-query = { version = "1", default-features = false, features = ["backend-postgres", "backend-sqlite", "with-time"] }
 sea-query-binder = { package = "sea-query-sqlx", version = "0.9.1", default-features = false, features = ["with-time"] }
 time = "0.3"
+getrandom = "0.4"
 libsqlite3-sys = { version = "=0.37.0", optional = true }
 
 [build-dependencies]

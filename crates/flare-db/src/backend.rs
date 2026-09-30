@@ -19,6 +19,12 @@ pub type Database = sqlx::Postgres;
 #[cfg(feature = "sqlite")]
 pub type Database = sqlx::Sqlite;
 
+/// Row type of the active backend (used by generated `FromRow` impls).
+#[cfg(feature = "postgres")]
+pub type Row = sqlx::postgres::PgRow;
+#[cfg(feature = "sqlite")]
+pub type Row = sqlx::sqlite::SqliteRow;
+
 /// The sea-query builder for the active backend — used by generated code to render
 /// dialect-correct SQL (placeholder syntax, quoting) for either backend uniformly.
 #[cfg(feature = "postgres")]
