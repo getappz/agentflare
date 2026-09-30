@@ -6,6 +6,14 @@ pub fn now() -> OffsetDateTime {
     OffsetDateTime::now_utc()
 }
 
+/// Field types `created_at` / `updated_at` may have (they are bound as `OffsetDateTime`).
+pub trait TimestampField {}
+impl TimestampField for OffsetDateTime {}
+impl TimestampField for Option<OffsetDateTime> {}
+
+/// Compile-time check used by generated code; never called.
+pub fn assert_timestamp<T: TimestampField>() {}
+
 const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 /// `prefix_<ULID>` (Medusa `generateEntityId` style), e.g. `ord_01J8Z5...`.

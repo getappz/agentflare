@@ -333,15 +333,23 @@ struct Order {
 - **Upsert.** `upsert_one`/`upsert_many` (target from `unique(..)`) and
   `upsert_one_on`/`upsert_many_on(pool, &[Field], ..)` use `ON CONFLICT (..) DO
   UPDATE`. Only patchable columns are overwritten (never immutable, readonly, pk
-  or `created_at`, nor `default` fields the caller left unset); `updated_at` is
-  bumped. The target must match a UNIQUE index; duplicate keys within one batch
-  are a database error.
+  or `created_at`); `default` fields are overwritten only for rows where the caller
+  supplied a value (`Some`), so an unset default never clobbers the stored one.
+  `updated_at` is bumped. Rows are grouped by which defaults they supply (one
+  statement per group, one transaction), so results follow group order. The target
+  must match a UNIQUE index; duplicate keys within one batch are a database error.
 - **Search and filters.** `{Entity}Filter.q` (present when a field is
   `searchable`) ORs a case-insensitive substring match over those fields, with
   `%`, `_` and `\` matched literally. `FilterOp` adds `Gt`, `Gte`, `Lt`, `Lte`,
   `Between` and `ILike`; `and`/`or` hold nested filters; `count_where` and
   `list_and_count_where` take a filter. Case folding is `ILIKE` on Postgres and
   ASCII-only on SQLite.
+- **Timestamps.** `created_at`/`updated_at` must be `OffsetDateTime` (or
+  `Option<..>`; checked at compile time) and are bound from Rust. `updated_at` is
+  bumped by every update, including `soft_delete`/`restore` and their `_where`
+  forms.
+- **Output shaping is type-level.** There is no serialization layer, so a Medusa-style
+  "skip null" option does not exist: nullable columns keep their `Option` values.
 
 ## Backup, restore, key rotation and plaintext migration
 

@@ -649,3 +649,72 @@ async fn mutation_events_fire_after_success_only() {
         .unwrap();
     assert_eq!(mine(&log).last().unwrap(), &(MutationKind::Deleted, None));
 }
+
+#[tokio::test]
+async fn upsert_overwrites_explicit_default_fields_per_row() {
+    let pool = pool().await;
+    let mut a = new_order("d1@x.io", "t");
+    a.status = Some("paid".into());
+    Order::upsert_one(&pool, a).await.unwrap();
+    Order::upsert_one(&pool, new_order("d2@x.io", "t"))
+        .await
+        .unwrap();
+    Order::update_where(
+        &pool,
+        OrderFilter {
+            email: Some(FilterOp::Eq("d2@x.io".into())),
+            ..Default::default()
+        },
+        OrderPatch {
+            status: Some("paid".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    // Mixed batch: d1 supplies nothing (keeps "paid"), d2 explicitly resets to "open".
+    let mut reset = new_order("d2@x.io", "t");
+    reset.status = Some("open".into());
+    let rows = Order::upsert_many_on(
+        &pool,
+        &[OrderField::Email],
+        vec![new_order("d1@x.io", "t"), reset],
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+    let status = |email: &str| {
+        rows.iter()
+            .find(|r| r.email == email)
+            .map(|r| r.status.clone())
+            .unwrap()
+    };
+    assert_eq!(status("d1@x.io"), "paid", "unset default must not clobber");
+    assert_eq!(status("d2@x.io"), "open", "explicit value must overwrite");
+}
+
+#[tokio::test]
+async fn soft_delete_and_restore_bump_updated_at() {
+    let pool = pool().await;
+    let a = Order::create_one(&pool, new_order("sd@x.io", "t"))
+        .await
+        .unwrap();
+    nap().await;
+    Order::soft_delete(&pool, a.id.clone()).await.unwrap();
+    let deleted = Order::list_where(
+        &pool,
+        OrderFilter {
+            with_deleted: true,
+            ..Default::default()
+        },
+        Page::default(),
+    )
+    .await
+    .unwrap();
+    assert!(deleted[0].updated_at > a.updated_at);
+    nap().await;
+    Order::restore(&pool, a.id.clone()).await.unwrap();
+    let restored = Order::get(&pool, a.id.clone()).await.unwrap().unwrap();
+    assert!(restored.updated_at > deleted[0].updated_at);
+}

@@ -16,7 +16,7 @@ pub use encrypted::{EncryptedSqliteOptions, connect_encrypted_sqlite};
 pub use error::{AsChoice, CrudError, Validate, ValidationError, check_choice};
 pub use events::{MutationEvent, MutationKind, clear_event_sink, set_event_sink};
 pub use filter::{FilterOp, escape_like, ilike_expr, search_condition};
-pub use id::{generate_id, now};
+pub use id::{TimestampField, assert_timestamp, generate_id, now};
 pub use migrate::run_migrations;
 pub use page::Page;
 

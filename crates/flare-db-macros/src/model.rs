@@ -183,18 +183,26 @@ impl Model {
             .collect()
     }
 
-    /// Columns an upsert's `DO UPDATE` may overwrite: patchable fields except those
-    /// with an insert-time `default` (an unset default must not clobber the stored
-    /// value), plus `updated_at`.
-    pub fn upsert_update_cols(&self) -> Vec<LitStr> {
+    /// Columns an upsert's `DO UPDATE` always overwrites: patchable fields without an
+    /// insert-time `default`, plus `updated_at`.
+    pub fn upsert_base_cols(&self) -> Vec<LitStr> {
+        let patch = self.patch_fields();
         self.fields
             .iter()
             .filter(|f| {
                 f.attrs.updated_at
-                    || (self.patch_fields().iter().any(|p| p.ident == f.ident)
-                        && f.attrs.default.is_none())
+                    || (f.attrs.default.is_none() && patch.iter().any(|p| p.ident == f.ident))
             })
             .map(col_lit)
+            .collect()
+    }
+
+    /// Patchable `default` fields: overwritten on conflict only for rows whose caller
+    /// supplied a value (an unset default must not clobber the stored value).
+    pub fn upsert_default_fields(&self) -> Vec<&FieldInfo> {
+        self.patch_fields()
+            .into_iter()
+            .filter(|f| f.attrs.default.is_some())
             .collect()
     }
 

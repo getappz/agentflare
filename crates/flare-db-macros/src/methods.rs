@@ -91,7 +91,11 @@ pub fn gen_impl(m: &Model, n: &Names) -> TokenStream {
         Some(col) => quote! { q.value(#col, flare_db::now()); },
         None => quote! {},
     };
-    let upsert_update_cols = m.upsert_update_cols();
+    let upsert_base_cols = m.upsert_base_cols();
+    let upsert_defaults = m.upsert_default_fields();
+    let default_idents: Vec<_> = upsert_defaults.iter().map(|f| &f.ident).collect();
+    let default_cols: Vec<_> = upsert_defaults.iter().map(|f| col_lit(f)).collect();
+    let default_bits: Vec<u32> = (0..default_idents.len() as u32).collect();
 
     // ---- filter ------------------------------------------------------------------
     let q_clause = {
@@ -138,6 +142,7 @@ pub fn gen_impl(m: &Model, n: &Names) -> TokenStream {
                 q.table(#table)
                     .value("deleted_at", flare_db::sea_query::Expr::current_timestamp())
                     .and_where(flare_db::sea_query::Expr::col(#pk_col).eq(#pk_ident));
+                #touch_updated_at
                 let (sql, values) = q.build_sqlx(flare_db::QUERY_BUILDER);
                 let done = flare_db::sqlx::query_with(flare_db::sqlx::AssertSqlSafe(sql), values).execute(pool).await?;
                 if done.rows_affected() > 0 {
@@ -154,6 +159,7 @@ pub fn gen_impl(m: &Model, n: &Names) -> TokenStream {
                 q.table(#table)
                     .value("deleted_at", flare_db::sea_query::Value::from(None::<#inner>))
                     .and_where(flare_db::sea_query::Expr::col(#pk_col).eq(#pk_ident));
+                #touch_updated_at
                 let (sql, values) = q.build_sqlx(flare_db::QUERY_BUILDER);
                 let done = flare_db::sqlx::query_with(flare_db::sqlx::AssertSqlSafe(sql), values).execute(pool).await?;
                 if done.rows_affected() > 0 {
@@ -167,6 +173,7 @@ pub fn gen_impl(m: &Model, n: &Names) -> TokenStream {
                 let mut q = flare_db::sea_query::Query::update();
                 q.table(#table).value("deleted_at", flare_db::sea_query::Expr::current_timestamp());
                 q.cond_where(Self::__where(filter));
+                #touch_updated_at
                 let (sql, values) = q.build_sqlx(flare_db::QUERY_BUILDER);
                 let done = flare_db::sqlx::query_with(flare_db::sqlx::AssertSqlSafe(sql), values).execute(pool).await?;
                 if done.rows_affected() > 0 {
@@ -180,6 +187,7 @@ pub fn gen_impl(m: &Model, n: &Names) -> TokenStream {
                 let mut q = flare_db::sea_query::Query::update();
                 q.table(#table).value("deleted_at", flare_db::sea_query::Value::from(None::<#inner>));
                 q.cond_where(Self::__where(filter));
+                #touch_updated_at
                 let (sql, values) = q.build_sqlx(flare_db::QUERY_BUILDER);
                 let done = flare_db::sqlx::query_with(flare_db::sqlx::AssertSqlSafe(sql), values).execute(pool).await?;
                 if done.rows_affected() > 0 {
@@ -214,18 +222,35 @@ pub fn gen_impl(m: &Model, n: &Names) -> TokenStream {
         let cols: Vec<String> = m.cfg.unique.iter().map(|i| i.to_string()).collect();
         quote! {
             /// Upserts on the `#[crud(unique(..))]` columns.
-            pub async fn upsert_many<'e>(pool: impl flare_db::sqlx::Executor<'e, Database = flare_db::Database>, news: Vec<#new_ty>) -> flare_db::sqlx::Result<Vec<#out_ty>> {
+            pub async fn upsert_many<'e>(pool: impl flare_db::sqlx::Acquire<'e, Database = flare_db::Database>, news: Vec<#new_ty>) -> flare_db::sqlx::Result<Vec<#out_ty>> {
                 Self::__upsert(pool, &[#(#cols),*], news).await
             }
 
-            pub async fn upsert_one<'e>(pool: impl flare_db::sqlx::Executor<'e, Database = flare_db::Database>, new: #new_ty) -> flare_db::sqlx::Result<#out_ty> {
+            pub async fn upsert_one<'e>(pool: impl flare_db::sqlx::Acquire<'e, Database = flare_db::Database>, new: #new_ty) -> flare_db::sqlx::Result<#out_ty> {
                 Ok(Self::__upsert(pool, &[#(#cols),*], vec![new]).await?.remove(0))
             }
         }
     };
 
+    let ts_ty_checks = m
+        .fields
+        .iter()
+        .filter(|f| f.attrs.created_at || f.attrs.updated_at)
+        .map(|f| {
+            let ty = &f.ty;
+            quote! { flare_db::assert_timestamp::<#ty>(); }
+        });
+
     quote! {
-        #[allow(unused_mut, unused_variables, unused_imports, clippy::all)]
+        #[allow(dead_code)]
+        const _: () = {
+            // created_at/updated_at are bound as OffsetDateTime: reject other types here.
+            fn __timestamp_fields() {
+                #(#ts_ty_checks)*
+            }
+        };
+
+        #[allow(unused_mut, unused_variables, unused_imports)]
         impl #struct_name {
             /// Columns that are ever selected or returned (no `hidden`/`computed`).
             pub const COLUMNS: &'static [&'static str] = &[#(#vis_cols),*];
@@ -515,8 +540,12 @@ pub fn gen_impl(m: &Model, n: &Names) -> TokenStream {
                 Ok(done.rows_affected())
             }
 
+            /// Rows are grouped by which `default` fields the caller supplied, one
+            /// statement per group inside one transaction, so an unset default never
+            /// clobbers a stored value while an explicit one does. Results follow group
+            /// order, not input order.
             async fn __upsert<'e>(
-                pool: impl flare_db::sqlx::Executor<'e, Database = flare_db::Database>,
+                pool: impl flare_db::sqlx::Acquire<'e, Database = flare_db::Database>,
                 target: &[&'static str],
                 news: Vec<#new_ty>,
             ) -> flare_db::sqlx::Result<Vec<#out_ty>> {
@@ -530,45 +559,60 @@ pub fn gen_impl(m: &Model, n: &Names) -> TokenStream {
                 for new in &news {
                     Self::__validate_new(new)?;
                 }
-                let now = flare_db::now();
-                let mut q = flare_db::sea_query::Query::insert();
-                q.into_table(#table).columns([#(#insert_cols),*]);
+                let mut groups: Vec<(u64, Vec<#new_ty>)> = Vec::new();
                 for new in news {
-                    q.values_panic(Self::__insert_row(new, now));
+                    let mask: u64 = 0u64 #( | ((new.#default_idents.is_some() as u64) << #default_bits) )*;
+                    match groups.iter_mut().find(|(m, _)| *m == mask) {
+                        Some((_, rows)) => rows.push(new),
+                        None => groups.push((mask, vec![new])),
+                    }
                 }
-                // Only patchable (never readonly/immutable/pk/created_at) columns are
-                // overwritten, plus updated_at. If nothing qualifies, rewrite the
-                // conflict key onto itself so RETURNING still yields the existing row.
-                let mut update: Vec<&'static str> = [#(#upsert_update_cols),*]
-                    .into_iter()
-                    .filter(|c| !target.contains(c))
-                    .collect();
-                if update.is_empty() {
-                    update.push(target[0]);
+                let now = flare_db::now();
+                let mut tx = pool.begin().await?;
+                let mut out = Vec::new();
+                for (mask, rows) in groups {
+                    let mut q = flare_db::sea_query::Query::insert();
+                    q.into_table(#table).columns([#(#insert_cols),*]);
+                    for new in rows {
+                        q.values_panic(Self::__insert_row(new, now));
+                    }
+                    // Only patchable (never readonly/immutable/pk/created_at) columns are
+                    // overwritten, plus updated_at. If nothing qualifies, rewrite the
+                    // conflict key onto itself so RETURNING still yields the existing row.
+                    let mut update: Vec<&'static str> = vec![#(#upsert_base_cols),*];
+                    #( if mask & (1u64 << #default_bits) != 0 { update.push(#default_cols); } )*
+                    update.retain(|c| !target.contains(c));
+                    if update.is_empty() {
+                        update.push(target[0]);
+                    }
+                    let mut on_conflict = flare_db::sea_query::OnConflict::columns(target.iter().copied());
+                    on_conflict.update_columns(update);
+                    q.on_conflict(on_conflict);
+                    q.returning(Self::__returning());
+                    let (sql, values) = q.build_sqlx(flare_db::QUERY_BUILDER);
+                    out.extend(
+                        flare_db::sqlx::query_as_with::<_, #out_ty, _>(flare_db::sqlx::AssertSqlSafe(sql), values)
+                            .fetch_all(&mut *tx)
+                            .await?,
+                    );
                 }
-                let mut on_conflict = flare_db::sea_query::OnConflict::columns(target.iter().copied());
-                on_conflict.update_columns(update);
-                q.on_conflict(on_conflict);
-                q.returning(Self::__returning());
-                let (sql, values) = q.build_sqlx(flare_db::QUERY_BUILDER);
-                let rows = flare_db::sqlx::query_as_with::<_, #out_ty, _>(flare_db::sqlx::AssertSqlSafe(sql), values).fetch_all(pool).await?;
-                for row in &rows {
+                tx.commit().await?;
+                for row in &out {
                     flare_db::events::emit(#table, flare_db::MutationKind::Upserted, Some(row.#pk_ident.to_string()));
                 }
-                Ok(rows)
+                Ok(out)
             }
 
             /// `INSERT .. ON CONFLICT (conflict) DO UPDATE`. `conflict` must match a
             /// UNIQUE index. Duplicate conflict keys within one batch are a database error.
-            pub async fn upsert_many_on<'e>(pool: impl flare_db::sqlx::Executor<'e, Database = flare_db::Database>, conflict: &[#field_ty], news: Vec<#new_ty>) -> flare_db::sqlx::Result<Vec<#out_ty>> {
+            pub async fn upsert_many_on<'e>(pool: impl flare_db::sqlx::Acquire<'e, Database = flare_db::Database>, conflict: &[#field_ty], news: Vec<#new_ty>) -> flare_db::sqlx::Result<Vec<#out_ty>> {
                 let target: Vec<&'static str> = conflict.iter().map(|f| f.as_str()).collect();
                 Self::__upsert(pool, &target, news).await
             }
 
-            pub async fn upsert_one_on<'e>(pool: impl flare_db::sqlx::Executor<'e, Database = flare_db::Database>, conflict: &[#field_ty], new: #new_ty) -> flare_db::sqlx::Result<#out_ty> {
+            pub async fn upsert_one_on<'e>(pool: impl flare_db::sqlx::Acquire<'e, Database = flare_db::Database>, conflict: &[#field_ty], new: #new_ty) -> flare_db::sqlx::Result<#out_ty> {
                 Ok(Self::upsert_many_on(pool, conflict, vec![new]).await?.remove(0))
             }
-
             #unique_upserts
 
             #delete_methods
