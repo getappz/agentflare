@@ -67,6 +67,12 @@ pub fn session_start(agent: &str) {
     } else {
         format!("{msg}\n\n{}", crate::messages::format_delivery(&pending))
     };
+    // A session joining a team catches up on what the team said before it
+    // arrived -- marked as history, not new mail.
+    let context = match crate::hook_messages::team_replay_block() {
+        Some(replay) => format!("{context}\n\n{replay}"),
+        None => context,
+    };
     if !pending.is_empty() {
         msg.push_str(&format!(
             "\nagentflare: {} agent message(s) delivered",

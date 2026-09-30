@@ -181,6 +181,39 @@ pub(crate) fn stop_output(msgs: &[Message]) -> Option<Value> {
     })
 }
 
+/// Team messages replayed to a session joining the team (spec §5.5).
+pub(crate) const REPLAY_LIMIT: usize = 10;
+
+/// Context block for a fresh team member: what the team said before it
+/// joined. Reuses the delivery envelope so the sender attribution and
+/// escaping are identical to live mail.
+pub(crate) fn format_replay(team: &str, msgs: &[Message]) -> Option<String> {
+    if msgs.is_empty() {
+        return None;
+    }
+    let mut out = format!(
+        "agentflare: last {} message(s) sent to team:{team} — history, already seen by the team; \
+         do not reply to these. New mail arrives separately.",
+        msgs.len()
+    );
+    // Drop format_delivery's own header (its first line) and keep the envelopes.
+    let rendered = messages::format_delivery(msgs);
+    if let Some((_, envelopes)) = rendered.split_once('\n') {
+        out.push('\n');
+        out.push_str(envelopes);
+    }
+    Some(out)
+}
+
+/// The SessionStart replay for this process's team, if any. Best-effort:
+/// no team, no db, or a db without the table yet all mean no replay.
+pub(crate) fn team_replay_block() -> Option<String> {
+    let team = identity::team_name()?;
+    let conn = messages::open_fast()?;
+    let msgs = messages::recent(&conn, &format!("team:{team}"), REPLAY_LIMIT).ok()?;
+    format_replay(&team, &msgs)
+}
+
 /// `agentflare hook stop`.
 pub fn stop(agent: &str) {
     let Some(input) = crate::hook::read_stdin_or_skip("Stop") else {
@@ -380,6 +413,39 @@ mod tests {
                 .get("permissionDecision")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn format_replay_marks_history_as_already_read() {
+        assert!(format_replay("alpha", &[]).is_none());
+        let m = msg(1);
+        let out = format_replay("alpha", std::slice::from_ref(&m)).unwrap();
+        assert!(out.starts_with("agentflare: last 1 message(s) sent to team:alpha"));
+        assert!(out.contains("history, already seen by the team; do not reply"));
+        assert!(out.contains("<agentflare-message from=\"codex:x\""));
+        assert!(!out.contains("NOT from your user"), "delivery header dropped");
+    }
+
+    #[test]
+    fn recent_returns_the_last_n_oldest_first() {
+        let c = conn();
+        for i in 0..12 {
+            messages::send_marked(
+                &c,
+                "codex:peer",
+                "claude-code:h",
+                &format!("m{i}"),
+                None,
+                "fyi",
+                100 + i,
+                no_item,
+            )
+            .unwrap();
+        }
+        let got = messages::recent(&c, "claude-code:h", REPLAY_LIMIT).unwrap();
+        assert_eq!(got.len(), 10);
+        assert_eq!(got.first().unwrap().body, "m2");
+        assert_eq!(got.last().unwrap().body, "m11");
     }
 
     #[test]
