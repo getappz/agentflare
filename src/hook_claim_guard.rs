@@ -199,6 +199,101 @@ fn deny_reason(
     ))
 }
 
+/// Pure core for the mirror case (item #641): writes in the shared main
+/// checkout while it sits on a non-default branch. The default branch is
+/// already denied by the branch guard, so only feature branches reach here.
+/// Denies when other sessions hold live claims in this repo and `caller` owns
+/// none. `bypass` (`AGENTFLARE_GIT_BYPASS`, the git shim's escape hatch) allows.
+fn main_checkout_deny_reason(
+    bypass: bool,
+    is_linked_worktree: bool,
+    branch: Option<&str>,
+    default: Option<&str>,
+    caller: &str,
+    repo_claims: impl FnOnce() -> Vec<(String, String, i64)>,
+) -> Option<String> {
+    let branch = branch?;
+    if bypass
+        || is_linked_worktree
+        || crate::hook_redirect::branch_guard_reason_for(Some(branch), default).is_some()
+    {
+        return None;
+    }
+    let claims = repo_claims();
+    if claims.is_empty() || claims.iter().any(|(_, o, _)| caller_is_owner(caller, o)) {
+        return None;
+    }
+    let (seq, owner, age_secs) = claims.into_iter().next()?;
+    Some(format!(
+        "the shared main checkout (on '{branch}') is not yours to edit: item {seq} is claimed by \
+         {owner} (active {age_secs}s ago) and {caller} holds no claim, so uncommitted changes here \
+         may belong to another session. Claim an item (item action=claim) and work in its \
+         worktree instead."
+    ))
+}
+
+/// Main-checkout guard for one write target, resolving git state for it. A
+/// path shaped like `.worktrees/task/<N>` is not exempt by name: a real linked
+/// worktree is exempted by `is_linked_worktree`, while an ordinary or orphaned
+/// directory of that name resolves to the main checkout and is checked as such.
+fn main_checkout_deny(path: &Path, caller: &str) -> Option<String> {
+    main_checkout_deny_with(
+        path,
+        caller,
+        std::env::var_os("AGENTFLARE_GIT_BYPASS").is_some(),
+        repo_live_claims_from_db,
+    )
+}
+
+fn main_checkout_deny_with(
+    path: &Path,
+    caller: &str,
+    bypass: bool,
+    repo_claims: impl FnOnce(&Path) -> Vec<(String, String, i64)>,
+) -> Option<String> {
+    let start = path.ancestors().find(|a| a.is_dir())?;
+    let repo = flare_git_core::branch::repo_toplevel(start)?;
+    main_checkout_deny_reason(
+        bypass,
+        flare_git_core::branch::is_linked_worktree(&repo),
+        flare_git_core::branch::current_branch(&repo).as_deref(),
+        Some(flare_git_core::branch::resolve_default_branch(&repo)).as_deref(),
+        caller,
+        || repo_claims(&repo),
+    )
+}
+
+/// `(item seq, owner, age_secs)` for live claims on items whose worktree
+/// `<repo>/.worktrees/task/<seq>` exists in THIS repo. The hook process cannot
+/// resolve the project, and `backend.db` is shared across projects that number
+/// their items independently, so that worktree directory is what ties a claim
+/// to this repo. Empty on any error, so a broken DB or directory never blocks
+/// edits.
+fn repo_live_claims_in(conn: &rusqlite::Connection, repo: &Path) -> Vec<(String, String, i64)> {
+    let Ok(dir) = std::fs::read_dir(repo.join(".worktrees").join("task")) else {
+        return Vec::new();
+    };
+    dir.filter_map(Result::ok)
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        .flat_map(|seq| {
+            live_claims_in(conn, &seq)
+                .into_iter()
+                .map(move |(owner, age)| (seq.clone(), owner, age))
+        })
+        .collect()
+}
+
+fn repo_live_claims_from_db(repo: &Path) -> Vec<(String, String, i64)> {
+    let db_path = crate::paths::agentflare_dir().join("backend.db");
+    if !db_path.exists() {
+        return Vec::new();
+    }
+    agentflare_backend::db::open_db(&db_path)
+        .map(|conn| repo_live_claims_in(&conn, repo))
+        .unwrap_or_default()
+}
+
 /// Live claims on every non-deleted item with sequence number `seq`. Empty
 /// on a lookup error, so a broken DB never blocks edits.
 fn live_claims_in(conn: &rusqlite::Connection, seq: &str) -> Vec<LiveClaim> {
@@ -233,19 +328,28 @@ fn live_claims_from_db(seq: &str) -> Vec<LiveClaim> {
     }
 }
 
-/// PreToolUse deny decision, or `None` to let the call through.
+/// PreToolUse deny decision, or `None` to let the call through. Runs under the
+/// same hard timeout as the branch guard: the main-checkout rule shells out to
+/// git, and a slow repo must fail open, not stall every tool call.
 pub fn claim_guard_decision(tool_name: &str, tool_input: Option<&Value>) -> Option<Value> {
-    let caller = crate::claims::owner_id();
-    let reason = write_targets(tool_name, tool_input)
-        .iter()
-        .find_map(|path| deny_reason(path, &caller, live_claims_from_db))?;
-    Some(json!({
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": reason,
-        }
-    }))
+    let tool_name = tool_name.to_string();
+    let tool_input = tool_input.cloned();
+    crate::hook_redirect::decide_with_timeout(crate::hook_redirect::GATING_TIMEOUT, move || {
+        let caller = crate::claims::owner_id();
+        let reason = write_targets(&tool_name, tool_input.as_ref())
+            .iter()
+            .find_map(|path| {
+                deny_reason(path, &caller, live_claims_from_db)
+                    .or_else(|| main_checkout_deny(path, &caller))
+            })?;
+        Some(json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }
+        }))
+    })
 }
 
 #[cfg(test)]
@@ -327,6 +431,157 @@ mod tests {
         let two = |_: &str| vec![(JOB.to_string(), 5), ("other:job".to_string(), 9)];
         assert!(deny_reason(Path::new(WT), INTERACTIVE_A, two).is_some());
         assert_eq!(deny_reason(Path::new(WT), "other:job", two), None);
+    }
+
+    #[test]
+    fn main_checkout_on_feature_branch_is_denied_when_others_hold_claims() {
+        let others = || vec![("607".to_string(), JOB.to_string(), 9)];
+        fn deny(
+            bypass: bool,
+            linked: bool,
+            branch: Option<&str>,
+            default: Option<&str>,
+            caller: &str,
+            claims: impl FnOnce() -> Vec<(String, String, i64)>,
+        ) -> Option<String> {
+            main_checkout_deny_reason(bypass, linked, branch, default, caller, claims)
+        }
+        let r = deny(
+            false,
+            false,
+            Some("feat/x"),
+            Some("master"),
+            INTERACTIVE_A,
+            others,
+        )
+        .expect("deny");
+        assert!(r.contains("feat/x") && r.contains(JOB), "{r}");
+        // bypass, caller owns a claim, no claims at all, linked worktree, default
+        // branch (branch guard's job), or no branch -> allowed.
+        let mine = || vec![("1".to_string(), JOB.to_string(), 9)];
+        let b = Some("feat/x");
+        let d = Some("master");
+        assert_eq!(deny(true, false, b, d, INTERACTIVE_A, others), None);
+        assert_eq!(deny(false, false, b, d, JOB, mine), None);
+        assert_eq!(deny(false, false, b, d, "me", Vec::new), None);
+        assert_eq!(deny(false, true, b, d, "me", others), None);
+        assert_eq!(deny(false, false, d, d, "me", others), None);
+        assert_eq!(deny(false, false, None, d, "me", others), None);
+    }
+
+    /// Real `backend.db`: only claims whose `.worktrees/task/<seq>` exists in
+    /// THIS repo count, so a live claim in another project that happens to
+    /// share nothing with this checkout never blocks it.
+    #[test]
+    fn repo_live_claims_only_count_items_with_a_worktree_in_this_repo() {
+        use crate::mcp_server::AgentflareMcp;
+        let tmp = tempfile::tempdir().unwrap();
+        let s = AgentflareMcp::for_test(
+            tmp.path().join("backend.db"),
+            tmp.path().to_path_buf(),
+            tmp.path().join("project.json"),
+        );
+        s.with_backend_db(|conn| {
+            let project = s.resolve_project(conn).unwrap();
+            let state = agentflare_backend::state::list_by_project(conn, &project.id)
+                .unwrap()
+                .into_iter()
+                .find(|st| st.is_default)
+                .unwrap();
+            let ttl = crate::mcp_server::types::backend_claim_ttl_secs();
+            let mut seqs = Vec::new();
+            for name in ["Here", "Elsewhere"] {
+                let item = agentflare_backend::item::create(
+                    conn,
+                    agentflare_backend::item::CreateItem {
+                        project_id: project.id.clone(),
+                        state_id: state.id.clone(),
+                        name: name.into(),
+                        description: None,
+                        priority: None,
+                        parent_id: None,
+                        assignee_agent: None,
+                        sort_order: None,
+                        external_source: None,
+                        external_id: None,
+                        metadata: None,
+                        label_ids: vec![],
+                        assignee_ids: vec![],
+                        dependency_ids: vec![],
+                        start_date: None,
+                        due_date: None,
+                    },
+                )
+                .unwrap();
+                agentflare_backend::item::claim(conn, &item.id, JOB, crate::claims::now(), ttl)
+                    .unwrap();
+                seqs.push(item.sequence_id);
+            }
+            let repo = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(repo.path().join(format!(".worktrees/task/{}", seqs[0])))
+                .unwrap();
+            let got = repo_live_claims_in(conn, repo.path());
+            assert_eq!(
+                got,
+                vec![(seqs[0].to_string(), JOB.to_string(), got[0].2)],
+                "only the item with a worktree here counts"
+            );
+            // No `.worktrees/task` at all -> nothing counts.
+            let empty = tempfile::tempdir().unwrap();
+            assert!(repo_live_claims_in(conn, empty.path()).is_empty());
+        })
+        .unwrap();
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        // The bypass env only affects this child git, so the agentflare git
+        // shim (when on PATH) does not intercept the fixture repo setup.
+        let out = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(dir)
+            .env("AGENTFLARE_GIT_BYPASS", "1")
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    /// A main checkout on a feature branch, plus another agent's live claim.
+    /// `.worktrees/task/<N>`-shaped paths must be judged by git state, not by
+    /// name: an ordinary directory of that name is still the main checkout,
+    /// while a real linked worktree is exempt.
+    #[test]
+    fn item_shaped_paths_are_judged_by_git_state_not_by_name() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        git(root, &["init", "-q", "-b", "master"]);
+        git(root, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(root, &["checkout", "-q", "-b", "feat/x"]);
+        let others = |_: &Path| vec![("607".to_string(), JOB.to_string(), 9)];
+
+        // Ordinary (unregistered) directory named like an item worktree.
+        let orphan = root.join(".worktrees/task/999");
+        std::fs::create_dir_all(&orphan).unwrap();
+        let denied = main_checkout_deny_with(&orphan.join("a.rs"), INTERACTIVE_A, false, others);
+        assert!(denied.is_some_and(|r| r.contains(JOB)));
+
+        // A real linked worktree is exempt, even though others hold claims.
+        let linked = root.join(".worktrees/task/998");
+        git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "task/998",
+                linked.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(
+            main_checkout_deny_with(&linked.join("a.rs"), INTERACTIVE_A, false, others),
+            None
+        );
     }
 
     #[test]

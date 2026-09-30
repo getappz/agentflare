@@ -13,7 +13,7 @@ use std::time::Duration;
 /// Hard wall-clock budget for classify_and_decide. Sized well under the 5s
 /// timeout `init.rs` wires into `~/.claude/settings.json`'s PreToolUse entry,
 /// so a hang here can never eat the whole hook budget.
-const GATING_TIMEOUT: Duration = Duration::from_millis(2000);
+pub(crate) const GATING_TIMEOUT: Duration = Duration::from_millis(2000);
 
 /// Native/MCP tools that mutate files on disk — every one of these is gated
 /// by `branch_guard_reason_for` so a direct edit can never land on the repo's
@@ -44,7 +44,7 @@ pub(crate) const MUTATING_TOOLS: &[&str] = &[
 /// it doesn't finish in time. `work` only sends to a channel, never prints,
 /// so a timed-out worker can't double-write stdout once it eventually
 /// finishes.
-fn decide_with_timeout<F>(timeout: Duration, work: F) -> Option<Value>
+pub(crate) fn decide_with_timeout<F>(timeout: Duration, work: F) -> Option<Value>
 where
     F: FnOnce() -> Option<Value> + Send + 'static,
 {
@@ -202,7 +202,10 @@ pub(crate) fn resolve_mutating_target_repo(tool_input: Option<&Value>) -> Target
 /// `AgentflareMcp` carries a `worktree_repo_root_override` for its own git
 /// operations). `branch` is `None` outside a git repo (git missing, not a
 /// repo) — never blocked, since "on the default branch" doesn't apply.
-fn branch_guard_reason_for(branch: Option<&str>, default: Option<&str>) -> Option<String> {
+pub(crate) fn branch_guard_reason_for(
+    branch: Option<&str>,
+    default: Option<&str>,
+) -> Option<String> {
     let branch = branch?;
     let is_protected = match default {
         Some(default) => branch == default,
