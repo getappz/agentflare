@@ -43,11 +43,50 @@ fn now() -> i64 {
     crate::claims::now()
 }
 
+/// Which markers a hook may take (spec §5.3). Nothing is ever dropped: a
+/// marker a policy skips waits for a later hook or an explicit inbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Delivery {
+    /// SessionStart / UserPromptSubmit: everything.
+    TurnStart,
+    /// PreToolUse: `important`, plus `status` once STATUS_BATCH are pending.
+    MidTurn,
+    /// Stop: `important` and `status`; never blocks a stop for `fyi`.
+    TurnEnd,
+}
+
+/// Pending `status` messages it takes before a mid-turn hook delivers them.
+pub(crate) const STATUS_BATCH: i64 = 3;
+
+fn markers_for(
+    conn: &rusqlite::Connection,
+    key: &str,
+    policy: Delivery,
+) -> rusqlite::Result<Vec<&'static str>> {
+    Ok(match policy {
+        Delivery::TurnStart => messages::MARKERS.to_vec(),
+        Delivery::TurnEnd => vec!["important", "status"],
+        Delivery::MidTurn => {
+            if messages::count_undelivered_where(conn, key, &["status"])? >= STATUS_BATCH {
+                vec!["important", "status"]
+            } else {
+                vec!["important"]
+            }
+        }
+    })
+}
+
 /// Registers the hook's session and, on a context-injecting host, takes its
-/// pending messages. `register` forces a full registration (SessionStart)
-/// and creates the db if needed; otherwise this stays a cheap no-op when
-/// there is no db yet. Best-effort: any failure means "no messages".
-pub(crate) fn sync(agent: &str, session: &HookSession, register: bool) -> Vec<Message> {
+/// pending messages the `policy` allows. `register` forces a full
+/// registration (SessionStart) and creates the db if needed; otherwise this
+/// stays a cheap no-op when there is no db yet. Best-effort: any failure
+/// means "no messages".
+pub(crate) fn sync(
+    agent: &str,
+    session: &HookSession,
+    register: bool,
+    policy: Delivery,
+) -> Vec<Message> {
     let key = match (&session.session_id, identity::job_owner()) {
         (_, Some(owner)) => owner,
         (Some(sid), None) => identity::hook_key(agent, sid),
@@ -61,11 +100,12 @@ pub(crate) fn sync(agent: &str, session: &HookSession, register: bool) -> Vec<Me
         },
         None => return vec![],
     };
-    sync_with(&conn, agent, &key, session.cwd.as_deref(), register, now())
+    let cwd = session.cwd.as_deref();
+    sync_with(&conn, agent, &key, cwd, register, policy, now())
         .or_else(|_| {
             // A table not created yet on a db an older binary made.
             let conn = crate::db::open()?;
-            sync_with(&conn, agent, &key, session.cwd.as_deref(), register, now())
+            sync_with(&conn, agent, &key, cwd, register, policy, now())
         })
         .unwrap_or_default()
 }
@@ -76,13 +116,15 @@ pub(crate) fn sync_with(
     key: &str,
     cwd: Option<&str>,
     register: bool,
+    policy: Delivery,
     now: i64,
 ) -> rusqlite::Result<Vec<Message>> {
     identity::touch_hook_session(conn, key, cwd, register, now)?;
     if !host_injects_context(agent) || !messages::has_undelivered(conn, key)? {
         return Ok(vec![]);
     }
-    messages::take_undelivered(conn, key, messages::MAX_BATCH, now)
+    let markers = markers_for(conn, key, policy)?;
+    messages::take_undelivered_where(conn, key, messages::MAX_BATCH, now, &markers)
 }
 
 /// Ends the hook's session (SessionEnd). A dispatched job's session is
@@ -134,7 +176,7 @@ pub fn stop(agent: &str) {
     let Some(input) = crate::hook::read_stdin_or_skip("Stop") else {
         return;
     };
-    let msgs = sync(agent, &parse_session(&input), false);
+    let msgs = sync(agent, &parse_session(&input), false, Delivery::TurnEnd);
     if let Some(out) = stop_output(&msgs) {
         println!("{out}");
     }
@@ -156,6 +198,57 @@ mod tests {
         Err(String::new())
     }
 
+    fn seed(c: &rusqlite::Connection, to: &str, marker: &str, n: usize) {
+        for i in 0..n {
+            messages::send_marked(
+                c,
+                "codex:peer",
+                to,
+                &format!("{marker} {i}"),
+                None,
+                marker,
+                100 + i as i64,
+                no_item,
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn mid_turn_takes_important_never_fyi_and_status_only_in_batches() {
+        let c = conn();
+        let key = "claude-code:s1";
+        seed(&c, key, "fyi", 2);
+        seed(&c, key, "important", 1);
+        seed(&c, key, "status", 2);
+        let got = sync_with(&c, "claude-code", key, None, true, Delivery::MidTurn, 200).unwrap();
+        let markers: Vec<&str> = got.iter().map(|m| m.marker.as_str()).collect();
+        assert_eq!(markers, vec!["important"]);
+        seed(&c, key, "status", 1); // now 3 status pending
+        let got = sync_with(&c, "claude-code", key, None, false, Delivery::MidTurn, 201).unwrap();
+        assert_eq!(got.len(), 3);
+        assert!(got.iter().all(|m| m.marker == "status"));
+        // FYI still waiting for a turn start.
+        assert_eq!(messages::count_undelivered(&c, key).unwrap(), 2);
+        let got =
+            sync_with(&c, "claude-code", key, None, false, Delivery::TurnStart, 202).unwrap();
+        assert_eq!(got.len(), 2);
+    }
+
+    #[test]
+    fn stop_lets_the_agent_stop_when_only_fyi_is_pending() {
+        let c = conn();
+        let key = "claude-code:s2";
+        seed(&c, key, "fyi", 3);
+        let got = sync_with(&c, "claude-code", key, None, true, Delivery::TurnEnd, 200).unwrap();
+        assert!(got.is_empty());
+        assert!(stop_output(&got).is_none());
+        seed(&c, key, "status", 1);
+        let got = sync_with(&c, "claude-code", key, None, false, Delivery::TurnEnd, 201).unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(stop_output(&got).is_some());
+    }
+
     #[test]
     fn parse_session_reads_session_id_and_cwd() {
         let s = parse_session(r#"{"session_id":"abc","cwd":"/r","hook_event_name":"Stop"}"#);
@@ -173,18 +266,26 @@ mod tests {
         let c = conn();
         let key = "claude-code:s1";
         assert!(
-            sync_with(&c, "claude-code", key, Some("/repo"), true, 10)
-                .unwrap()
-                .is_empty()
+            sync_with(
+                &c,
+                "claude-code",
+                key,
+                Some("/repo"),
+                true,
+                Delivery::TurnStart,
+                10
+            )
+            .unwrap()
+            .is_empty()
         );
         let s = sessions::get(&c, key).unwrap().unwrap();
         assert_eq!(s.cwd.as_deref(), Some("/repo"));
 
         messages::send(&c, "codex:x", key, "please rebase", None, 11, no_item).unwrap();
-        let got = sync_with(&c, "claude-code", key, None, false, 12).unwrap();
+        let got = sync_with(&c, "claude-code", key, None, false, Delivery::TurnStart, 12).unwrap();
         assert_eq!(got.len(), 1);
         assert!(
-            sync_with(&c, "claude-code", key, None, false, 13)
+            sync_with(&c, "claude-code", key, None, false, Delivery::TurnStart, 13)
                 .unwrap()
                 .is_empty()
         );
@@ -195,7 +296,7 @@ mod tests {
         let c = conn();
         messages::send(&c, "a:1", "cursor:s", "hi", None, 1, no_item).unwrap();
         assert!(
-            sync_with(&c, "cursor", "cursor:s", None, true, 2)
+            sync_with(&c, "cursor", "cursor:s", None, true, Delivery::TurnStart, 2)
                 .unwrap()
                 .is_empty()
         );
@@ -207,7 +308,7 @@ mod tests {
         let c = conn();
         messages::send(&c, "a:1", "codex:s", "hi", None, 1, no_item).unwrap();
         assert_eq!(
-            sync_with(&c, "codex", "codex:s", None, true, 2)
+            sync_with(&c, "codex", "codex:s", None, true, Delivery::TurnStart, 2)
                 .unwrap()
                 .len(),
             1

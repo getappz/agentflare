@@ -409,6 +409,66 @@ pub fn take_undelivered_before(
     Ok(out)
 }
 
+/// `'a','b'` for an `IN (...)` clause. Only ever fed constants from
+/// [`MARKERS`]; never caller input.
+fn marker_list(markers: &[&str]) -> String {
+    debug_assert!(markers.iter().all(|m| MARKERS.contains(m)));
+    markers
+        .iter()
+        .map(|m| format!("'{m}'"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// [`take_undelivered`] restricted to the given markers.
+pub fn take_undelivered_where(
+    conn: &Connection,
+    to_key: &str,
+    limit: usize,
+    now: i64,
+    markers: &[&str],
+) -> rusqlite::Result<Vec<Message>> {
+    if markers.is_empty() {
+        return Ok(vec![]);
+    }
+    let sql = format!(
+        "UPDATE agent_messages SET delivered_at = ?3
+         WHERE id IN (
+             SELECT id FROM agent_messages
+             WHERE to_key = ?1 AND delivered_at IS NULL AND marker IN ({})
+             ORDER BY id LIMIT ?2
+         ) AND delivered_at IS NULL
+         RETURNING {COLUMNS}",
+        marker_list(markers)
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut out = stmt
+        .query_map(params![to_key, limit as i64, now], row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    out.sort_by_key(|m| m.id);
+    Ok(out)
+}
+
+/// Undelivered messages for `to_key` carrying one of `markers`.
+pub fn count_undelivered_where(
+    conn: &Connection,
+    to_key: &str,
+    markers: &[&str],
+) -> rusqlite::Result<i64> {
+    if markers.is_empty() {
+        return Ok(0);
+    }
+    conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM agent_messages
+             WHERE to_key = ?1 AND delivered_at IS NULL AND marker IN ({})",
+            marker_list(markers)
+        ),
+        [to_key],
+        |r| r.get(0),
+    )
+}
+
 /// Undoes a [`take_undelivered`] whose delivery didn't stick (e.g. the SDD
 /// state write failed), so the next delivery point retries them.
 pub fn requeue(conn: &Connection, ids: &[i64]) -> rusqlite::Result<usize> {

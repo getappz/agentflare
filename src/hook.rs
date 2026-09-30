@@ -56,7 +56,12 @@ pub fn session_start(agent: &str) {
     let session = crate::hook_messages::parse_session(
         &read_stdin_timeout(SESSION_START_STDIN_TIMEOUT_MS).unwrap_or_default(),
     );
-    let pending = crate::hook_messages::sync(agent, &session, true);
+    let pending = crate::hook_messages::sync(
+        agent,
+        &session,
+        true,
+        crate::hook_messages::Delivery::TurnStart,
+    );
     let context = if pending.is_empty() {
         msg.clone()
     } else {
@@ -567,9 +572,14 @@ pub fn pre_tool_use(agent: &str) {
     crate::optimize::save_runtime(&runtime);
 
     // Inter-agent messages ride along on every tool call, so a peer's
-    // message reaches a working agent within one tool call.
-    let msgs =
-        crate::hook_messages::sync(agent, &crate::hook_messages::parse_session(&input), false);
+    // message reaches a working agent within one tool call (`important`
+    // always; `status` in batches; never `fyi`).
+    let msgs = crate::hook_messages::sync(
+        agent,
+        &crate::hook_messages::parse_session(&input),
+        false,
+        crate::hook_messages::Delivery::MidTurn,
+    );
     if let Some(out) = crate::hook_messages::pre_tool_use_output(&msgs, &nudges) {
         println!("{out}");
     }
@@ -699,8 +709,12 @@ pub fn prompt_submit(agent: &str) {
     }
     // Taken only past the early returns above, which print nothing (or
     // nothing that carries them): a taken message must reach the output.
-    let agent_msgs =
-        crate::hook_messages::sync(agent, &crate::hook_messages::parse_session(&input), false);
+    let agent_msgs = crate::hook_messages::sync(
+        agent,
+        &crate::hook_messages::parse_session(&input),
+        false,
+        crate::hook_messages::Delivery::TurnStart,
+    );
 
     if !s.active {
         if !agent_msgs.is_empty() {
