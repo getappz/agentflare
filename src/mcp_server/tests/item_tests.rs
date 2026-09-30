@@ -2591,3 +2591,62 @@ fn item_get_unknown_sequence_id_returns_not_found() {
         .unwrap_err();
     assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
 }
+
+#[test]
+fn item_claim_errors_for_second_claimant_but_own_reclaim_succeeds() {
+    // item #609: a live claim held by another owner is a hard error at the
+    // MCP boundary, not a `status: held` success payload.
+    // Isolated throwaway repo: `claim` runs real `git worktree` commands.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_root = repo_dir.path().to_path_buf();
+    let run_git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo_root)
+            .output()
+            .unwrap()
+    };
+    run_git(&["init", "-b", "master"]);
+    run_git(&["config", "user.email", "test@test.com"]);
+    run_git(&["config", "user.name", "Test"]);
+    run_git(&["commit", "--allow-empty", "-m", "initial"]);
+    let s = AgentflareMcp {
+        backend_db_override: Some(tmp.path().join("backend.db")),
+        backend_project_link_override: Some(tmp.path().join("project.json")),
+        worktree_repo_root_override: Some(repo_root),
+        ..Default::default()
+    };
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+    let claim = |s: &AgentflareMcp| {
+        s.item_claim(ItemRequest {
+            action: "claim".into(),
+            id: Some(id.clone()),
+            ..Default::default()
+        })
+    };
+    crate::claims::with_owner_override("claude-code:job", || {
+        assert!(claim(&s).is_ok());
+        // own re-acquire refreshes the heartbeat
+        assert!(claim(&s).is_ok());
+    });
+    let err = crate::claims::with_owner_override("claude-code:interactive", || claim(&s))
+        .expect_err("second claimant must be denied");
+    assert!(
+        err.message.contains("claimed by claude-code:job"),
+        "{}",
+        err.message
+    );
+    // The structured form `agentflare work` consumes is unchanged.
+    let held = crate::claims::with_owner_override("claude-code:interactive", || {
+        s.item_claim_outcome(ItemRequest {
+            action: "claim".into(),
+            id: Some(id.clone()),
+            ..Default::default()
+        })
+    })
+    .unwrap();
+    assert!(held.contains("\"status\":\"held\""), "{held}");
+}

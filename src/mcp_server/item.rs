@@ -1110,7 +1110,29 @@ impl AgentflareMcp {
         })?
     }
 
+    /// MCP-boundary claim: a live claim held by someone else is a hard error,
+    /// not a success payload -- a `status: held` string is what let a second
+    /// session edit a worktree a dispatched job was working in (item #609).
     pub(crate) fn item_claim(&self, req: ItemRequest) -> Result<String, ErrorData> {
+        let resp = self.item_claim_outcome(req)?;
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap_or_default();
+        if v["status"] == "held" {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "item {} is claimed by {} (active {}s ago) -- do not edit its worktree;                      wait, or release/steal explicitly",
+                    v["item_id"].as_str().unwrap_or("?"),
+                    v["owner"].as_str().unwrap_or("?"),
+                    v["age_secs"].as_i64().unwrap_or(0),
+                ),
+                None,
+            ));
+        }
+        Ok(resp)
+    }
+
+    /// Structured claim result, `status: held` included. In-process callers
+    /// (`agentflare work`) that format their own held message use this.
+    pub(crate) fn item_claim_outcome(&self, req: ItemRequest) -> Result<String, ErrorData> {
         let raw = require_id(req.id, "claim")?;
         let owner = crate::claims::owner_id();
         let now = crate::claims::now();

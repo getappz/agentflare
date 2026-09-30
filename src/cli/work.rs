@@ -701,7 +701,7 @@ fn execute_work_impl(
     }
 
     // --- Claim ---
-    let claim_resp = match mcp.item_claim(ItemRequest {
+    let claim_resp = match mcp.item_claim_outcome(ItemRequest {
         action: "claim".into(),
         id: Some(args.target.clone()),
         ..Default::default()
