@@ -29,7 +29,7 @@
     #[test]
     fn launch_unknown_agent_errors() {
         let reg = test_registry();
-        match run_launch(&reg, "nonexistent", None, None, &[]) {
+        match run_launch_env(&reg, "nonexistent", None, None, &[], &[], false) {
             LaunchOutcome::UnknownAgent(msg) => assert!(msg.contains("nonexistent")),
             _ => panic!("expected UnknownAgent"),
         }
@@ -38,7 +38,7 @@
     #[test]
     fn launch_extension_agent_errors() {
         let reg = test_registry();
-        match run_launch(&reg, "cline", None, None, &[]) {
+        match run_launch_env(&reg, "cline", None, None, &[], &[], false) {
             LaunchOutcome::Extension(msg) => assert!(msg.contains("editor extension")),
             _ => panic!("expected Extension"),
         }
@@ -48,7 +48,7 @@
     fn launch_not_on_path_errors() {
         let reg = test_registry();
         // "aider" unlikely to be on a test PATH
-        match run_launch(&reg, "aider", None, None, &[]) {
+        match run_launch_env(&reg, "aider", None, None, &[], &[], false) {
             LaunchOutcome::NotFound(msg) => assert!(msg.contains("not found on PATH")),
             other => panic!("expected NotFound, got {other:?}"),
         }

@@ -173,8 +173,37 @@ pub fn cli_uninstall(agent: &str, dry_run: bool) {
     }
 }
 
-pub fn cli_launch(agent: &str, model: Option<&str>, mode: Option<&str>, args: &[String]) {
-    match agent_launch::run_launch(agent_registry::REGISTRY, agent, model, mode, args) {
+/// Env for a launched agent so its hooks register under a team and name
+/// (`identity::touch_hook_session`). Blank values are dropped.
+pub fn team_env(team: Option<&str>, name: Option<&str>) -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    if let Some(t) = team.map(str::trim).filter(|t| !t.is_empty()) {
+        env.push((crate::messages::identity::TEAM_ENV.to_string(), t.to_string()));
+    }
+    if let Some(n) = name.map(str::trim).filter(|n| !n.is_empty()) {
+        env.push(("AGENTFLARE_SESSION_NAME".to_string(), n.to_string()));
+    }
+    env
+}
+
+pub fn cli_launch(
+    agent: &str,
+    model: Option<&str>,
+    mode: Option<&str>,
+    args: &[String],
+    team: Option<&str>,
+    name: Option<&str>,
+) {
+    let env = team_env(team, name);
+    match agent_launch::run_launch_env(
+        agent_registry::REGISTRY,
+        agent,
+        model,
+        mode,
+        args,
+        &env,
+        false,
+    ) {
         LaunchOutcome::Launched => {}
         LaunchOutcome::NotFound(msg) => crate::ui::error(&msg),
         LaunchOutcome::UnknownAgent(msg) => crate::ui::error(&format!("unknown agent: {msg}")),
@@ -191,6 +220,8 @@ pub fn cli_run(
     model: Option<&str>,
     mode: Option<&str>,
     args: &[String],
+    team: Option<&str>,
+    name: Option<&str>,
 ) {
     let cwd = std::env::current_dir().unwrap_or_default();
     let vault_env = crate::vault::vault_env(&cwd);
@@ -207,6 +238,7 @@ pub fn cli_run(
             "agentflare run: no .dev.vars.{s} or .dev.vars found"
         ));
     }
+    env.extend(team_env(team, name));
     match agent_launch::run_launch_env(
         agent_registry::REGISTRY,
         agent,
@@ -307,6 +339,19 @@ mod tests {
             package_manager: None,
             package_name: None,
         }]
+    }
+
+    #[test]
+    fn team_env_sets_only_what_is_given() {
+        assert!(team_env(None, None).is_empty());
+        assert_eq!(
+            team_env(Some("alpha"), Some("pm")),
+            vec![
+                ("AGENTFLARE_TEAM".to_string(), "alpha".to_string()),
+                ("AGENTFLARE_SESSION_NAME".to_string(), "pm".to_string()),
+            ]
+        );
+        assert_eq!(team_env(Some(" "), None), vec![]);
     }
 
     #[test]
