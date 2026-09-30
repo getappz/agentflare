@@ -259,11 +259,89 @@ this rollback guarantee. Encrypted failure/reopen behaviour is tested.
 
 `list_and_count` uses the caller/backend isolation level. PostgreSQL's default
 READ COMMITTED is not a repeatable snapshot; use a caller transaction with
-REPEATABLE READ when that guarantee is needed. Filtered reads intentionally
-include soft-deleted rows unless your filter excludes them, and an empty
-filter on a bulk write affects **all rows**. These are query primitives, not
+REPEATABLE READ when that guarantee is needed. Filtered reads exclude
+soft-deleted rows unless `with_deleted` is set or `deleted_at` is filtered
+explicitly (a behavior change from earlier versions, which included them), and
+an empty filter on a bulk write affects **all rows**. These are query primitives, not
 tenant or business authorization checks. Apply tenant filters/constraints and
 check permissions in the consuming application.
+
+## Model-controlled data access (field policies and friends)
+
+The entity definition decides what goes in and what comes out, enforced by
+generated types rather than runtime checks. Still no relations, populate,
+cascades or DDL: this is a data-access layer, not an ORM.
+
+```rust,no_run
+use flare_db::{Crud, sqlx};
+use time::OffsetDateTime;
+
+#[derive(sqlx::FromRow, Crud)]
+#[crud(table = "orders", pk = "id", soft_delete, unique(email))]
+struct Order {
+    #[crud(id(prefix = "ord"))] // New.id: Option<String>; None => "ord_<ULID>"
+    id: String,
+    #[crud(immutable, searchable)] // in New; never in Patch or upsert updates
+    email: String,
+    #[crud(enum_values("open", "paid"), default = "open".to_string())]
+    status: String, // New.status: Option<String>; choices checked before writes
+    #[crud(readonly)] // readable; in neither New nor Patch
+    version: i64,
+    #[crud(hidden)] // insertable/patchable, never selected or returned
+    api_secret: String,
+    #[crud(computed)] // not a column; `Default` in output
+    label: String,
+    #[crud(created_at)] // set on insert
+    created_at: OffsetDateTime,
+    #[crud(updated_at)] // set on insert and every update
+    updated_at: OffsetDateTime,
+    deleted_at: Option<OffsetDateTime>,
+}
+```
+
+| Field attribute | New | Patch | Returned |
+| --- | --- | --- | --- |
+| `readonly` | no | no | yes |
+| `immutable` | yes | no (never upserted either) | yes |
+| `hidden` | yes | yes | **no** (`OrderPublic` lacks it) |
+| `computed` | no | no | `Default` (no SQL at all) |
+| `created_at` / `updated_at` | no (auto) | no (auto bump) | yes |
+| `id(prefix = "..")` / `default = ..` | `Option<T>` | no / yes | yes |
+
+- **Output type.** Every read and write return path selects `Entity::COLUMNS`
+  and decodes into one type: the entity itself, or `{Entity}Public` when any
+  field is `hidden`/`computed`. Hidden columns are never in a SELECT/RETURNING
+  list; filters may still reference them (e.g. look up by token hash), but
+  `searchable` ignores them. Generated output types carry no derives.
+- **Projection.** `{Entity}Field` names the selectable columns;
+  `get_select(pool, id, &[Field::Id])` and `list_select(pool, filter, page, &[..])`
+  return `{Entity}Partial` (every field an `Option`; unselected = `None`).
+- **Errors.** Methods still return `sqlx::Result` (no breaking change);
+  `CrudError::from(err)` classifies it as `NotFound`, `Conflict { table, cols,
+  values }` (values on Postgres only), `NotNull`, `ForeignKey`, `Validation` or
+  `Other`, with readable `Display`. Validation failures travel in
+  `sqlx::Error::Encode`.
+- **Validation.** `enum_values(..)` is always checked; `#[crud(validate)]` also
+  calls your `flare_db::Validate` impls on `{Entity}New`/`{Entity}Patch` before
+  insert, update and upsert.
+- **Events.** `flare_db::set_event_sink(|e| ..)` receives `Created`, `Updated`,
+  `Deleted`, `Restored` or `Upserted` with `{ object, id }` after each successful
+  statement (soft delete => `Deleted`, restore => `Restored`; `*_where` bulk
+  writes carry `id: None`). Inside a caller transaction that means "statement
+  succeeded", not "committed": use an outbox for commit-gated delivery.
+  `update_many` emits after its own commit.
+- **Upsert.** `upsert_one`/`upsert_many` (target from `unique(..)`) and
+  `upsert_one_on`/`upsert_many_on(pool, &[Field], ..)` use `ON CONFLICT (..) DO
+  UPDATE`. Only patchable columns are overwritten (never immutable, readonly, pk
+  or `created_at`, nor `default` fields the caller left unset); `updated_at` is
+  bumped. The target must match a UNIQUE index; duplicate keys within one batch
+  are a database error.
+- **Search and filters.** `{Entity}Filter.q` (present when a field is
+  `searchable`) ORs a case-insensitive substring match over those fields, with
+  `%`, `_` and `\` matched literally. `FilterOp` adds `Gt`, `Gte`, `Lt`, `Lte`,
+  `Between` and `ILike`; `and`/`or` hold nested filters; `count_where` and
+  `list_and_count_where` take a filter. Case folding is `ILIKE` on Postgres and
+  ASCII-only on SQLite.
 
 ## Backup, restore, key rotation and plaintext migration
 
