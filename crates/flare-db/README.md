@@ -9,7 +9,7 @@ your migrations. This is not an ORM, an authorization layer, or a key vault.
 
 ```toml
 [dependencies]
-flare-db = { version = "0.1.2", default-features = false, features = ["sqlcipher-bundled"] }
+flare-db = { version = "0.2.0", default-features = false, features = ["sqlcipher-bundled"] }
 sqlx = { version = "0.9", default-features = false, features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
@@ -66,7 +66,7 @@ OpenSSL dependency and does not download or discover an SDK automatically.
 You still need a C compiler (MSVC C++ Build Tools on Windows).
 
 ```toml
-flare-db = { version = "0.1.2", default-features = false, features = ["sqlcipher-bundled-external-openssl"] }
+flare-db = { version = "0.2.0", default-features = false, features = ["sqlcipher-bundled-external-openssl"] }
 ```
 
 ```powershell

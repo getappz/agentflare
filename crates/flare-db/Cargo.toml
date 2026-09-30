@@ -3,7 +3,7 @@
 
 [package]
 name = "flare-db"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.94"
 license = "Apache-2.0 AND BSD-3-Clause"
@@ -13,7 +13,7 @@ readme = "README.md"
 include = ["src/**", "tests/**", "migrations/**", "vendor/**", "build.rs", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "NOTICE"]
 
 [dependencies]
-flare-db-macros = { version = "=0.1.0", path = "../flare-db-macros" }
+flare-db-macros = { version = "=0.2.0", path = "../flare-db-macros" }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "migrate", "macros", "time"] }
 sea-query = { version = "1", default-features = false, features = ["backend-postgres", "backend-sqlite", "with-time"] }
 sea-query-binder = { package = "sea-query-sqlx", version = "0.9.1", default-features = false, features = ["with-time"] }
