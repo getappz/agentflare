@@ -553,6 +553,37 @@ pub fn since(
         .collect()
 }
 
+/// Messages addressed to `address` (a fanout address like `team:alpha`, or
+/// a session key), ascending, after `after`.
+pub fn history(
+    conn: &Connection,
+    address: &str,
+    after: i64,
+    limit: usize,
+) -> rusqlite::Result<Vec<Message>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {COLUMNS} FROM agent_messages
+         WHERE (to_address = ?1 OR to_key = ?1) AND id > ?2
+         ORDER BY id LIMIT ?3"
+    ))?;
+    stmt.query_map(params![address, after, limit as i64], row)?
+        .collect()
+}
+
+/// The last `limit` messages addressed to `address`, oldest first.
+pub fn recent(conn: &Connection, address: &str, limit: usize) -> rusqlite::Result<Vec<Message>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {COLUMNS} FROM agent_messages
+         WHERE to_address = ?1 OR to_key = ?1
+         ORDER BY id DESC LIMIT ?2"
+    ))?;
+    let mut v: Vec<Message> = stmt
+        .query_map(params![address, limit as i64], row)?
+        .collect::<Result<_, _>>()?;
+    v.reverse();
+    Ok(v)
+}
+
 pub fn max_id(conn: &Connection) -> rusqlite::Result<i64> {
     conn.query_row("SELECT COALESCE(MAX(id), 0) FROM agent_messages", [], |r| {
         r.get(0)

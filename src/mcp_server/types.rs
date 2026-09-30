@@ -1253,10 +1253,10 @@ pub(crate) struct CommentRequest {
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct MessageRequest {
-    #[schemars(description = "Action: send|list|inbox|read|whoami")]
+    #[schemars(description = "Action: send|list|inbox|read|whoami|history")]
     pub(crate) action: String,
     #[schemars(
-        description = "Recipient (send): a session key from action=list, a unique session name, item:<id> (whoever is working that item; also recorded as an item comment), agent:<name> (every live session of that agent), team:<name> (every live session launched with --team <name>, except you), or * (every live session)"
+        description = "Recipient (send): a session key from action=list, a unique session name, item:<id> (whoever is working that item; also recorded as an item comment), agent:<name> (every live session of that agent), team:<name> (every live session launched with --team <name>, except you), or * (every live session). (history): the address or session key whose messages to list, e.g. team:alpha (default: your own key)"
     )]
     #[serde(default)]
     pub(crate) to: Option<String>,
@@ -1266,6 +1266,14 @@ pub(crate) struct MessageRequest {
     #[schemars(description = "Id of the message this answers (send)")]
     #[serde(default)]
     pub(crate) reply_to: Option<i64>,
+    #[schemars(
+        description = "Priority (send): important (default; delivered at the next tool call), status (delivered at turn boundaries, or mid-turn once 3 pile up), fyi (never interrupts; read via inbox or at session start)"
+    )]
+    #[serde(default)]
+    pub(crate) marker: Option<String>,
+    #[schemars(description = "Only messages with id greater than this (history)")]
+    #[serde(default)]
+    pub(crate) after: Option<i64>,
     #[schemars(description = "Message ids to mark read (read)")]
     #[serde(default)]
     pub(crate) ids: Option<Vec<i64>>,
