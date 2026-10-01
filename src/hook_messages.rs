@@ -295,7 +295,16 @@ mod tests {
         let busy = |c: &rusqlite::Connection| crate::sessions::get(c, key).unwrap().unwrap().busy;
         sync_with(&c, "claude-code", key, None, true, Delivery::TurnStart, 99).unwrap();
         assert!(!busy(&c), "a session start is not a turn");
-        sync_with(&c, "claude-code", key, None, false, Delivery::TurnStart, 100).unwrap();
+        sync_with(
+            &c,
+            "claude-code",
+            key,
+            None,
+            false,
+            Delivery::TurnStart,
+            100,
+        )
+        .unwrap();
         assert!(busy(&c), "a submitted prompt marks the session busy");
         sync_with(&c, "claude-code", key, None, false, Delivery::MidTurn, 101).unwrap();
         assert!(busy(&c));
