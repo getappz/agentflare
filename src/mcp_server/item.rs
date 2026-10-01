@@ -1147,10 +1147,11 @@ impl AgentflareMcp {
                 let item_id = self.resolve_item_id(conn, &raw)?;
                 // What `item::claim` is about to change (state -> "started",
                 // assignee), so a claim whose worktree then can't be created
-                // can be put back exactly as it was found.
+                // can be put back as found -- plus whether we already held it.
+                let held = super::item_force::holds_claim(conn, &item_id, &owner);
                 let before_claim = agentflare_backend::item::get(conn, &item_id)
                     .ok()
-                    .map(|i| (i.state_id, i.assignee_agent));
+                    .map(|i| (i.state_id, i.assignee_agent, held));
                 // Read again (cheap) so a `Held` response can report the TTL it
                 // was actually gated by -- `item::claim` computes this internally
                 // for in-review items but doesn't hand it back (item #108).
@@ -1182,6 +1183,7 @@ impl AgentflareMcp {
                 &repo_root,
                 target,
                 current_progress_sender().as_ref(),
+                before_claim.as_ref().is_some_and(|b| b.2),
             )),
             _ => None,
         };
@@ -1192,7 +1194,7 @@ impl AgentflareMcp {
         // restore the item's prior state/assignee right here, rather than
         // relying on every caller to clean up after it.
         let claim_rolled_back = match (&worktree_result, &before_claim) {
-            (Some(Err(e)), Some((prev_state_id, prev_assignee)))
+            (Some(Err(e)), Some((prev_state_id, prev_assignee, _)))
                 if !flare_git_core::worktree::is_retryable_worktree_race(e) =>
             {
                 self.roll_back_claim(&item_id, &owner, prev_state_id, prev_assignee.as_deref())
@@ -1697,7 +1699,7 @@ impl AgentflareMcp {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .unwrap_or("Auto-committed by item done: uncommitted changes at completion");
-            match crate::worktree::commit_uncommitted(item, &repo_root, message) {
+            match crate::worktree::commit_uncommitted(item, &repo_root, message, req.force) {
                 crate::worktree::CommitOutcome::Committed => {
                     eprintln!("worktree: auto-committed uncommitted changes for item {item_id}");
                 }
@@ -1727,6 +1729,8 @@ impl AgentflareMcp {
                 }
             }
         }
+        let guard_push = should_push && req.force != Some(true);
+        self.refuse_wipe_push(&item_id, &item, &repo_root, &target_branch, guard_push)?;
         let agent = crate::claims::agent_of(&owner);
         let pr_outcome = match (&item, &target_branch) {
             (Some(item), Some(target)) if should_push => crate::worktree::push_and_open_pr(

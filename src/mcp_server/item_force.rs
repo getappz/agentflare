@@ -22,6 +22,16 @@ pub(crate) const FORCE_OVERRIDE_MARKER: &str = "## agentflare — forced claim o
 /// Prefix on the comment `auto_release_dead_claims` posts.
 pub(crate) const AUTO_RELEASE_MARKER: &str = "## supervisor — auto-released dead claim";
 
+/// Prefix on the comment `refuse_wipe_push` posts.
+pub(crate) const WIPE_PUSH_REFUSED_MARKER: &str = "## agentflare — push refused: mass deletion";
+
+/// Whether `owner` already holds `item_id`'s claim. Asked before
+/// `item::claim` renews it, so `create_worktree` knows it is running for
+/// the worktree's live claimant and must never clear it (item #689).
+pub(super) fn holds_claim(conn: &rusqlite::Connection, item_id: &str, owner: &str) -> bool {
+    agentflare_backend::claim::is_owner(conn, item_id, owner).unwrap_or(false)
+}
+
 /// Adds `forced_override` (the gate evidence) to a response when one happened.
 pub(super) fn with_forced(mut resp: serde_json::Value, forced: Option<String>) -> String {
     if let Some(evidence) = forced {
@@ -142,6 +152,44 @@ pub(super) fn branch_gate(
 }
 
 impl AgentflareMcp {
+    /// `done`'s last check before publishing: refuses (with a comment on the
+    /// item) when pushing its branch would publish a mass deletion -- the
+    /// signature of a wiped worktree that got committed (item #689), not of
+    /// real work. `guard` is false when `done` isn't pushing or was forced.
+    pub(super) fn refuse_wipe_push(
+        &self,
+        item_id: &str,
+        item: &Option<agentflare_backend::item::Item>,
+        repo_root: &std::path::Path,
+        target_branch: &Option<String>,
+        guard: bool,
+    ) -> Result<(), ErrorData> {
+        let (true, Some(item), Some(target)) = (guard, item, target_branch) else {
+            return Ok(());
+        };
+        let branch = flare_git_core::worktree::resolve_item_task_branch(item, repo_root);
+        let Some(wipe) = flare_git_core::worktree::branch_mass_deletion(repo_root, &branch, target)
+        else {
+            return Ok(());
+        };
+        self.post_item_comment(
+            item_id,
+            format!(
+                "{WIPE_PUSH_REFUSED_MARKER}\n\n`{branch}` was NOT pushed: {wipe} relative to \
+                 `{target}`. That is what a wiped worktree looks like once committed. Reset the \
+                 branch to its last good commit, or, if the deletion is intended, re-run `done` \
+                 with `force=true` and a `force_reason`."
+            ),
+        );
+        Err(ErrorData::invalid_params(
+            format!(
+                "item {item_id}: refusing to push `{branch}` -- {wipe}; pass force=true with a \
+                 force_reason if the deletion is intended"
+            ),
+            None,
+        ))
+    }
+
     /// Entry point for `release|done|check_merge`: validates `force` +
     /// `force_reason`, then runs [`Self::force_takeover`] as the caller.
     pub(super) fn force_if_requested(

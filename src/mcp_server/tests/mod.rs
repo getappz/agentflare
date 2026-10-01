@@ -436,6 +436,7 @@ mod item_tests_cross_project;
 mod item_tests_filters;
 mod item_tests_relations;
 mod item_tests_reporting;
+mod item_wipe_guard_tests;
 mod pm_tests;
 mod project_resolution_tests;
 mod search_tests;

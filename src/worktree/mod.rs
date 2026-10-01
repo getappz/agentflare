@@ -38,8 +38,15 @@ pub fn create_worktree(
     repo_root: &Path,
     target_branch: &str,
     progress: Option<&ProgressSender>,
+    caller_holds_live_claim: bool,
 ) -> Result<PathBuf, String> {
-    flare_git_core::worktree::create_worktree(item, repo_root, target_branch, as_progress(progress))
+    flare_git_core::worktree::create_worktree_for(
+        item,
+        repo_root,
+        target_branch,
+        as_progress(progress),
+        caller_holds_live_claim,
+    )
 }
 
 /// The `done`-side counterpart to `create_worktree`: removes it now that the
@@ -55,11 +62,27 @@ pub use flare_git_core::worktree::{RebaseOutcome, rebase_item_worktree};
 
 /// Commits any uncommitted changes in `item`'s worktree. See
 /// `flare_git_core::worktree::commit_uncommitted`.
+///
+/// `done`'s auto-commit is a safety net for a forgotten commit, not a way to
+/// publish a wiped tree: a working tree missing a mass of tracked files is
+/// refused (item #689) unless the caller passed `force`.
 pub fn commit_uncommitted(
     item: &agentflare_backend::item::Item,
     repo_root: &Path,
     message: &str,
+    force: Option<bool>,
 ) -> CommitOutcome {
+    let worktree = flare_git_core::worktree::item_worktree_path(repo_root, item.sequence_id);
+    if force != Some(true)
+        && let Some(wipe) = flare_git_core::worktree::worktree_mass_deletion(&worktree)
+    {
+        return CommitOutcome::Failed(format!(
+            "refusing to auto-commit a {wipe} in {}. If the files were not deleted on purpose, \
+             `git restore --worktree --source=HEAD -- .` there; if they were, re-run done with \
+             force=true and a force_reason",
+            worktree.display()
+        ));
+    }
     flare_git_core::worktree::commit_uncommitted(item, repo_root, message)
 }
 

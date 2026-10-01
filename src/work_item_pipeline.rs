@@ -342,11 +342,24 @@ fn synthesize_reply_text(last_report: Option<&str>, ledger: &[String]) -> String
 /// worktree, and committing into whatever it actually is would be a
 /// correctness hazard, not just a missed checkpoint. Best-effort otherwise:
 /// a commit failure is logged, not fatal.
-fn checkpoint_implementer_turn(data: &mut WorkItemData, task_id: usize) {
+///
+/// `Err` only for a mass deletion of tracked files (item #689): a worktree
+/// hollowed out from under the agent must stop the run, not be committed as
+/// if it were the turn's work -- that made `git status` read clean over an
+/// 868-file wipe.
+fn checkpoint_implementer_turn(data: &mut WorkItemData, task_id: usize) -> Result<(), String> {
     if data.worktree_path.is_empty() {
-        return;
+        return Ok(());
     }
     let worktree_path = std::path::PathBuf::from(&data.worktree_path);
+    if let Some(wipe) = flare_git_core::worktree::worktree_mass_deletion(&worktree_path) {
+        return Err(format!(
+            "sdd_loop: task {task_id} checkpoint refused -- {wipe} in {}. Nothing was committed. \
+             If the files were not deleted on purpose, `git restore --worktree --source=HEAD -- .` \
+             there; if they were, commit it by hand before re-dispatching.",
+            worktree_path.display()
+        ));
+    }
     if data.checkpoint_base_sha.is_none() {
         data.checkpoint_base_sha = crate::worktree::head_sha(&worktree_path);
     }
@@ -356,6 +369,7 @@ fn checkpoint_implementer_turn(data: &mut WorkItemData, task_id: usize) {
     {
         eprintln!("sdd_loop: checkpoint commit for task {task_id} failed: {e}");
     }
+    Ok(())
 }
 
 pub(crate) fn build_sdd_loop_step(
@@ -546,8 +560,13 @@ pub(crate) fn build_sdd_loop_step(
                 ctx.input_tokens += in_tok;
                 ctx.output_tokens += out_tok;
 
-                if is_implementer_turn {
-                    checkpoint_implementer_turn(&mut ctx.data, task.id);
+                if is_implementer_turn
+                    && let Err(message) = checkpoint_implementer_turn(&mut ctx.data, task.id)
+                {
+                    // `Failed`, not `Err`: retrying the step would re-run the
+                    // agent against the same wiped tree.
+                    eprintln!("{message}");
+                    return Ok(StepResult::Failed(message));
                 }
 
                 let (role_reply, role_session_id) = strip_session_marker(&raw_role_reply);

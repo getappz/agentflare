@@ -21,12 +21,18 @@ mod heal;
 mod orphans;
 #[path = "worktree_process.rs"]
 mod process;
+#[path = "worktree_wipe_guard.rs"]
+mod wipe_guard;
 
 use heal::*;
-use orphans::remove_worktree_dir;
 pub use orphans::{OrphanWorktree, audit_orphans, gc_orphans};
+use orphans::{is_structurally_broken, remove_worktree_dir};
 pub(crate) use process::run_output_timeout;
 use process::*;
+use wipe_guard::restore_mass_deleted_worktree;
+pub use wipe_guard::{
+    MASS_DELETION_MARKER, MassDeletion, branch_mass_deletion, worktree_mass_deletion,
+};
 
 /// Minimal progress-reporting interface — decouples this crate from the
 /// main binary's MCP-specific `ProgressSender` (which depends on `rmcp`),
@@ -403,6 +409,20 @@ pub fn create_worktree(
     target_branch: &str,
     progress: Option<&dyn Progress>,
 ) -> Result<PathBuf, String> {
+    create_worktree_for(item, repo_root, target_branch, progress, false)
+}
+
+/// [`create_worktree`] for a caller that knows whether it already held
+/// `item`'s live claim before this call. A live claimant's worktree is in
+/// use right now, so an existing directory there is never cleared on its
+/// behalf, however broken it looks (item #689).
+pub fn create_worktree_for(
+    item: &Item,
+    repo_root: &Path,
+    target_branch: &str,
+    progress: Option<&dyn Progress>,
+    caller_holds_live_claim: bool,
+) -> Result<PathBuf, String> {
     let worktree_path = item_worktree_path(repo_root, item.sequence_id);
     let label = format!("task-{}", item.sequence_id);
     if worktree_path.is_dir() && !is_own_checkout(&worktree_path) {
@@ -413,6 +433,26 @@ pub fn create_worktree(
         let path = worktree_path.to_string_lossy().to_string();
         let _ = run_git_in(repo_root, &["worktree", "repair", &path]);
         if !is_own_checkout(&worktree_path) {
+            // `is_own_checkout` is one git call: it is also false when git
+            // merely failed or answered for another repository. Only a
+            // directory that is structurally not a worktree may be cleared;
+            // this runs on every dispatch into an existing worktree, and
+            // clearing on a git failure wiped live ones (item #689).
+            let intact = !is_structurally_broken(repo_root, &worktree_path);
+            if intact || caller_holds_live_claim {
+                return Err(format!(
+                    "worktree: {} does not answer as its own checkout, but {} -- refusing to \
+                     clear it for item {}; nothing was deleted",
+                    worktree_path.display(),
+                    if intact {
+                        "its .git pointer and registration are intact (git is failing or \
+                         misdirected, the checkout is not broken)"
+                    } else {
+                        "the caller holds the item's live claim"
+                    },
+                    item.id
+                ));
+            }
             let name = item.sequence_id.to_string();
             if gc_orphans(repo_root, std::slice::from_ref(&name)).is_empty() {
                 return Err(format!(
@@ -456,6 +496,7 @@ pub fn create_worktree(
         // Re-claiming an existing worktree: nothing to create, but still
         // ensure its target dir is isolated (idempotent, no-op if present),
         // and re-warn since the ambient env can still be shadowing it.
+        restore_mass_deleted_worktree(&worktree_path)?;
         warn_if_ambient_target_dir();
         isolate_worktree_target_dir(&worktree_path);
         lock_item_worktree(repo_root, &worktree_path);
@@ -1212,3 +1253,7 @@ mod tests;
 #[cfg(test)]
 #[path = "worktree_heal_tests.rs"]
 mod heal_tests;
+
+#[cfg(test)]
+#[path = "worktree_wipe_tests.rs"]
+mod wipe_tests;

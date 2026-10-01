@@ -6,8 +6,60 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use super::{remove_stale_registration_for_path, resolve_gitdir_pointer};
+use super::{remove_stale_registration_for_path, resolve_gitdir_pointer, same_location};
 use crate::shell::run_in as run_git_in;
+
+/// What a worktree directory's `.git` says about it, read straight off disk
+/// -- no git command involved, so a failing or misdirected git can't change
+/// the answer.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum GitPointer {
+    /// No readable `.git` at all.
+    Missing,
+    /// A pointer file naming an admin directory that no longer exists.
+    Dangling,
+    /// A pointer file whose admin directory exists (or a real `.git` dir).
+    Intact,
+}
+
+pub(super) fn git_pointer(path: &Path) -> GitPointer {
+    let dot_git = path.join(".git");
+    if dot_git.is_dir() {
+        return GitPointer::Intact;
+    }
+    let Ok(content) = std::fs::read_to_string(&dot_git) else {
+        return GitPointer::Missing;
+    };
+    let gitdir = content.trim().trim_start_matches("gitdir: ");
+    if resolve_gitdir_pointer(path, gitdir).exists() {
+        GitPointer::Intact
+    } else {
+        GitPointer::Dangling
+    }
+}
+
+/// Whether `worktree_path` is structurally not a worktree of `repo_root`:
+/// its `.git` pointer is missing or dangling, or git does not list it as a
+/// registered worktree. This is the only ground on which `create_worktree`
+/// may clear an existing directory -- "a git command failed inside it" is
+/// not (item #689: a leaked `GIT_WORK_TREE` made `rev-parse` answer for the
+/// main repo and a live worktree was garbage-collected). Fails closed: an
+/// unreadable registration list is not evidence of anything.
+pub(super) fn is_structurally_broken(repo_root: &Path, worktree_path: &Path) -> bool {
+    if worktree_path.join(".git").is_dir() {
+        return false;
+    }
+    match git_pointer(worktree_path) {
+        GitPointer::Missing | GitPointer::Dangling => true,
+        GitPointer::Intact => run_git_in(repo_root, &["worktree", "list", "--porcelain"])
+            .is_ok_and(|list| {
+                !list
+                    .lines()
+                    .filter_map(|l| l.strip_prefix("worktree "))
+                    .any(|listed| same_location(Path::new(listed), worktree_path))
+            }),
+    }
+}
 
 /// Information about an orphaned worktree detected during audit.
 pub struct OrphanWorktree {
@@ -62,18 +114,7 @@ pub fn audit_orphans(
             Some(n) => n.to_string(),
             None => continue,
         };
-        let dot_git = path.join(".git");
-        let has_broken_gitdir = if dot_git.is_file() {
-            match std::fs::read_to_string(&dot_git) {
-                Ok(content) => {
-                    let gitdir = content.trim().trim_start_matches("gitdir: ");
-                    !resolve_gitdir_pointer(path, gitdir).exists()
-                }
-                Err(_) => false,
-            }
-        } else {
-            false
-        };
+        let has_broken_gitdir = git_pointer(path) == GitPointer::Dangling;
         // Exclude directories whose name matches a live claimed item
         if let Some(claimed) = claimed_item_ids
             && claimed.contains(&dir_name)
@@ -131,10 +172,9 @@ pub fn audit_orphans(
 /// Delete orphaned worktrees: snapshot first, then remove with retry.
 ///
 /// Takes a list of worktree names (as returned by `audit_orphans`) and
-/// snapshots each one before removing it. Removal uses `remove_worktree_dir`
-/// which retries with exponential backoff on Windows, falls back to `cmd /c
-/// rmdir`, and reports locking processes via handle64.exe when present.
-/// Returns the names actually deleted.
+/// snapshots each one before removing it. Removal uses `remove_worktree_dir`,
+/// which either takes the whole directory or leaves it untouched. Returns
+/// the names actually deleted.
 pub fn gc_orphans(repo_root: &Path, names: &[String]) -> Vec<String> {
     let mut deleted = Vec::new();
     for name in names {
@@ -169,65 +209,75 @@ pub fn gc_orphans(repo_root: &Path, names: &[String]) -> Vec<String> {
     deleted
 }
 
-/// Remove a worktree directory, with retry + Windows fallback.
+/// Where a worktree directory is parked before it is deleted:
+/// `<repo>/.worktrees/.trash` for anything under `.worktrees`, a sibling
+/// `.trash` otherwise. Always on the directory's own volume, so getting
+/// there is a plain rename.
+fn trash_root(path: &Path) -> Option<PathBuf> {
+    let parent = path.parent()?;
+    let root = path
+        .ancestors()
+        .skip(1)
+        .find(|a| a.file_name().is_some_and(|n| n == ".worktrees"))
+        .unwrap_or(parent);
+    Some(root.join(".trash"))
+}
+
+/// Remove a worktree directory: rename it aside, then delete the copy.
 ///
-/// On Windows, background processes (rust-analyzer, proc-macro-srv) may
-/// hold file handles that block `remove_dir_all` with Permission denied.
-/// Retries with exponential backoff, falls back to `cmd /c rmdir`, and
-/// attempts to identify the locking process via handle64.exe when present.
+/// Deleting in place is not atomic. On Windows any open handle under the
+/// tree (a running test exe under `target\`, an editor, a git process)
+/// makes `remove_dir_all` delete everything it can reach and then fail,
+/// leaving a registered worktree with its branch intact and every tracked
+/// file gone (item #689). Renaming the directory either moves the whole
+/// tree or fails having touched nothing -- and it fails for exactly those
+/// open handles. So the rename (retried past transient locks) is the only
+/// step that can report failure, and it does so with `path` fully intact.
+/// Once the tree is parked, `path` is free and deleting the parked copy is
+/// best-effort. Reports the locking process via handle64.exe when present.
 pub(super) fn remove_worktree_dir(path: &Path, name: &str) -> bool {
-    let delays_ms = [100u64, 200, 400, 800, 1600];
-    for delay in &delays_ms {
-        if std::fs::remove_dir_all(path).is_ok() {
-            return true;
+    let Some(trash) = trash_root(path) else {
+        return false;
+    };
+    if let Err(e) = std::fs::create_dir_all(&trash) {
+        eprintln!(
+            "worktree: failed to remove orphan '{name}': cannot create {}: {e}",
+            trash.display()
+        );
+        return false;
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let safe_name = name.replace(['/', '\\'], "-");
+    let mut parked = trash.join(format!("{safe_name}-{stamp}"));
+    let mut n = 0;
+    while parked.exists() {
+        n += 1;
+        parked = trash.join(format!("{safe_name}-{stamp}-{n}"));
+    }
+
+    let mut last_err = String::new();
+    for delay_ms in [100u64, 200, 400, 800, 1600, 0] {
+        match std::fs::rename(path, &parked) {
+            Ok(()) => {
+                delete_parked(&parked);
+                // Sweep copies an earlier call could not delete, then drop
+                // the trash directory itself once it is empty.
+                for stale in std::fs::read_dir(&trash).into_iter().flatten().flatten() {
+                    let _ = std::fs::remove_dir_all(stale.path());
+                }
+                let _ = std::fs::remove_dir(&trash);
+                return true;
+            }
+            Err(e) => last_err = e.to_string(),
         }
-        std::thread::sleep(Duration::from_millis(*delay));
+        std::thread::sleep(Duration::from_millis(delay_ms));
     }
-    if std::fs::remove_dir_all(path).is_ok() {
-        return true;
-    }
+    let _ = std::fs::remove_dir(&trash);
 
     #[cfg(windows)]
     {
-        if flare_process::command("cmd")
-            .args(["/c", "rmdir", "/s", "/q", &path.to_string_lossy()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        {
-            return true;
-        }
-
-        // `rmdir`/`remove_dir_all` both fail identically against a genuine
-        // ACL denial, not just a transient in-use lock -- item #267's actual
-        // failure mode: cargo's own `target/*/.fingerprint/*` files can end
-        // up ACL-restricted (not merely open), which no amount of retrying
-        // or an in-use-lock-only tool like `rmdir` can clear. `icacls /grant
-        // ... /T` resets ownership access recursively before one final
-        // delete attempt; a no-op (and thus never destructive) if the real
-        // problem was actually an in-use lock the retries above already
-        // would have cleared.
-        if let Ok(user) = std::env::var("USERNAME") {
-            let icacls_args: Vec<String> = vec![
-                path.to_string_lossy().to_string(),
-                "/grant".to_string(),
-                format!("{user}:F"),
-                "/T".to_string(),
-                "/C".to_string(),
-                "/Q".to_string(),
-            ];
-            let _ = flare_process::command("icacls")
-                .args(&icacls_args)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-            if std::fs::remove_dir_all(path).is_ok() {
-                return true;
-            }
-        }
-
         for handle_exe in &["handle64.exe", "handle.exe"] {
             if let Ok(output) = flare_process::command(handle_exe)
                 .args(["-accepteula", "-nobanner", &path.to_string_lossy()])
@@ -246,11 +296,56 @@ pub(super) fn remove_worktree_dir(path: &Path, name: &str) -> bool {
         }
     }
 
-    eprintln!(
-        "worktree: failed to remove orphan '{}': Permission denied",
-        name
-    );
+    eprintln!("worktree: failed to remove orphan '{name}', left untouched: {last_err}");
     false
+}
+
+/// Best-effort delete of a directory already moved into the trash; a
+/// leftover is swept by the next successful removal.
+fn delete_parked(parked: &Path) {
+    if std::fs::remove_dir_all(parked).is_ok() {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        let _ = flare_process::command("cmd")
+            .args(["/c", "rmdir", "/s", "/q", &parked.to_string_lossy()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        // `rmdir`/`remove_dir_all` both fail identically against a genuine
+        // ACL denial, not just a transient in-use lock -- item #267's actual
+        // failure mode: cargo's own `target/*/.fingerprint/*` files can end
+        // up ACL-restricted (not merely open), which no amount of retrying
+        // or an in-use-lock-only tool like `rmdir` can clear. `icacls /grant
+        // ... /T` resets ownership access recursively before one final
+        // delete attempt.
+        if parked.exists()
+            && let Ok(user) = std::env::var("USERNAME")
+        {
+            let icacls_args: Vec<String> = vec![
+                parked.to_string_lossy().to_string(),
+                "/grant".to_string(),
+                format!("{user}:F"),
+                "/T".to_string(),
+                "/C".to_string(),
+                "/Q".to_string(),
+            ];
+            let _ = flare_process::command("icacls")
+                .args(&icacls_args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+    if parked.exists()
+        && let Err(e) = std::fs::remove_dir_all(parked)
+    {
+        eprintln!(
+            "worktree: could not delete parked copy {}: {e}",
+            parked.display()
+        );
+    }
 }
 
 /// Recursive directory size in bytes.

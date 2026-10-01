@@ -139,6 +139,18 @@ pub(crate) fn git_binary() -> PathBuf {
     resolved_git().binary.clone()
 }
 
+/// Environment variables that override which repository, work tree or index
+/// a git command operates on, regardless of its cwd.
+pub(crate) const GIT_LOCATION_ENV: [&str; 7] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_PREFIX",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_NAMESPACE",
+];
+
 /// Applies the same filtered/deduped PATH used to resolve `git_binary()` to
 /// the spawned command's own environment. Without this, `Command::output()`
 /// inherits the FULL parent environment by default -- including whatever
@@ -159,9 +171,19 @@ pub(crate) fn git_binary() -> PathBuf {
 ///   until a timeout (or forever, for calls without one).
 /// - `GIT_OPTIONAL_LOCKS=0`: read-only polling (`status`) must not take
 ///   `index.lock` in a worktree an agent is actively committing in.
+/// - no [`GIT_LOCATION_ENV`]: every call here names its repository by cwd.
+///   A daemon started from inside a git hook (or a shell exporting one of
+///   these) keeps it for life, and each git call then answers for that
+///   other repository -- `rev-parse --show-toplevel` inside a task worktree
+///   returned the main repo, which read as "not a checkout" and got the
+///   live worktree garbage-collected (item #689). A caller that needs one
+///   of them sets it after this runs (see `snapshot::run_git_with_index`).
 pub(crate) fn apply_filtered_path(cmd: &mut Command) {
     if let Some(path) = &resolved_git().filtered_path {
         cmd.env("PATH", path);
+    }
+    for var in GIT_LOCATION_ENV {
+        cmd.env_remove(var);
     }
     cmd.env_remove("LC_ALL")
         .env("LC_MESSAGES", "C")
