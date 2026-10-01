@@ -39,6 +39,7 @@ pub fn create_worktree(
     target_branch: &str,
     progress: Option<&ProgressSender>,
     caller_holds_live_claim: bool,
+    allow_mass_deletion: bool,
 ) -> Result<PathBuf, String> {
     flare_git_core::worktree::create_worktree_for(
         item,
@@ -46,6 +47,7 @@ pub fn create_worktree(
         target_branch,
         as_progress(progress),
         caller_holds_live_claim,
+        allow_mass_deletion,
     )
 }
 
@@ -73,15 +75,25 @@ pub fn commit_uncommitted(
     force: Option<bool>,
 ) -> CommitOutcome {
     let worktree = flare_git_core::worktree::item_worktree_path(repo_root, item.sequence_id);
-    if force != Some(true)
-        && let Some(wipe) = flare_git_core::worktree::worktree_mass_deletion(&worktree)
-    {
-        return CommitOutcome::Failed(format!(
-            "refusing to auto-commit a {wipe} in {}. If the files were not deleted on purpose, \
-             `git restore --worktree --source=HEAD -- .` there; if they were, re-run done with \
-             force=true and a force_reason",
-            worktree.display()
-        ));
+    if force != Some(true) {
+        match flare_git_core::worktree::worktree_mass_deletion(&worktree) {
+            Ok(None) => {}
+            Ok(Some(wipe)) => {
+                return CommitOutcome::Failed(format!(
+                    "refusing to auto-commit a {wipe} in {}. If the files were not deleted on \
+                     purpose, `git restore --worktree --source=HEAD -- .` there; if they were, \
+                     label the item `{}` or re-run done with force=true and a force_reason",
+                    worktree.display(),
+                    flare_git_core::worktree::ALLOW_MASS_DELETION_LABEL
+                ));
+            }
+            Err(e) => {
+                return CommitOutcome::Failed(format!(
+                    "refusing to auto-commit in {}: could not check it for a mass deletion: {e}",
+                    worktree.display()
+                ));
+            }
+        }
     }
     flare_git_core::worktree::commit_uncommitted(item, repo_root, message)
 }

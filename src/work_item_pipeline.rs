@@ -68,6 +68,11 @@ pub(crate) struct WorkItemData {
     /// re-resolving `owner_id()` itself.
     #[serde(default)]
     pub owner: String,
+    /// The item carried the `allow-mass-deletion` label when the run was
+    /// dispatched: a mass deletion in its worktree is deliberate, so the
+    /// checkpoint commits it instead of refusing (item #689).
+    #[serde(default)]
+    pub allow_mass_deletion: bool,
     pub reply_text: String,
     pub session_id: Option<String>,
     pub cost_usd: Option<f64>,
@@ -352,13 +357,27 @@ fn checkpoint_implementer_turn(data: &mut WorkItemData, task_id: usize) -> Resul
         return Ok(());
     }
     let worktree_path = std::path::PathBuf::from(&data.worktree_path);
-    if let Some(wipe) = flare_git_core::worktree::worktree_mass_deletion(&worktree_path) {
-        return Err(format!(
-            "sdd_loop: task {task_id} checkpoint refused -- {wipe} in {}. Nothing was committed. \
-             If the files were not deleted on purpose, `git restore --worktree --source=HEAD -- .` \
-             there; if they were, commit it by hand before re-dispatching.",
-            worktree_path.display()
-        ));
+    if !data.allow_mass_deletion {
+        match flare_git_core::worktree::worktree_mass_deletion(&worktree_path) {
+            Ok(None) => {}
+            Ok(Some(wipe)) => {
+                return Err(format!(
+                    "sdd_loop: task {task_id} checkpoint refused -- {wipe} in {}. Nothing was \
+                     committed. If the files were not deleted on purpose, `git restore --worktree \
+                     --source=HEAD -- .` there; if they were, label the item `{}` and dispatch \
+                     again.",
+                    worktree_path.display(),
+                    flare_git_core::worktree::ALLOW_MASS_DELETION_LABEL
+                ));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "sdd_loop: task {task_id} checkpoint refused -- could not check {} for a mass \
+                     deletion: {e}. Nothing was committed.",
+                    worktree_path.display()
+                ));
+            }
+        }
     }
     if data.checkpoint_base_sha.is_none() {
         data.checkpoint_base_sha = crate::worktree::head_sha(&worktree_path);
@@ -1116,6 +1135,7 @@ pub(crate) fn run_or_resume_with_sender(
     // `finalize` re-resolving `owner_id()` itself.
     let owner = crate::claims::owner_id();
     let heartbeat_owner = owner.clone();
+    let allow_mass_deletion = mcp.item_allows_mass_deletion(&item.id);
 
     let eng = engine();
     let definition = build_work_item_pipeline_with_sender(mcp.clone(), send);
@@ -1135,6 +1155,7 @@ pub(crate) fn run_or_resume_with_sender(
             agent_name: agent_name.clone(),
             judge_agent_name: judge_agent_name.clone(),
             owner: owner.clone(),
+            allow_mass_deletion,
             notify_recipient: notify_recipient.clone(),
             tasks: tasks.clone(),
             review_only,

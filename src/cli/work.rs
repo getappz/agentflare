@@ -772,7 +772,16 @@ fn execute_work_impl(
             Some(detail) => format!("claim succeeded but no worktree was created: {detail}"),
             None => "claim succeeded but no worktree was created (bad git state?)".to_string(),
         };
-        release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
+        // A claim this run already held is the lease protecting the
+        // worktree the failure left alone: say why, but keep it.
+        let keeps_lease = claim["worktree_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("nothing was deleted"));
+        if keeps_lease {
+            mcp.post_item_comment(item_id, &msg);
+        } else {
+            release_and_comment(&mcp, item_id, &msg, args.notify.as_deref());
+        }
         crate::ui::error(&msg);
         let _ = writeln!(log, "{msg}");
         // Transient registration/lock races (teardown still in flight) must

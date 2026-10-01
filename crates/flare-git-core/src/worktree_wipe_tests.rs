@@ -162,10 +162,27 @@ fn create_worktree_restores_a_reclaimed_worktree_whose_tracked_files_were_delete
         std::fs::remove_file(wt.join(format!("f{i}.txt"))).unwrap();
     }
 
-    create_worktree(&item, &repo.path, "master", None).unwrap();
+    let err = create_worktree(&item, &repo.path, "master", None)
+        .expect_err("a restore must fail the dispatch loudly, once");
+    assert!(err.contains("restored"), "{err}");
+    assert!(err.contains(ALLOW_MASS_DELETION_LABEL), "{err}");
     assert_eq!(tracked_files_present(&wt, 30), 30);
     let status = run_git_in(&wt, &["status", "--porcelain"]).unwrap();
     assert!(status.is_empty(), "restored tree must be clean: {status}");
+    create_worktree(&item, &repo.path, "master", None).expect("the second dispatch is quiet");
+}
+
+// R5: an item labelled `allow-mass-deletion` keeps its deliberate deletion.
+#[test]
+fn create_worktree_leaves_a_mass_deletion_alone_when_the_item_allows_it() {
+    let repo = seeded_repo(30);
+    let item = test_item(686);
+    let wt = create_worktree(&item, &repo.path, "master", None).unwrap();
+    for i in 0..30 {
+        std::fs::remove_file(wt.join(format!("f{i}.txt"))).unwrap();
+    }
+    create_worktree_for(&item, &repo.path, "master", None, true, true).unwrap();
+    assert_eq!(tracked_files_present(&wt, 30), 0, "nothing may be restored");
 }
 
 #[test]
@@ -201,12 +218,12 @@ fn create_worktree_never_clears_a_directory_for_its_live_claimant() {
     std::fs::write(wt.join("leftover.txt"), "x").unwrap();
     assert!(is_structurally_broken(&repo.path, &wt));
 
-    let err = create_worktree_for(&item, &repo.path, "master", None, true).unwrap_err();
+    let err = create_worktree_for(&item, &repo.path, "master", None, true, false).unwrap_err();
     assert!(err.contains("live claim"), "{err}");
     assert!(err.contains("nothing was deleted"), "{err}");
     assert!(wt.join("leftover.txt").exists());
 
-    create_worktree_for(&item, &repo.path, "master", None, false)
+    create_worktree_for(&item, &repo.path, "master", None, false, false)
         .expect("without a live claim the broken directory is cleared and recreated");
     assert!(is_own_checkout(&wt));
 }
@@ -261,23 +278,23 @@ fn worktree_mass_deletion_trips_on_count_or_share_and_not_below() {
     let repo = seeded_repo(100);
     let item = test_item(686);
     let wt = create_worktree(&item, &repo.path, "master", None).unwrap();
-    assert_eq!(worktree_mass_deletion(&wt), None, "clean tree");
+    assert_eq!(worktree_mass_deletion(&wt), Ok(None), "clean tree");
 
     for i in 0..20 {
         std::fs::remove_file(wt.join(format!("f{i}.txt"))).unwrap();
     }
     assert_eq!(
         worktree_mass_deletion(&wt),
-        None,
+        Ok(None),
         "20 of 100 is neither more than 20 files nor more than 25%"
     );
     std::fs::remove_file(wt.join("f20.txt")).unwrap();
     assert_eq!(
         worktree_mass_deletion(&wt),
-        Some(MassDeletion {
+        Ok(Some(MassDeletion {
             deleted: 21,
             tracked: 100
-        })
+        }))
     );
 
     let small = seeded_repo(8);
@@ -286,16 +303,16 @@ fn worktree_mass_deletion_trips_on_count_or_share_and_not_below() {
     std::fs::remove_file(small_wt.join("f1.txt")).unwrap();
     assert_eq!(
         worktree_mass_deletion(&small_wt),
-        None,
+        Ok(None),
         "2 of 8 is exactly 25%"
     );
     std::fs::remove_file(small_wt.join("f2.txt")).unwrap();
     assert_eq!(
         worktree_mass_deletion(&small_wt),
-        Some(MassDeletion {
+        Ok(Some(MassDeletion {
             deleted: 3,
             tracked: 8
-        })
+        }))
     );
 }
 
@@ -307,7 +324,7 @@ fn branch_mass_deletion_sees_a_committed_wipe_but_not_renames_or_an_untouched_br
     let branch = task_branch_name(&item);
     assert_eq!(
         branch_mass_deletion(&repo.path, &branch, "master"),
-        None,
+        Ok(None),
         "a branch with no commits of its own has nothing to refuse"
     );
 
@@ -320,7 +337,7 @@ fn branch_mass_deletion_sees_a_committed_wipe_but_not_renames_or_an_untouched_br
     run_git_in(&wt, &["commit", "-m", "move everything"]).unwrap();
     assert_eq!(
         branch_mass_deletion(&repo.path, &branch, "master"),
-        None,
+        Ok(None),
         "renames are not deletions"
     );
 
@@ -329,15 +346,182 @@ fn branch_mass_deletion_sees_a_committed_wipe_but_not_renames_or_an_untouched_br
     run_git_in(&wt, &["commit", "-m", "wip(sdd-loop): task 0 checkpoint"]).unwrap();
     assert_eq!(
         branch_mass_deletion(&repo.path, &branch, "master"),
-        Some(MassDeletion {
+        Ok(Some(MassDeletion {
             deleted: 30,
             tracked: 30
-        })
+        }))
     );
 
     // A later commit on top does not launder the wipe.
     std::fs::write(wt.join("new.txt"), "x").unwrap();
     run_git_in(&wt, &["add", "-A"]).unwrap();
     run_git_in(&wt, &["commit", "-m", "more"]).unwrap();
-    assert!(branch_mass_deletion(&repo.path, &branch, "master").is_some());
+    assert!(matches!(
+        branch_mass_deletion(&repo.path, &branch, "master"),
+        Ok(Some(_))
+    ));
+}
+
+fn commit_all(dir: &Path, msg: &str) {
+    run_git_in(dir, &["add", "-A"]).unwrap();
+    run_git_in(dir, &["commit", "-m", msg]).unwrap();
+}
+
+/// `master` (stale, 40 files) plus `refs/remotes/origin/master`, which
+/// deleted 25 of them upstream. Returns the item's worktree, branched from
+/// the stale master, and its branch.
+fn stale_local_target() -> (Repo, PathBuf, String) {
+    let repo = seeded_repo(40);
+    let item = test_item(686);
+    let wt = create_worktree(&item, &repo.path, "master", None).unwrap();
+    let branch = task_branch_name(&item);
+    let up = tempfile::TempDir::new().unwrap();
+    let up_path = up.path().join("up");
+    run_git_in(
+        &repo.path,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "up",
+            up_path.to_str().unwrap(),
+            "master",
+        ],
+    )
+    .unwrap();
+    for i in 0..25 {
+        std::fs::remove_file(up_path.join(format!("f{i}.txt"))).unwrap();
+    }
+    commit_all(&up_path, "upstream deletes 25");
+    let tip = run_git_in(&up_path, &["rev-parse", "HEAD"]).unwrap();
+    run_git_in(
+        &repo.path,
+        &["update-ref", "refs/remotes/origin/master", &tip],
+    )
+    .unwrap();
+    run_git_in(
+        &repo.path,
+        &["worktree", "remove", "--force", up_path.to_str().unwrap()],
+    )
+    .unwrap();
+    (repo, wt, branch)
+}
+
+// R1: the daemon never pulls the local target while claim rebases onto
+// origin, so upstream deletions must not count against the branch.
+#[test]
+fn branch_mass_deletion_ignores_upstream_deletions_behind_a_stale_local_target() {
+    let (repo, wt, branch) = stale_local_target();
+    run_git_in(&wt, &["rebase", "refs/remotes/origin/master"]).unwrap();
+    std::fs::write(wt.join("mine.txt"), "x").unwrap();
+    commit_all(&wt, "my work");
+    assert_eq!(
+        branch_mass_deletion(&repo.path, &branch, "master"),
+        Ok(None)
+    );
+}
+
+#[test]
+fn branch_mass_deletion_does_not_probe_below_a_merge_tip() {
+    let (repo, wt, branch) = stale_local_target();
+    std::fs::write(wt.join("mine.txt"), "x").unwrap();
+    commit_all(&wt, "my work");
+    run_git_in(&wt, &["merge", "--no-edit", "refs/remotes/origin/master"]).unwrap();
+    assert_eq!(
+        branch_mass_deletion(&repo.path, &branch, "master"),
+        Ok(None),
+        "the merge's first parent differs from the tip by everything upstream deleted"
+    );
+}
+
+#[test]
+fn branch_mass_deletion_still_sees_a_wipe_behind_a_stale_local_target() {
+    let (repo, wt, branch) = stale_local_target();
+    run_git_in(&wt, &["rebase", "refs/remotes/origin/master"]).unwrap();
+    for i in 25..40 {
+        std::fs::remove_file(wt.join(format!("f{i}.txt"))).unwrap();
+    }
+    commit_all(&wt, "wipe the rest");
+    assert!(matches!(
+        branch_mass_deletion(&repo.path, &branch, "master"),
+        Ok(Some(_))
+    ));
+}
+
+#[test]
+fn branch_mass_deletion_refuses_when_it_cannot_look() {
+    let repo = seeded_repo(30);
+    let item = test_item(686);
+    create_worktree(&item, &repo.path, "master", None).unwrap();
+    let branch = task_branch_name(&item);
+    assert!(
+        branch_mass_deletion(&repo.path, &branch, "no-such-target").is_err(),
+        "no target ref to compare against"
+    );
+    assert!(branch_mass_deletion(&repo.path, "no-such-branch", "master").is_err());
+
+    // Unrelated histories: `merge-base` fails.
+    let tree = run_git_in(&repo.path, &["rev-parse", "master^{tree}"]).unwrap();
+    let orphan = run_git_in(&repo.path, &["commit-tree", &tree, "-m", "orphan"]).unwrap();
+    run_git_in(&repo.path, &["branch", "orphan", &orphan]).unwrap();
+    assert!(branch_mass_deletion(&repo.path, "orphan", "master").is_err());
+}
+
+// R4: a `.git` that cannot be read right now is not a broken one.
+#[cfg(windows)]
+#[test]
+fn a_locked_git_pointer_reads_as_intact_not_missing() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let repo = init_repo();
+    let item = test_item(1);
+    let wt = create_worktree(&item, &repo.path, "master", None).unwrap();
+    let _held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(wt.join(".git"))
+        .unwrap();
+    assert_eq!(
+        orphans::git_pointer(&wt),
+        orphans::GitPointer::Intact,
+        "a transient lock must not read as a missing pointer"
+    );
+    assert!(!is_structurally_broken(&repo.path, &wt));
+}
+
+// F3 caveat: Rust opens files with FILE_SHARE_DELETE by default, which on
+// Windows may let a rename of the containing directory through. Whatever
+// the platform does, the outcome must be all-or-nothing.
+#[cfg(windows)]
+#[test]
+fn remove_worktree_dir_is_all_or_nothing_with_a_default_share_mode_handle() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().join("wt");
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("a.txt"), b"a").unwrap();
+    let open_file = dir.join("sub").join("open.txt");
+    std::fs::write(&open_file, b"open").unwrap();
+    let _held = std::fs::File::open(&open_file).unwrap();
+
+    if remove_worktree_dir(&dir, "test") {
+        assert!(
+            !dir.exists(),
+            "reported removed but the path is still there"
+        );
+    } else {
+        assert!(
+            dir.join("a.txt").exists(),
+            "reported kept but files are gone"
+        );
+        assert!(open_file.exists());
+    }
+}
+
+// R7: one deleted file of a tiny repo is not a mass deletion.
+#[test]
+fn a_tiny_repo_losing_one_file_is_not_a_mass_deletion() {
+    let repo = seeded_repo(3);
+    let item = test_item(686);
+    let wt = create_worktree(&item, &repo.path, "master", None).unwrap();
+    std::fs::remove_file(wt.join("f0.txt")).unwrap();
+    assert_eq!(worktree_mass_deletion(&wt), Ok(None));
 }

@@ -5,7 +5,7 @@
 //! verbatim; `item_inner` itself is now just the `match` dispatch.
 
 use super::*;
-use crate::dispatch_failure_ceiling::{COMMIT_FAILED_MARKER, PR_CREATION_FAILED_MARKER};
+use crate::dispatch_failure_ceiling::PR_CREATION_FAILED_MARKER;
 use rusqlite::Connection;
 
 /// Default/max page size for `list` — omitting `limit` used to return every
@@ -1177,6 +1177,7 @@ impl AgentflareMcp {
                     before_claim,
                 ))
             })??;
+        let allow_mass_deletion = self.item_allows_mass_deletion(&item_id);
         let worktree_result = match (&item, &target_branch) {
             (Some(item), Some(target)) => Some(crate::worktree::create_worktree(
                 item,
@@ -1184,6 +1185,7 @@ impl AgentflareMcp {
                 target,
                 current_progress_sender().as_ref(),
                 before_claim.as_ref().is_some_and(|b| b.2),
+                allow_mass_deletion,
             )),
             _ => None,
         };
@@ -1194,8 +1196,10 @@ impl AgentflareMcp {
         // restore the item's prior state/assignee right here, rather than
         // relying on every caller to clean up after it.
         let claim_rolled_back = match (&worktree_result, &before_claim) {
-            (Some(Err(e)), Some((prev_state_id, prev_assignee, _)))
-                if !flare_git_core::worktree::is_retryable_worktree_race(e) =>
+            // Never when the caller already held the claim: that lease is the
+            // one protecting the worktree, and nothing was deleted.
+            (Some(Err(e)), Some((prev_state_id, prev_assignee, held)))
+                if !*held && !flare_git_core::worktree::is_retryable_worktree_race(e) =>
             {
                 self.roll_back_claim(&item_id, &owner, prev_state_id, prev_assignee.as_deref())
             }
@@ -1686,51 +1690,14 @@ impl AgentflareMcp {
         })??;
         let should_push = req.push.unwrap_or(true);
         let summary = req.summary.as_deref();
-        // An agent can make real file edits and still exit without ever
-        // running `git commit` itself -- with no commit, the branch never
-        // diverges from target, so `nothing_was_ever_committed` below can't
-        // tell that apart from a genuine no-op, and the edits are silently
-        // stranded in the worktree while `done` still reports success
-        // (item #57). Commit them here, before push/PR or the "nothing was
-        // committed" classification ever run, using the agent's own summary
-        // as the commit message when there is one.
-        if let Some(item) = &item {
-            let message = summary
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .unwrap_or("Auto-committed by item done: uncommitted changes at completion");
-            match crate::worktree::commit_uncommitted(item, &repo_root, message, req.force) {
-                crate::worktree::CommitOutcome::Committed => {
-                    eprintln!("worktree: auto-committed uncommitted changes for item {item_id}");
-                }
-                crate::worktree::CommitOutcome::NothingToCommit => {}
-                // A dirty tree existed but `add`/`commit` itself failed
-                // (item #88's read-only `.git` under bwrap was one cause;
-                // disk-full, a rejecting pre-commit hook, or a git config
-                // issue could all reproduce it) -- this must NOT fall
-                // through to `nothing_was_ever_committed` below, which
-                // reads "no new commit" as "genuinely nothing to do" and
-                // releases the claim + cleans up the worktree as if the
-                // tree were clean. The real edits are still sitting
-                // uncommitted in the worktree; surface that loudly instead
-                // (item #92).
-                crate::worktree::CommitOutcome::Failed(err) => {
-                    let comment_body = format!(
-                        "{COMMIT_FAILED_MARKER}\n\nAuto-commit of uncommitted \
-                         changes failed:\n\n```\n{err}\n```\n\nThe work is still sitting \
-                         uncommitted in the item's worktree; it was left in place rather than \
-                         reported as done."
-                    );
-                    self.post_item_comment(&item_id, comment_body);
-                    return Err(ErrorData::internal_error(
-                        format!("item {item_id}: auto-commit of uncommitted changes failed: {err}"),
-                        None,
-                    ));
-                }
-            }
-        }
-        let guard_push = should_push && req.force != Some(true);
-        self.refuse_wipe_push(&item_id, &item, &repo_root, &target_branch, guard_push)?;
+        self.commit_and_guard_done(
+            &item_id,
+            &item,
+            &repo_root,
+            &target_branch,
+            (summary, should_push),
+            (req.force, req.force_reason.as_deref()),
+        )?;
         let agent = crate::claims::agent_of(&owner);
         let pr_outcome = match (&item, &target_branch) {
             (Some(item), Some(target)) if should_push => crate::worktree::push_and_open_pr(

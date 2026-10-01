@@ -31,7 +31,8 @@ pub(crate) use process::run_output_timeout;
 use process::*;
 use wipe_guard::restore_mass_deleted_worktree;
 pub use wipe_guard::{
-    MASS_DELETION_MARKER, MassDeletion, branch_mass_deletion, worktree_mass_deletion,
+    ALLOW_MASS_DELETION_LABEL, MASS_DELETION_MARKER, MassDeletion, branch_mass_deletion,
+    worktree_mass_deletion,
 };
 
 /// Minimal progress-reporting interface — decouples this crate from the
@@ -409,19 +410,22 @@ pub fn create_worktree(
     target_branch: &str,
     progress: Option<&dyn Progress>,
 ) -> Result<PathBuf, String> {
-    create_worktree_for(item, repo_root, target_branch, progress, false)
+    create_worktree_for(item, repo_root, target_branch, progress, false, false)
 }
 
 /// [`create_worktree`] for a caller that knows whether it already held
 /// `item`'s live claim before this call. A live claimant's worktree is in
 /// use right now, so an existing directory there is never cleared on its
-/// behalf, however broken it looks (item #689).
+/// behalf, however broken it looks (item #689). `allow_mass_deletion` is the
+/// item's opt-in to a deliberate mass deletion: its worktree is then not
+/// restored from `HEAD` on re-claim.
 pub fn create_worktree_for(
     item: &Item,
     repo_root: &Path,
     target_branch: &str,
     progress: Option<&dyn Progress>,
     caller_holds_live_claim: bool,
+    allow_mass_deletion: bool,
 ) -> Result<PathBuf, String> {
     let worktree_path = item_worktree_path(repo_root, item.sequence_id);
     let label = format!("task-{}", item.sequence_id);
@@ -496,7 +500,9 @@ pub fn create_worktree_for(
         // Re-claiming an existing worktree: nothing to create, but still
         // ensure its target dir is isolated (idempotent, no-op if present),
         // and re-warn since the ambient env can still be shadowing it.
-        restore_mass_deleted_worktree(&worktree_path)?;
+        if !allow_mass_deletion {
+            restore_mass_deleted_worktree(&worktree_path)?;
+        }
         warn_if_ambient_target_dir();
         isolate_worktree_target_dir(&worktree_path);
         lock_item_worktree(repo_root, &worktree_path);

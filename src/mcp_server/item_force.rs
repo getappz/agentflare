@@ -15,7 +15,10 @@
 //! fixed-and-pushed item un-completable for ~2h45m of remaining TTL.
 
 use super::*;
-use crate::dispatch_failure_ceiling::{WORK_SUCCESS_MARKER, is_terminal_work_failure};
+use crate::dispatch_failure_ceiling::{
+    COMMIT_FAILED_MARKER, WORK_SUCCESS_MARKER, is_terminal_work_failure,
+};
+use flare_git_core::worktree::ALLOW_MASS_DELETION_LABEL;
 
 /// Prefix on the audit comment `force_takeover` posts.
 pub(crate) const FORCE_OVERRIDE_MARKER: &str = "## agentflare — forced claim override";
@@ -24,6 +27,9 @@ pub(crate) const AUTO_RELEASE_MARKER: &str = "## supervisor — auto-released de
 
 /// Prefix on the comment `refuse_wipe_push` posts.
 pub(crate) const WIPE_PUSH_REFUSED_MARKER: &str = "## agentflare — push refused: mass deletion";
+/// Prefix on the comment `refuse_wipe_push` posts when the guard was waived.
+pub(crate) const WIPE_PUSH_OVERRIDDEN_MARKER: &str =
+    "## agentflare — mass-deletion guard OVERRIDDEN";
 
 /// Whether `owner` already holds `item_id`'s claim. Asked before
 /// `item::claim` renews it, so `create_worktree` knows it is running for
@@ -152,25 +158,62 @@ pub(super) fn branch_gate(
 }
 
 impl AgentflareMcp {
+    /// Whether `item_id` carries the `allow-mass-deletion` label: its mass
+    /// deletion is deliberate, so the wipe guards stand down for it.
+    pub(crate) fn item_allows_mass_deletion(&self, item_id: &str) -> bool {
+        self.with_backend_db(|conn| {
+            agentflare_backend::item::list_labels(conn, item_id)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|id| agentflare_backend::label::get(conn, id).ok())
+                .any(|l| l.name == flare_git_core::worktree::ALLOW_MASS_DELETION_LABEL)
+        })
+        .unwrap_or(false)
+    }
+
     /// `done`'s last check before publishing: refuses (with a comment on the
     /// item) when pushing its branch would publish a mass deletion -- the
     /// signature of a wiped worktree that got committed (item #689), not of
-    /// real work. `guard` is false when `done` isn't pushing or was forced.
+    /// real work. Also refuses when the branch cannot be checked at all.
+    /// `waived_by` names what waives the guard (force, or the item's label);
+    /// the publication then goes ahead but leaves an OVERRIDDEN audit comment.
     pub(super) fn refuse_wipe_push(
         &self,
         item_id: &str,
         item: &Option<agentflare_backend::item::Item>,
         repo_root: &std::path::Path,
         target_branch: &Option<String>,
-        guard: bool,
+        should_push: bool,
+        waived_by: Option<&str>,
     ) -> Result<(), ErrorData> {
-        let (true, Some(item), Some(target)) = (guard, item, target_branch) else {
+        let (true, Some(item), Some(target)) = (should_push, item, target_branch) else {
             return Ok(());
         };
         let branch = flare_git_core::worktree::resolve_item_task_branch(item, repo_root);
-        let Some(wipe) = flare_git_core::worktree::branch_mass_deletion(repo_root, &branch, target)
-        else {
-            return Ok(());
+        let found = flare_git_core::worktree::branch_mass_deletion(repo_root, &branch, target);
+        let wipe = match (found, waived_by) {
+            (Ok(None), _) => return Ok(()),
+            (Ok(Some(wipe)), Some(waiver)) => {
+                self.post_item_comment(
+                    item_id,
+                    format!(
+                        "{WIPE_PUSH_OVERRIDDEN_MARKER}\n\n`{branch}` is being pushed despite a \
+                         {wipe} relative to `{target}` ({waiver})."
+                    ),
+                );
+                return Ok(());
+            }
+            (Ok(Some(wipe)), None) => wipe,
+            (Err(_), Some(_)) => return Ok(()),
+            (Err(e), None) => {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "item {item_id}: refusing to push `{branch}` -- could not check it for a \
+                         mass deletion against `{target}`: {e}"
+                    ),
+                    None,
+                ));
+            }
         };
         self.post_item_comment(
             item_id,
@@ -178,7 +221,8 @@ impl AgentflareMcp {
                 "{WIPE_PUSH_REFUSED_MARKER}\n\n`{branch}` was NOT pushed: {wipe} relative to \
                  `{target}`. That is what a wiped worktree looks like once committed. Reset the \
                  branch to its last good commit, or, if the deletion is intended, re-run `done` \
-                 with `force=true` and a `force_reason`."
+                 with `force=true` and a `force_reason`, or label the item \
+                 `{ALLOW_MASS_DELETION_LABEL}`."
             ),
         );
         Err(ErrorData::invalid_params(
@@ -188,6 +232,82 @@ impl AgentflareMcp {
             ),
             None,
         ))
+    }
+
+    /// `done`'s pre-publication step: auto-commits whatever the agent left
+    /// uncommitted, then runs [`Self::refuse_wipe_push`]. The mass-deletion
+    /// guards in both are waived by an explicit `force` or by the item's
+    /// `allow-mass-deletion` label; the waiver is named in the audit comment.
+    pub(super) fn commit_and_guard_done(
+        &self,
+        item_id: &str,
+        item: &Option<agentflare_backend::item::Item>,
+        repo_root: &std::path::Path,
+        target_branch: &Option<String>,
+        (summary, should_push): (Option<&str>, bool),
+        (force, force_reason): (Option<bool>, Option<&str>),
+    ) -> Result<(), ErrorData> {
+        let waiver = if force == Some(true) {
+            Some(format!(
+                "force=true, force_reason: {}",
+                force_reason.unwrap_or_default().trim()
+            ))
+        } else if self.item_allows_mass_deletion(item_id) {
+            Some(format!("label `{ALLOW_MASS_DELETION_LABEL}`"))
+        } else {
+            None
+        };
+        // An agent can make real file edits and still exit without ever
+        // running `git commit` itself -- with no commit, the branch never
+        // diverges from target, so `nothing_was_ever_committed` can't tell
+        // that apart from a genuine no-op, and the edits are silently
+        // stranded in the worktree while `done` still reports success
+        // (item #57). Commit them here, before push/PR or the "nothing was
+        // committed" classification ever run, using the agent's own summary
+        // as the commit message when there is one.
+        if let Some(item) = item {
+            let message = summary
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("Auto-committed by item done: uncommitted changes at completion");
+            let commit_force = if waiver.is_some() { Some(true) } else { force };
+            match crate::worktree::commit_uncommitted(item, repo_root, message, commit_force) {
+                crate::worktree::CommitOutcome::Committed => {
+                    eprintln!("worktree: auto-committed uncommitted changes for item {item_id}");
+                }
+                crate::worktree::CommitOutcome::NothingToCommit => {}
+                // A dirty tree existed but `add`/`commit` itself failed
+                // (item #88's read-only `.git` under bwrap was one cause;
+                // disk-full, a rejecting pre-commit hook, or a git config
+                // issue could all reproduce it) -- this must NOT fall
+                // through to `nothing_was_ever_committed`, which reads "no
+                // new commit" as "genuinely nothing to do" and releases the
+                // claim + cleans up the worktree as if the tree were clean.
+                // The real edits are still sitting uncommitted in the
+                // worktree; surface that loudly instead (item #92).
+                crate::worktree::CommitOutcome::Failed(err) => {
+                    let comment_body = format!(
+                        "{COMMIT_FAILED_MARKER}\n\nAuto-commit of uncommitted \
+                         changes failed:\n\n```\n{err}\n```\n\nThe work is still sitting \
+                         uncommitted in the item's worktree; it was left in place rather than \
+                         reported as done."
+                    );
+                    self.post_item_comment(item_id, comment_body);
+                    return Err(ErrorData::internal_error(
+                        format!("item {item_id}: auto-commit of uncommitted changes failed: {err}"),
+                        None,
+                    ));
+                }
+            }
+        }
+        self.refuse_wipe_push(
+            item_id,
+            item,
+            repo_root,
+            target_branch,
+            should_push,
+            waiver.as_deref(),
+        )
     }
 
     /// Entry point for `release|done|check_merge`: validates `force` +

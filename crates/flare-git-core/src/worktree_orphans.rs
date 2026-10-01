@@ -14,7 +14,7 @@ use crate::shell::run_in as run_git_in;
 /// the answer.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum GitPointer {
-    /// No readable `.git` at all.
+    /// No `.git` at all (an unreadable one is `Intact`: unknown is not broken).
     Missing,
     /// A pointer file naming an admin directory that no longer exists.
     Dangling,
@@ -27,8 +27,12 @@ pub(super) fn git_pointer(path: &Path) -> GitPointer {
     if dot_git.is_dir() {
         return GitPointer::Intact;
     }
-    let Ok(content) = std::fs::read_to_string(&dot_git) else {
-        return GitPointer::Missing;
+    let content = match std::fs::read_to_string(&dot_git) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return GitPointer::Missing,
+        // Locked by an antivirus scan or an editor, say: not evidence the
+        // worktree is broken, and callers clear a directory only on that.
+        Err(_) => return GitPointer::Intact,
     };
     let gitdir = content.trim().trim_start_matches("gitdir: ");
     if resolve_gitdir_pointer(path, gitdir).exists() {
@@ -228,6 +232,9 @@ fn trash_root(path: &Path) -> Option<PathBuf> {
     Some(root.join(".trash"))
 }
 
+/// Parked copies younger than this are left to whichever call parked them.
+const TRASH_SWEEP_MIN_AGE: Duration = Duration::from_secs(300);
+
 /// Remove a worktree directory: rename it aside, then delete the copy.
 ///
 /// Deleting in place is not atomic. On Windows any open handle under the
@@ -266,11 +273,32 @@ pub(super) fn remove_worktree_dir(path: &Path, name: &str) -> bool {
     for delay_ms in [100u64, 200, 400, 800, 1600, 0] {
         match std::fs::rename(path, &parked) {
             Ok(()) => {
+                // A rename moves the whole tree or none of it; if the path is
+                // still there, this one did not (a copy+delete fallback, or
+                // someone recreated it). Delete nothing then.
+                if path.exists() {
+                    eprintln!(
+                        "worktree: moving '{name}' aside left {} behind, nothing deleted \
+                         (parked copy kept at {})",
+                        path.display(),
+                        parked.display()
+                    );
+                    return false;
+                }
                 delete_parked(&parked);
-                // Sweep copies an earlier call could not delete, then drop
-                // the trash directory itself once it is empty.
+                // Sweep copies an earlier call could not delete -- but not
+                // fresh ones, which another call may be deleting right now --
+                // then drop the trash directory itself once it is empty.
                 for stale in std::fs::read_dir(&trash).into_iter().flatten().flatten() {
-                    let _ = std::fs::remove_dir_all(stale.path());
+                    let settled = stale
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age > TRASH_SWEEP_MIN_AGE);
+                    if settled {
+                        let _ = std::fs::remove_dir_all(stale.path());
+                    }
                 }
                 let _ = std::fs::remove_dir(&trash);
                 return true;
@@ -347,7 +375,8 @@ fn delete_parked(parked: &Path) {
         && let Err(e) = std::fs::remove_dir_all(parked)
     {
         eprintln!(
-            "worktree: could not delete parked copy {}: {e}",
+            "worktree: WARNING could not delete parked copy {} (the worktree path itself is \
+             free; a later removal sweeps it): {e}",
             parked.display()
         );
     }

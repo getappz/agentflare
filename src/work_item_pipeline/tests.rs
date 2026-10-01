@@ -188,9 +188,39 @@ fn checkpoint_implementer_turn_refuses_to_commit_a_mass_deletion() {
         "the wipe must not be committed"
     );
     assert!(
-        flare_git_core::worktree::worktree_mass_deletion(&worktree_path).is_some(),
+        flare_git_core::worktree::worktree_mass_deletion(&worktree_path).is_ok_and(|w| w.is_some()),
         "the deletions stay visible in the working tree instead of hidden in a commit"
     );
+}
+
+// R5: a deliberate mass deletion (item labelled `allow-mass-deletion`) must
+// be able to finish: the checkpoint commits it instead of refusing forever.
+#[test]
+fn checkpoint_implementer_turn_commits_a_labelled_mass_deletion() {
+    let (_mcp, _backend_tmp, _repo_tmp, _item_id, _project_id, worktree_path) =
+        crate::mcp_server::tests::mcp_with_claimed_item("Checkpoint wipe label");
+    let mut data = WorkItemData {
+        worktree_path: worktree_path.to_string_lossy().to_string(),
+        allow_mass_deletion: true,
+        ..Default::default()
+    };
+    for i in 0..40 {
+        std::fs::write(worktree_path.join(format!("f{i}.txt")), "tracked").unwrap();
+    }
+    checkpoint_implementer_turn(&mut data, 0).unwrap();
+    for i in 0..40 {
+        std::fs::remove_file(worktree_path.join(format!("f{i}.txt"))).unwrap();
+    }
+    let head = crate::worktree::head_sha(&worktree_path).unwrap();
+    checkpoint_implementer_turn(&mut data, 1).expect("the label waives the guard");
+    assert_ne!(
+        crate::worktree::head_sha(&worktree_path).as_deref(),
+        Some(head.as_str()),
+        "the deletion is committed as the turn's work"
+    );
+    data.allow_mass_deletion = false;
+    std::fs::write(worktree_path.join("again.txt"), "x").unwrap();
+    checkpoint_implementer_turn(&mut data, 2).expect("ordinary work still checkpoints");
 }
 
 use flare_workflow::store::InMemoryStore;

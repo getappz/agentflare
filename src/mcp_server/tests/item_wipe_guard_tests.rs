@@ -4,18 +4,11 @@
 
 use super::*;
 
+/// Through `run_in`, which scrubs `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`:
+/// run from a hook, a raw `git` would act on the real checkout, and the
+/// `restore` below would destroy its uncommitted edits.
 fn git(dir: &std::path::Path, args: &[&str]) -> String {
-    let out = std::process::Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
+    flare_git_core::shell::run_in(dir, args).unwrap_or_else(|e| panic!("git {args:?} failed: {e}"))
 }
 
 /// Commits `n` tracked files on the item's branch -- the "real work" a wipe
@@ -91,6 +84,54 @@ fn item_done_refuses_to_push_a_tip_commit_that_mass_deletes_tracked_files() {
     let forced = done(&s, &item_id, true).expect("force with a reason must publish");
     assert!(forced.contains("\"completed\""), "{forced}");
     assert!(!git(repo_dir.path(), &["ls-remote", "origin", &branch]).is_empty());
+    // R3: the caller owns the claim, so `force_takeover` posts nothing; the
+    // override itself must still leave an audit record.
+    let comments = comment_bodies(&s, &item_id);
+    assert!(comments.contains("OVERRIDDEN"), "{comments}");
+    assert!(comments.contains("the deletion is the task"), "{comments}");
+    assert!(comments.contains(&branch), "{comments}");
+}
+
+// R5: the `allow-mass-deletion` label waives both guards without `force`.
+#[test]
+fn item_done_honours_the_allow_mass_deletion_label() {
+    let (s, _tmp, repo_dir, item_id, project_id, worktree) = mcp_with_claimed_item("Wipe label");
+    commit_tracked_files(&worktree, 30);
+    delete_tracked_files(&worktree, 30);
+    std::fs::write(worktree.join("kept.txt"), "x").unwrap();
+    git(&worktree, &["add", "-A"]);
+    git(&worktree, &["commit", "-m", "deliberate deletion"]);
+    let branch = git(&worktree, &["branch", "--show-current"]);
+    assert!(done(&s, &item_id, false).is_err(), "unlabelled is refused");
+
+    s.with_backend_db(|conn| {
+        let project = agentflare_backend::project::get(conn, &project_id).unwrap();
+        agentflare_backend::label::create(
+            conn,
+            agentflare_backend::label::CreateLabel {
+                project_id: Some(project_id.clone()),
+                workspace_id: project.workspace_id,
+                name: flare_git_core::worktree::ALLOW_MASS_DELETION_LABEL.into(),
+                color: None,
+                parent_id: None,
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+            },
+        )
+        .unwrap();
+        agentflare_backend::item::add_label_by_name(
+            conn,
+            &item_id,
+            flare_git_core::worktree::ALLOW_MASS_DELETION_LABEL,
+        )
+        .unwrap();
+    })
+    .unwrap();
+    assert!(s.item_allows_mass_deletion(&item_id));
+    done(&s, &item_id, false).expect("the label waives the push guard");
+    assert!(!git(repo_dir.path(), &["ls-remote", "origin", &branch]).is_empty());
+    assert!(comment_bodies(&s, &item_id).contains("OVERRIDDEN"));
 }
 
 #[test]
@@ -131,7 +172,7 @@ fn item_claim_by_the_live_claimant_never_clears_its_worktree() {
     let reclaimed: serde_json::Value = serde_json::from_str(
         &s.item(Parameters(ItemRequest {
             action: "claim".into(),
-            id: Some(item_id),
+            id: Some(item_id.clone()),
             ..Default::default()
         }))
         .unwrap(),
@@ -142,5 +183,25 @@ fn item_claim_by_the_live_claimant_never_clears_its_worktree() {
     assert!(
         worktree.join("precious.txt").exists(),
         "the claimant's own worktree was cleared"
+    );
+
+    // R2: the refusal protects the claim -- it must not release it. A second
+    // claim by the same owner behaves the same and the lease survives both.
+    let owner = crate::claims::owner_id();
+    let again = s
+        .item(Parameters(ItemRequest {
+            action: "claim".into(),
+            id: Some(item_id.clone()),
+            ..Default::default()
+        }))
+        .unwrap();
+    assert!(again.contains("live claim"), "{again}");
+    assert!(worktree.join("precious.txt").exists());
+    let still_held = s
+        .with_backend_db(|conn| crate::mcp_server::item_force::holds_claim(conn, &item_id, &owner))
+        .unwrap();
+    assert!(
+        still_held,
+        "the refusal released the claim it was protecting"
     );
 }
