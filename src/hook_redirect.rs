@@ -333,13 +333,13 @@ pub(crate) fn completion_gate_reason(
     }
     if !has_fresh_verification {
         return Some(format!(
-            "no fresh, passing verification evidence for this session -- run this project's test/build/lint command (e.g. `cargo test`, `npm test`, `pytest`) via Bash before calling `item` action={action}; a run more than {}m ago, or one that failed, doesn't count.",
+            "no fresh, passing verification evidence for this session -- run this project's test/build/lint command (e.g. `cargo test`, `npm test`, `pytest`) via a Bash-family tool (Bash, or ctx_shell through the flare gateway) before calling `item` action={action}; a failed run doesn't count, and a passing run only counts while the working tree is unchanged since it (or, if the tree can't be fingerprinted, for {}m).",
             crate::optimize::VERIFICATION_FRESHNESS_SECS / 60
         ));
     }
     if !has_fresh_review {
         return Some(format!(
-            "no fresh code review evidence for this session -- report the completed review through `ReportFindings` or `mcp__flare__review(action=\"submit\", findings=[...])` before calling `item` action={action}; an empty findings list is valid after reviewing, but a reviewer dispatch alone does not count. A review more than {}m ago doesn't count.",
+            "no fresh code review evidence for this session -- report the completed review through `ReportFindings` or `mcp__flare__review(action=\"submit\", findings=[...])` before calling `item` action={action}; an empty findings list is valid after reviewing, but a reviewer dispatch alone does not count. A review only counts while the working tree is unchanged since it (or, if the tree can't be fingerprinted, for {}m).",
             crate::optimize::VERIFICATION_FRESHNESS_SECS / 60
         ));
     }
