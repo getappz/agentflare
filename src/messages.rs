@@ -557,6 +557,14 @@ pub fn since(
         .collect()
 }
 
+/// Row ids of the messages addressed to `?1`, one per message sent. A fanout
+/// address stores one row per recipient; those copies (one sender, body,
+/// marker and send time) are the one message they were sent as, listed
+/// under its first row.
+const ADDRESSED_TO: &str = "SELECT MIN(id) FROM agent_messages
+     WHERE to_address = ?1 OR to_key = ?1
+     GROUP BY from_key, to_address, body, reply_to, marker, created_at";
+
 /// Messages addressed to `address` (a fanout address like `team:alpha`, or
 /// a session key), ascending, after `after`.
 pub fn history(
@@ -567,24 +575,18 @@ pub fn history(
 ) -> rusqlite::Result<Vec<Message>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {COLUMNS} FROM agent_messages
-         WHERE (to_address = ?1 OR to_key = ?1) AND id > ?2
+         WHERE id IN ({ADDRESSED_TO}) AND id > ?2
          ORDER BY id LIMIT ?3"
     ))?;
     stmt.query_map(params![address, after, limit as i64], row)?
         .collect()
 }
 
-/// The last `limit` messages addressed to `address`, oldest first. A fanout
-/// address stores one row per recipient; those copies (one sender, body,
-/// marker and send time) are the one message they were sent as.
+/// The last `limit` messages addressed to `address`, oldest first.
 pub fn recent(conn: &Connection, address: &str, limit: usize) -> rusqlite::Result<Vec<Message>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {COLUMNS} FROM agent_messages
-         WHERE id IN (
-             SELECT MIN(id) FROM agent_messages
-             WHERE to_address = ?1 OR to_key = ?1
-             GROUP BY from_key, to_address, body, reply_to, marker, created_at
-         )
+         WHERE id IN ({ADDRESSED_TO})
          ORDER BY id DESC LIMIT ?2"
     ))?;
     let mut v: Vec<Message> = stmt
@@ -796,6 +798,38 @@ mod tests {
             "{err}"
         );
         assert!(send(&c, "claude-code:a", "team:", "hi", None, 100, no_item).is_err());
+    }
+
+    #[test]
+    fn history_lists_a_team_message_once_and_pages_by_its_id() {
+        let c = conn();
+        for key in ["claude-code:a", "codex:b", "codex:c"] {
+            live_in_team(&c, key, Some("alpha"));
+        }
+        for i in 0..3 {
+            let body = format!("m{i}");
+            send(
+                &c,
+                "claude-code:a",
+                "team:alpha",
+                &body,
+                None,
+                100 + i,
+                no_item,
+            )
+            .unwrap();
+        }
+        let bodies = |after: i64| -> Vec<String> {
+            let page = history(&c, "team:alpha", after, 50).unwrap();
+            page.into_iter().map(|m| m.body).collect()
+        };
+        assert_eq!(bodies(0), ["m0", "m1", "m2"]);
+        // A cursor on a message doesn't bring it back through the copy the
+        // next recipient got.
+        let first = history(&c, "team:alpha", 0, 1).unwrap()[0].id;
+        assert_eq!(bodies(first), ["m1", "m2"]);
+        // A member's own mailbox still lists everything it received.
+        assert_eq!(history(&c, "codex:b", 0, 50).unwrap().len(), 3);
     }
 
     #[test]
