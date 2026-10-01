@@ -1115,7 +1115,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn verification_evidence_tree_matches_only_when_start_equals_end() {
         assert_eq!(
             verification_evidence_tree(Some("a".into()), Some("a".into())).as_deref(),
@@ -1128,6 +1127,7 @@ mod tests {
         assert_eq!(verification_evidence_tree(None, Some("a".into())), None);
     }
 
+    #[test]
     fn evidence_fresh_same_fingerprint_old_ts_counts_as_fresh() {
         assert!(evidence_fresh(1000, Some("abc"), 5000, Some("abc")));
     }
