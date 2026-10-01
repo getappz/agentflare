@@ -58,15 +58,18 @@ fn remove_worktree_dir_succeeds_immediately_when_unlocked() {
     std::fs::write(dir.join("file.txt"), b"hello").unwrap();
     assert!(remove_worktree_dir(&dir, "test"));
     assert!(!dir.exists());
+    let trash = tmp.path().join(".trash");
+    assert!(!trash.exists(), "the parked copy must be deleted too");
 }
 
 #[cfg(windows)]
 #[test]
 fn remove_worktree_dir_clears_a_genuine_acl_denial() {
     // item #267's actual failure mode: cargo's own target/*/.fingerprint/*
-    // files can end up ACL-restricted, not just transiently open. Neither
-    // the retry loop nor `cmd /c rmdir` clears a real ACL deny -- only
-    // `icacls /grant ... /T` does.
+    // files can end up ACL-restricted, not just transiently open. The
+    // directory still renames into the trash, but deleting the parked copy
+    // hits the deny: neither `remove_dir_all` nor `cmd /c rmdir` clears a
+    // real ACL deny -- only `icacls /grant ... /T` does.
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().join("wt");
     std::fs::create_dir_all(&dir).unwrap();
@@ -87,18 +90,22 @@ fn remove_worktree_dir_clears_a_genuine_acl_denial() {
 
     assert!(
         remove_worktree_dir(&dir, "test"),
-        "must clear the ACL denial via icacls /grant, not just retry"
+        "an ACL denial inside the tree must not stop it being moved aside"
     );
     assert!(!dir.exists());
+    assert!(
+        !tmp.path().join(".trash").exists(),
+        "must clear the ACL denial via icacls /grant when deleting the parked copy"
+    );
 }
 
 #[test]
 fn remove_worktree_dir_retries_past_a_transient_lock() {
-    // On Windows, an open file handle blocks remove_dir_all with
-    // Permission denied until released -- exactly item #302's failure
-    // mode (rust-analyzer holding a worktree file open). On Unix this
-    // doesn't block deletion at all, so the test still passes there,
-    // just without exercising the retry path meaningfully.
+    // On Windows, an open file handle anywhere under the directory blocks
+    // renaming it (Access denied) until released -- exactly item #302's
+    // failure mode (rust-analyzer holding a worktree file open). On Unix
+    // this doesn't block the rename at all, so the test still passes
+    // there, just without exercising the retry path meaningfully.
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().join("wt");
     std::fs::create_dir_all(&dir).unwrap();
