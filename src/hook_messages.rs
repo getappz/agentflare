@@ -149,7 +149,13 @@ pub(crate) fn end(agent: &str, session: &HookSession) {
         return;
     };
     if let Some(conn) = messages::open_fast() {
-        let _ = crate::sessions::end(&conn, &identity::hook_key(agent, sid), now());
+        let key = identity::hook_key(agent, sid);
+        if crate::sessions::end(&conn, &key, now()).is_err()
+            // A column not added yet on a db an older binary made.
+            && let Ok(conn) = crate::db::open()
+        {
+            let _ = crate::sessions::end(&conn, &key, now());
+        }
     }
 }
 
@@ -501,6 +507,38 @@ mod tests {
         let bodies: Vec<String> = got.into_iter().map(|m| m.body).collect();
         let last_ten: Vec<String> = (2..12).map(|i| format!("m{i}")).collect();
         assert_eq!(bodies, last_ten);
+    }
+
+    #[test]
+    fn end_ends_the_session_on_a_db_an_older_binary_made() {
+        if identity::job_owner().is_some() {
+            return; // a dispatched job's session is never ended by its hooks
+        }
+        crate::paths::test_support::with_temp_home(|| {
+            // A db from before `team`/`busy` existed, not yet opened (so not
+            // yet migrated) by this binary: SessionEnd is its first hook.
+            let path = crate::db::agentflare_db_path();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let old = rusqlite::Connection::open(&path).unwrap();
+            old.execute_batch(
+                "CREATE TABLE agent_sessions (
+                    key TEXT PRIMARY KEY, agent TEXT NOT NULL, name TEXT, item_id TEXT, cwd TEXT,
+                    host TEXT NOT NULL, pid INTEGER, started_at INTEGER NOT NULL,
+                    last_seen_at INTEGER NOT NULL, ended_at INTEGER);
+                 INSERT INTO agent_sessions (key,agent,host,started_at,last_seen_at)
+                    VALUES ('claude-code:s9','claude-code','h',1,1);",
+            )
+            .unwrap();
+            drop(old);
+            let session = HookSession {
+                session_id: Some("s9".into()),
+                cwd: None,
+            };
+            end("claude-code", &session);
+            let c = crate::db::open().unwrap();
+            let s = sessions::get(&c, "claude-code:s9").unwrap().unwrap();
+            assert!(s.ended_at.is_some(), "an ended session must not stay live");
+        });
     }
 
     #[test]
