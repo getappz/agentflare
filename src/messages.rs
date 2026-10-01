@@ -574,11 +574,17 @@ pub fn history(
         .collect()
 }
 
-/// The last `limit` messages addressed to `address`, oldest first.
+/// The last `limit` messages addressed to `address`, oldest first. A fanout
+/// address stores one row per recipient; those copies (one sender, body,
+/// marker and send time) are the one message they were sent as.
 pub fn recent(conn: &Connection, address: &str, limit: usize) -> rusqlite::Result<Vec<Message>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {COLUMNS} FROM agent_messages
-         WHERE to_address = ?1 OR to_key = ?1
+         WHERE id IN (
+             SELECT MIN(id) FROM agent_messages
+             WHERE to_address = ?1 OR to_key = ?1
+             GROUP BY from_key, to_address, body, reply_to, marker, created_at
+         )
          ORDER BY id DESC LIMIT ?2"
     ))?;
     let mut v: Vec<Message> = stmt

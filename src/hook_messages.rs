@@ -460,6 +460,37 @@ mod tests {
     }
 
     #[test]
+    fn recent_counts_a_team_message_once_however_many_members_got_it() {
+        let c = conn();
+        for key in ["claude-code:a1", "claude-code:a2", "codex:c1"] {
+            let touch = sessions::Touch {
+                key,
+                team: Some("alpha"),
+                ..Default::default()
+            };
+            sessions::touch(&c, &touch, 100).unwrap();
+        }
+        for i in 0..12 {
+            let sent = messages::send_marked(
+                &c,
+                "claude-code:a1",
+                "team:alpha",
+                &format!("m{i}"),
+                None,
+                "important",
+                100 + i,
+                no_item,
+            )
+            .unwrap();
+            assert_eq!(sent.recipients.len(), 2, "one row per other member");
+        }
+        let got = messages::recent(&c, "team:alpha", REPLAY_LIMIT).unwrap();
+        let bodies: Vec<String> = got.into_iter().map(|m| m.body).collect();
+        let last_ten: Vec<String> = (2..12).map(|i| format!("m{i}")).collect();
+        assert_eq!(bodies, last_ten);
+    }
+
+    #[test]
     fn stop_output_blocks_only_with_messages() {
         assert!(stop_output(&[]).is_none());
         let out = stop_output(&[msg(3)]).unwrap();
