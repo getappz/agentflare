@@ -18,10 +18,12 @@ pub struct MessageArgs {
 
 #[derive(Subcommand)]
 pub enum MessageCommand {
-    /// Send a message to a session key/name, item:<id>, agent:<name>, or *.
+    /// Send a message to a session key/name, item:<id>, agent:<name>,
+    /// team:<name>, or *.
     Send {
         /// Recipient: a session key or unique name (see `message list`),
-        /// item:<id>, agent:<name>, or * for every live session.
+        /// item:<id>, agent:<name>, team:<name> (sessions launched with
+        /// --team <name>, except you), or * for every live session.
         to: String,
         /// Message text (joined with spaces).
         #[arg(required = true, num_args = 1..)]
@@ -29,9 +31,27 @@ pub enum MessageCommand {
         /// Id of the message this answers.
         #[arg(long)]
         reply_to: Option<i64>,
+        /// important (default: delivered at the recipient's next tool call),
+        /// status (turn boundaries, or mid-turn once 3 pile up), or fyi
+        /// (never interrupts; read via inbox or at session start).
+        #[arg(long)]
+        marker: Option<String>,
     },
     /// List live agent sessions.
     List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Messages sent to an address (e.g. team:alpha) or session key, oldest first.
+    History {
+        /// Address or key (default: your own key).
+        #[arg(long)]
+        to: Option<String>,
+        /// Only ids greater than this.
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
         #[arg(long)]
         json: bool,
     },
@@ -92,12 +112,18 @@ impl MessageArgs {
             serde_json::from_str(&out).unwrap_or_default()
         };
         match self.command {
-            MessageCommand::Send { to, body, reply_to } => {
+            MessageCommand::Send {
+                to,
+                body,
+                reply_to,
+                marker,
+            } => {
                 let v = run(MessageRequest {
                     action: "send".into(),
                     to: Some(to),
                     body: Some(body.join(" ")),
                     reply_to,
+                    marker,
                     ..Default::default()
                 });
                 let recipients: Vec<&str> = v["recipients"]
@@ -126,7 +152,7 @@ impl MessageArgs {
                 for s in sessions {
                     let str_of = |k: &str| s[k].as_str().unwrap_or("-").to_string();
                     println!(
-                        "{}{}  name={}  item={}  idle={}s  cwd={}",
+                        "{}{}  name={}  item={}  team={}  busy={}  idle={}s  cwd={}",
                         if s["you"].as_bool() == Some(true) {
                             "* "
                         } else {
@@ -135,9 +161,37 @@ impl MessageArgs {
                         str_of("key"),
                         str_of("name"),
                         str_of("item"),
+                        str_of("team"),
+                        s["busy"].as_bool().unwrap_or(false),
                         s["idle_secs"].as_i64().unwrap_or(0),
                         str_of("cwd"),
                     );
+                }
+            }
+            MessageCommand::History {
+                to,
+                after,
+                limit,
+                json,
+            } => {
+                let v = run(MessageRequest {
+                    action: "history".into(),
+                    to,
+                    after: Some(after),
+                    limit: Some(limit),
+                    ..Default::default()
+                });
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                    return;
+                }
+                let msgs: Vec<messages::Message> =
+                    serde_json::from_value(v["messages"].clone()).unwrap_or_default();
+                if msgs.is_empty() {
+                    println!("No messages for {}.", v["address"].as_str().unwrap_or("-"));
+                }
+                for m in &msgs {
+                    println!("{}", messages::format_line(m));
                 }
             }
             MessageCommand::Inbox { all, limit, json } => {
@@ -313,6 +367,61 @@ fn watch_sse(to: &str, take: bool, json: bool, port: u16, after: i64) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clap_parses_marker_and_history() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: MessageArgs,
+        }
+        let cli = Cli::try_parse_from([
+            "x",
+            "send",
+            "team:alpha",
+            "--marker",
+            "fyi",
+            "hello",
+            "there",
+        ])
+        .unwrap();
+        match cli.args.command {
+            MessageCommand::Send {
+                to, marker, body, ..
+            } => {
+                assert_eq!(to, "team:alpha");
+                assert_eq!(marker.as_deref(), Some("fyi"));
+                assert_eq!(body, vec!["hello", "there"]);
+            }
+            _ => panic!("expected send"),
+        }
+        let cli = Cli::try_parse_from([
+            "x",
+            "history",
+            "--to",
+            "team:alpha",
+            "--after",
+            "7",
+            "--limit",
+            "5",
+        ])
+        .unwrap();
+        match cli.args.command {
+            MessageCommand::History {
+                to,
+                after,
+                limit,
+                json,
+            } => {
+                assert_eq!(to.as_deref(), Some("team:alpha"));
+                assert_eq!(after, 7);
+                assert_eq!(limit, 5);
+                assert!(!json);
+            }
+            _ => panic!("expected history"),
+        }
+    }
 
     #[test]
     fn encode_keeps_keys_readable_and_escapes_the_rest() {

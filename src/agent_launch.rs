@@ -18,20 +18,11 @@ pub enum LaunchOutcome {
     Extension(String),
 }
 
-pub fn run_launch(
-    registry: &[AgentSpec],
-    agent: &str,
-    model: Option<&str>,
-    mode: Option<&str>,
-    args: &[String],
-) -> LaunchOutcome {
-    run_launch_env(registry, agent, model, mode, args, &[], false)
-}
-
-/// Like `run_launch`, but injects `env` overrides into the child and — when
-/// `via_mise` is set and mise is available — launches through `mise exec` so the
-/// agent (and everything it spawns) inherits mise's tool paths. Powers
-/// `agentflare run`. Falls back to a plain launch if mise isn't installed.
+/// Launches `agent` interactively, injecting `env` overrides into the child
+/// and — when `via_mise` is set and mise is available — launching through
+/// `mise exec` so the agent (and everything it spawns) inherits mise's tool
+/// paths. Powers `agents launch` and `agentflare run`. Falls back to a plain
+/// launch if mise isn't installed.
 pub fn run_launch_env(
     registry: &[AgentSpec],
     agent: &str,

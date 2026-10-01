@@ -18,6 +18,12 @@ pub struct RunArgs {
     /// Codex: sandbox policy (read-only, workspace-write, danger-full-access).
     #[arg(long)]
     pub mode: Option<String>,
+    /// Register the session under this team (message address team:<name>).
+    #[arg(long)]
+    pub team: Option<String>,
+    /// Readable session name for `message send <name>`.
+    #[arg(long)]
+    pub name: Option<String>,
     /// Run non-interactively on this prompt and print the reply to stdout.
     #[arg(long, value_name = "PROMPT")]
     pub print: Option<String>,
@@ -46,6 +52,12 @@ impl RunArgs {
         }
         if self.env.is_some() {
             conflicts.push("--env");
+        }
+        if self.team.is_some() {
+            conflicts.push("--team");
+        }
+        if self.name.is_some() {
+            conflicts.push("--name");
         }
         if !self.args.is_empty() {
             conflicts.push("trailing args");
@@ -76,6 +88,8 @@ impl RunArgs {
             self.model.as_deref(),
             self.mode.as_deref(),
             &self.args,
+            self.team.as_deref(),
+            self.name.as_deref(),
         );
     }
 }
@@ -90,6 +104,8 @@ mod tests {
             env: None,
             model: None,
             mode: None,
+            team: None,
+            name: None,
             print: print.map(str::to_string),
             timeout: 120,
             args: Vec::new(),
@@ -131,6 +147,14 @@ mod tests {
         let mut args = base_args(Some("hello"));
         args.env = Some("staging".to_string());
         assert_eq!(args.print_flag_conflicts(), vec!["--env"]);
+    }
+
+    #[test]
+    fn print_with_team_or_name_conflicts() {
+        let mut args = base_args(Some("hello"));
+        args.team = Some("alpha".to_string());
+        args.name = Some("pm".to_string());
+        assert_eq!(args.print_flag_conflicts(), vec!["--team", "--name"]);
     }
 
     #[test]

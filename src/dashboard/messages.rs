@@ -2,8 +2,9 @@
 //!
 //! - `GET /api/sessions` -- live agent sessions.
 //! - `GET /api/messages?to=KEY[&all=true][&limit=N]` -- a mailbox, read-only.
-//! - `POST /api/messages` `{to, body, reply_to?}` -- send as the local human
-//!   (`human:<user>`); a dashboard caller can't speak as an agent session.
+//! - `POST /api/messages` `{to, body, reply_to?, marker?}` -- send as the
+//!   local human (`human:<user>`); a dashboard caller can't speak as an agent
+//!   session. `marker` is important (default) | status | fyi.
 //! - `GET /api/messages/stream?to=KEY[&after=ID]` -- SSE, one `message`
 //!   event per message past `after` (default: now). Sends made in this
 //!   process are pushed off the in-process bus at once; sends from other
@@ -78,6 +79,8 @@ struct SendRequest {
     to: String,
     body: String,
     reply_to: Option<i64>,
+    /// important (default) | status | fyi -- see `messages::MARKERS`.
+    marker: Option<String>,
 }
 
 async fn send_handler(Json(req): Json<SendRequest>) -> Response {
@@ -95,6 +98,7 @@ async fn send_handler(Json(req): Json<SendRequest>) -> Response {
                     to: Some(req.to),
                     body: Some(req.body),
                     reply_to: req.reply_to,
+                    marker: req.marker,
                     ..Default::default()
                 },
             )
@@ -237,19 +241,35 @@ mod tests {
                 });
                 let client = reqwest::Client::new();
 
+                // A registered session shows up with its team/busy columns.
+                {
+                    let conn = crate::db::open().unwrap();
+                    crate::sessions::touch(
+                        &conn,
+                        &crate::sessions::Touch {
+                            key: "codex:dash-probe",
+                            team: Some("alpha"),
+                            ..Default::default()
+                        },
+                        crate::claims::now(),
+                    )
+                    .unwrap();
+                }
                 let sessions = client
                     .get(format!("http://{addr}/api/sessions"))
                     .send()
                     .await
                     .unwrap();
                 assert_eq!(sessions.status(), StatusCode::OK);
-                assert!(
-                    sessions
-                        .json::<serde_json::Value>()
-                        .await
-                        .unwrap()
-                        .is_array()
-                );
+                let rows = sessions.json::<serde_json::Value>().await.unwrap();
+                let row = rows
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|s| s["key"] == "codex:dash-probe")
+                    .expect("touched session listed");
+                assert_eq!(row["team"], "alpha");
+                assert_eq!(row["busy"], false);
 
                 let bad = client
                     .post(format!("http://{addr}/api/messages"))
@@ -270,11 +290,19 @@ mod tests {
                 assert_eq!(resp.status(), StatusCode::OK);
                 let sent = client
                     .post(format!("http://{addr}/api/messages"))
-                    .json(&serde_json::json!({"to": "human:probe-7c1", "body": "stream probe"}))
+                    .json(&serde_json::json!({
+                        "to": "human:probe-7c1",
+                        "body": "stream probe",
+                        "marker": "status",
+                    }))
                     .send()
                     .await
                     .unwrap();
                 assert_eq!(sent.status(), StatusCode::OK);
+                assert_eq!(
+                    sent.json::<serde_json::Value>().await.unwrap()["marker"],
+                    "status"
+                );
 
                 let mut stream = resp.bytes_stream();
                 let mut seen = String::new();
@@ -293,6 +321,7 @@ mod tests {
                 }
                 assert!(seen.contains("stream probe"), "got: {seen}");
                 assert!(seen.contains("event: message"));
+                assert!(seen.contains(r#""marker":"status""#), "got: {seen}");
                 // Observing never marks delivered: SSE gives no receipt.
                 let conn = crate::db::open().unwrap();
                 assert!(messages::has_undelivered(&conn, "human:probe-7c1").unwrap());

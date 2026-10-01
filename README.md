@@ -270,6 +270,47 @@ it. Detection-first — already-satisfied components are skipped, nothing gets
 clobbered. Persistent memory ships in the binary itself — nothing to install
 for it.
 
+## Inter-agent messaging
+
+Live sessions (Claude Code, Codex, Cursor, daemon-dispatched jobs) and humans
+exchange short messages through `agentflare.db`. Send from the MCP `message`
+tool or the CLI; delivery lands in the recipient's context through its hooks
+(or piggybacked on the next agentflare tool result on hosts without hooks).
+
+```bash
+agentflare message send <to> "text" [--marker important|status|fyi] [--reply-to <id>]
+agentflare message list                 # live sessions: key, name, item, team, busy
+agentflare message inbox                # your unread mail
+agentflare message history --to team:alpha [--after <id>] [--limit N]
+agentflare message watch                # stream your mailbox, one line each
+```
+
+Addresses: a session key or unique name (`message list`), `item:<id>`
+(whoever works that item), `agent:<name>` (every live session of that agent),
+`team:<name>` (every live session launched with `--team <name>`, except you),
+or `*` (everyone).
+
+Teams: `agentflare agents launch <agent> --team alpha --name pm` (or
+`agentflare run <agent> --team alpha --name pm`) registers the session under
+`team:alpha` and names it `pm`. A session that joins a team gets the last 10
+`team:alpha` messages replayed at SessionStart, marked as history.
+
+Markers decide *when* a message is pushed, never whether it is stored:
+
+| Marker | SessionStart / PromptSubmit | PreToolUse (mid-turn) | Stop | inbox / watch / MCP piggyback |
+|---|---|---|---|---|
+| `important` (default) | deliver | deliver | block stop and deliver | yes |
+| `status` | deliver | only once 3 or more are pending | block stop and deliver | yes |
+| `fyi` | deliver | never | never blocks the stop | yes |
+
+Codex runs sandboxed: let it write the message store by adding to
+`~/.codex/config.toml`:
+
+```toml
+[sandbox_workspace_write]
+writable_roots = ["~/.agentflare"]
+```
+
 ## Docs-only fallback (Aider, other AGENTS.md readers)
 
 ```bash

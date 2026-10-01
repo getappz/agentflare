@@ -322,6 +322,8 @@ impl HeadlessSession {
                     item_id: Some(&self.item_id),
                     cwd: Some(&self.cwd),
                     pid: Some(std::process::id()),
+                    // Dispatched jobs have no team (spec §5.2).
+                    team: None,
                 },
                 crate::claims::now(),
             );

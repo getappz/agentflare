@@ -108,11 +108,30 @@ pub fn job_owner() -> Option<String> {
     set.then(crate::claims::owner_id)
 }
 
-fn session_name() -> Option<String> {
-    std::env::var("AGENTFLARE_SESSION_NAME")
-        .ok()
+/// Env var naming the team an interactive session registers under (the
+/// target of a `team:<name>` message address); set by `agents launch
+/// --team` / `run --team`.
+pub const TEAM_ENV: &str = "AGENTFLARE_TEAM";
+
+fn env_name(raw: Result<String, std::env::VarError>) -> Option<String> {
+    raw.ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+fn session_name() -> Option<String> {
+    env_name(std::env::var("AGENTFLARE_SESSION_NAME"))
+}
+
+/// This process's team, from [`TEAM_ENV`].
+pub(crate) fn team_name() -> Option<String> {
+    env_name(std::env::var(TEAM_ENV))
+}
+
+/// The team this process is a member of, given the `team` it was launched
+/// with: dispatched jobs have no team (spec §5.2).
+pub(crate) fn member_team(team: Option<String>) -> Option<String> {
+    if job_owner().is_some() { None } else { team }
 }
 
 /// The session key a hook acts for.
@@ -127,6 +146,20 @@ pub fn touch_hook_session(
     conn: &Connection,
     key: &str,
     cwd: Option<&str>,
+    force: bool,
+    now: i64,
+) -> rusqlite::Result<()> {
+    let team = member_team(team_name());
+    touch_hook_session_with(conn, key, cwd, team.as_deref(), force, now)
+}
+
+/// [`touch_hook_session`] with the team supplied (tests; the env is
+/// process-global).
+pub(crate) fn touch_hook_session_with(
+    conn: &Connection,
+    key: &str,
+    cwd: Option<&str>,
+    team: Option<&str>,
     force: bool,
     now: i64,
 ) -> rusqlite::Result<()> {
@@ -146,6 +179,7 @@ pub fn touch_hook_session(
             name: name.as_deref(),
             cwd: if is_job { None } else { cwd },
             pid: if is_job { None } else { agent_pid() },
+            team,
             ..Default::default()
         },
         now,
@@ -273,6 +307,39 @@ mod tests {
             _ => None,
         };
         assert_eq!(agent_pid_from(30, orphan), None);
+    }
+
+    #[test]
+    fn env_name_trims_and_drops_empty() {
+        assert_eq!(env_name(Ok(" alpha ".into())), Some("alpha".into()));
+        assert_eq!(env_name(Ok("   ".into())), None);
+        assert_eq!(env_name(Err(std::env::VarError::NotPresent)), None);
+    }
+
+    #[test]
+    fn member_team_is_none_for_a_dispatched_job() {
+        let job = crate::claims::with_owner_override("claude-code:job-1", || {
+            member_team(Some("alpha".into()))
+        });
+        assert_eq!(job, None);
+        if job_owner().is_none() {
+            assert_eq!(member_team(Some("alpha".into())), Some("alpha".into()));
+        }
+    }
+
+    #[test]
+    fn touch_hook_session_records_the_team_given() {
+        let c = Connection::open_in_memory().unwrap();
+        sessions::migrate(&c).unwrap();
+        touch_hook_session_with(&c, "codex:t9", None, Some("alpha"), true, 100).unwrap();
+        assert_eq!(
+            sessions::get(&c, "codex:t9")
+                .unwrap()
+                .unwrap()
+                .team
+                .as_deref(),
+            Some("alpha")
+        );
     }
 
     #[test]
