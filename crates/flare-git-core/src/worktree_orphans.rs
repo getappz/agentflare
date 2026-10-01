@@ -45,6 +45,11 @@ pub(super) fn git_pointer(path: &Path) -> GitPointer {
 /// not (item #689: a leaked `GIT_WORK_TREE` made `rev-parse` answer for the
 /// main repo and a live worktree was garbage-collected). Fails closed: an
 /// unreadable registration list is not evidence of anything.
+///
+/// `audit_orphans` shares the pointer half (`git_pointer`) but not this
+/// function: a directory with no `.git` of its own is skipped there (never
+/// classified or gc'd from the enclosing repo's answers), whereas for
+/// `create_worktree` that same state is the one it may clear and recreate.
 pub(super) fn is_structurally_broken(repo_root: &Path, worktree_path: &Path) -> bool {
     if worktree_path.join(".git").is_dir() {
         return false;
