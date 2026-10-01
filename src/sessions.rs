@@ -197,7 +197,7 @@ pub fn touch(conn: &Connection, t: &Touch<'_>, now: i64) -> rusqlite::Result<()>
 
 pub fn end(conn: &Connection, key: &str, now: i64) -> rusqlite::Result<bool> {
     Ok(conn.execute(
-        "UPDATE agent_sessions SET ended_at = ?2 WHERE key = ?1 AND ended_at IS NULL",
+        "UPDATE agent_sessions SET ended_at = ?2, busy = 0 WHERE key = ?1 AND ended_at IS NULL",
         params![key, now],
     )? > 0)
 }
@@ -496,5 +496,19 @@ mod tests {
             !set_busy(&c, "codex:t1", false, 104).unwrap(),
             "ended rows are not updated"
         );
+    }
+
+    #[test]
+    fn end_clears_busy_so_a_resumed_session_comes_back_idle() {
+        let c = conn();
+        let t = Touch {
+            key: "codex:t2",
+            ..Default::default()
+        };
+        touch(&c, &t, 100).unwrap();
+        set_busy(&c, "codex:t2", true, 101).unwrap();
+        end(&c, "codex:t2", 102).unwrap();
+        touch(&c, &t, 103).unwrap();
+        assert!(!get(&c, "codex:t2").unwrap().unwrap().busy);
     }
 }

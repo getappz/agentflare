@@ -120,7 +120,9 @@ pub(crate) fn sync_with(
     now: i64,
 ) -> rusqlite::Result<Vec<Message>> {
     identity::touch_hook_session(conn, key, cwd, register, now)?;
-    if policy == Delivery::TurnStart {
+    // A submitted prompt starts a turn; a session start (`register`) is a
+    // session idling at its prompt, not a turn (spec §5.4).
+    if policy == Delivery::TurnStart && !register {
         crate::sessions::set_busy(conn, key, true, now)?;
     }
     let taken = if !host_injects_context(agent) || !messages::has_undelivered(conn, key)? {
@@ -291,8 +293,10 @@ mod tests {
         let c = conn();
         let key = "claude-code:s3";
         let busy = |c: &rusqlite::Connection| crate::sessions::get(c, key).unwrap().unwrap().busy;
-        sync_with(&c, "claude-code", key, None, true, Delivery::TurnStart, 100).unwrap();
-        assert!(busy(&c), "a turn start marks the session busy");
+        sync_with(&c, "claude-code", key, None, true, Delivery::TurnStart, 99).unwrap();
+        assert!(!busy(&c), "a session start is not a turn");
+        sync_with(&c, "claude-code", key, None, false, Delivery::TurnStart, 100).unwrap();
+        assert!(busy(&c), "a submitted prompt marks the session busy");
         sync_with(&c, "claude-code", key, None, false, Delivery::MidTurn, 101).unwrap();
         assert!(busy(&c));
         seed(&c, key, "important", 1);
