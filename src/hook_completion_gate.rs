@@ -371,6 +371,7 @@ pub fn post_tool_use(agent: &str) {
         record.last_review = Some(crate::optimize::ReviewEvidence {
             source: parsed.tool_name.clone(),
             ts: now,
+            tree: crate::optimize::tree_fingerprint(),
         });
         crate::optimize::save_runtime(&runtime);
         return;
@@ -412,6 +413,7 @@ pub fn post_tool_use(agent: &str) {
             exit_code: parsed.exit_code,
             passed,
             ts: now,
+            tree: crate::optimize::tree_fingerprint(),
         });
     }
     if crate::optimize::is_diagnosis_command(command) {
