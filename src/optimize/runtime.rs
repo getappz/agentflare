@@ -45,6 +45,11 @@ pub struct SessionRecord {
     /// isn't undone by the edit that follows it.
     #[serde(default)]
     pub last_diagnosis: Option<DiagnosisEvidence>,
+    /// [`tree_fingerprint`] captured in PreToolUse right before a verification
+    /// shell command runs; PostToolUse compares it to the post-command
+    /// fingerprint so chained commands cannot bind evidence to an untested tree.
+    #[serde(default)]
+    pub verification_start_tree: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
@@ -232,9 +237,14 @@ pub fn has_fresh_passing_verification(
 /// the same before and after committing unchanged content, so "ran tests,
 /// committed, `item done`" stays covered. `None` outside a git repo or on
 /// any git failure.
+///
+/// Known gap: uncommitted edits inside initialized submodules are not
+/// reflected (the superproject tree stores submodule commit IDs only).
 pub fn tree_fingerprint() -> Option<String> {
     let run = |args: &[&str], index: Option<&std::path::Path>| -> Option<String> {
         let mut cmd = std::process::Command::new("git");
+        cmd.env_remove("GIT_DIR");
+        cmd.env_remove("GIT_WORK_TREE");
         cmd.args(args);
         if let Some(i) = index {
             cmd.env("GIT_INDEX_FILE", i);
@@ -248,11 +258,21 @@ pub fn tree_fingerprint() -> Option<String> {
         &["rev-parse", "--path-format=absolute", "--git-path", "index"],
         None,
     )?;
-    let tmp = std::env::temp_dir().join(format!("af-tree-fp-{}", std::process::id()));
-    let _ = fs::copy(&real, &tmp);
-    let fp = run(&["add", "-A"], Some(&tmp)).and_then(|_| run(&["write-tree"], Some(&tmp)));
-    let _ = fs::remove_file(&tmp);
-    fp
+    let tmp_dir = tempfile::tempdir().ok()?;
+    let tmp = tmp_dir.path().join("index");
+    fs::copy(&real, &tmp).ok()?;
+    let _ = run(&["update-index", "--really-refresh"], Some(&tmp));
+    run(&["add", "-A"], Some(&tmp)).and_then(|_| run(&["write-tree"], Some(&tmp)))
+}
+
+/// Fingerprint to store on verification evidence: only when the tree at
+/// command start matches the tree at command end (see
+/// [`SessionRecord::verification_start_tree`]).
+pub fn verification_evidence_tree(start: Option<String>, end: Option<String>) -> Option<String> {
+    match (start.as_deref(), end.as_deref()) {
+        (Some(s), Some(e)) if s == e => Some(e.to_string()),
+        _ => None,
+    }
 }
 
 /// Whether evidence recorded at `ts` with fingerprint `tree` still covers the
@@ -625,6 +645,7 @@ mod tests {
                     last_verification: None,
                     last_review: None,
                     last_diagnosis: None,
+                    verification_start_tree: None,
                 },
             );
             save_runtime(&state);
@@ -655,6 +676,7 @@ mod tests {
                 last_verification: None,
                 last_review: None,
                 last_diagnosis: None,
+                verification_start_tree: None,
             },
         );
         state.sessions.insert(
@@ -666,6 +688,7 @@ mod tests {
                 last_verification: None,
                 last_review: None,
                 last_diagnosis: None,
+                verification_start_tree: None,
             },
         );
         let now = 100_100; // 100s after "recent", ~27.7h after "old"
@@ -683,6 +706,7 @@ mod tests {
             last_verification: None,
             last_review: None,
             last_diagnosis: None,
+            verification_start_tree: None,
         };
         assert!(session_hygiene_nudge(&record, 100).is_none());
     }
@@ -696,6 +720,7 @@ mod tests {
             last_verification: None,
             last_review: None,
             last_diagnosis: None,
+            verification_start_tree: None,
         };
         assert!(session_hygiene_nudge(&record, 100).is_some());
     }
@@ -709,6 +734,7 @@ mod tests {
             last_verification: None,
             last_review: None,
             last_diagnosis: None,
+            verification_start_tree: None,
         };
         assert!(session_hygiene_nudge(&record, 2 * 60 * 60 + 1).is_some());
     }
@@ -835,6 +861,7 @@ mod tests {
                 command: "git log".into(),
                 ts: 1000,
             }),
+            verification_start_tree: None,
         };
         assert!(has_fresh_diagnosis_evidence(&record));
     }
@@ -848,6 +875,7 @@ mod tests {
             last_verification: None,
             last_review: None,
             last_diagnosis: None,
+            verification_start_tree: None,
         };
         assert!(!has_fresh_diagnosis_evidence(&record));
     }
@@ -870,6 +898,7 @@ mod tests {
                     command: "git log".into(),
                     ts: 1000,
                 }),
+                verification_start_tree: None,
             },
         );
         invalidate_verification(&mut state, "s1");
@@ -894,6 +923,7 @@ mod tests {
                 }),
                 last_review: None,
                 last_diagnosis: None,
+                verification_start_tree: None,
             },
         );
         invalidate_verification(&mut state, "s1");
@@ -938,6 +968,7 @@ mod tests {
                     ts: 1000,
                 }),
                 last_diagnosis: None,
+                verification_start_tree: None,
             },
         );
         invalidate_review(&mut state, "s1");
@@ -964,6 +995,7 @@ mod tests {
                 ts: 1000,
             }),
             last_diagnosis: None,
+            verification_start_tree: None,
         };
         assert!(has_fresh_review(&record, 1000 + 60, None));
     }
@@ -981,6 +1013,7 @@ mod tests {
                 ts: 1000,
             }),
             last_diagnosis: None,
+            verification_start_tree: None,
         };
         assert!(!has_fresh_review(
             &record,
@@ -998,6 +1031,7 @@ mod tests {
             last_verification: None,
             last_review: None,
             last_diagnosis: None,
+            verification_start_tree: None,
         };
         assert!(!has_fresh_review(&record, 1000, None));
     }
@@ -1017,6 +1051,7 @@ mod tests {
             }),
             last_review: None,
             last_diagnosis: None,
+            verification_start_tree: None,
         };
         assert!(has_fresh_passing_verification(&record, 1000 + 60, None));
     }
@@ -1036,6 +1071,7 @@ mod tests {
             }),
             last_review: None,
             last_diagnosis: None,
+            verification_start_tree: None,
         };
         assert!(!has_fresh_passing_verification(
             &record,
@@ -1059,6 +1095,7 @@ mod tests {
             }),
             last_review: None,
             last_diagnosis: None,
+            verification_start_tree: None,
         };
         assert!(!has_fresh_passing_verification(&record, 1000, None));
     }
@@ -1072,11 +1109,25 @@ mod tests {
             last_verification: None,
             last_review: None,
             last_diagnosis: None,
+            verification_start_tree: None,
         };
         assert!(!has_fresh_passing_verification(&record, 1000, None));
     }
 
     #[test]
+    #[test]
+    fn verification_evidence_tree_matches_only_when_start_equals_end() {
+        assert_eq!(
+            verification_evidence_tree(Some("a".into()), Some("a".into())).as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            verification_evidence_tree(Some("a".into()), Some("b".into())),
+            None
+        );
+        assert_eq!(verification_evidence_tree(None, Some("a".into())), None);
+    }
+
     fn evidence_fresh_same_fingerprint_old_ts_counts_as_fresh() {
         assert!(evidence_fresh(1000, Some("abc"), 5000, Some("abc")));
     }

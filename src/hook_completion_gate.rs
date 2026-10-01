@@ -367,6 +367,7 @@ pub fn post_tool_use(agent: &str) {
                 last_verification: None,
                 last_review: None,
                 last_diagnosis: None,
+                verification_start_tree: None,
             });
         record.last_review = Some(crate::optimize::ReviewEvidence {
             source: parsed.tool_name.clone(),
@@ -406,14 +407,17 @@ pub fn post_tool_use(agent: &str) {
                 last_verification: None,
                 last_review: None,
                 last_diagnosis: None,
+                verification_start_tree: None,
             });
     if crate::optimize::is_verification_command(command) {
+        let start = record.verification_start_tree.take();
+        let end = crate::optimize::tree_fingerprint();
         record.last_verification = Some(crate::optimize::VerificationEvidence {
             command: command.clone(),
             exit_code: parsed.exit_code,
             passed,
             ts: now,
-            tree: crate::optimize::tree_fingerprint(),
+            tree: crate::optimize::verification_evidence_tree(start, end),
         });
     }
     if crate::optimize::is_diagnosis_command(command) {
