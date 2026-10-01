@@ -352,6 +352,9 @@ mod tests {
 
     #[test]
     fn sync_registers_the_session_and_delivers_once_on_claude_code() {
+        if identity::job_owner().is_some() {
+            return; // a dispatched job's row only ever gets `last_seen_at`
+        }
         let c = conn();
         let key = "claude-code:s1";
         assert!(
