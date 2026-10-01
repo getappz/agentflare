@@ -214,9 +214,10 @@ pub(crate) fn format_replay(team: &str, msgs: &[Message]) -> Option<String> {
 }
 
 /// The SessionStart replay for this process's team, if any. Best-effort:
-/// no team, no db, or a db without the table yet all mean no replay.
+/// no team (a dispatched job never has one), no db, or a db without the
+/// table yet all mean no replay.
 pub(crate) fn team_replay_block() -> Option<String> {
-    let team = identity::team_name()?;
+    let team = identity::member_team(identity::team_name())?;
     let conn = messages::open_fast()?;
     let msgs = messages::recent(&conn, &format!("team:{team}"), REPLAY_LIMIT).ok()?;
     format_replay(&team, &msgs)

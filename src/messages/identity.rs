@@ -128,6 +128,12 @@ pub(crate) fn team_name() -> Option<String> {
     env_name(std::env::var(TEAM_ENV))
 }
 
+/// The team this process is a member of, given the `team` it was launched
+/// with: dispatched jobs have no team (spec §5.2).
+pub(crate) fn member_team(team: Option<String>) -> Option<String> {
+    if job_owner().is_some() { None } else { team }
+}
+
 /// The session key a hook acts for.
 pub fn hook_key(agent: &str, session_id: &str) -> String {
     job_owner().unwrap_or_else(|| format!("{agent}:{session_id}"))
@@ -143,12 +149,7 @@ pub fn touch_hook_session(
     force: bool,
     now: i64,
 ) -> rusqlite::Result<()> {
-    // Dispatched jobs have no team (spec §5.2).
-    let team = if job_owner().is_some() {
-        None
-    } else {
-        team_name()
-    };
+    let team = member_team(team_name());
     touch_hook_session_with(conn, key, cwd, team.as_deref(), force, now)
 }
 
@@ -313,6 +314,17 @@ mod tests {
         assert_eq!(env_name(Ok(" alpha ".into())), Some("alpha".into()));
         assert_eq!(env_name(Ok("   ".into())), None);
         assert_eq!(env_name(Err(std::env::VarError::NotPresent)), None);
+    }
+
+    #[test]
+    fn member_team_is_none_for_a_dispatched_job() {
+        let job = crate::claims::with_owner_override("claude-code:job-1", || {
+            member_team(Some("alpha".into()))
+        });
+        assert_eq!(job, None);
+        if job_owner().is_none() {
+            assert_eq!(member_team(Some("alpha".into())), Some("alpha".into()));
+        }
     }
 
     #[test]
