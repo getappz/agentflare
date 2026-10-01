@@ -438,6 +438,23 @@ fn resolve_item_task_type(
         .map(String::from)
 }
 
+fn shell_command_from_tool_input(tool_input: Option<&serde_json::Value>) -> Option<String> {
+    tool_input.and_then(|ti| {
+        ti.get("command")
+            .or_else(|| ti.get("cmd"))
+            .or_else(|| ti.get("script"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    })
+}
+
+fn is_verification_shell_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "Bash" | "bash" | "PowerShell" | "powershell" | "shell"
+    ) || tool_name.ends_with("__ctx_shell")
+}
+
 pub fn pre_tool_use(agent: &str) {
     let Some(input) = read_stdin_or_skip("PreToolUse") else {
         return;
@@ -497,7 +514,18 @@ pub fn pre_tool_use(agent: &str) {
             last_verification: None,
             last_review: None,
             last_diagnosis: None,
+            verification_start_tree: None,
         });
+
+    if is_verification_shell_tool(&parsed.tool_name)
+        && parsed
+            .tool_input
+            .as_ref()
+            .and_then(|ti| shell_command_from_tool_input(Some(ti)))
+            .is_some_and(|cmd| crate::optimize::is_verification_command(&cmd))
+    {
+        record.verification_start_tree = crate::optimize::tree_fingerprint();
+    }
 
     // Completion gate (item #169, extended by item #182, extended by item
     // #203): `item done`/`check_merge` requires fresh, passing verification
@@ -505,11 +533,16 @@ pub fn pre_tool_use(agent: &str) {
     // task_type=bugfix item) diagnosis evidence -- see
     // hook_redirect::completion_gate_reason's doc comment.
     let task_type = resolve_item_task_type(&parsed.tool_name, parsed.tool_input.as_ref());
+    // Only item calls can hit the gate, so only they pay for the git hash.
+    let current_tree = (parsed.tool_name == crate::hook_redirect::ITEM_TOOL_NAME
+        || parsed.tool_name == "item")
+        .then(crate::optimize::tree_fingerprint)
+        .flatten();
     if let Some(reason) = crate::hook_redirect::completion_gate_reason(
         &parsed.tool_name,
         parsed.tool_input.as_ref(),
-        crate::optimize::has_fresh_passing_verification(record, now),
-        crate::optimize::has_fresh_review(record, now),
+        crate::optimize::has_fresh_passing_verification(record, now, current_tree.as_deref()),
+        crate::optimize::has_fresh_review(record, now, current_tree.as_deref()),
         crate::optimize::has_fresh_diagnosis_evidence(record),
         task_type.as_deref(),
     ) {
@@ -781,6 +814,7 @@ pub fn prompt_submit(agent: &str) {
                     last_verification: None,
                     last_review: None,
                     last_diagnosis: None,
+                    verification_start_tree: None,
                 });
         first_turn = record.turn_count == 0;
         record.turn_count += 1;

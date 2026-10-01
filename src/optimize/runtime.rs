@@ -45,6 +45,11 @@ pub struct SessionRecord {
     /// isn't undone by the edit that follows it.
     #[serde(default)]
     pub last_diagnosis: Option<DiagnosisEvidence>,
+    /// [`tree_fingerprint`] captured in PreToolUse right before a verification
+    /// shell command runs; PostToolUse compares it to the post-command
+    /// fingerprint so chained commands cannot bind evidence to an untested tree.
+    #[serde(default)]
+    pub verification_start_tree: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
@@ -62,6 +67,9 @@ pub struct VerificationEvidence {
     pub exit_code: Option<i32>,
     pub passed: bool,
     pub ts: u64,
+    /// [`tree_fingerprint`] when the command ran; see [`evidence_fresh`].
+    #[serde(default)]
+    pub tree: Option<String>,
 }
 
 /// Evidence that a code review actually *completed* in this session,
@@ -75,6 +83,9 @@ pub struct VerificationEvidence {
 pub struct ReviewEvidence {
     pub source: String,
     pub ts: u64,
+    /// [`tree_fingerprint`] when the review completed; see [`evidence_fresh`].
+    #[serde(default)]
+    pub tree: Option<String>,
 }
 
 /// Evidence that a root-cause-investigation command was actually run in this
@@ -209,11 +220,70 @@ pub fn is_verification_command(command: &str) -> bool {
 
 /// Whether `record` carries verification evidence recent and passing enough
 /// to satisfy the completion gate right now.
-pub fn has_fresh_passing_verification(record: &SessionRecord, now: u64) -> bool {
+pub fn has_fresh_passing_verification(
+    record: &SessionRecord,
+    now: u64,
+    current_tree: Option<&str>,
+) -> bool {
     record
         .last_verification
         .as_ref()
-        .is_some_and(|v| v.passed && now.saturating_sub(v.ts) < VERIFICATION_FRESHNESS_SECS)
+        .is_some_and(|v| v.passed && evidence_fresh(v.ts, v.tree.as_deref(), now, current_tree))
+}
+
+/// Content identity of the working tree (tracked + untracked, gitignore
+/// respected) as a git tree hash, computed in the current directory via a
+/// throwaway index so the real one is untouched. Unlike `HEAD` + diff, it is
+/// the same before and after committing unchanged content, so "ran tests,
+/// committed, `item done`" stays covered. `None` outside a git repo or on
+/// any git failure.
+///
+/// Known gap: uncommitted edits inside initialized submodules are not
+/// reflected (the superproject tree stores submodule commit IDs only).
+pub fn tree_fingerprint() -> Option<String> {
+    let run = |args: &[&str], index: Option<&std::path::Path>| -> Option<String> {
+        let mut cmd = std::process::Command::new("git");
+        cmd.env_remove("GIT_DIR");
+        cmd.env_remove("GIT_WORK_TREE");
+        cmd.args(args);
+        if let Some(i) = index {
+            cmd.env("GIT_INDEX_FILE", i);
+        }
+        let out = cmd.output().ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let real = run(
+        &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+        None,
+    )?;
+    let tmp_dir = tempfile::tempdir().ok()?;
+    let tmp = tmp_dir.path().join("index");
+    fs::copy(&real, &tmp).ok()?;
+    let _ = run(&["update-index", "--really-refresh"], Some(&tmp));
+    run(&["add", "-A"], Some(&tmp)).and_then(|_| run(&["write-tree"], Some(&tmp)))
+}
+
+/// Fingerprint to store on verification evidence: only when the tree at
+/// command start matches the tree at command end (see
+/// [`SessionRecord::verification_start_tree`]).
+pub fn verification_evidence_tree(start: Option<String>, end: Option<String>) -> Option<String> {
+    match (start.as_deref(), end.as_deref()) {
+        (Some(s), Some(e)) if s == e => Some(e.to_string()),
+        _ => None,
+    }
+}
+
+/// Whether evidence recorded at `ts` with fingerprint `tree` still covers the
+/// current tree. With a fingerprint on both sides it is valid exactly while
+/// they match (no time limit; a changed tree is stale even inside the
+/// window). Otherwise falls back to [`VERIFICATION_FRESHNESS_SECS`].
+fn evidence_fresh(ts: u64, tree: Option<&str>, now: u64, current: Option<&str>) -> bool {
+    match (tree, current) {
+        (Some(t), Some(c)) => t == c,
+        _ => now.saturating_sub(ts) < VERIFICATION_FRESHNESS_SECS,
+    }
 }
 
 /// Substrings (lowercased) that mark a shell command as a root-cause-
@@ -282,11 +352,11 @@ pub const REVIEW_COMPLETION_TOOL: &str = "ReportFindings";
 /// evidence ([`VERIFICATION_FRESHNESS_SECS`]), no separate window since both
 /// answer the same question: "does this evidence still cover the current
 /// tree".
-pub fn has_fresh_review(record: &SessionRecord, now: u64) -> bool {
+pub fn has_fresh_review(record: &SessionRecord, now: u64, current_tree: Option<&str>) -> bool {
     record
         .last_review
         .as_ref()
-        .is_some_and(|r| now.saturating_sub(r.ts) < VERIFICATION_FRESHNESS_SECS)
+        .is_some_and(|r| evidence_fresh(r.ts, r.tree.as_deref(), now, current_tree))
 }
 
 /// Clears a session's recorded verification evidence -- called by the
@@ -575,6 +645,7 @@ mod tests {
                     last_verification: None,
                     last_review: None,
                     last_diagnosis: None,
+                    verification_start_tree: None,
                 },
             );
             save_runtime(&state);
@@ -605,6 +676,7 @@ mod tests {
                 last_verification: None,
                 last_review: None,
                 last_diagnosis: None,
+                verification_start_tree: None,
             },
         );
         state.sessions.insert(
@@ -616,6 +688,7 @@ mod tests {
                 last_verification: None,
                 last_review: None,
                 last_diagnosis: None,
+                verification_start_tree: None,
             },
         );
         let now = 100_100; // 100s after "recent", ~27.7h after "old"
@@ -633,6 +706,7 @@ mod tests {
             last_verification: None,
             last_review: None,
             last_diagnosis: None,
+            verification_start_tree: None,
         };
         assert!(session_hygiene_nudge(&record, 100).is_none());
     }
@@ -646,6 +720,7 @@ mod tests {
             last_verification: None,
             last_review: None,
             last_diagnosis: None,
+            verification_start_tree: None,
         };
         assert!(session_hygiene_nudge(&record, 100).is_some());
     }
@@ -659,6 +734,7 @@ mod tests {
             last_verification: None,
             last_review: None,
             last_diagnosis: None,
+            verification_start_tree: None,
         };
         assert!(session_hygiene_nudge(&record, 2 * 60 * 60 + 1).is_some());
     }
@@ -785,6 +861,7 @@ mod tests {
                 command: "git log".into(),
                 ts: 1000,
             }),
+            verification_start_tree: None,
         };
         assert!(has_fresh_diagnosis_evidence(&record));
     }
@@ -798,6 +875,7 @@ mod tests {
             last_verification: None,
             last_review: None,
             last_diagnosis: None,
+            verification_start_tree: None,
         };
         assert!(!has_fresh_diagnosis_evidence(&record));
     }
@@ -820,6 +898,7 @@ mod tests {
                     command: "git log".into(),
                     ts: 1000,
                 }),
+                verification_start_tree: None,
             },
         );
         invalidate_verification(&mut state, "s1");
@@ -836,6 +915,7 @@ mod tests {
                 turn_count: 0,
                 recent_tool_calls: vec![],
                 last_verification: Some(VerificationEvidence {
+                    tree: None,
                     command: "cargo test".into(),
                     exit_code: Some(0),
                     passed: true,
@@ -843,6 +923,7 @@ mod tests {
                 }),
                 last_review: None,
                 last_diagnosis: None,
+                verification_start_tree: None,
             },
         );
         invalidate_verification(&mut state, "s1");
@@ -882,10 +963,12 @@ mod tests {
                 recent_tool_calls: vec![],
                 last_verification: None,
                 last_review: Some(ReviewEvidence {
+                    tree: None,
                     source: "code-review".into(),
                     ts: 1000,
                 }),
                 last_diagnosis: None,
+                verification_start_tree: None,
             },
         );
         invalidate_review(&mut state, "s1");
@@ -907,12 +990,14 @@ mod tests {
             recent_tool_calls: vec![],
             last_verification: None,
             last_review: Some(ReviewEvidence {
+                tree: None,
                 source: "code-review".into(),
                 ts: 1000,
             }),
             last_diagnosis: None,
+            verification_start_tree: None,
         };
-        assert!(has_fresh_review(&record, 1000 + 60));
+        assert!(has_fresh_review(&record, 1000 + 60, None));
     }
 
     #[test]
@@ -923,14 +1008,17 @@ mod tests {
             recent_tool_calls: vec![],
             last_verification: None,
             last_review: Some(ReviewEvidence {
+                tree: None,
                 source: "code-review".into(),
                 ts: 1000,
             }),
             last_diagnosis: None,
+            verification_start_tree: None,
         };
         assert!(!has_fresh_review(
             &record,
-            1000 + VERIFICATION_FRESHNESS_SECS + 1
+            1000 + VERIFICATION_FRESHNESS_SECS + 1,
+            None
         ));
     }
 
@@ -943,8 +1031,9 @@ mod tests {
             last_verification: None,
             last_review: None,
             last_diagnosis: None,
+            verification_start_tree: None,
         };
-        assert!(!has_fresh_review(&record, 1000));
+        assert!(!has_fresh_review(&record, 1000, None));
     }
 
     #[test]
@@ -954,6 +1043,7 @@ mod tests {
             turn_count: 0,
             recent_tool_calls: vec![],
             last_verification: Some(VerificationEvidence {
+                tree: None,
                 command: "cargo test".into(),
                 exit_code: Some(0),
                 passed: true,
@@ -961,8 +1051,9 @@ mod tests {
             }),
             last_review: None,
             last_diagnosis: None,
+            verification_start_tree: None,
         };
-        assert!(has_fresh_passing_verification(&record, 1000 + 60));
+        assert!(has_fresh_passing_verification(&record, 1000 + 60, None));
     }
 
     #[test]
@@ -972,6 +1063,7 @@ mod tests {
             turn_count: 0,
             recent_tool_calls: vec![],
             last_verification: Some(VerificationEvidence {
+                tree: None,
                 command: "cargo test".into(),
                 exit_code: Some(0),
                 passed: true,
@@ -979,10 +1071,12 @@ mod tests {
             }),
             last_review: None,
             last_diagnosis: None,
+            verification_start_tree: None,
         };
         assert!(!has_fresh_passing_verification(
             &record,
-            1000 + VERIFICATION_FRESHNESS_SECS + 1
+            1000 + VERIFICATION_FRESHNESS_SECS + 1,
+            None
         ));
     }
 
@@ -993,6 +1087,7 @@ mod tests {
             turn_count: 0,
             recent_tool_calls: vec![],
             last_verification: Some(VerificationEvidence {
+                tree: None,
                 command: "cargo test".into(),
                 exit_code: Some(1),
                 passed: false,
@@ -1000,8 +1095,9 @@ mod tests {
             }),
             last_review: None,
             last_diagnosis: None,
+            verification_start_tree: None,
         };
-        assert!(!has_fresh_passing_verification(&record, 1000));
+        assert!(!has_fresh_passing_verification(&record, 1000, None));
     }
 
     #[test]
@@ -1013,8 +1109,43 @@ mod tests {
             last_verification: None,
             last_review: None,
             last_diagnosis: None,
+            verification_start_tree: None,
         };
-        assert!(!has_fresh_passing_verification(&record, 1000));
+        assert!(!has_fresh_passing_verification(&record, 1000, None));
+    }
+
+    #[test]
+    fn verification_evidence_tree_matches_only_when_start_equals_end() {
+        assert_eq!(
+            verification_evidence_tree(Some("a".into()), Some("a".into())).as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            verification_evidence_tree(Some("a".into()), Some("b".into())),
+            None
+        );
+        assert_eq!(verification_evidence_tree(None, Some("a".into())), None);
+    }
+
+    #[test]
+    fn evidence_fresh_same_fingerprint_old_ts_counts_as_fresh() {
+        assert!(evidence_fresh(1000, Some("abc"), 5000, Some("abc")));
+    }
+
+    #[test]
+    fn evidence_fresh_different_fingerprint_in_window_counts_as_stale() {
+        assert!(!evidence_fresh(1000, Some("abc"), 1000 + 60, Some("def")));
+    }
+
+    #[test]
+    fn evidence_fresh_no_fingerprint_falls_back_to_time_window() {
+        assert!(evidence_fresh(1000, None, 1000 + 60, None));
+        assert!(!evidence_fresh(
+            1000,
+            None,
+            1000 + VERIFICATION_FRESHNESS_SECS + 1,
+            None
+        ));
     }
 
     #[test]
