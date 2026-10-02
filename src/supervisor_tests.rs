@@ -1467,10 +1467,13 @@ fn claim_self_repair_defers_when_another_workstation_already_holds_a_live_claim(
     // (and beacon-labeled) independently by two workstations. This simulates
     // the second workstation's check -- a live claim from a different
     // `owner` must make it back off instead of dispatching its own repair.
+    // Derived from our own label so it differs on every machine, including
+    // the workstation whose real id the incident's marker carried.
+    let other = format!("{}-other", crate::github::bridge::config::machine_label());
     let server = crate::github::test_support::MockServer::start(vec![
         crate::github::test_support::MockResponse::json(
             200,
-            &comment_json(1, &claim_marker("flared:c997d745ae66", 1_000)),
+            &comment_json(1, &claim_marker(&other, 1_000)),
         ),
     ]);
     let client = server.client(Some("tok"));

@@ -24,11 +24,35 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             pid INTEGER,
             started_at INTEGER NOT NULL,
             last_seen_at INTEGER NOT NULL,
-            ended_at INTEGER
+            ended_at INTEGER,
+            team TEXT,
+            busy INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_agent_sessions_live
             ON agent_sessions(ended_at, last_seen_at);",
-    )
+    )?;
+    add_team_columns_if_missing(conn)
+}
+
+/// Additive migration for DBs created before `team`/`busy` existed; same
+/// idempotency pattern as `claims::add_scope_column_if_missing`.
+fn add_team_columns_if_missing(conn: &Connection) -> rusqlite::Result<()> {
+    let has_team: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('agent_sessions') WHERE name = 'team'")?
+        .exists([])?;
+    if !has_team {
+        conn.execute("ALTER TABLE agent_sessions ADD COLUMN team TEXT", [])?;
+    }
+    let has_busy: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('agent_sessions') WHERE name = 'busy'")?
+        .exists([])?;
+    if !has_busy {
+        conn.execute(
+            "ALTER TABLE agent_sessions ADD COLUMN busy INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 /// A session is presumed gone once it hasn't been seen this long AND its
@@ -49,6 +73,11 @@ pub struct Session {
     pub started_at: i64,
     pub last_seen_at: i64,
     pub ended_at: Option<i64>,
+    /// Team the session registered under (`AGENTFLARE_TEAM`); the target of
+    /// a `team:<name>` message address.
+    pub team: Option<String>,
+    /// Mid-turn (set at turn start, cleared by a Stop that delivers nothing).
+    pub busy: bool,
 }
 
 /// What a caller knows about a session when it registers/touches it. `None`
@@ -60,6 +89,7 @@ pub struct Touch<'a> {
     pub item_id: Option<&'a str>,
     pub cwd: Option<&'a str>,
     pub pid: Option<u32>,
+    pub team: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,8 +169,8 @@ fn resolve_host(
 pub fn touch(conn: &Connection, t: &Touch<'_>, now: i64) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO agent_sessions
-            (key, agent, name, item_id, cwd, host, pid, started_at, last_seen_at, ended_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, NULL)
+            (key, agent, name, item_id, cwd, host, pid, started_at, last_seen_at, ended_at, team)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, NULL, ?9)
          ON CONFLICT(key) DO UPDATE SET
             name = COALESCE(excluded.name, name),
             item_id = COALESCE(excluded.item_id, item_id),
@@ -148,7 +178,8 @@ pub fn touch(conn: &Connection, t: &Touch<'_>, now: i64) -> rusqlite::Result<()>
             host = excluded.host,
             pid = COALESCE(excluded.pid, pid),
             last_seen_at = excluded.last_seen_at,
-            ended_at = NULL",
+            ended_at = NULL,
+            team = COALESCE(excluded.team, team)",
         params![
             t.key,
             crate::claims::agent_of(t.key),
@@ -158,6 +189,7 @@ pub fn touch(conn: &Connection, t: &Touch<'_>, now: i64) -> rusqlite::Result<()>
             this_host(),
             t.pid,
             now,
+            t.team,
         ],
     )?;
     Ok(())
@@ -165,8 +197,18 @@ pub fn touch(conn: &Connection, t: &Touch<'_>, now: i64) -> rusqlite::Result<()>
 
 pub fn end(conn: &Connection, key: &str, now: i64) -> rusqlite::Result<bool> {
     Ok(conn.execute(
-        "UPDATE agent_sessions SET ended_at = ?2 WHERE key = ?1 AND ended_at IS NULL",
+        "UPDATE agent_sessions SET ended_at = ?2, busy = 0 WHERE key = ?1 AND ended_at IS NULL",
         params![key, now],
+    )? > 0)
+}
+
+/// Marks a live session as mid-turn (`true`) or idle (`false`). Ended rows
+/// are left alone. Returns whether a row changed.
+pub fn set_busy(conn: &Connection, key: &str, busy: bool, now: i64) -> rusqlite::Result<bool> {
+    Ok(conn.execute(
+        "UPDATE agent_sessions SET busy = ?2, last_seen_at = ?3
+         WHERE key = ?1 AND ended_at IS NULL",
+        params![key, i64::from(busy), now],
     )? > 0)
 }
 
@@ -182,11 +224,13 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         started_at: r.get(7)?,
         last_seen_at: r.get(8)?,
         ended_at: r.get(9)?,
+        team: r.get(10)?,
+        busy: r.get::<_, i64>(11)? != 0,
     })
 }
 
 const COLUMNS: &str =
-    "key, agent, name, item_id, cwd, host, pid, started_at, last_seen_at, ended_at";
+    "key, agent, name, item_id, cwd, host, pid, started_at, last_seen_at, ended_at, team, busy";
 
 /// Deletes `key`'s row outright (unlike [`end`], which records it as
 /// ended -- i.e. `Liveness::Dead` -- for claim liveness). For a key that
@@ -394,5 +438,77 @@ mod tests {
             resolve(&c, "planner", 3).unwrap().map(|s| s.key),
             Some("claude-code:a".into())
         );
+    }
+
+    #[test]
+    fn migrate_twice_and_old_rows_read_back_with_defaults() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE agent_sessions (
+                key TEXT PRIMARY KEY, agent TEXT NOT NULL, name TEXT, item_id TEXT, cwd TEXT,
+                host TEXT NOT NULL, pid INTEGER, started_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL, ended_at INTEGER);
+             INSERT INTO agent_sessions (key,agent,host,started_at,last_seen_at)
+                VALUES ('claude-code:old','claude-code','h',1,1);",
+        )
+        .unwrap();
+        migrate(&c).unwrap();
+        migrate(&c).unwrap();
+        let s = get(&c, "claude-code:old").unwrap().unwrap();
+        assert_eq!(s.team, None);
+        assert!(!s.busy);
+    }
+
+    #[test]
+    fn touch_records_a_team_and_set_busy_flips_the_flag() {
+        let c = conn();
+        touch(
+            &c,
+            &Touch {
+                key: "codex:t1",
+                team: Some("alpha"),
+                ..Default::default()
+            },
+            100,
+        )
+        .unwrap();
+        let s = get(&c, "codex:t1").unwrap().unwrap();
+        assert_eq!(s.team.as_deref(), Some("alpha"));
+        assert!(!s.busy);
+        assert!(set_busy(&c, "codex:t1", true, 101).unwrap());
+        assert!(get(&c, "codex:t1").unwrap().unwrap().busy);
+        // A later touch without a team keeps the team (COALESCE).
+        touch(
+            &c,
+            &Touch {
+                key: "codex:t1",
+                ..Default::default()
+            },
+            102,
+        )
+        .unwrap();
+        assert_eq!(
+            get(&c, "codex:t1").unwrap().unwrap().team.as_deref(),
+            Some("alpha")
+        );
+        end(&c, "codex:t1", 103).unwrap();
+        assert!(
+            !set_busy(&c, "codex:t1", false, 104).unwrap(),
+            "ended rows are not updated"
+        );
+    }
+
+    #[test]
+    fn end_clears_busy_so_a_resumed_session_comes_back_idle() {
+        let c = conn();
+        let t = Touch {
+            key: "codex:t2",
+            ..Default::default()
+        };
+        touch(&c, &t, 100).unwrap();
+        set_busy(&c, "codex:t2", true, 101).unwrap();
+        end(&c, "codex:t2", 102).unwrap();
+        touch(&c, &t, 103).unwrap();
+        assert!(!get(&c, "codex:t2").unwrap().unwrap().busy);
     }
 }

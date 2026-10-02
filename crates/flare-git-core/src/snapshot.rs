@@ -57,9 +57,10 @@ fn run_git_with_index(cwd: &Path, index_file: &Path, args: &[&str]) -> Result<St
     let mut cmd = Command::new(crate::shell::git_binary());
     cmd.args(["-c", "core.autocrlf=false"])
         .args(args)
-        .current_dir(cwd)
-        .env("GIT_INDEX_FILE", index_file);
+        .current_dir(cwd);
     crate::shell::apply_filtered_path(&mut cmd);
+    // After the scrub above, which removes any inherited `GIT_INDEX_FILE`.
+    cmd.env("GIT_INDEX_FILE", index_file);
     let out = cmd
         .output()
         .map_err(|e| format!("git not available: {e}"))?;

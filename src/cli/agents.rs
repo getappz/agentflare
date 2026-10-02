@@ -38,6 +38,12 @@ pub enum AgentsAction {
         /// Codex: sandbox policy (read-only, workspace-write, danger-full-access).
         #[arg(long)]
         mode: Option<String>,
+        /// Register the session under this team (message address team:<name>).
+        #[arg(long)]
+        team: Option<String>,
+        /// Readable session name for `message send <name>`.
+        #[arg(long)]
+        name: Option<String>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -64,8 +70,17 @@ impl AgentsArgs {
                 agent,
                 model,
                 mode,
+                team,
+                name,
                 args,
-            } => crate::agents::cli_launch(&agent, model.as_deref(), mode.as_deref(), &args),
+            } => crate::agents::cli_launch(
+                &agent,
+                model.as_deref(),
+                mode.as_deref(),
+                &args,
+                team.as_deref(),
+                name.as_deref(),
+            ),
         }
     }
 }

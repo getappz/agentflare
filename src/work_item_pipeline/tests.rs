@@ -119,7 +119,7 @@ fn clean_agent_reply_fixes_claude_stream_json_so_judge_parsing_succeeds() {
 #[test]
 fn checkpoint_implementer_turn_is_a_noop_without_a_worktree_path() {
     let mut data = WorkItemData::default();
-    checkpoint_implementer_turn(&mut data, 0);
+    checkpoint_implementer_turn(&mut data, 0).unwrap();
     assert!(data.checkpoint_base_sha.is_none());
 }
 
@@ -135,7 +135,7 @@ fn checkpoint_implementer_turn_commits_and_squash_since_folds_turns_back_togethe
     };
 
     std::fs::write(worktree_path.join("real_work.txt"), "turn 1").unwrap();
-    checkpoint_implementer_turn(&mut data, 0);
+    checkpoint_implementer_turn(&mut data, 0).unwrap();
     assert_eq!(
         data.checkpoint_base_sha.as_deref(),
         Some(head_before.as_str())
@@ -147,7 +147,7 @@ fn checkpoint_implementer_turn_commits_and_squash_since_folds_turns_back_togethe
     );
 
     std::fs::write(worktree_path.join("real_work.txt"), "turn 2").unwrap();
-    checkpoint_implementer_turn(&mut data, 0);
+    checkpoint_implementer_turn(&mut data, 0).unwrap();
     // Base is captured once, not re-captured on the second checkpoint.
     assert_eq!(
         data.checkpoint_base_sha.as_deref(),
@@ -158,6 +158,69 @@ fn checkpoint_implementer_turn_commits_and_squash_since_folds_turns_back_togethe
     assert_eq!(crate::worktree::head_sha(&worktree_path), Some(head_before));
     let content = std::fs::read_to_string(worktree_path.join("real_work.txt")).unwrap();
     assert_eq!(content, "turn 2");
+}
+
+// Item #689: the worktree was hollowed out from under the agent (867 tracked
+// files gone) and the checkpoint committed that as the turn's work, leaving
+// `git status` clean over the wipe.
+#[test]
+fn checkpoint_implementer_turn_refuses_to_commit_a_mass_deletion() {
+    let (_mcp, _backend_tmp, _repo_tmp, _item_id, _project_id, worktree_path) =
+        crate::mcp_server::tests::mcp_with_claimed_item("Checkpoint wipe guard");
+    let mut data = WorkItemData {
+        worktree_path: worktree_path.to_string_lossy().to_string(),
+        ..Default::default()
+    };
+    for i in 0..30 {
+        std::fs::write(worktree_path.join(format!("f{i}.txt")), "tracked").unwrap();
+    }
+    checkpoint_implementer_turn(&mut data, 0).expect("adding files is ordinary work");
+    let head = crate::worktree::head_sha(&worktree_path).unwrap();
+
+    for i in 0..30 {
+        std::fs::remove_file(worktree_path.join(format!("f{i}.txt"))).unwrap();
+    }
+    let err = checkpoint_implementer_turn(&mut data, 0).unwrap_err();
+    assert!(err.contains("mass deletion"), "{err}");
+    assert_eq!(
+        crate::worktree::head_sha(&worktree_path).as_deref(),
+        Some(head.as_str()),
+        "the wipe must not be committed"
+    );
+    assert!(
+        flare_git_core::worktree::worktree_mass_deletion(&worktree_path).is_ok_and(|w| w.is_some()),
+        "the deletions stay visible in the working tree instead of hidden in a commit"
+    );
+}
+
+// R5: a deliberate mass deletion (item labelled `allow-mass-deletion`) must
+// be able to finish: the checkpoint commits it instead of refusing forever.
+#[test]
+fn checkpoint_implementer_turn_commits_a_labelled_mass_deletion() {
+    let (_mcp, _backend_tmp, _repo_tmp, _item_id, _project_id, worktree_path) =
+        crate::mcp_server::tests::mcp_with_claimed_item("Checkpoint wipe label");
+    let mut data = WorkItemData {
+        worktree_path: worktree_path.to_string_lossy().to_string(),
+        allow_mass_deletion: true,
+        ..Default::default()
+    };
+    for i in 0..40 {
+        std::fs::write(worktree_path.join(format!("f{i}.txt")), "tracked").unwrap();
+    }
+    checkpoint_implementer_turn(&mut data, 0).unwrap();
+    for i in 0..40 {
+        std::fs::remove_file(worktree_path.join(format!("f{i}.txt"))).unwrap();
+    }
+    let head = crate::worktree::head_sha(&worktree_path).unwrap();
+    checkpoint_implementer_turn(&mut data, 1).expect("the label waives the guard");
+    assert_ne!(
+        crate::worktree::head_sha(&worktree_path).as_deref(),
+        Some(head.as_str()),
+        "the deletion is committed as the turn's work"
+    );
+    data.allow_mass_deletion = false;
+    std::fs::write(worktree_path.join("again.txt"), "x").unwrap();
+    checkpoint_implementer_turn(&mut data, 2).expect("ordinary work still checkpoints");
 }
 
 use flare_workflow::store::InMemoryStore;

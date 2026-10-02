@@ -68,6 +68,11 @@ pub(crate) struct WorkItemData {
     /// re-resolving `owner_id()` itself.
     #[serde(default)]
     pub owner: String,
+    /// The item carried the `allow-mass-deletion` label when the run was
+    /// dispatched: a mass deletion in its worktree is deliberate, so the
+    /// checkpoint commits it instead of refusing (item #689).
+    #[serde(default)]
+    pub allow_mass_deletion: bool,
     pub reply_text: String,
     pub session_id: Option<String>,
     pub cost_usd: Option<f64>,
@@ -342,11 +347,38 @@ fn synthesize_reply_text(last_report: Option<&str>, ledger: &[String]) -> String
 /// worktree, and committing into whatever it actually is would be a
 /// correctness hazard, not just a missed checkpoint. Best-effort otherwise:
 /// a commit failure is logged, not fatal.
-fn checkpoint_implementer_turn(data: &mut WorkItemData, task_id: usize) {
+///
+/// `Err` only for a mass deletion of tracked files (item #689): a worktree
+/// hollowed out from under the agent must stop the run, not be committed as
+/// if it were the turn's work -- that made `git status` read clean over an
+/// 868-file wipe.
+fn checkpoint_implementer_turn(data: &mut WorkItemData, task_id: usize) -> Result<(), String> {
     if data.worktree_path.is_empty() {
-        return;
+        return Ok(());
     }
     let worktree_path = std::path::PathBuf::from(&data.worktree_path);
+    if !data.allow_mass_deletion {
+        match flare_git_core::worktree::worktree_mass_deletion(&worktree_path) {
+            Ok(None) => {}
+            Ok(Some(wipe)) => {
+                return Err(format!(
+                    "sdd_loop: task {task_id} checkpoint refused -- {wipe} in {}. Nothing was \
+                     committed. If the files were not deleted on purpose, `git restore --worktree \
+                     --source=HEAD -- .` there; if they were, label the item `{}` and dispatch \
+                     again.",
+                    worktree_path.display(),
+                    flare_git_core::worktree::ALLOW_MASS_DELETION_LABEL
+                ));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "sdd_loop: task {task_id} checkpoint refused -- could not check {} for a mass \
+                     deletion: {e}. Nothing was committed.",
+                    worktree_path.display()
+                ));
+            }
+        }
+    }
     if data.checkpoint_base_sha.is_none() {
         data.checkpoint_base_sha = crate::worktree::head_sha(&worktree_path);
     }
@@ -356,6 +388,7 @@ fn checkpoint_implementer_turn(data: &mut WorkItemData, task_id: usize) {
     {
         eprintln!("sdd_loop: checkpoint commit for task {task_id} failed: {e}");
     }
+    Ok(())
 }
 
 pub(crate) fn build_sdd_loop_step(
@@ -546,8 +579,13 @@ pub(crate) fn build_sdd_loop_step(
                 ctx.input_tokens += in_tok;
                 ctx.output_tokens += out_tok;
 
-                if is_implementer_turn {
-                    checkpoint_implementer_turn(&mut ctx.data, task.id);
+                if is_implementer_turn
+                    && let Err(message) = checkpoint_implementer_turn(&mut ctx.data, task.id)
+                {
+                    // `Failed`, not `Err`: retrying the step would re-run the
+                    // agent against the same wiped tree.
+                    eprintln!("{message}");
+                    return Ok(StepResult::Failed(message));
                 }
 
                 let (role_reply, role_session_id) = strip_session_marker(&raw_role_reply);
@@ -1097,6 +1135,7 @@ pub(crate) fn run_or_resume_with_sender(
     // `finalize` re-resolving `owner_id()` itself.
     let owner = crate::claims::owner_id();
     let heartbeat_owner = owner.clone();
+    let allow_mass_deletion = mcp.item_allows_mass_deletion(&item.id);
 
     let eng = engine();
     let definition = build_work_item_pipeline_with_sender(mcp.clone(), send);
@@ -1116,6 +1155,7 @@ pub(crate) fn run_or_resume_with_sender(
             agent_name: agent_name.clone(),
             judge_agent_name: judge_agent_name.clone(),
             owner: owner.clone(),
+            allow_mass_deletion,
             notify_recipient: notify_recipient.clone(),
             tasks: tasks.clone(),
             review_only,

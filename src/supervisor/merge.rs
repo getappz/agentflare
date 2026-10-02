@@ -8,6 +8,27 @@
 
 use super::*;
 
+/// PR comment `handle_ci_green` posts when reverting a stale self-repair /
+/// needs-human stage label on a passing PR.
+pub(super) const CI_GREEN_PR_COMMENT: &str =
+    "## supervisor — CI green\n\nChecks are passing again.";
+
+/// Which PR stage label `handle_ci_green` should revert before posting the
+/// CI-green comment. Skips `NEEDS_HUMAN_PR_LABEL` while CodeRabbit repair is
+/// capped with unresolved findings so the cap/CI-green label flip-flop (PR
+/// #829) cannot run.
+pub(super) fn ci_green_stale_stage_label(
+    labels: &[String],
+    coderabbit_capped: bool,
+) -> Option<&'static str> {
+    if coderabbit_capped && labels.iter().any(|l| l == NEEDS_HUMAN_PR_LABEL) {
+        return None;
+    }
+    [SELF_REPAIR_PR_LABEL, NEEDS_HUMAN_PR_LABEL]
+        .into_iter()
+        .find(|l| labels.iter().any(|have| have == l))
+}
+
 /// Whether a CI-green PR may be merged this tick, and at which head. Both
 /// arms carry the head the green verdict was made on and the PR's
 /// auto-merge handle (`worktree::AutoMergeRef`): once approved, either arm
@@ -86,16 +107,17 @@ pub(super) fn handle_ci_green(
     // label on a now-passing PR. `labels` is already in hand from
     // the batched/single fetch above, so this only touches GitHub
     // when there's actually something to revert.
-    if let Some(stale) = [SELF_REPAIR_PR_LABEL, NEEDS_HUMAN_PR_LABEL]
-        .into_iter()
-        .find(|l| labels.iter().any(|have| have == l))
-    {
+    // The cap only matters to a PR carrying `NEEDS_HUMAN_PR_LABEL`: skip its
+    // item/comment lookups on every other green PR.
+    let coderabbit_capped = labels.iter().any(|l| l == NEEDS_HUMAN_PR_LABEL)
+        && coderabbit_repair_capped_unresolved(mcp, item);
+    if let Some(stale) = ci_green_stale_stage_label(labels, coderabbit_capped) {
         update_pr_stage(
             folder_path,
             number,
             Some(stale),
             IN_REVIEW_PR_LABEL,
-            "## supervisor — CI green\n\nChecks are passing again.",
+            CI_GREEN_PR_COMMENT,
         );
     }
     // Item #303: post the one-time completion summary for whichever
@@ -478,6 +500,7 @@ pub(super) fn merge_or_repair_findings(
         CODERABBIT_REPAIR_COMPLETED_KEY,
     );
     clear_stale_coderabbit_repair_label(folder_path, number, labels, summary.as_deref());
+    clear_coderabbit_repair_cap(mcp, item);
     if merge_if_approved(mcp, item, repo_root, number, labels, merge) {
         PassingPrOutcome::Merged
     } else {

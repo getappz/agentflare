@@ -43,13 +43,18 @@ impl AgentflareMcp {
                 let body = req
                     .body
                     .ok_or_else(|| ErrorData::invalid_params("body is required for send", None))?;
-                let sent = self.send_message(conn, me, &to, &body, req.reply_to, now)?;
+                let marker = messages::validate_marker(
+                    req.marker.as_deref().unwrap_or(messages::DEFAULT_MARKER),
+                )
+                .map_err(|e| ErrorData::invalid_params(e, None))?;
+                let sent = self.send_message(conn, me, &to, &body, req.reply_to, marker, now)?;
                 serde_json::json!({
                     "sent": sent.ids,
                     "recipients": sent.recipients,
                     "to": to.trim(),
                     "item_id": sent.item_id,
                     "from": me,
+                    "marker": marker,
                 })
             }
             "list" => {
@@ -62,6 +67,8 @@ impl AgentflareMcp {
                             "agent": s.agent,
                             "name": s.name,
                             "item": s.item_id,
+                            "team": s.team,
+                            "busy": s.busy,
                             "cwd": s.cwd,
                             "host": s.host,
                             "last_seen": s.last_seen_at,
@@ -103,10 +110,20 @@ impl AgentflareMcp {
                     "unread": messages::count_undelivered(conn, me).map_err(db_err)?,
                 })
             }
+            "history" => {
+                let address = req
+                    .to
+                    .filter(|t| !t.trim().is_empty())
+                    .unwrap_or_else(|| me.to_string());
+                let limit = req.limit.unwrap_or(50).clamp(1, 500);
+                let msgs = messages::history(conn, address.trim(), req.after.unwrap_or(0), limit)
+                    .map_err(db_err)?;
+                serde_json::json!({ "address": address.trim(), "messages": msgs })
+            }
             other => {
                 return Err(ErrorData::invalid_params(
                     format!(
-                        "unknown message action: '{other}' — expected send|list|inbox|read|whoami"
+                        "unknown message action: '{other}' — expected send|list|inbox|read|whoami|history"
                     ),
                     None,
                 ));
@@ -117,6 +134,7 @@ impl AgentflareMcp {
 
     /// Resolves, stores, and (for an `item:` address) mirrors a message as
     /// an item comment.
+    #[allow(clippy::too_many_arguments)]
     fn send_message(
         &self,
         conn: &rusqlite::Connection,
@@ -124,10 +142,11 @@ impl AgentflareMcp {
         to: &str,
         body: &str,
         reply_to: Option<i64>,
+        marker: &str,
         now: i64,
     ) -> Result<messages::Sent, ErrorData> {
         messages::validate_body(body).map_err(|e| ErrorData::invalid_params(e, None))?;
-        let sent = messages::send(conn, from, to, body, reply_to, now, |raw| {
+        let sent = messages::send_marked(conn, from, to, body, reply_to, marker, now, |raw| {
             self.item_route(raw)
         })
         .map_err(|e| ErrorData::invalid_params(e, None))?;
@@ -291,7 +310,93 @@ mod tests {
             assert!(mcp.message_as(&conn, me, empty).is_err());
             assert!(mcp.message_as(&conn, me, req("read")).is_err());
             let err = mcp.message_as(&conn, me, req("bogus")).unwrap_err();
-            assert!(err.message.contains("send|list|inbox|read|whoami"));
+            assert!(err.message.contains("send|list|inbox|read|whoami|history"));
+        });
+    }
+
+    #[test]
+    fn send_accepts_a_marker_and_history_lists_an_address() {
+        with_temp_home(|| {
+            let mcp = AgentflareMcp::for_test_memory();
+            let conn = crate::db::open().unwrap();
+            let sent = json(
+                &mcp.message_as(
+                    &conn,
+                    "claude-code:me",
+                    MessageRequest {
+                        to: Some("codex:t1".into()),
+                        body: Some("s1".into()),
+                        marker: Some("Status".into()),
+                        ..req("send")
+                    },
+                )
+                .unwrap(),
+            );
+            assert_eq!(sent["marker"], "status");
+            let bad = MessageRequest {
+                to: Some("codex:t1".into()),
+                body: Some("x".into()),
+                marker: Some("urgent".into()),
+                ..req("send")
+            };
+            assert!(mcp.message_as(&conn, "claude-code:me", bad).is_err());
+
+            let out = json(
+                &mcp.message_as(
+                    &conn,
+                    "codex:t1",
+                    MessageRequest {
+                        to: Some("codex:t1".into()),
+                        ..req("history")
+                    },
+                )
+                .unwrap(),
+            );
+            let msgs = out["messages"].as_array().unwrap();
+            assert_eq!(msgs.len(), 1);
+            assert_eq!(msgs[0]["marker"], "status");
+            assert_eq!(msgs[0]["from_key"], "claude-code:me");
+            // Default address is the caller's own key; `after` cuts.
+            let mine = json(&mcp.message_as(&conn, "codex:t1", req("history")).unwrap());
+            assert_eq!(mine["address"], "codex:t1");
+            assert_eq!(mine["messages"].as_array().unwrap().len(), 1);
+            let after = json(
+                &mcp.message_as(
+                    &conn,
+                    "codex:t1",
+                    MessageRequest {
+                        after: Some(msgs[0]["id"].as_i64().unwrap()),
+                        ..req("history")
+                    },
+                )
+                .unwrap(),
+            );
+            assert!(after["messages"].as_array().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn list_reports_team_and_busy() {
+        with_temp_home(|| {
+            let mcp = AgentflareMcp::for_test_memory();
+            let conn = crate::db::open().unwrap();
+            let now = crate::claims::now();
+            crate::sessions::touch(
+                &conn,
+                &crate::sessions::Touch {
+                    key: "codex:t1",
+                    team: Some("alpha"),
+                    ..Default::default()
+                },
+                now,
+            )
+            .unwrap();
+            crate::sessions::set_busy(&conn, "codex:t1", true, now).unwrap();
+            let out = json(&mcp.message_as(&conn, "codex:t1", req("list")).unwrap());
+            let s = &out["sessions"][0];
+            assert_eq!(s["key"], "codex:t1");
+            assert_eq!(s["team"], "alpha");
+            assert_eq!(s["busy"], true);
         });
     }
 

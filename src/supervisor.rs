@@ -73,6 +73,24 @@ const NEEDS_HUMAN_PR_LABEL: &str = "agentflare:needs-human";
 /// still has unresolved findings (item #273's `coderabbit_repair_or_gate`).
 const CODERABBIT_REPAIR_PR_LABEL: &str = "agentflare:review-repair";
 
+#[cfg(test)]
+thread_local! {
+    static PR_STAGE_COMMENTS_FOR_TEST: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Drains PR-stage comment bodies recorded by `update_pr_stage` during tests
+/// (including when GitHub is unavailable).
+#[cfg(test)]
+pub(crate) fn take_pr_stage_comments_for_test() -> Vec<String> {
+    PR_STAGE_COMMENTS_FOR_TEST.with(|v| v.borrow_mut().drain(..).collect())
+}
+
+#[cfg(test)]
+fn record_pr_stage_comment_for_test(comment: &str) {
+    PR_STAGE_COMMENTS_FOR_TEST.with(|v| v.borrow_mut().push(comment.to_string()));
+}
+
 /// Best-effort GitHub-visible stage transition for a PR: removes `from` (if
 /// any -- tolerates it already being absent, same as every other caller of
 /// `remove_label`), adds `to`, and posts `comment`. Never returns an error:
@@ -81,6 +99,10 @@ const CODERABBIT_REPAIR_PR_LABEL: &str = "agentflare:review-repair";
 /// fail-open contract `relabel_pr_completed` and `merge_approved_pr` use for
 /// their own GitHub calls.
 fn update_pr_stage(folder_path: &str, number: u64, from: Option<&str>, to: &str, comment: &str) {
+    if !comment.is_empty() {
+        #[cfg(test)]
+        record_pr_stage_comment_for_test(comment);
+    }
     let Some(repo) = crate::github::RepoId::resolve_from_remote(std::path::Path::new(folder_path))
     else {
         return;
