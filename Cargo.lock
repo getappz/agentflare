@@ -1639,6 +1639,7 @@ dependencies = [
  "agent-detector",
  "agentflare-workspace-hack",
  "sysinfo",
+ "tempfile",
  "windows-sys 0.59.0",
 ]
 
