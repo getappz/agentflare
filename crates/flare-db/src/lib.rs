@@ -3,14 +3,20 @@
 mod backend;
 #[cfg(feature = "sqlite")]
 mod encrypted;
+mod error;
+pub mod events;
 mod filter;
+mod id;
 mod migrate;
 mod page;
 
-pub use backend::{Database, Pool, QUERY_BUILDER};
+pub use backend::{Database, Pool, QUERY_BUILDER, Row};
 #[cfg(feature = "sqlite")]
 pub use encrypted::{EncryptedSqliteOptions, connect_encrypted_sqlite};
-pub use filter::FilterOp;
+pub use error::{AsChoice, CrudError, Validate, ValidationError, check_choice};
+pub use events::{MutationEvent, MutationKind, clear_event_sink, set_event_sink};
+pub use filter::{FilterOp, escape_like, ilike_expr, search_condition};
+pub use id::{TimestampField, assert_timestamp, generate_id, now};
 pub use migrate::run_migrations;
 pub use page::Page;
 
@@ -21,3 +27,4 @@ pub use flare_db_macros::Crud;
 pub use sea_query;
 pub use sea_query_binder;
 pub use sqlx;
+pub use time;

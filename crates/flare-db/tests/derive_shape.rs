@@ -98,3 +98,92 @@ fn filter_op_can_be_constructed_per_variant() {
     let _: FilterOp<i64> = FilterOp::IsNull;
     let _: FilterOp<i64> = FilterOp::IsNotNull;
 }
+
+#[derive(sqlx::FromRow, Crud)]
+#[crud(table = "accounts", pk = "id", soft_delete, unique(email))]
+#[allow(dead_code)]
+struct Account {
+    #[crud(id(prefix = "acc"))]
+    id: String,
+    #[crud(immutable, searchable)]
+    email: String,
+    #[crud(readonly)]
+    version: i64,
+    #[crud(hidden)]
+    password_hash: String,
+    #[crud(computed)]
+    display: String,
+    #[crud(created_at)]
+    created_at: time::OffsetDateTime,
+    #[crud(updated_at)]
+    updated_at: time::OffsetDateTime,
+    #[crud(default = 0)]
+    score: i64,
+    deleted_at: Option<time::OffsetDateTime>,
+}
+
+#[allow(dead_code)]
+async fn _policy_api_shape_compiles(pool: &Pool) -> sqlx::Result<()> {
+    let row: AccountPublic = Account::create_one(
+        pool,
+        AccountNew {
+            id: None,
+            email: "a@b.c".into(),
+            password_hash: "x".into(),
+            score: None,
+        },
+    )
+    .await?;
+    let _: Option<AccountPartial> =
+        Account::get_select(pool, row.id.clone(), &[AccountField::Email]).await?;
+    let _: Vec<AccountPartial> =
+        Account::list_select(pool, AccountFilter::default(), Page::default(), &[]).await?;
+    let _: Vec<AccountPublic> =
+        Account::upsert_many_on(pool, &[AccountField::Email], vec![]).await?;
+    let _: Vec<AccountPublic> = Account::upsert_many(pool, vec![]).await?;
+    let _: i64 = Account::count_where(
+        pool,
+        AccountFilter {
+            q: Some("a".into()),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let _ = flare_db::CrudError::from(sqlx::Error::RowNotFound);
+    Ok(())
+}
+
+#[test]
+fn policy_attributes_shape_new_and_patch() {
+    // Exhaustive (no `..`): readonly/computed/auto fields are not in New; id and
+    // default fields are optional.
+    let AccountNew {
+        id: _,
+        email: _,
+        password_hash: _,
+        score: _,
+    } = AccountNew {
+        id: None,
+        email: String::new(),
+        password_hash: String::new(),
+        score: None,
+    };
+    // Patch: no id (pk), email (immutable), version (readonly), timestamps, deleted_at.
+    let AccountPatch {
+        password_hash: _,
+        score: _,
+    } = AccountPatch::default();
+    assert_eq!(
+        Account::COLUMNS,
+        [
+            "id",
+            "email",
+            "version",
+            "created_at",
+            "updated_at",
+            "score",
+            "deleted_at"
+        ]
+    );
+    assert_eq!(AccountField::Email.as_str(), "email");
+}
