@@ -513,9 +513,33 @@ pub(crate) fn release_and_comment(
     reason: &str,
     notify_recipient: Option<&str>,
 ) {
+    release_and_comment_inner(mcp, item_id, reason, notify_recipient, false);
+}
+
+/// Like [`release_and_comment`], but leaves the item worktree in place.
+/// Used by daemon orphan-restart reconcile so rediscovery can resume a
+/// clean mid-work checkout (item #322). True abandon releases keep using
+/// [`release_and_comment`] so item #335 cleanup still runs.
+pub(crate) fn release_and_comment_preserving_worktree(
+    mcp: &AgentflareMcp,
+    item_id: &str,
+    reason: &str,
+    notify_recipient: Option<&str>,
+) {
+    release_and_comment_inner(mcp, item_id, reason, notify_recipient, true);
+}
+
+fn release_and_comment_inner(
+    mcp: &AgentflareMcp,
+    item_id: &str,
+    reason: &str,
+    notify_recipient: Option<&str>,
+    preserve_worktree: bool,
+) {
     let _ = mcp.item_release(ItemRequest {
         action: "release".into(),
         id: Some(item_id.into()),
+        preserve_worktree: preserve_worktree.then_some(true),
         ..Default::default()
     });
     let comment_body = format!("## agentflare work — failed\n\n{reason}");

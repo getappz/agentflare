@@ -1583,9 +1583,13 @@ impl AgentflareMcp {
         // up, so an item released without going through either (abandoned,
         // or completed by hand) orphaned its `.worktrees/task/<id>` forever
         // (item #335). `cleanup_worktree` itself still refuses a dirty tree,
-        // so this is safe to attempt unconditionally here, before the claim
-        // is actually given up.
-        if owns_claim && let Some(item) = &item {
+        // so this is safe to attempt for true abandon releases, before the
+        // claim is actually given up.
+        //
+        // Orphan-restart reconcile (and any other "failed but will rediscover"
+        // path) passes `preserve_worktree` so a clean mid-work checkout stays
+        // for the next dispatch instead of being deleted and reborn (item #322).
+        if owns_claim && req.preserve_worktree != Some(true) && let Some(item) = &item {
             crate::worktree::cleanup_worktree(item, &repo_root);
         }
         let ok = self.with_backend_db(|conn| {

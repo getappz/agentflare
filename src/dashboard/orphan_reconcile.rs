@@ -72,7 +72,10 @@ pub(super) fn reconcile_orphaned_jobs(queue: &Queue) {
         }
         let owner = format!("{agent}:{job_id}");
         crate::claims::with_owner_override(owner, || {
-            crate::cli::work::release_and_comment(
+            // Preserve the worktree: orphan restart restores ready-for-work
+            // for rediscovery, and deleting a clean mid-work checkout here
+            // forces reclaim to recreate it (item #322 / #319).
+            crate::cli::work::release_and_comment_preserving_worktree(
                 &mcp,
                 item_id,
                 "orphaned by daemon restart",
