@@ -1589,7 +1589,10 @@ impl AgentflareMcp {
         // Orphan-restart reconcile (and any other "failed but will rediscover"
         // path) passes `preserve_worktree` so a clean mid-work checkout stays
         // for the next dispatch instead of being deleted and reborn (item #322).
-        if owns_claim && req.preserve_worktree != Some(true) && let Some(item) = &item {
+        if owns_claim
+            && req.preserve_worktree != Some(true)
+            && let Some(item) = &item
+        {
             crate::worktree::cleanup_worktree(item, &repo_root);
         }
         let ok = self.with_backend_db(|conn| {
