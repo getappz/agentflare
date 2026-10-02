@@ -26,8 +26,8 @@ mod wipe_guard;
 
 pub(crate) use heal::AGENTFLARE_LOCK_REASON;
 use heal::*;
-pub(crate) use orphans::dir_size;
 pub use orphans::{OrphanWorktree, audit_orphans, gc_orphans};
+pub(crate) use orphans::{delete_parked, dir_size, park_dir};
 use orphans::{is_structurally_broken, remove_worktree_dir};
 pub(crate) use process::run_output_timeout;
 use process::*;
