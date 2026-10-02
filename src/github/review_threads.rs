@@ -159,6 +159,11 @@ pub fn resolve_review_thread(client: &Client, thread_id: &str) -> Result<(), Git
 /// it. The order is the point: a thread resolved without its reply reads as
 /// silently dismissed, while a reply without the resolve is merely untidy
 /// and the next sweep finishes the job. Returns the reply's id.
+///
+/// Production supervisor calls `reply_to_review_comment` and
+/// `resolve_review_thread` separately so a body-level finding that cannot
+/// resolve still records the agent's reply.
+#[allow(dead_code)]
 pub fn reply_then_resolve(
     client: &Client,
     repo: &RepoId,

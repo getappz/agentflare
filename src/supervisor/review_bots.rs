@@ -44,6 +44,10 @@ pub(super) const CODERABBIT_REPAIR_COMPLETE_MARKER: &str =
 pub(super) const CODERABBIT_REPAIR_CAP_MARKER: &str =
     "## supervisor — CodeRabbit review repair cap reached";
 
+/// Item-metadata key recording which findings fingerprint already received a
+/// cap-reached announcement (PR #829 idempotency).
+pub(super) const CODERABBIT_REPAIR_CAP_KEY: &str = "coderabbit_repair_cap_for";
+
 /// Item-metadata keys tracking review-repair announcements (item #633
 /// follow-up): the findings snapshot is fingerprinted and the dispatch post
 /// goes out once per snapshot; retries re-dispatch silently.
@@ -119,6 +123,54 @@ pub(super) fn coderabbit_repair_capped_unresolved(
         return false;
     }
     coderabbit_repair_prior_attempts(mcp, item) >= crate::quota::decide::SELF_REPAIR_CAP
+}
+
+fn coderabbit_cap_announced_for(
+    mcp: &AgentflareMcp,
+    item: &agentflare_backend::item::Item,
+    fingerprint: &str,
+) -> bool {
+    let meta = current_metadata(mcp, item);
+    if meta
+        .get(CODERABBIT_REPAIR_CAP_KEY)
+        .and_then(|v| v.as_str())
+        == Some(fingerprint)
+    {
+        return true;
+    }
+    mcp.with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &item.id))
+        .ok()
+        .and_then(Result::ok)
+        .is_some_and(|comments| {
+            comments.iter().any(|c| {
+                c.body.starts_with(CODERABBIT_REPAIR_CAP_MARKER)
+                    && c.body.contains(fingerprint)
+            })
+        })
+}
+
+fn ensure_needs_human_item_gate(
+    mcp: &AgentflareMcp,
+    item: &agentflare_backend::item::Item,
+    label_id_by_name: &std::collections::HashMap<String, String>,
+) {
+    let Some(gate_id) = label_id_by_name.get(NEEDS_HUMAN_GATE_LABEL) else {
+        return;
+    };
+    let already = mcp
+        .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item.id))
+        .ok()
+        .and_then(Result::ok)
+        .is_some_and(|ids| ids.contains(gate_id));
+    if already {
+        return;
+    }
+    let _ = mcp.item_add_label(ItemRequest {
+        action: "add_label".into(),
+        id: Some(item.id.clone()),
+        label_id: Some(gate_id.clone()),
+        ..Default::default()
+    });
 }
 
 /// What one sweep of a PR's bot threads left for the merge gate.
@@ -761,7 +813,7 @@ pub(super) fn coderabbit_repair_or_gate(
         return SelfRepairOutcome::Skipped;
     }
 
-    let (announced_for, silent_attempts, _) = repair_track(
+    let (announced_for, _, _) = repair_track(
         item,
         CODERABBIT_REPAIR_ANNOUNCED_KEY,
         CODERABBIT_REPAIR_SILENT_KEY,
@@ -773,20 +825,14 @@ pub(super) fn coderabbit_repair_or_gate(
     let prior_attempts = coderabbit_repair_prior_attempts(mcp, item);
 
     if prior_attempts >= crate::quota::decide::SELF_REPAIR_CAP {
-        let cap_already = labels.iter().any(|l| l == NEEDS_HUMAN_PR_LABEL)
-            || mcp
-                .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &item.id))
-                .ok()
-                .and_then(Result::ok)
-                .is_some_and(|comments| {
-                    comments
-                        .iter()
-                        .any(|c| c.body.starts_with(CODERABBIT_REPAIR_CAP_MARKER))
-                });
-        if !cap_already {
+        ensure_needs_human_item_gate(mcp, item, label_id_by_name);
+        let skip_cap_announce = coderabbit_cap_announced_for(mcp, item, &fingerprint)
+            || labels.iter().any(|l| l == NEEDS_HUMAN_PR_LABEL);
+        if !skip_cap_announce {
             let cap_message = format!(
-                "{CODERABBIT_REPAIR_CAP_MARKER}\n\n{} unresolved finding(s) remain. {} automatic \
-                 repair attempt(s) already made — needs a human look.",
+                "{CODERABBIT_REPAIR_CAP_MARKER}\n\nfindings fingerprint: {fingerprint}\n\n\
+                 {} unresolved finding(s) remain. {} automatic repair attempt(s) already made — \
+                 needs a human look.",
                 findings.len(),
                 crate::quota::decide::SELF_REPAIR_CAP,
             );
@@ -796,14 +842,12 @@ pub(super) fn coderabbit_repair_or_gate(
                 body: Some(cap_message.clone()),
                 ..Default::default()
             });
-            if let Some(gate_id) = label_id_by_name.get(NEEDS_HUMAN_GATE_LABEL) {
-                let _ = mcp.item_add_label(ItemRequest {
-                    action: "add_label".into(),
-                    id: Some(item.id.clone()),
-                    label_id: Some(gate_id.clone()),
-                    ..Default::default()
-                });
-            }
+            update_metadata(mcp, &item.id, |m| {
+                m.insert(
+                    CODERABBIT_REPAIR_CAP_KEY.into(),
+                    fingerprint.clone().into(),
+                );
+            });
             update_pr_stage(
                 folder_path,
                 pr_number,

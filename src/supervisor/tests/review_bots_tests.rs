@@ -666,6 +666,52 @@ fn sweep_replies_then_resolves_a_fixed_thread_once_the_sha_is_on_the_remote() {
 }
 
 #[test]
+fn sweep_settles_a_fixed_thread_when_resolve_fails_like_body_level_findings() {
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
+    record_result(
+        &mcp,
+        &item_id,
+        "PRRT_1",
+        &ReviewResult {
+            round: 1,
+            outcome: ReviewOutcome::Fixed,
+            sha: Some("abc1234".into()),
+            note: "addressed outside the diff".into(),
+            test: None,
+        },
+    );
+    let server = MockServer::start(vec![
+        MockResponse::json(
+            200,
+            &threads_page(&[("PRRT_1", false, vec![(11, BOT, MAJOR_BODY.into())])]),
+        ),
+        MockResponse::json(200, r#"[{"sha":"abc1234deadbeef"}]"#),
+        MockResponse::json(201, r#"{"id":99}"#),
+        MockResponse::json(
+            200,
+            r#"{"errors":[{"message":"resolveReviewThread is not supported"}]}"#,
+        ),
+    ]);
+    let state = sweep(
+        &server,
+        &mcp,
+        &queue,
+        &item_id,
+        None,
+        &ReviewBotConfig::default(),
+    );
+    assert_eq!(state.replied, 1, "reply must land even when resolve fails");
+    assert!(state.to_dispatch.is_empty());
+    let meta = item_meta(&mcp, &item_id);
+    assert!(
+        thread_result(&meta, "PRRT_1").is_none(),
+        "metadata must clear once the fix sha is on the PR"
+    );
+}
+
+#[test]
 fn sweep_waits_while_a_fixed_sha_is_not_on_the_remote_and_a_job_still_runs() {
     let mcp = test_mcp();
     let queue = test_queue();

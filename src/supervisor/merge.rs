@@ -8,6 +8,11 @@
 
 use super::*;
 
+/// PR comment `handle_ci_green` posts when reverting a stale self-repair /
+/// needs-human stage label on a passing PR.
+pub(super) const CI_GREEN_PR_COMMENT: &str =
+    "## supervisor — CI green\n\nChecks are passing again.";
+
 /// Which PR stage label `handle_ci_green` should revert before posting the
 /// CI-green comment. Skips `NEEDS_HUMAN_PR_LABEL` while CodeRabbit repair is
 /// capped with unresolved findings so the cap/CI-green label flip-flop (PR
@@ -107,7 +112,7 @@ pub(super) fn handle_ci_green(
             number,
             Some(stale),
             IN_REVIEW_PR_LABEL,
-            "## supervisor — CI green\n\nChecks are passing again.",
+            CI_GREEN_PR_COMMENT,
         );
     }
     // Item #303: post the one-time completion summary for whichever

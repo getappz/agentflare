@@ -6,11 +6,14 @@
 //! `coderabbit_repair_or_gate` first. Split out rather than added to
 //! `supervisor_tests.rs`, which is frozen -- see that file's own doc comment.
 
+use std::path::Path;
+
 use super::tests::{
     coderabbit_finding, seed_gate_label, seed_in_review_item_with_claim_age, test_auth_conn,
     test_mcp, test_queue,
 };
 use super::*;
+use crate::worktree::AutoMergeRef;
 
 fn current_item(mcp: &AgentflareMcp, item_id: &str) -> agentflare_backend::item::Item {
     mcp.with_backend_db(|conn| agentflare_backend::item::get(conn, item_id).unwrap())
@@ -399,6 +402,7 @@ fn ci_self_repair_completion_summary_posts_exactly_once() {
 #[test]
 fn coderabbit_cap_and_ci_green_do_not_flip_flop_across_sweeps() {
     crate::paths::test_support::with_temp_home(|| {
+        let _ = take_pr_stage_comments_for_test();
         let mcp = test_mcp();
         let queue = test_queue();
         let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
@@ -406,6 +410,8 @@ fn coderabbit_cap_and_ci_green_do_not_flip_flop_across_sweeps() {
         let auth_conn = test_auth_conn();
         let findings = vec![coderabbit_finding(1, "coderabbitai[bot]")];
         let fingerprint = coderabbit_findings_fingerprint(&findings);
+        let repo_root = Path::new("/repo");
+        let auto_merge = AutoMergeRef::default();
 
         for _ in 0..crate::quota::decide::SELF_REPAIR_CAP {
             mcp.comment_impl(CommentRequest {
@@ -428,17 +434,9 @@ fn coderabbit_cap_and_ci_green_do_not_flip_flop_across_sweeps() {
         );
 
         let item = current_item(&mcp, &item_id);
-        assert!(
-            coderabbit_repair_capped_unresolved(&mcp, &item),
-            "metadata + marker count must read as capped-with-open findings"
-        );
+        assert!(coderabbit_repair_capped_unresolved(&mcp, &item));
 
-        let pr_needs_human = vec![NEEDS_HUMAN_PR_LABEL.to_string()];
-        assert!(
-            ci_green_stale_stage_label(&pr_needs_human, true).is_none(),
-            "CI green must not strip needs-human while CodeRabbit repair is capped"
-        );
-
+        // First cap announcement (PR not yet carrying needs-human).
         let outcome = coderabbit_repair_or_gate(
             &mcp,
             &queue,
@@ -447,20 +445,56 @@ fn coderabbit_cap_and_ci_green_do_not_flip_flop_across_sweeps() {
             &item,
             1,
             &findings,
-            &pr_needs_human,
+            &[],
             &label_id_by_name,
             "/repo",
         );
         assert!(matches!(outcome, SelfRepairOutcome::Skipped));
 
+        let labels_on_item = mcp
+            .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id).unwrap())
+            .unwrap();
+        assert!(
+            labels_on_item.contains(&label_id_by_name[NEEDS_HUMAN_GATE_LABEL]),
+            "cap must always land the item gate label"
+        );
+
+        let pr_needs_human = vec![NEEDS_HUMAN_PR_LABEL.to_string()];
+        assert!(
+            ci_green_stale_stage_label(&pr_needs_human, true).is_none(),
+            "CI green must not strip needs-human while CodeRabbit repair is capped"
+        );
+
         const SWEEPS: usize = 8;
         for _ in 0..SWEEPS {
-            let labels = vec![IN_REVIEW_PR_LABEL.to_string()];
-            assert!(
-                ci_green_stale_stage_label(&labels, true).is_none(),
-                "simulated post-CI-green labels must not invite another needs-human revert"
-            );
             let item = current_item(&mcp, &item_id);
+            let mut sweep = ReviewSweepResult {
+                promoted: 0,
+                self_repaired: 0,
+                review_repaired: 0,
+                skipped: 0,
+                waiting: 0,
+                updated: 0,
+                discovered: 0,
+                requeued: 0,
+            };
+            handle_ci_green(
+                &mcp,
+                &queue,
+                &auth_conn,
+                agentflare_resource_gate::Policy::Normal,
+                &item,
+                1,
+                &pr_needs_human,
+                CiGreenMerge::Allowed {
+                    head_sha: None,
+                    auto_merge: &auto_merge,
+                },
+                &label_id_by_name,
+                "/repo",
+                repo_root,
+                &mut sweep,
+            );
             let outcome = coderabbit_repair_or_gate(
                 &mcp,
                 &queue,
@@ -469,12 +503,22 @@ fn coderabbit_cap_and_ci_green_do_not_flip_flop_across_sweeps() {
                 &item,
                 1,
                 &findings,
-                &labels,
+                &pr_needs_human,
                 &label_id_by_name,
                 "/repo",
             );
             assert!(matches!(outcome, SelfRepairOutcome::Skipped));
         }
+
+        let pr_stage_comments = take_pr_stage_comments_for_test();
+        assert_eq!(
+            pr_stage_comments
+                .iter()
+                .filter(|c| c.contains("CI green"))
+                .count(),
+            0,
+            "handle_ci_green must not post CI-green PR comments while capped"
+        );
 
         let comments = mcp
             .with_backend_db(|conn| {
@@ -488,14 +532,6 @@ fn coderabbit_cap_and_ci_green_do_not_flip_flop_across_sweeps() {
                 .count(),
             1,
             "cap reached must be announced on the item exactly once across sweeps"
-        );
-        assert_eq!(
-            comments
-                .iter()
-                .filter(|c| c.body.contains("CI green"))
-                .count(),
-            0,
-            "capped CodeRabbit repair must not post CI-green item comments"
         );
     });
 }
