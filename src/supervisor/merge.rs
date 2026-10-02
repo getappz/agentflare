@@ -26,7 +26,6 @@ pub(super) fn ci_green_stale_stage_label(
     }
     [SELF_REPAIR_PR_LABEL, NEEDS_HUMAN_PR_LABEL]
         .into_iter()
-        .filter(|l| *l != NEEDS_HUMAN_PR_LABEL || !coderabbit_capped)
         .find(|l| labels.iter().any(|have| have == l))
 }
 
@@ -108,7 +107,10 @@ pub(super) fn handle_ci_green(
     // label on a now-passing PR. `labels` is already in hand from
     // the batched/single fetch above, so this only touches GitHub
     // when there's actually something to revert.
-    let coderabbit_capped = coderabbit_repair_capped_unresolved(mcp, item);
+    // The cap only matters to a PR carrying `NEEDS_HUMAN_PR_LABEL`: skip its
+    // item/comment lookups on every other green PR.
+    let coderabbit_capped = labels.iter().any(|l| l == NEEDS_HUMAN_PR_LABEL)
+        && coderabbit_repair_capped_unresolved(mcp, item);
     if let Some(stale) = ci_green_stale_stage_label(labels, coderabbit_capped) {
         update_pr_stage(
             folder_path,
@@ -498,6 +500,7 @@ pub(super) fn merge_or_repair_findings(
         CODERABBIT_REPAIR_COMPLETED_KEY,
     );
     clear_stale_coderabbit_repair_label(folder_path, number, labels, summary.as_deref());
+    clear_coderabbit_repair_cap(mcp, item);
     if merge_if_approved(mcp, item, repo_root, number, labels, merge) {
         PassingPrOutcome::Merged
     } else {

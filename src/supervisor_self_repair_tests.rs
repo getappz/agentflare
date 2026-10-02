@@ -465,8 +465,15 @@ fn coderabbit_cap_and_ci_green_do_not_flip_flop_across_sweeps() {
             "CI green must not strip needs-human while CodeRabbit repair is capped"
         );
 
+        // The cap side runs against a label map with no gate label, as on a
+        // project that has none: the item never reads as already gated, so
+        // every sweep re-enters the cap branch -- the state PR #829 looped
+        // in. Odd sweeps drop the PR's stage label too, so the fingerprint
+        // guard is what has to hold, not only the label one.
+        let ungated = std::collections::HashMap::new();
+        let pr_in_review = vec![IN_REVIEW_PR_LABEL.to_string()];
         const SWEEPS: usize = 8;
-        for _ in 0..SWEEPS {
+        for sweep_no in 0..SWEEPS {
             let item = current_item(&mcp, &item_id);
             let mut sweep = ReviewSweepResult {
                 promoted: 0,
@@ -503,8 +510,12 @@ fn coderabbit_cap_and_ci_green_do_not_flip_flop_across_sweeps() {
                 &item,
                 1,
                 &findings,
-                &pr_needs_human,
-                &label_id_by_name,
+                if sweep_no % 2 == 0 {
+                    &pr_needs_human
+                } else {
+                    &pr_in_review
+                },
+                &ungated,
                 "/repo",
             );
             assert!(matches!(outcome, SelfRepairOutcome::Skipped));
@@ -589,6 +600,27 @@ fn coderabbit_capped_unresolved_when_new_cap_fingerprint_differs_from_completed(
         assert!(
             coderabbit_repair_capped_unresolved(&mcp, &item),
             "new capped findings must stay unresolved even when an earlier fingerprint completed"
+        );
+
+        // ...and the cap closes once the findings clear, though `fp_b` was
+        // never the announced fingerprint a completion is recorded against.
+        let outcome = coderabbit_repair_or_gate(
+            &mcp,
+            &test_queue(),
+            &test_auth_conn(),
+            agentflare_resource_gate::Policy::Normal,
+            &item,
+            1,
+            &[],
+            &[],
+            &seed_gate_label(&mcp),
+            "/repo",
+        );
+        assert!(matches!(outcome, SelfRepairOutcome::Skipped));
+        let item = current_item(&mcp, &item_id);
+        assert!(
+            !coderabbit_repair_capped_unresolved(&mcp, &item),
+            "a cap whose findings are all resolved must stop holding needs-human"
         );
     });
 }

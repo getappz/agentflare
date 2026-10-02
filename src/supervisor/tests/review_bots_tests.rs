@@ -805,6 +805,43 @@ fn sweep_retains_pending_body_level_fixed_result_without_posting_detached_commen
 }
 
 #[test]
+fn sweep_drops_a_body_level_fixed_result_once_its_sha_is_on_the_pr() {
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
+    record_result(
+        &mcp,
+        &item_id,
+        "body:src/lib.rs:1",
+        &ReviewResult {
+            round: 1,
+            outcome: ReviewOutcome::Fixed,
+            sha: Some("abc1234".into()),
+            note: "fixed in module docs".into(),
+            test: None,
+        },
+    );
+    let server = MockServer::start(vec![
+        MockResponse::json(200, &threads_page(&[])),
+        MockResponse::json(200, r#"[{"sha":"abc1234deadbeef"}]"#),
+    ]);
+    let _state = sweep(
+        &server,
+        &mcp,
+        &queue,
+        &item_id,
+        None,
+        &ReviewBotConfig::default(),
+    );
+    let reqs = server.requests();
+    assert_eq!(reqs.len(), 2, "threads, then the commit list: {reqs:?}");
+    assert!(
+        thread_result(&item_meta(&mcp, &item_id), "body:src/lib.rs:1").is_none(),
+        "a body-level fix whose sha is on the PR must not stay pending forever"
+    );
+}
+
+#[test]
 fn sweep_replies_without_resolving_for_a_not_valid_result() {
     let mcp = test_mcp();
     let queue = test_queue();
