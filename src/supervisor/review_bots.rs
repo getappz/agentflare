@@ -110,16 +110,17 @@ pub(super) fn coderabbit_repair_capped_unresolved(
     mcp: &AgentflareMcp,
     item: &agentflare_backend::item::Item,
 ) -> bool {
-    if coderabbit_repair_prior_attempts(mcp, item) < crate::quota::decide::SELF_REPAIR_CAP {
-        return false;
-    }
     // A recorded cap stays open until the findings clear
     // (`clear_coderabbit_repair_cap`). Its fingerprint is taken when the cap
     // trips, so it need not be the announced one -- the only fingerprint
     // `CODERABBIT_REPAIR_COMPLETED_KEY` is ever set to -- and comparing the
-    // two could never close it.
+    // two could never close it. Checked before the attempt count, which
+    // reads low when its comment lookup fails.
     if current_metadata(mcp, item).contains_key(CODERABBIT_REPAIR_CAP_KEY) {
         return true;
+    }
+    if coderabbit_repair_prior_attempts(mcp, item) < crate::quota::decide::SELF_REPAIR_CAP {
+        return false;
     }
     let (announced_for, _, completed_for) = repair_track(
         item,
