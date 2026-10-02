@@ -69,6 +69,16 @@ struct Audited {
     deleted_at: Option<OffsetDateTime>,
 }
 
+// A raw identifier names the column without the `r#` prefix.
+#[derive(sqlx::FromRow, Crud)]
+#[crud(table = "kinds", pk = "id")]
+#[allow(dead_code)]
+struct Kind {
+    id: i64,
+    #[sqlx(rename = "type")]
+    r#type: String,
+}
+
 async fn pool() -> flare_db::Pool {
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
@@ -83,6 +93,7 @@ async fn pool() -> flare_db::Pool {
             deleted_at TIMESTAMP NULL, amount INTEGER NOT NULL)",
         "CREATE TABLE audited (
             id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, deleted_at TIMESTAMP NULL)",
+        "CREATE TABLE kinds (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL)",
         "CREATE TABLE parent (id INTEGER PRIMARY KEY)",
         "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL REFERENCES parent(id))",
     ] {
@@ -420,6 +431,10 @@ async fn q_search_is_case_insensitive_or_across_fields_and_escapes_wildcards() {
         ("bob@x.io", "Gadget_v2"),
         ("cat@x.io", "Other thing"),
         ("dan@x.io", "Plain"),
+        // The only value with a backslash. If `\` were not escaped it would act as
+        // the LIKE escape character and match the `%` row instead, so the test checks
+        // *which* row comes back, not just how many.
+        ("bs@x.io", "Back\\slash"),
     ] {
         Order::create_one(&pool, new_order(email, title))
             .await
@@ -437,9 +452,19 @@ async fn q_search_is_case_insensitive_or_across_fields_and_escapes_wildcards() {
     assert_eq!(count("cat@").await, 1, "matches the email field too");
     assert_eq!(count("%").await, 1, "% is literal, not a wildcard");
     assert_eq!(count("_").await, 1, "_ is literal, not a wildcard");
-    assert_eq!(count("\\").await, 0, "backslash is literal");
-    assert_eq!(count("   ").await, 4, "blank q restricts nothing");
-    assert_eq!(count("x.io").await, 4);
+    let backslash = Order::list_where(&pool, search("\\"), Page::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        backslash
+            .iter()
+            .map(|o| o.email.as_str())
+            .collect::<Vec<_>>(),
+        ["bs@x.io"],
+        "backslash is matched literally, not treated as an escape"
+    );
+    assert_eq!(count("   ").await, 5, "blank q restricts nothing");
+    assert_eq!(count("x.io").await, 5);
     assert_eq!(count("100%' OR '1'='1").await, 0, "values are bound");
 }
 
@@ -717,4 +742,128 @@ async fn soft_delete_and_restore_bump_updated_at() {
     Order::restore(&pool, a.id.clone()).await.unwrap();
     let restored = Order::get(&pool, a.id.clone()).await.unwrap().unwrap();
     assert!(restored.updated_at > deleted[0].updated_at);
+}
+
+fn with_deleted() -> OrderFilter {
+    OrderFilter {
+        with_deleted: true,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn soft_delete_and_restore_only_change_rows_whose_state_changes() {
+    let pool = pool().await;
+    let a = Order::create_one(&pool, new_order("g1@x.io", "t"))
+        .await
+        .unwrap();
+    let b = Order::create_one(&pool, new_order("g2@x.io", "t"))
+        .await
+        .unwrap();
+    nap().await;
+    Order::soft_delete(&pool, a.id.clone()).await.unwrap();
+    let after_first = Order::list_where(&pool, with_deleted(), Page::default())
+        .await
+        .unwrap();
+    let first = after_first.iter().find(|o| o.id == a.id).unwrap();
+
+    // Deleting a deleted row again must not move deleted_at or updated_at.
+    nap().await;
+    Order::soft_delete(&pool, a.id.clone()).await.unwrap();
+    let n = Order::soft_delete_where(
+        &pool,
+        OrderFilter {
+            id: Some(FilterOp::Eq(a.id.clone())),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, 0, "an already-deleted row is not deleted again");
+    let after_second = Order::list_where(&pool, with_deleted(), Page::default())
+        .await
+        .unwrap();
+    let second = after_second.iter().find(|o| o.id == a.id).unwrap();
+    assert_eq!(second.deleted_at, first.deleted_at);
+    assert_eq!(second.updated_at, first.updated_at);
+
+    // Restoring a live row is a no-op that leaves updated_at alone.
+    nap().await;
+    Order::restore(&pool, b.id.clone()).await.unwrap();
+    let n = Order::restore_where(
+        &pool,
+        OrderFilter {
+            id: Some(FilterOp::Eq(b.id.clone())),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, 0, "a live row is not restored");
+    let live = Order::get(&pool, b.id.clone()).await.unwrap().unwrap();
+    assert_eq!(live.updated_at, b.updated_at);
+}
+
+#[tokio::test]
+async fn updates_do_not_reach_soft_deleted_rows() {
+    let pool = pool().await;
+    let a = Order::create_one(&pool, new_order("u1@x.io", "before"))
+        .await
+        .unwrap();
+    Order::soft_delete(&pool, a.id.clone()).await.unwrap();
+    let patch = || OrderPatch {
+        title: Some("after".into()),
+        ..Default::default()
+    };
+
+    let err = Order::update_one(&pool, a.id.clone(), patch())
+        .await
+        .must_fail();
+    assert!(matches!(err, sqlx::Error::RowNotFound), "{err:?}");
+    let err = Order::update_many(&pool, vec![(a.id.clone(), patch())])
+        .await
+        .must_fail();
+    assert!(matches!(err, sqlx::Error::RowNotFound), "{err:?}");
+    let filter = || OrderFilter {
+        id: Some(FilterOp::Eq(a.id.clone())),
+        ..Default::default()
+    };
+    assert_eq!(
+        Order::update_where(&pool, filter(), patch()).await.unwrap(),
+        0
+    );
+
+    // Opting in the same way reads do reaches the row.
+    let mut opted_in = filter();
+    opted_in.with_deleted = true;
+    assert_eq!(
+        Order::update_where(&pool, opted_in, patch()).await.unwrap(),
+        1
+    );
+    let rows = Order::list_where(&pool, with_deleted(), Page::default())
+        .await
+        .unwrap();
+    assert_eq!(rows[0].title, "after");
+}
+
+#[tokio::test]
+async fn raw_identifier_fields_use_the_unprefixed_column_name() {
+    let pool = pool().await;
+    assert_eq!(KindField::Type.as_str(), "type");
+    let k = Kind::create_one(&pool, KindNew { r#type: "x".into() })
+        .await
+        .unwrap();
+    assert_eq!(k.r#type, "x");
+    let got = Kind::get(&pool, k.id).await.unwrap().unwrap();
+    assert_eq!(got.r#type, "x");
+    let n = Kind::count_where(
+        &pool,
+        KindFilter {
+            r#type: Some(FilterOp::Eq("x".into())),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, 1);
 }

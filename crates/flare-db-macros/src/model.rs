@@ -33,7 +33,9 @@ pub fn unwrap_option(ty: &Type) -> Option<&Type> {
 }
 
 pub fn col_lit(f: &FieldInfo) -> LitStr {
-    LitStr::new(&f.ident.to_string(), f.ident.span())
+    // `r#type` names the column `type`, not `r#type`.
+    use syn::ext::IdentExt as _;
+    LitStr::new(&f.ident.unraw().to_string(), f.ident.span())
 }
 
 pub fn pascal(ident: &Ident) -> Ident {

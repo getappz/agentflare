@@ -142,6 +142,9 @@ pub fn gen_impl(m: &Model, n: &Names) -> TokenStream {
                 q.table(#table)
                     .value("deleted_at", flare_db::sea_query::Expr::current_timestamp())
                     .and_where(flare_db::sea_query::Expr::col(#pk_col).eq(#pk_ident));
+                // Only a live row changes state: an already-deleted row keeps its
+                // original `deleted_at` and `updated_at`, and emits no event.
+                #soft_guard_stmt
                 #touch_updated_at
                 let (sql, values) = q.build_sqlx(flare_db::QUERY_BUILDER);
                 let done = flare_db::sqlx::query_with(flare_db::sqlx::AssertSqlSafe(sql), values).execute(pool).await?;
@@ -159,6 +162,8 @@ pub fn gen_impl(m: &Model, n: &Names) -> TokenStream {
                 q.table(#table)
                     .value("deleted_at", flare_db::sea_query::Value::from(None::<#inner>))
                     .and_where(flare_db::sea_query::Expr::col(#pk_col).eq(#pk_ident));
+                // Only a deleted row is restored; a live row is left untouched.
+                q.and_where(flare_db::sea_query::Expr::col("deleted_at").is_not_null());
                 #touch_updated_at
                 let (sql, values) = q.build_sqlx(flare_db::QUERY_BUILDER);
                 let done = flare_db::sqlx::query_with(flare_db::sqlx::AssertSqlSafe(sql), values).execute(pool).await?;
@@ -170,9 +175,11 @@ pub fn gen_impl(m: &Model, n: &Names) -> TokenStream {
 
             pub async fn soft_delete_where<'e>(pool: impl flare_db::sqlx::Executor<'e, Database = flare_db::Database>, filter: #filter_ty) -> flare_db::sqlx::Result<u64> {
                 use flare_db::sea_query_binder::SqlxBinder as _;
+                use flare_db::sea_query::ExprTrait as _;
                 let mut q = flare_db::sea_query::Query::update();
                 q.table(#table).value("deleted_at", flare_db::sea_query::Expr::current_timestamp());
                 q.cond_where(Self::__where(filter));
+                #soft_guard_stmt
                 #touch_updated_at
                 let (sql, values) = q.build_sqlx(flare_db::QUERY_BUILDER);
                 let done = flare_db::sqlx::query_with(flare_db::sqlx::AssertSqlSafe(sql), values).execute(pool).await?;
@@ -184,9 +191,11 @@ pub fn gen_impl(m: &Model, n: &Names) -> TokenStream {
 
             pub async fn restore_where<'e>(pool: impl flare_db::sqlx::Executor<'e, Database = flare_db::Database>, filter: #filter_ty) -> flare_db::sqlx::Result<u64> {
                 use flare_db::sea_query_binder::SqlxBinder as _;
+                use flare_db::sea_query::ExprTrait as _;
                 let mut q = flare_db::sea_query::Query::update();
                 q.table(#table).value("deleted_at", flare_db::sea_query::Value::from(None::<#inner>));
                 q.cond_where(Self::__where(filter));
+                q.and_where(flare_db::sea_query::Expr::col("deleted_at").is_not_null());
                 #touch_updated_at
                 let (sql, values) = q.build_sqlx(flare_db::QUERY_BUILDER);
                 let done = flare_db::sqlx::query_with(flare_db::sqlx::AssertSqlSafe(sql), values).execute(pool).await?;
@@ -484,6 +493,8 @@ pub fn gen_impl(m: &Model, n: &Names) -> TokenStream {
                 }
                 #touch_updated_at
                 q.and_where(flare_db::sea_query::Expr::col(#pk_col).eq(#pk_ident));
+                // Reads hide soft-deleted rows, so a patch must not reach one either.
+                #soft_guard_stmt
                 q.returning(Self::__returning());
                 let (sql, values) = q.build_sqlx(flare_db::QUERY_BUILDER);
                 flare_db::sqlx::query_as_with::<_, #out_ty, _>(flare_db::sqlx::AssertSqlSafe(sql), values).fetch_one(pool).await
@@ -531,7 +542,9 @@ pub fn gen_impl(m: &Model, n: &Names) -> TokenStream {
                     return Ok(0);
                 }
                 #touch_updated_at
-                q.cond_where(Self::__where(filter));
+                // Same visibility as reads: soft-deleted rows are skipped unless the
+                // filter opts in (`with_deleted` or an explicit `deleted_at`).
+                q.cond_where(Self::__read_cond(filter));
                 let (sql, values) = q.build_sqlx(flare_db::QUERY_BUILDER);
                 let done = flare_db::sqlx::query_with(flare_db::sqlx::AssertSqlSafe(sql), values).execute(pool).await?;
                 if done.rows_affected() > 0 {
