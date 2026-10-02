@@ -24,6 +24,7 @@ use std::ffi::OsStr;
 use std::process::Command;
 
 pub mod agent;
+pub mod cwd;
 pub use agent::{agent_name, is_agent};
 
 /// `Command::new(program)` plus `CREATE_NO_WINDOW` on Windows: the child never
