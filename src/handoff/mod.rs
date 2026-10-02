@@ -169,7 +169,12 @@ pub fn doctor(db: Option<PathBuf>) -> Result<String, String> {
         Err(e) => lines.push(format!("insights db: {e}")),
     }
     let config = flare_insights::config::InsightsConfig::default();
-    let mut sources: Vec<(&String, &PathBuf)> = config.sources.iter().collect();
+    // Documented ingest sources only; reserved stubs (gemini/copilot) stay out of doctor.
+    let mut sources: Vec<(&String, &PathBuf)> = config
+        .sources
+        .iter()
+        .filter(|(name, _)| matches!(name.as_str(), "claude_code" | "codex" | "opencode"))
+        .collect();
     sources.sort_by(|a, b| a.0.cmp(b.0));
     for (name, path) in sources {
         lines.push(format!(

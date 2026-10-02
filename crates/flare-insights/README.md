@@ -10,7 +10,7 @@ Unified local-first observability for AI coding agent sessions — `agentflare`'
 
 | Layer | What |
 |-------|------|
-| **Ingest** | Adapters for Claude Code (`~/.agentflare/projects/*.jsonl` + hook), Codex (`~/.codex/sessions`), OpenCode (`opencode.db` SQLite), Cursor/Gemini/Copilot/Amp/Pi/Qoder/OpenClaw/Kimi — `CLAUDE_PROJECTS_DIR` env overrides, file watcher + poll, fail-open |
+| **Ingest** | Adapters for Claude Code (`~/.claude/projects/*.jsonl` + hook), Codex (`~/.codex/sessions`), OpenCode (`opencode.db` SQLite) only — Cursor/Gemini/Copilot/etc. reserved for later; `CLAUDE_PROJECTS_DIR` env overrides, file watcher + poll, fail-open |
 | **Store** | SQLite `observatory.db` with FTS5 trigram index, WAL, `turns_fts` triggers, retention prune |
 | **Replay** | `Turn → Generation → ToolSpan` timeline, tool payload renderers (Bash terminal, Read chip, Edit diff, Grep matches, MCP kv), subagent tree, file timeline, queued-input placement |
 | **Search** | FTS5 + trigram fuzzy + hybrid-ready (`flare-search-kit`), `GET /api/search?q=` + `local-session-search` skill pattern |
@@ -68,6 +68,6 @@ Uses `agentflare-flare-insights` as lib: `flare_insights::store::InsightsStore::
 ## Next steps
 
 - [ ] Flesh `api.rs` axum + `tokio-tungstenite` WS (behind `api` feature)
-- [ ] Add `cursor/gemini/copilot` adapters (SQLite/protobuf)
+- [ ] Add `cursor/gemini/copilot` adapters when a consumer asks (SQLite/protobuf; not advertised until then)
 - [ ] Hook server `127.0.0.1:4318` OTEL bridge (langfuse parity)
 - [ ] Frontend Svelte5 dashboard (reuse agentsview assets)
