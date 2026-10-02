@@ -112,9 +112,43 @@ pub struct ScanInput<'a> {
     pub live: &'a [flare_process::cwd::LiveProc],
 }
 
-fn wanted(opts: &CleanOptions, label: &str) -> bool {
-    (opts.only.is_empty() || opts.only.iter().any(|g| glob_match(g, label)))
-        && !opts.exclude.iter().any(|g| glob_match(g, label))
+/// `--only` / `--exclude`: a glob may name the label (a path, for worktrees
+/// and artifacts) or the branch an item carries.
+fn wanted(opts: &CleanOptions, label: &str, branch: Option<&str>) -> bool {
+    let hit = |g: &String| glob_match(g, label) || branch.is_some_and(|b| glob_match(g, b));
+    (opts.only.is_empty() || opts.only.iter().any(hit)) && !opts.exclude.iter().any(hit)
+}
+
+fn scan_git(input: &ScanInput, repo_root: &Path, plan: &mut Plan) {
+    let opts = input.opts;
+    // Never guessed from HEAD: a wrong "default" would make the real trunk
+    // look merged into a feature branch.
+    let Some(default) = crate::branch::resolve_default_branch_known(repo_root) else {
+        plan.notes.push(
+            "could not determine the default branch (no origin/HEAD, main or master): \
+             branch and worktree cleanup skipped"
+                .into(),
+        );
+        return;
+    };
+    if opts.branches || opts.worktrees {
+        let branches = merged::classify_local(input, repo_root, &default);
+        let (items, skipped) = worktrees::candidates(input, repo_root, branches);
+        plan.items.extend(items);
+        plan.skipped.extend(skipped);
+    }
+    if opts.remote {
+        let (items, skipped) = merged::classify_remote(input, repo_root, &default);
+        plan.items.extend(items);
+        plan.skipped.extend(skipped);
+    }
+    if !input.pr_lookup_available {
+        plan.notes.push(
+            "GitHub lookup unavailable: squash-merged branches could not be verified and \
+             are listed as not merged"
+                .into(),
+        );
+    }
 }
 
 /// Builds the plan. Read-only: nothing is deleted, moved or fetched.
@@ -122,38 +156,36 @@ fn wanted(opts: &CleanOptions, label: &str) -> bool {
 pub fn scan(input: &ScanInput) -> Plan {
     let mut plan = Plan::default();
     let opts = input.opts;
-    let git = opts.branches || opts.worktrees || opts.remote;
-    if let Some(repo_root) = input.repo_root {
-        let default = crate::branch::resolve_default_branch(repo_root);
-        if opts.branches || opts.worktrees {
-            let branches = merged::classify_local(input, repo_root, &default);
-            let (items, skipped) = worktrees::candidates(input, repo_root, branches);
-            plan.items.extend(items);
-            plan.skipped.extend(skipped);
+    if opts.branches || opts.worktrees || opts.remote {
+        match input.repo_root {
+            Some(repo_root) => scan_git(input, repo_root, &mut plan),
+            None => plan
+                .notes
+                .push("not a git repository: branch and worktree cleanup skipped".into()),
         }
-        if opts.remote {
-            let (items, skipped) = merged::classify_remote(input, repo_root, &default);
-            plan.items.extend(items);
-            plan.skipped.extend(skipped);
-        }
-        if git && !input.pr_lookup_available {
-            plan.notes.push(
-                "GitHub lookup unavailable: squash-merged branches could not be verified and \
-                 are listed as not merged"
-                    .into(),
-            );
-        }
-    } else if git {
-        plan.notes
-            .push("not a git repository: branch and worktree cleanup skipped".into());
     }
     if let Some(kinds) = &opts.artifacts {
         let (items, skipped) = artifacts::scan(input, kinds);
         plan.items.extend(items);
         plan.skipped.extend(skipped);
     }
-    plan.items.retain(|i| wanted(opts, &i.label));
-    plan.skipped.retain(|s| wanted(opts, &s.label));
+    plan.items
+        .retain(|i| wanted(opts, &i.label, i.branch.as_deref()));
+    plan.skipped.retain(|s| wanted(opts, &s.label, None));
+    // A worktree that is going away takes its artifacts with it.
+    let doomed: Vec<PathBuf> = plan
+        .items
+        .iter()
+        .filter(|i| matches!(i.kind, Kind::Worktree | Kind::Orphan))
+        .filter_map(|i| i.path.clone())
+        .collect();
+    plan.items.retain(|i| {
+        i.kind != Kind::Artifact
+            || !i
+                .path
+                .as_ref()
+                .is_some_and(|p| doomed.iter().any(|d| p.starts_with(d)))
+    });
     plan.items
         .sort_by(|a, b| (a.kind, b.size_bytes, &a.label).cmp(&(b.kind, a.size_bytes, &b.label)));
     plan.skipped.sort_by(|a, b| a.label.cmp(&b.label));
@@ -318,5 +350,65 @@ mod tests {
             v.iter().map(|x| x * 2).collect::<Vec<_>>()
         );
         assert!(par_map(&Vec::<u32>::new(), |x| *x).is_empty());
+    }
+
+    fn add_worktree(repo: &Path, rel: &str, branch: &str) -> PathBuf {
+        let path = repo.join(rel);
+        let p = path.to_str().unwrap();
+        run_in(repo, &["worktree", "add", "-b", branch, p]).unwrap();
+        path
+    }
+
+    // Review finding 4: filters name a branch, and a worktree's label is its path.
+    #[test]
+    fn only_and_exclude_also_match_a_worktrees_branch() {
+        let repo = init_repo_with_branch("master");
+        add_worktree(&repo.path, ".worktrees/task/7", "task/7-x");
+        let exclude = CleanOptions {
+            exclude: vec!["task/7-*".into()],
+            ..git_opts()
+        };
+        assert!(scan_repo(&repo.path, &exclude).items.is_empty());
+        let only = CleanOptions {
+            only: vec!["task/7-*".into()],
+            ..git_opts()
+        };
+        assert_eq!(scan_repo(&repo.path, &only).items.len(), 1);
+    }
+
+    // Review finding 5: never guess the default branch from HEAD.
+    #[test]
+    fn unknown_default_branch_skips_git_cleanup_with_a_note() {
+        let repo = init_repo_with_branch("develop");
+        run_in(&repo.path, &["switch", "-c", "feat"]).unwrap();
+        let plan = scan_repo(&repo.path, &git_opts());
+        assert!(plan.items.is_empty(), "{:?}", plan.items);
+        assert!(
+            plan.notes.iter().any(|n| n.contains("default branch")),
+            "{:?}",
+            plan.notes
+        );
+    }
+
+    // Review finding 9: a removable worktree already accounts for the
+    // artifacts inside it.
+    #[test]
+    fn artifacts_inside_a_planned_worktree_are_not_planned_twice() {
+        let repo = init_repo_with_branch("master");
+        let r = &repo.path;
+        std::fs::write(r.join(".gitignore"), "target/\n.worktrees/\n").unwrap();
+        std::fs::write(r.join("Cargo.toml"), "[package]\nname='x'\n").unwrap();
+        run_in(r, &["add", "."]).unwrap();
+        run_in(r, &["commit", "-m", "base"]).unwrap();
+        let wt = add_worktree(r, ".worktrees/task/7", "task/7-x");
+        std::fs::create_dir_all(wt.join("target")).unwrap();
+        std::fs::write(wt.join("target/a.o"), b"obj").unwrap();
+        let opts = CleanOptions {
+            artifacts: Some(Vec::new()),
+            ..git_opts()
+        };
+        let plan = scan_repo(r, &opts);
+        let ids: Vec<&str> = plan.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, ["worktree:.worktrees/task/7"]);
     }
 }
