@@ -238,6 +238,9 @@ pub(crate) fn extract_limit_snippet(text: &str) -> Option<String> {
         "you\u{2019}ve hit your",
         "weekly limit",
         "monthly limit",
+        "daily limit",
+        "per day",
+        "day limit",
         "5-hour limit",
         "try again in",
         "resets at",
@@ -843,6 +846,13 @@ mod classify_tests {
         let msg = "codex exited non-zero\nYou've hit your usage limit. Try again in 3 hours.";
         let snippet = extract_limit_snippet(msg).expect("snippet");
         assert!(snippet.contains("Try again in 3 hours"));
+    }
+
+    #[test]
+    fn extract_limit_snippet_finds_daily_limit_line() {
+        let msg = "agent exited\nRESOURCE_EXHAUSTED: daily limit reached; try tomorrow.";
+        let snippet = extract_limit_snippet(msg).expect("daily snippet");
+        assert!(snippet.to_lowercase().contains("daily limit"));
     }
 
     #[test]
