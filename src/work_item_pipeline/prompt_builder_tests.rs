@@ -183,6 +183,8 @@ fn judge_prompt_instructs_json_only_output() {
     );
     assert!(prompt.contains("JSON"));
     assert!(prompt.contains("DONE: implemented flag"));
+    assert!(prompt.contains("Do not include task_model_tier unless action is insert_task"));
+    assert!(prompt.contains("localized edit"));
 }
 
 #[test]

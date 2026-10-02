@@ -9,6 +9,13 @@ fn parses_valid_decision() {
 }
 
 #[test]
+fn parses_string_null_task_model_tier_as_none() {
+    let reply = r#"{"action":"advance_task","rationale":"x","ledger_line":"x","task_model_tier":"null"}"#;
+    let decision = parse_judge_decision(reply).expect("string null tier");
+    assert_eq!(decision.task_model_tier, None);
+}
+
+#[test]
 fn parses_decision_wrapped_in_prose_by_stripping_to_the_json_object() {
     // Agents sometimes wrap JSON in a sentence despite instructions;
     // strip to the first {...} span before parsing.

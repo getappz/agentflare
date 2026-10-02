@@ -1,3 +1,5 @@
+use serde::Deserialize;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum JudgeAction {
@@ -17,7 +19,29 @@ pub(crate) struct JudgeDecision {
     pub action: JudgeAction,
     pub rationale: String,
     pub ledger_line: String,
+    #[serde(default, deserialize_with = "deserialize_task_model_tier")]
     pub task_model_tier: Option<TaskModelTier>,
+}
+
+/// Judges often copy the prose template's `"null"` tier label as a JSON
+/// string; accept that (and JSON `null` / omission) as no tier.
+fn deserialize_task_model_tier<'de, D>(deserializer: D) -> Result<Option<TaskModelTier>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(s) => {
+            if s == "null" || s.trim().is_empty() {
+                Ok(None)
+            } else {
+                serde_json::from_value(serde_json::Value::String(s))
+                    .map_err(serde::de::Error::custom)
+            }
+        }
+        other => serde_json::from_value(other).map_err(serde::de::Error::custom),
+    }
 }
 
 #[derive(Debug)]
