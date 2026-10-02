@@ -38,6 +38,12 @@ pub(super) const CODERABBIT_REPAIR_MARKER: &str =
 pub(super) const CODERABBIT_REPAIR_COMPLETE_MARKER: &str =
     "## supervisor — CodeRabbit review repair complete";
 
+/// Marker prefix on the one-time cap-reached comment for review repair (PR
+/// #829: without this guard, a CI-green sweep that keeps reverting
+/// `NEEDS_HUMAN_PR_LABEL` could re-post the cap comment every tick).
+pub(super) const CODERABBIT_REPAIR_CAP_MARKER: &str =
+    "## supervisor — CodeRabbit review repair cap reached";
+
 /// Item-metadata keys tracking review-repair announcements (item #633
 /// follow-up): the findings snapshot is fingerprinted and the dispatch post
 /// goes out once per snapshot; retries re-dispatch silently.
@@ -66,6 +72,53 @@ pub(super) fn coderabbit_findings_fingerprint(findings: &[BotFinding]) -> String
         .collect();
     rows.sort();
     rows.join("\n").chars().take(2000).collect()
+}
+
+fn coderabbit_repair_prior_attempts(
+    mcp: &AgentflareMcp,
+    item: &agentflare_backend::item::Item,
+) -> u32 {
+    let (_, silent_attempts, _) = repair_track(
+        item,
+        CODERABBIT_REPAIR_ANNOUNCED_KEY,
+        CODERABBIT_REPAIR_SILENT_KEY,
+        CODERABBIT_REPAIR_COMPLETED_KEY,
+    );
+    let prior_markers = mcp
+        .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &item.id))
+        .ok()
+        .and_then(Result::ok)
+        .map(|comments| {
+            comments
+                .iter()
+                .filter(|c| c.body.starts_with(CODERABBIT_REPAIR_MARKER))
+                .count() as u32
+        })
+        .unwrap_or(0);
+    prior_markers + silent_attempts
+}
+
+/// Whether CodeRabbit review repair has exhausted `SELF_REPAIR_CAP` while the
+/// announced findings fingerprint is still open (not completed). Used by
+/// `handle_ci_green` so a green PR does not strip `NEEDS_HUMAN_PR_LABEL` and
+/// re-enter the cap/CI-green flip-flop.
+pub(super) fn coderabbit_repair_capped_unresolved(
+    mcp: &AgentflareMcp,
+    item: &agentflare_backend::item::Item,
+) -> bool {
+    let (announced_for, _, completed_for) = repair_track(
+        item,
+        CODERABBIT_REPAIR_ANNOUNCED_KEY,
+        CODERABBIT_REPAIR_SILENT_KEY,
+        CODERABBIT_REPAIR_COMPLETED_KEY,
+    );
+    let Some(fingerprint) = announced_for else {
+        return false;
+    };
+    if completed_for.as_deref() == Some(fingerprint.as_str()) {
+        return false;
+    }
+    coderabbit_repair_prior_attempts(mcp, item) >= crate::quota::decide::SELF_REPAIR_CAP
 }
 
 /// What one sweep of a PR's bot threads left for the merge gate.
@@ -267,6 +320,41 @@ pub(crate) fn sweep_review_threads(
         let next = f.round();
         let record = thread_record(&meta, &f.thread_id);
         let Some(thread) = by_id.get(f.thread_id.as_str()) else {
+            // Body-level / out-of-diff ids are not GraphQL review threads: once
+            // the agent reports a fix whose sha is on the PR, drop the pending
+            // result instead of dispatching forever (resolve is impossible).
+            if let Some(result) =
+                thread_result(&meta, &f.thread_id).filter(|r| r.round.max(1) == next)
+            {
+                if result.outcome == ReviewOutcome::Fixed {
+                    if commits.is_none() {
+                        match review_threads::pr_commit_shas(client, repo, input.number) {
+                            Ok(s) => commits = Some(s),
+                            Err(e) => {
+                                eprintln!(
+                                    "agentflare-supervisor: could not list commits of PR #{}: {}",
+                                    input.number,
+                                    e.log_safe()
+                                );
+                                state.waiting_push += 1;
+                                continue;
+                            }
+                        }
+                    }
+                    let shas = commits.as_deref().unwrap_or_default();
+                    let pushed = result
+                        .sha
+                        .as_deref()
+                        .is_some_and(|s| sha_on_remote(s, shas));
+                    if pushed {
+                        update_metadata(mcp, &item.id, |m| {
+                            remove_thread_result(m, &f.thread_id);
+                        });
+                    } else if in_flight {
+                        state.waiting_push += 1;
+                    }
+                }
+            }
             continue;
         };
         if let Some(result) = thread_result(&meta, &f.thread_id).filter(|r| r.round.max(1) == next)
@@ -381,13 +469,25 @@ fn reply_and_settle(
     let replied = already_replied(thread, round, result);
     match (result.outcome, replied) {
         (ReviewOutcome::Fixed, false) => {
-            review_threads::reply_then_resolve(
+            let root = thread
+                .root()
+                .ok_or_else(|| crate::github::GitHubError::Parse("thread has no root".into()))?;
+            review_threads::reply_to_review_comment(
                 client,
                 repo,
                 number,
-                thread,
+                root.database_id,
                 &render_reply(result, &marker),
             )?;
+            if let Err(e) = review_threads::resolve_review_thread(client, &thread.id) {
+                eprintln!(
+                    "agentflare-supervisor: could not resolve thread {} of PR #{} (body-level \
+                     findings may not support resolve): {}",
+                    thread.id,
+                    number,
+                    e.log_safe()
+                );
+            }
         }
         (ReviewOutcome::Fixed, true) => {
             // A restart between the reply and the resolve: finish the job
@@ -668,58 +768,59 @@ pub(super) fn coderabbit_repair_or_gate(
         CODERABBIT_REPAIR_COMPLETED_KEY,
     );
     let fingerprint = coderabbit_findings_fingerprint(findings);
-    let prior_markers = mcp
-        .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &item.id))
-        .ok()
-        .and_then(Result::ok)
-        .map(|comments| {
-            comments
-                .iter()
-                .filter(|c| c.body.starts_with(CODERABBIT_REPAIR_MARKER))
-                .count() as u32
-        })
-        .unwrap_or(0);
     // Marker comments (announced dispatches) + the silent-dispatch counter =
     // every dispatch so far; retries without a new post still count.
-    let prior_attempts = prior_markers + silent_attempts;
+    let prior_attempts = coderabbit_repair_prior_attempts(mcp, item);
 
     if prior_attempts >= crate::quota::decide::SELF_REPAIR_CAP {
-        let cap_message = format!(
-            "## supervisor — CodeRabbit review repair cap reached\n\n{} unresolved finding(s) \
-             remain. {} automatic repair attempt(s) already made — needs a human look.",
-            findings.len(),
-            crate::quota::decide::SELF_REPAIR_CAP,
-        );
-        let _ = mcp.comment_impl(CommentRequest {
-            action: "create".into(),
-            item_id: Some(item.id.clone()),
-            body: Some(cap_message.clone()),
-            ..Default::default()
-        });
-        if let Some(gate_id) = label_id_by_name.get(NEEDS_HUMAN_GATE_LABEL) {
-            let _ = mcp.item_add_label(ItemRequest {
-                action: "add_label".into(),
-                id: Some(item.id.clone()),
-                label_id: Some(gate_id.clone()),
+        let cap_already = labels.iter().any(|l| l == NEEDS_HUMAN_PR_LABEL)
+            || mcp
+                .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &item.id))
+                .ok()
+                .and_then(Result::ok)
+                .is_some_and(|comments| {
+                    comments
+                        .iter()
+                        .any(|c| c.body.starts_with(CODERABBIT_REPAIR_CAP_MARKER))
+                });
+        if !cap_already {
+            let cap_message = format!(
+                "{CODERABBIT_REPAIR_CAP_MARKER}\n\n{} unresolved finding(s) remain. {} automatic \
+                 repair attempt(s) already made — needs a human look.",
+                findings.len(),
+                crate::quota::decide::SELF_REPAIR_CAP,
+            );
+            let _ = mcp.comment_impl(CommentRequest {
+                action: "create".into(),
+                item_id: Some(item.id.clone()),
+                body: Some(cap_message.clone()),
                 ..Default::default()
             });
+            if let Some(gate_id) = label_id_by_name.get(NEEDS_HUMAN_GATE_LABEL) {
+                let _ = mcp.item_add_label(ItemRequest {
+                    action: "add_label".into(),
+                    id: Some(item.id.clone()),
+                    label_id: Some(gate_id.clone()),
+                    ..Default::default()
+                });
+            }
+            update_pr_stage(
+                folder_path,
+                pr_number,
+                Some(CODERABBIT_REPAIR_PR_LABEL),
+                NEEDS_HUMAN_PR_LABEL,
+                &cap_message,
+            );
+            notify_human_gate(
+                item,
+                &format!(
+                    "CodeRabbit review repair cap reached ({} attempt(s), {} finding(s) still \
+                     unresolved)",
+                    crate::quota::decide::SELF_REPAIR_CAP,
+                    findings.len(),
+                ),
+            );
         }
-        update_pr_stage(
-            folder_path,
-            pr_number,
-            Some(CODERABBIT_REPAIR_PR_LABEL),
-            NEEDS_HUMAN_PR_LABEL,
-            &cap_message,
-        );
-        notify_human_gate(
-            item,
-            &format!(
-                "CodeRabbit review repair cap reached ({} attempt(s), {} finding(s) still \
-                 unresolved)",
-                crate::quota::decide::SELF_REPAIR_CAP,
-                findings.len()
-            ),
-        );
         return SelfRepairOutcome::Skipped;
     }
 

@@ -8,6 +8,20 @@
 
 use super::*;
 
+/// Which PR stage label `handle_ci_green` should revert before posting the
+/// CI-green comment. Skips `NEEDS_HUMAN_PR_LABEL` while CodeRabbit repair is
+/// capped with unresolved findings so the cap/CI-green label flip-flop (PR
+/// #829) cannot run.
+pub(super) fn ci_green_stale_stage_label(
+    labels: &[String],
+    coderabbit_capped: bool,
+) -> Option<&'static str> {
+    [SELF_REPAIR_PR_LABEL, NEEDS_HUMAN_PR_LABEL]
+        .into_iter()
+        .filter(|l| *l != NEEDS_HUMAN_PR_LABEL || !coderabbit_capped)
+        .find(|l| labels.iter().any(|have| have == l))
+}
+
 /// Whether a CI-green PR may be merged this tick, and at which head. Both
 /// arms carry the head the green verdict was made on and the PR's
 /// auto-merge handle (`worktree::AutoMergeRef`): once approved, either arm
@@ -86,10 +100,8 @@ pub(super) fn handle_ci_green(
     // label on a now-passing PR. `labels` is already in hand from
     // the batched/single fetch above, so this only touches GitHub
     // when there's actually something to revert.
-    if let Some(stale) = [SELF_REPAIR_PR_LABEL, NEEDS_HUMAN_PR_LABEL]
-        .into_iter()
-        .find(|l| labels.iter().any(|have| have == l))
-    {
+    let coderabbit_capped = coderabbit_repair_capped_unresolved(mcp, item);
+    if let Some(stale) = ci_green_stale_stage_label(labels, coderabbit_capped) {
         update_pr_stage(
             folder_path,
             number,
