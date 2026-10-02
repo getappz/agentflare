@@ -44,7 +44,8 @@ fn default_sources() -> HashMap<String, PathBuf> {
             .join("opencode")
             .join("opencode.db"),
     );
-    m.insert("cursor".into(), h.join(".config").join("Cursor"));
+    // Cursor has no ingest adapter yet (#321) — omit path mapping so `doctor`
+    // does not list a dead source. Gemini/Copilot stay as reserved path stubs.
     m.insert("gemini".into(), h.join(".gemini"));
     m.insert("copilot".into(), h.join(".copilot"));
     // env overrides
@@ -52,7 +53,6 @@ fn default_sources() -> HashMap<String, PathBuf> {
         ("claude_code", "CLAUDE_PROJECTS_DIR"),
         ("codex", "CODEX_SESSIONS_DIR"),
         ("opencode", "OPENCODE_DIR"),
-        ("cursor", "CURSOR_DIR"),
         ("gemini", "GEMINI_DIR"),
     ] {
         if let Ok(v) = std::env::var(env) {

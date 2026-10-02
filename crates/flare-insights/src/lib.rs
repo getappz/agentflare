@@ -4,7 +4,7 @@
 //! vscode-monitor / opensync / claude-monitor / cogpit / langfuse.
 //!
 //! Layers:
-//! - ingest: adapters for Claude/Codex/OpenCode/Cursor/Gemini/Copilot + watcher
+//! - ingest: adapters for Claude/Codex/OpenCode + watcher (Cursor/Gemini/Copilot not yet)
 //! - store: SQLite FTS5 + trigram index (local-first, 127.0.0.1 only)
 //! - model: unified Session/Turn/ToolCall/Subagent schema
 //! - search: FTS5 + trigram + hybrid (flare-search-kit ready)
