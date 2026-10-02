@@ -7,6 +7,7 @@
 pub mod audit;
 pub mod branch;
 pub mod classify;
+pub mod clean;
 pub mod config_loader;
 pub mod doctor;
 pub mod policy_config;
