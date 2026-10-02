@@ -39,6 +39,12 @@ pub fn normalize_source(input: &str) -> Result<String, String> {
         "opencode" | "oc" => Ok("opencode".into()),
         "gemini" | "gemini-cli" => Ok("gemini".into()),
         "auto" => Ok("auto".into()),
+        // No CursorAdapter yet (#321); fail closed with an explicit message
+        // so CLI/docs scrub stays honest until a consumer asks for one.
+        "cursor" | "cursor-agent" | "cursor-cli" => Err(format!(
+            "unsupported source 'cursor' — no ingest adapter yet; use one of: auto, {}",
+            SUPPORTED.join(", ")
+        )),
         other => Err(format!(
             "unsupported source '{other}' — use one of: auto, {}",
             SUPPORTED.join(", ")
@@ -161,7 +167,13 @@ mod tests {
         assert_eq!(normalize_source("gemini").unwrap(), "gemini");
         assert_eq!(normalize_source("gemini-cli").unwrap(), "gemini");
         assert_eq!(normalize_source("claude-code").unwrap(), "claude_code");
-        assert!(normalize_source("cursor").is_err());
+        let cursor_err = normalize_source("cursor").unwrap_err();
+        assert!(
+            cursor_err.contains("unsupported source 'cursor'")
+                && cursor_err.contains("no ingest adapter yet"),
+            "{cursor_err}"
+        );
+        assert!(normalize_source("cursor-agent").is_err());
     }
 
     #[test]
