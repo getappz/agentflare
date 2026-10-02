@@ -258,7 +258,6 @@ fn add_hook_entry(
     true
 }
 
-
 /// True when `command` is the agentflare role identified by `marker`.
 /// Lifecycle markers like `"hook session-start"` are substrings of optimize
 /// markers (`"optimize code hook session-start"`), so a bare `contains`
@@ -537,7 +536,13 @@ fn wire_cursor() {
     let failure_matcher = cursor_post_tool_failure_matcher();
     let mut added = false;
     for (event, marker, matcher, subcommand, timeout) in [
-        ("sessionStart", "hook session-start", None, "session-start", 30),
+        (
+            "sessionStart",
+            "hook session-start",
+            None,
+            "session-start",
+            30,
+        ),
         (
             "beforeSubmitPrompt",
             "hook prompt-submit",
@@ -593,7 +598,6 @@ fn wire_cursor() {
         Err(e) => ui::error(&format!("writing .cursor/hooks.json: {e}")),
     }
 }
-
 
 /// Install Codex-supported lifecycle hooks in the user config. Codex enables
 /// hooks by default, so this leaves the user's config.toml policy untouched.
@@ -851,7 +855,12 @@ fn wire_optimize_cursor() {
 
     let mut added = false;
     for (event, marker, subcommand, timeout) in [
-        ("sessionStart", "optimize code hook session-start", "session-start", 30),
+        (
+            "sessionStart",
+            "optimize code hook session-start",
+            "session-start",
+            30,
+        ),
         (
             "beforeSubmitPrompt",
             "optimize code hook prompt-submit",
@@ -888,7 +897,6 @@ fn wire_optimize_cursor() {
         Err(e) => ui::error(&format!("writing .cursor/hooks.json: {e}")),
     }
 }
-
 
 fn wire_optimize_opencode() {
     ui::info(
@@ -1399,8 +1407,7 @@ mod tests {
 
             wire_cursor();
 
-            let parsed: Value =
-                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            let parsed: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
             assert_eq!(parsed["hooks"]["sessionStart"].as_array().unwrap().len(), 2);
             assert_eq!(
                 parsed["hooks"]["sessionStart"][0]["command"],
@@ -1449,14 +1456,18 @@ mod tests {
                             "timeout": 10
                         }]
                     }
-                })).unwrap(),
+                }))
+                .unwrap(),
             )
             .unwrap();
 
             wire_optimize_cursor();
             let first = fs::read_to_string(&path).unwrap();
             let parsed: Value = serde_json::from_str(&first).unwrap();
-            assert_eq!(parsed["hooks"]["subagentStart"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                parsed["hooks"]["subagentStart"].as_array().unwrap().len(),
+                1
+            );
             assert!(first.contains("optimize code hook subagent-start"));
 
             wire_optimize_cursor();
@@ -1569,8 +1580,7 @@ mod tests {
 
             wire_cursor();
 
-            let parsed: Value =
-                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            let parsed: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
             let session = parsed["hooks"]["sessionStart"].as_array().unwrap();
             assert_eq!(session.len(), 2);
             assert!(
