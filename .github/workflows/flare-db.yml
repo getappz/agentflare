@@ -36,7 +36,10 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          choco upgrade openssl --version=4.0.2 --allow-downgrade -y --no-progress
+          # No patch pin: the Chocolatey package downloads from slproweb.com, which
+          # hosts only the current release, so an exact pin (4.0.2) went 404. The
+          # version check below still requires major 4 and fails loudly on OpenSSL 5.
+          choco upgrade openssl -y --no-progress
           if ($LASTEXITCODE -ne 0) { throw 'OpenSSL installation failed' }
           $sdk = Get-ChildItem 'C:\Program Files\OpenSSL*' -Directory | Where-Object { Test-Path "$($_.FullName)\bin\libcrypto-4-x64.dll" }
           if (@($sdk).Count -ne 1) { throw 'Expected exactly one OpenSSL 4 x64 SDK' }
@@ -47,7 +50,7 @@ jobs:
           "OPENSSL_LIB_DIR=$lib" >> $env:GITHUB_ENV
           $version = & "$root\bin\openssl.exe" version
           $version
-          if ($LASTEXITCODE -ne 0 -or $version -notmatch '^OpenSSL 4\.0\.2 ') { throw 'Unexpected OpenSSL version' }
+          if ($LASTEXITCODE -ne 0 -or $version -notmatch '^OpenSSL 4\.\d+\.\d+ ') { throw "Unexpected OpenSSL version: $version" }
       - run: cargo +1.94.0 test --manifest-path crates/flare-db/Cargo.toml --locked --no-default-features --features sqlcipher-bundled-external-openssl --no-run
       - name: Stage exact Windows crypto DLL and test isolated runtime
         if: runner.os == 'Windows'
