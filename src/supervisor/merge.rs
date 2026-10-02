@@ -21,6 +21,9 @@ pub(super) fn ci_green_stale_stage_label(
     labels: &[String],
     coderabbit_capped: bool,
 ) -> Option<&'static str> {
+    if coderabbit_capped && labels.iter().any(|l| l == NEEDS_HUMAN_PR_LABEL) {
+        return None;
+    }
     [SELF_REPAIR_PR_LABEL, NEEDS_HUMAN_PR_LABEL]
         .into_iter()
         .filter(|l| *l != NEEDS_HUMAN_PR_LABEL || !coderabbit_capped)

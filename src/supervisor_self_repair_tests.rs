@@ -535,3 +535,159 @@ fn coderabbit_cap_and_ci_green_do_not_flip_flop_across_sweeps() {
         );
     });
 }
+
+#[test]
+fn ci_green_stale_stage_label_ignores_self_repair_while_capped_with_needs_human() {
+    let labels = vec![
+        SELF_REPAIR_PR_LABEL.to_string(),
+        NEEDS_HUMAN_PR_LABEL.to_string(),
+    ];
+    assert!(
+        ci_green_stale_stage_label(&labels, true).is_none(),
+        "must not revert self-repair or needs-human while CodeRabbit cap + needs-human gate"
+    );
+}
+
+#[test]
+fn coderabbit_capped_unresolved_when_new_cap_fingerprint_differs_from_completed() {
+    crate::paths::test_support::with_temp_home(|| {
+        let mcp = test_mcp();
+        let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
+        let findings_a = vec![coderabbit_finding(1, "coderabbitai[bot]")];
+        let findings_b = vec![coderabbit_finding(2, "coderabbitai[bot]")];
+        let fp_a = coderabbit_findings_fingerprint(&findings_a);
+        let fp_b = coderabbit_findings_fingerprint(&findings_b);
+
+        for _ in 0..crate::quota::decide::SELF_REPAIR_CAP {
+            mcp.comment_impl(CommentRequest {
+                action: "create".into(),
+                item_id: Some(item_id.clone()),
+                body: Some(format!("{CODERABBIT_REPAIR_MARKER}\n\njob: prior")),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        persist_repair_track(
+            &mcp,
+            &item_id,
+            CODERABBIT_REPAIR_ANNOUNCED_KEY,
+            CODERABBIT_REPAIR_SILENT_KEY,
+            CODERABBIT_REPAIR_COMPLETED_KEY,
+            Some(&fp_a),
+            false,
+            Some(&fp_a),
+        );
+        mcp.with_backend_db(|conn| {
+            crate::mcp_server::merge_item_metadata(conn, &item_id, |m| {
+                m.insert(CODERABBIT_REPAIR_CAP_KEY.into(), fp_b.clone().into());
+            })
+            .unwrap()
+        })
+        .unwrap();
+
+        let item = current_item(&mcp, &item_id);
+        assert!(
+            coderabbit_repair_capped_unresolved(&mcp, &item),
+            "new capped findings must stay unresolved even when an earlier fingerprint completed"
+        );
+    });
+}
+
+#[test]
+fn coderabbit_cap_announced_requires_exact_fingerprint_not_substring() {
+    crate::paths::test_support::with_temp_home(|| {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
+        let label_id_by_name = seed_gate_label(&mcp);
+        let findings_a = vec![coderabbit_finding(1, "coderabbitai[bot]")];
+        let mut second = coderabbit_finding(2, "coderabbitai[bot]");
+        second.body = "Different finding body for fingerprint split.".into();
+        let findings_ab = vec![findings_a[0].clone(), second];
+        let fp_ab = coderabbit_findings_fingerprint(&findings_ab);
+        let fp_a = coderabbit_findings_fingerprint(&findings_a);
+
+        for _ in 0..crate::quota::decide::SELF_REPAIR_CAP {
+            mcp.comment_impl(CommentRequest {
+                action: "create".into(),
+                item_id: Some(item_id.clone()),
+                body: Some(format!("{CODERABBIT_REPAIR_MARKER}\n\njob: prior")),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        persist_repair_track(
+            &mcp,
+            &item_id,
+            CODERABBIT_REPAIR_ANNOUNCED_KEY,
+            CODERABBIT_REPAIR_SILENT_KEY,
+            CODERABBIT_REPAIR_COMPLETED_KEY,
+            Some(&fp_ab),
+            false,
+            None,
+        );
+        mcp.with_backend_db(|conn| {
+            crate::mcp_server::merge_item_metadata(conn, &item_id, |m| {
+                m.insert(CODERABBIT_REPAIR_CAP_KEY.into(), fp_ab.clone().into());
+            })
+            .unwrap()
+        })
+        .unwrap();
+        mcp.comment_impl(CommentRequest {
+            action: "create".into(),
+            item_id: Some(item_id.clone()),
+            body: Some(format!(
+                "{CODERABBIT_REPAIR_CAP_MARKER}\n\nfindings fingerprint: {fp_ab}\n\nprior cap"
+            )),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let item = current_item(&mcp, &item_id);
+        let comments_before = mcp
+            .with_backend_db(|conn| {
+                agentflare_backend::comment::list_by_item(conn, &item_id).unwrap()
+            })
+            .unwrap();
+        let cap_before = comments_before
+            .iter()
+            .filter(|c| c.body.starts_with(CODERABBIT_REPAIR_CAP_MARKER))
+            .count();
+
+        let outcome = coderabbit_repair_or_gate(
+            &mcp,
+            &queue,
+            &test_auth_conn(),
+            agentflare_resource_gate::Policy::Normal,
+            &item,
+            1,
+            &findings_a,
+            &[],
+            &label_id_by_name,
+            "/repo",
+        );
+        assert!(matches!(outcome, SelfRepairOutcome::Skipped));
+
+        let comments_after = mcp
+            .with_backend_db(|conn| {
+                agentflare_backend::comment::list_by_item(conn, &item_id).unwrap()
+            })
+            .unwrap();
+        let cap_after = comments_after
+            .iter()
+            .filter(|c| c.body.starts_with(CODERABBIT_REPAIR_CAP_MARKER))
+            .count();
+        assert_eq!(
+            cap_after,
+            cap_before + 1,
+            "fingerprint {fp_a} is not the announced cap {fp_ab}, so a new cap comment must post"
+        );
+        assert!(
+            comments_after.iter().any(|c| {
+                c.body.starts_with(CODERABBIT_REPAIR_CAP_MARKER)
+                    && c.body.contains(&format!("findings fingerprint: {fp_a}"))
+            }),
+            "new cap must reference the current findings fingerprint exactly"
+        );
+    });
+}

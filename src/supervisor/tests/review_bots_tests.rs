@@ -763,6 +763,48 @@ fn sweep_waits_while_a_fixed_sha_is_not_on_the_remote_and_a_job_still_runs() {
 }
 
 #[test]
+fn sweep_retains_pending_body_level_fixed_result_without_posting_detached_comment() {
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
+    record_result(
+        &mcp,
+        &item_id,
+        "body:src/lib.rs:1",
+        &ReviewResult {
+            round: 1,
+            outcome: ReviewOutcome::Fixed,
+            sha: Some("abc1234".into()),
+            note: "fixed in module docs".into(),
+            test: None,
+        },
+    );
+    let server = MockServer::start(vec![
+        MockResponse::json(200, &threads_page(&[])),
+        MockResponse::json(200, r#"[{"sha":"0000000unrelated"}]"#),
+    ]);
+    let _state = sweep(
+        &server,
+        &mcp,
+        &queue,
+        &item_id,
+        None,
+        &ReviewBotConfig::default(),
+    );
+    let reqs = server.requests();
+    assert!(
+        !reqs
+            .iter()
+            .any(|r| r.method == "POST" && r.path.contains("/issues/7/comments")),
+        "pending fixed body-level results must not be posted or cleared: {reqs:?}"
+    );
+    assert!(
+        thread_result(&item_meta(&mcp, &item_id), "body:src/lib.rs:1").is_some(),
+        "metadata must stay until the fix sha is on the PR branch"
+    );
+}
+
+#[test]
 fn sweep_replies_without_resolving_for_a_not_valid_result() {
     let mcp = test_mcp();
     let queue = test_queue();

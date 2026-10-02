@@ -110,19 +110,34 @@ pub(super) fn coderabbit_repair_capped_unresolved(
     mcp: &AgentflareMcp,
     item: &agentflare_backend::item::Item,
 ) -> bool {
+    if coderabbit_repair_prior_attempts(mcp, item) < crate::quota::decide::SELF_REPAIR_CAP {
+        return false;
+    }
     let (announced_for, _, completed_for) = repair_track(
         item,
         CODERABBIT_REPAIR_ANNOUNCED_KEY,
         CODERABBIT_REPAIR_SILENT_KEY,
         CODERABBIT_REPAIR_COMPLETED_KEY,
     );
-    let Some(fingerprint) = announced_for else {
-        return false;
+    let meta = current_metadata(mcp, item);
+    let capped_for = meta
+        .get(CODERABBIT_REPAIR_CAP_KEY)
+        .and_then(|v| v.as_str())
+        .or(announced_for.as_deref());
+    let Some(fingerprint) = capped_for else {
+        return true;
     };
-    if completed_for.as_deref() == Some(fingerprint.as_str()) {
-        return false;
+    !completed_for
+        .as_deref()
+        .is_some_and(|completed| completed == fingerprint)
+}
+
+fn cap_comment_fingerprint(body: &str) -> Option<&str> {
+    if !body.starts_with(CODERABBIT_REPAIR_CAP_MARKER) {
+        return None;
     }
-    coderabbit_repair_prior_attempts(mcp, item) >= crate::quota::decide::SELF_REPAIR_CAP
+    body.lines()
+        .find_map(|line| line.strip_prefix("findings fingerprint: "))
 }
 
 fn coderabbit_cap_announced_for(
@@ -131,21 +146,16 @@ fn coderabbit_cap_announced_for(
     fingerprint: &str,
 ) -> bool {
     let meta = current_metadata(mcp, item);
-    if meta
-        .get(CODERABBIT_REPAIR_CAP_KEY)
-        .and_then(|v| v.as_str())
-        == Some(fingerprint)
-    {
+    if meta.get(CODERABBIT_REPAIR_CAP_KEY).and_then(|v| v.as_str()) == Some(fingerprint) {
         return true;
     }
     mcp.with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &item.id))
         .ok()
         .and_then(Result::ok)
         .is_some_and(|comments| {
-            comments.iter().any(|c| {
-                c.body.starts_with(CODERABBIT_REPAIR_CAP_MARKER)
-                    && c.body.contains(fingerprint)
-            })
+            comments
+                .iter()
+                .any(|c| cap_comment_fingerprint(&c.body) == Some(fingerprint))
         })
 }
 
@@ -377,34 +387,33 @@ pub(crate) fn sweep_review_threads(
             // result instead of dispatching forever (resolve is impossible).
             if let Some(result) =
                 thread_result(&meta, &f.thread_id).filter(|r| r.round.max(1) == next)
+                && result.outcome == ReviewOutcome::Fixed
             {
-                if result.outcome == ReviewOutcome::Fixed {
-                    if commits.is_none() {
-                        match review_threads::pr_commit_shas(client, repo, input.number) {
-                            Ok(s) => commits = Some(s),
-                            Err(e) => {
-                                eprintln!(
-                                    "agentflare-supervisor: could not list commits of PR #{}: {}",
-                                    input.number,
-                                    e.log_safe()
-                                );
-                                state.waiting_push += 1;
-                                continue;
-                            }
+                if commits.is_none() {
+                    match review_threads::pr_commit_shas(client, repo, input.number) {
+                        Ok(s) => commits = Some(s),
+                        Err(e) => {
+                            eprintln!(
+                                "agentflare-supervisor: could not list commits of PR #{}: {}",
+                                input.number,
+                                e.log_safe()
+                            );
+                            state.waiting_push += 1;
+                            continue;
                         }
                     }
-                    let shas = commits.as_deref().unwrap_or_default();
-                    let pushed = result
-                        .sha
-                        .as_deref()
-                        .is_some_and(|s| sha_on_remote(s, shas));
-                    if pushed {
-                        update_metadata(mcp, &item.id, |m| {
-                            remove_thread_result(m, &f.thread_id);
-                        });
-                    } else if in_flight {
-                        state.waiting_push += 1;
-                    }
+                }
+                let shas = commits.as_deref().unwrap_or_default();
+                let pushed = result
+                    .sha
+                    .as_deref()
+                    .is_some_and(|s| sha_on_remote(s, shas));
+                if pushed {
+                    update_metadata(mcp, &item.id, |m| {
+                        remove_thread_result(m, &f.thread_id);
+                    });
+                } else if in_flight {
+                    state.waiting_push += 1;
                 }
             }
             continue;
@@ -636,6 +645,7 @@ fn post_detached_results(
         .keys()
         .filter(|id| !threads.contains_key(id.as_str()))
         .filter_map(|id| thread_result(meta, id).map(|r| (id.clone(), r)))
+        .filter(|(_, r)| r.outcome != ReviewOutcome::Fixed)
         .collect();
     if detached.is_empty() {
         return;
@@ -843,10 +853,7 @@ pub(super) fn coderabbit_repair_or_gate(
                 ..Default::default()
             });
             update_metadata(mcp, &item.id, |m| {
-                m.insert(
-                    CODERABBIT_REPAIR_CAP_KEY.into(),
-                    fingerprint.clone().into(),
-                );
+                m.insert(CODERABBIT_REPAIR_CAP_KEY.into(), fingerprint.clone().into());
             });
             update_pr_stage(
                 folder_path,
