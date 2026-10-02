@@ -67,6 +67,18 @@ pub fn step(message: &str) {
     }
 }
 
+/// A titled block of lines the user should read but cannot act on.
+pub fn note(title: &str, body: &str) {
+    if interactive() {
+        let _ = cliclack::note(title, body);
+    } else {
+        println!("{title}");
+        for line in body.lines() {
+            println!("      {line}");
+        }
+    }
+}
+
 /// "Nothing to do" — dimmer than [`info`], for already-satisfied work.
 pub fn skip(message: &str) {
     if interactive() {
