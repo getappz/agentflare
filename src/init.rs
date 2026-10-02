@@ -259,11 +259,24 @@ fn add_hook_entry(
 }
 
 
+/// True when `command` is the agentflare role identified by `marker`.
+/// Lifecycle markers like `"hook session-start"` are substrings of optimize
+/// markers (`"optimize code hook session-start"`), so a bare `contains`
+/// would let `wire_cursor` clobber an optimize co-tenant on the same event.
+fn cursor_command_matches_marker(command: &str, marker: &str) -> bool {
+    if !command.contains(marker) {
+        return false;
+    }
+    let is_optimize_marker = marker.contains("optimize code");
+    let is_optimize_command = command.contains("optimize code");
+    is_optimize_marker == is_optimize_command
+}
+
 /// Cursor's `hooks.json` is flat (`[{ command, type, timeout, matcher? }]`) —
 /// unlike Claude/Codex nested `{ hooks: [{ command, ... }] }` entries — so
 /// matcher refresh and idempotent backfill need a Cursor-shaped helper.
-/// Same marker rules as [`add_hook_entry`]: substring of `"hook <event>"`,
-/// must not collide with `"optimize code hook X"`.
+/// Marker matching uses [`cursor_command_matches_marker`] so lifecycle installs
+/// do not clobber optimize co-tenants on the same event.
 fn add_cursor_hook_entry(
     hooks_obj: &mut Map<String, Value>,
     event: &str,
@@ -281,7 +294,7 @@ fn add_cursor_hook_entry(
         entry
             .get("command")
             .and_then(Value::as_str)
-            .is_some_and(|existing| existing.contains(marker))
+            .is_some_and(|existing| cursor_command_matches_marker(existing, marker))
     }) {
         let existing = arr[idx].as_object_mut().unwrap();
         let mut changed = false;
@@ -1523,6 +1536,67 @@ mod tests {
             wire_cursor();
             let second = fs::read_to_string(&path).unwrap();
             assert_eq!(first, second);
+        });
+    }
+
+    #[test]
+    fn wire_cursor_preserves_optimize_co_tenant_on_same_event() {
+        with_temp_cwd(|| {
+            let path = cwd().join(".cursor").join("hooks.json");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            // Optimize already owns sessionStart/beforeSubmitPrompt; lifecycle
+            // markers are substrings of those optimize commands.
+            fs::write(
+                &path,
+                serde_json::to_string_pretty(&json!({
+                    "version": 1,
+                    "hooks": {
+                        "sessionStart": [{
+                            "command": "\"agentflare\" optimize code hook session-start",
+                            "type": "command",
+                            "timeout": 30
+                        }],
+                        "beforeSubmitPrompt": [{
+                            "command": "\"agentflare\" optimize code hook prompt-submit",
+                            "type": "command",
+                            "timeout": 10
+                        }]
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            wire_cursor();
+
+            let parsed: Value =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            let session = parsed["hooks"]["sessionStart"].as_array().unwrap();
+            assert_eq!(session.len(), 2);
+            assert!(
+                session[0]["command"]
+                    .as_str()
+                    .unwrap()
+                    .contains("optimize code hook session-start")
+            );
+            assert!(
+                session[1]["command"]
+                    .as_str()
+                    .unwrap()
+                    .contains("hook session-start")
+                    && !session[1]["command"]
+                        .as_str()
+                        .unwrap()
+                        .contains("optimize code")
+            );
+            let prompt = parsed["hooks"]["beforeSubmitPrompt"].as_array().unwrap();
+            assert_eq!(prompt.len(), 2);
+            assert!(
+                prompt[0]["command"]
+                    .as_str()
+                    .unwrap()
+                    .contains("optimize code hook prompt-submit")
+            );
         });
     }
 

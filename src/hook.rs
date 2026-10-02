@@ -287,13 +287,13 @@ struct PostToolFailureInput {
 
 /// Extracts the tool name and a best-effort failure-text field from a
 /// PostToolUseFailure stdin payload. Live-verified (2026-07-29, real Claude
-/// Code session): the failure text is carried in "error". "tool_response"
-/// and "reason" are kept as defensive fallbacks in case a future payload
-/// shape omits "error", but are not currently exercised by real traffic.
+/// Code session): the failure text is carried in "error". Cursor's
+/// `postToolUseFailure` stdin uses `error_message` instead. "tool_response"
+/// and "reason" remain defensive fallbacks when the primary keys are absent.
 fn parse_post_tool_failure(input: &str) -> Option<PostToolFailureInput> {
     let v: serde_json::Value = serde_json::from_str(input).ok()?;
     let tool_name = v.get("tool_name")?.as_str()?.to_string();
-    let failure_text = ["error", "tool_response", "reason"]
+    let failure_text = ["error", "error_message", "tool_response", "reason"]
         .iter()
         .find_map(|key| v.get(key))
         .map(|val| {
@@ -1012,6 +1012,18 @@ mod tests {
         let input = r#"{"session_id":"s1","tool_name":"Edit","tool_response":"parse error: unexpected EOF"}"#;
         let parsed = parse_post_tool_failure(input).unwrap();
         assert!(parsed.failure_text.contains("unexpected EOF"));
+    }
+
+    #[test]
+    fn parse_post_tool_failure_reads_cursor_error_message() {
+        let input = r#"{
+            "session_id": "s1",
+            "tool_name": "Shell",
+            "error_message": "command not found: foobarbaz"
+        }"#;
+        let parsed = parse_post_tool_failure(input).unwrap();
+        assert_eq!(parsed.tool_name, "Shell");
+        assert!(parsed.failure_text.contains("foobarbaz"));
     }
 
     #[test]
