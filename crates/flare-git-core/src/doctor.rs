@@ -504,24 +504,27 @@ pub fn format_markdown(report: &DoctorReport) -> String {
     out
 }
 
-struct WorktreeEntry {
-    path: String,
-    branch: Option<String>,
+pub(crate) struct WorktreeEntry {
+    pub(crate) path: String,
+    pub(crate) branch: Option<String>,
     /// Set instead of `branch` for a detached-HEAD worktree — kept separate
     /// so detached lanes don't get run through branch-only checks
     /// (`has_upstream`, duplicate-branch grouping) with a fake "branch name".
-    detached_at: Option<String>,
+    pub(crate) detached_at: Option<String>,
+    /// `Some(reason)` when git reports the worktree locked ("" = no reason).
+    pub(crate) locked: Option<String>,
 }
 
 fn list_worktrees(repo_root: &Path) -> String {
     run_git_in(repo_root, &["worktree", "list", "--porcelain"]).unwrap_or_default()
 }
 
-fn parse_worktree_list(output: &str) -> Vec<WorktreeEntry> {
+pub(crate) fn parse_worktree_list(output: &str) -> Vec<WorktreeEntry> {
     let mut entries = Vec::new();
     let mut current_path: Option<String> = None;
     let mut current_branch: Option<String> = None;
     let mut current_detached: Option<String> = None;
+    let mut current_locked: Option<String> = None;
     for line in output.lines() {
         if line.trim().is_empty() {
             if let Some(path) = current_path.take() {
@@ -529,6 +532,7 @@ fn parse_worktree_list(output: &str) -> Vec<WorktreeEntry> {
                     path,
                     branch: current_branch.take(),
                     detached_at: current_detached.take(),
+                    locked: current_locked.take(),
                 });
             }
         } else if let Some(path) = line.strip_prefix("worktree ") {
@@ -537,11 +541,14 @@ fn parse_worktree_list(output: &str) -> Vec<WorktreeEntry> {
                     path: prev_path,
                     branch: current_branch.take(),
                     detached_at: current_detached.take(),
+                    locked: current_locked.take(),
                 });
             }
             current_path = Some(path.to_string());
         } else if let Some(branch) = line.strip_prefix("branch refs/heads/") {
             current_branch = Some(branch.to_string());
+        } else if let Some(reason) = line.strip_prefix("locked") {
+            current_locked = Some(reason.trim().to_string());
         } else if let Some(rev) = line.strip_prefix("HEAD ")
             && current_branch.is_none()
         {
@@ -553,6 +560,7 @@ fn parse_worktree_list(output: &str) -> Vec<WorktreeEntry> {
             path,
             branch: current_branch.take(),
             detached_at: current_detached.take(),
+            locked: current_locked.take(),
         });
     }
     entries
@@ -731,6 +739,21 @@ mod tests {
     #[test]
     fn parse_worktree_list_empty() {
         assert!(parse_worktree_list("").is_empty());
+    }
+
+    #[test]
+    fn parse_worktree_list_captures_lock_reason() {
+        let out = "worktree /r\nHEAD abc\nbranch refs/heads/master\n\n\
+                   worktree /r/.worktrees/task/7\nHEAD def\nbranch refs/heads/task/7-x\n\
+                   locked agentflare: in use by work item\n\n\
+                   worktree /r/.worktrees/x\nHEAD 123\nbranch refs/heads/x\nlocked\n";
+        let e = parse_worktree_list(out);
+        assert_eq!(e[0].locked, None);
+        assert_eq!(
+            e[1].locked.as_deref(),
+            Some("agentflare: in use by work item")
+        );
+        assert_eq!(e[2].locked.as_deref(), Some(""));
     }
 
     #[test]

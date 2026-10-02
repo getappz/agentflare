@@ -197,7 +197,7 @@ pub(super) fn adopt_existing_checkout(
 
 /// Reason recorded by [`lock_item_worktree`]; registrations locked with it
 /// are ours to clean up, any other lock is someone's deliberate pin.
-pub(super) const AGENTFLARE_LOCK_REASON: &str = "agentflare: in use by work item";
+pub(crate) const AGENTFLARE_LOCK_REASON: &str = "agentflare: in use by work item";
 
 /// `git worktree lock`s a claimed item's worktree so nothing outside this
 /// process (a human's `git worktree prune`, `gc`'s own pruning, another
