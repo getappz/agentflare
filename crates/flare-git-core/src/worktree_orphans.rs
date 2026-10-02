@@ -246,50 +246,60 @@ pub(crate) fn park_dir(
 ) -> Result<PathBuf, String> {
     let default_trash =
         trash_root(path).ok_or_else(|| format!("{} has no parent", path.display()))?;
+    let mut last_err = String::new();
+    for trash in preferred_trash.into_iter().chain([default_trash.as_path()]) {
+        match park_dir_in(path, name, trash) {
+            Ok(parked) => return Ok(parked),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
+}
+
+/// [`park_dir`] into exactly this trash directory, with no fallback -- for a
+/// caller that must keep the parked copy out of some tree (a worktree about
+/// to be removed cannot hold its own trash).
+pub(crate) fn park_dir_in(path: &Path, name: &str, trash: &Path) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(trash)
+        .map_err(|e| format!("cannot create {}: {e}", trash.display()))?;
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let safe_name = name.replace(['/', '\\'], "-");
+    let mut parked = trash.join(format!("{safe_name}-{stamp}"));
+    let mut n = 0;
+    while parked.exists() {
+        n += 1;
+        parked = trash.join(format!("{safe_name}-{stamp}-{n}"));
+    }
     let mut last_err = String::new();
-    for trash in preferred_trash.into_iter().chain([default_trash.as_path()]) {
-        if let Err(e) = std::fs::create_dir_all(trash) {
-            last_err = format!("cannot create {}: {e}", trash.display());
-            continue;
-        }
-        let mut parked = trash.join(format!("{safe_name}-{stamp}"));
-        let mut n = 0;
-        while parked.exists() {
-            n += 1;
-            parked = trash.join(format!("{safe_name}-{stamp}-{n}"));
-        }
-        for delay_ms in [100u64, 200, 400, 800, 1600, 0] {
-            match std::fs::rename(path, &parked) {
-                // A rename moves the whole tree or none of it; if the path is
-                // still there, this one did not (a copy+delete fallback, or
-                // someone recreated it). Delete nothing then.
-                Ok(()) if path.exists() => {
-                    return Err(format!(
-                        "moving it aside left {} behind, nothing deleted (parked copy kept at {})",
-                        path.display(),
-                        parked.display()
-                    ));
-                }
-                Ok(()) => return Ok(parked),
-                Err(e) => {
-                    last_err = e.to_string();
-                    // No retry fixes a missing source or another volume.
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::CrossesDevices
-                    ) {
-                        break;
-                    }
+    for delay_ms in [100u64, 200, 400, 800, 1600, 0] {
+        match std::fs::rename(path, &parked) {
+            // A rename moves the whole tree or none of it; if the path is
+            // still there, this one did not (a copy+delete fallback, or
+            // someone recreated it). Delete nothing then.
+            Ok(()) if path.exists() => {
+                return Err(format!(
+                    "moving it aside left {} behind, nothing deleted (parked copy kept at {})",
+                    path.display(),
+                    parked.display()
+                ));
+            }
+            Ok(()) => return Ok(parked),
+            Err(e) => {
+                last_err = e.to_string();
+                // No retry fixes a missing source or another volume.
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::CrossesDevices
+                ) {
+                    break;
                 }
             }
-            std::thread::sleep(Duration::from_millis(delay_ms));
         }
-        let _ = std::fs::remove_dir(trash);
+        std::thread::sleep(Duration::from_millis(delay_ms));
     }
+    let _ = std::fs::remove_dir(trash);
     Err(last_err)
 }
 

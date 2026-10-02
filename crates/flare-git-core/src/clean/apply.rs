@@ -2,11 +2,12 @@
 //! is touched, and heavy directories are parked (renamed aside) so the
 //! caller can unlink them separately with [`purge`].
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use super::{Item, Kind, artifacts, par_map, worktrees};
 use crate::shell::{run_in, run_in_ok};
-use crate::worktree::{delete_parked, gc_orphans, park_dir};
+use crate::worktree::{audit_orphans, delete_parked, gc_orphans, park_dir, park_dir_in};
 use flare_process::cwd::LiveProc;
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -74,6 +75,8 @@ struct Ctx<'a> {
     repo_root: Option<&'a Path>,
     scan_root: &'a Path,
     live: Vec<LiveProc>,
+    /// Sequence ids with a live claim, read fresh for this apply.
+    claimed: &'a HashSet<String>,
     /// The repo's own trash, when it already keeps a `.worktrees` directory.
     trash: Option<PathBuf>,
 }
@@ -89,11 +92,19 @@ fn remove_worktree(
         item.branch.as_deref().ok_or("item has no branch")?,
         item.sha.as_deref().ok_or("item has no sha")?,
     );
-    if !run_in(path, &["status", "--porcelain"])?.is_empty() {
-        return Err("uncommitted changes appeared since the plan".into());
+    // Re-read the registration: the plan may be minutes old, and the same
+    // checks that admitted the worktree must still hold right now.
+    let listing = run_in(repo, &["worktree", "list", "--porcelain"])?;
+    let entry = crate::doctor::parse_worktree_list(&listing)
+        .into_iter()
+        .find(|e| Path::new(&e.path).canonicalize().is_ok_and(|p| p == path))
+        .ok_or("no longer a registered worktree")?;
+    if entry.branch.as_deref() != Some(name) {
+        return Err("worktree switched branch since the plan".into());
     }
-    if let Some(p) = worktrees::occupant(path, &ctx.live) {
-        return Err(format!("live process: {} (pid {})", p.name, p.pid));
+    let locked = entry.locked.as_deref();
+    if let Some(reason) = worktrees::blocker(&ctx.live, ctx.claimed, path, path, locked) {
+        return Err(reason);
     }
     let full = format!("refs/heads/{name}");
     if run_in(repo, &["rev-parse", "--verify", "--quiet", &full]).as_deref() != Ok(sha) {
@@ -101,17 +112,26 @@ fn remove_worktree(
     }
     // Park the heavy ignored directories first, so git only has source
     // files left to delete. The tree is clean, so anything matched here is
-    // either tracked (kept) or ignored build output.
+    // either tracked (kept) or ignored build output. The trash must sit
+    // outside the worktree, or git would see it as an untracked file.
+    let outside = ctx
+        .trash
+        .clone()
+        .or_else(|| path.parent().map(|p| p.join(".trash")));
     for (dir, _) in artifacts::find_dirs(path, &[]) {
         let rel = dir.strip_prefix(path).unwrap_or(&dir).to_string_lossy();
-        if run_in(path, &["ls-files", "--", &rel]).is_ok_and(|o| o.is_empty())
-            && let Ok(parked) = park_dir(&dir, &item.label, ctx.trash.as_deref())
+        if let Some(trash) = outside.as_deref().filter(|t| !t.starts_with(path))
+            && run_in(path, &["ls-files", "--", &rel]).is_ok_and(|o| o.is_empty())
+            && let Ok(parked) = park_dir_in(&dir, &item.label, trash)
         {
             report.parked.push(parked);
         }
     }
     let p = path.to_string_lossy();
-    let _ = run_in(repo, &["worktree", "unlock", &p]);
+    if locked.is_some() {
+        // Only our own stale lock reaches here; `blocker` refused the rest.
+        run_in(repo, &["worktree", "unlock", &p])?;
+    }
     // No --force: git's own dirty-tree refusal stays as a second guard.
     run_in(repo, &["worktree", "remove", &p])?;
     delete_branch(repo, name, sha)?;
@@ -145,6 +165,9 @@ fn remove_artifact(
     );
     if has_tracked_files(parent, name) {
         return Err("contains tracked files".into());
+    }
+    if std::fs::symlink_metadata(path.join(".git")).is_ok() {
+        return Err("is its own git repository".into());
     }
     if let Some(p) = worktrees::occupant(path, &ctx.live) {
         return Err(format!("in use: {} (pid {})", p.name, p.pid));
@@ -180,6 +203,13 @@ fn apply_one(ctx: &Ctx, item: &Item, report: &mut Report) -> Result<String, Stri
                 .id
                 .strip_prefix("orphan:")
                 .ok_or("malformed orphan id")?;
+            // It may have been re-registered or claimed since the plan.
+            if !audit_orphans(repo, Some(ctx.claimed))
+                .iter()
+                .any(|o| o.name == name)
+            {
+                return Err("no longer an orphan; left untouched".into());
+            }
             // Snapshots first, then removes; reports its own stderr detail.
             if gc_orphans(repo, &[name.to_string()])
                 .iter()
@@ -202,12 +232,14 @@ pub fn apply(
     repo_root: Option<&Path>,
     scan_root: &Path,
     items: &[Item],
+    claimed_items: &HashSet<String>,
     on_progress: &mut dyn FnMut(&Outcome),
 ) -> Report {
     let ctx = Ctx {
         repo_root,
         scan_root,
         live: flare_process::cwd::live_procs(),
+        claimed: claimed_items,
         trash: repo_root
             .map(|r| r.join(".worktrees"))
             .filter(|w| w.is_dir())
@@ -252,6 +284,7 @@ mod tests {
     use crate::clean::{Item, Kind};
     use crate::shell::test_support::init_repo_with_branch;
     use crate::shell::{run_in, run_in_ok};
+    use std::collections::HashSet;
 
     fn has_branch(repo: &std::path::Path, name: &str) -> bool {
         let full = format!("refs/heads/{name}");
@@ -264,9 +297,15 @@ mod tests {
         run_in(&repo.path, &["branch", "done"]).unwrap();
         let plan = scan_repo(&repo.path, &git_opts());
         let mut seen = Vec::new();
-        let report = apply(Some(&repo.path), &repo.path, &plan.items, &mut |o| {
-            seen.push(o.id.clone());
-        });
+        let report = apply(
+            Some(&repo.path),
+            &repo.path,
+            &plan.items,
+            &HashSet::new(),
+            &mut |o| {
+                seen.push(o.id.clone());
+            },
+        );
         assert_eq!(report.failed(), 0, "{:?}", report.outcomes);
         assert_eq!(seen, ["branch:done"]);
         assert!(!has_branch(&repo.path, "done"));
@@ -282,7 +321,13 @@ mod tests {
         run_in(&repo.path, &["switch", "done"]).unwrap();
         run_in(&repo.path, &["commit", "--allow-empty", "-m", "new work"]).unwrap();
         run_in(&repo.path, &["switch", "master"]).unwrap();
-        let report = apply(Some(&repo.path), &repo.path, &plan.items, &mut |_| {});
+        let report = apply(
+            Some(&repo.path),
+            &repo.path,
+            &plan.items,
+            &HashSet::new(),
+            &mut |_| {},
+        );
         assert_eq!(report.failed(), 1);
         assert!(
             report.outcomes[0].detail.contains("moved"),
@@ -307,7 +352,13 @@ mod tests {
         std::fs::write(wt.join("target/debug/big.o"), vec![0u8; 4096]).unwrap();
 
         let plan = scan_repo(&repo.path, &git_opts());
-        let report = apply(Some(&repo.path), &repo.path, &plan.items, &mut |_| {});
+        let report = apply(
+            Some(&repo.path),
+            &repo.path,
+            &plan.items,
+            &HashSet::new(),
+            &mut |_| {},
+        );
         assert_eq!(report.failed(), 0, "{:?}", report.outcomes);
         assert!(!wt.exists());
         assert!(!has_branch(&repo.path, "task/7-x"));
@@ -330,7 +381,13 @@ mod tests {
         run_in(&repo.path, &["worktree", "add", "-b", "task/7-x", p]).unwrap();
         let plan = scan_repo(&repo.path, &git_opts());
         std::fs::write(wt.join("wip.txt"), "late edit").unwrap();
-        let report = apply(Some(&repo.path), &repo.path, &plan.items, &mut |_| {});
+        let report = apply(
+            Some(&repo.path),
+            &repo.path,
+            &plan.items,
+            &HashSet::new(),
+            &mut |_| {},
+        );
         assert_eq!(report.failed(), 1);
         assert!(wt.join("wip.txt").exists());
         assert!(has_branch(&repo.path, "task/7-x"));
@@ -362,6 +419,7 @@ mod tests {
             Some(r),
             r,
             &[artifact("target"), artifact("docs")],
+            &HashSet::new(),
             &mut |_| {},
         );
         assert!(report.outcomes[0].ok, "{:?}", report.outcomes);
@@ -388,8 +446,89 @@ mod tests {
             size_bytes: 0,
             reason: String::new(),
         };
-        let report = apply(None, inside.path(), &[item], &mut |_| {});
+        let report = apply(None, inside.path(), &[item], &HashSet::new(), &mut |_| {});
         assert_eq!(report.failed(), 1);
         assert!(victim.exists());
+    }
+
+    // Review finding 2: an orphan that was claimed after the plan is no
+    // longer an orphan.
+    #[test]
+    fn orphan_claimed_since_the_plan_is_left_alone() {
+        let repo = init_repo_with_branch("master");
+        let dir = repo.path.join(".worktrees/task/12");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".git"), "gitdir: /nonexistent/worktrees/12\n").unwrap();
+        std::fs::write(dir.join("work.rs"), "fn main() {}").unwrap();
+        let item = Item {
+            id: "orphan:12".into(),
+            kind: Kind::Orphan,
+            label: ".worktrees/task/12".into(),
+            path: Some(dir.clone()),
+            branch: None,
+            sha: None,
+            size_bytes: 0,
+            reason: String::new(),
+        };
+        let claimed = HashSet::from(["12".to_string()]);
+        let report = apply(Some(&repo.path), &repo.path, &[item], &claimed, &mut |_| {});
+        assert_eq!(report.failed(), 1, "{:?}", report.outcomes);
+        assert!(dir.join("work.rs").exists());
+    }
+
+    // Review finding 3: a lock placed after the plan is respected, and kept.
+    #[test]
+    fn worktree_locked_since_the_plan_is_left_alone_and_stays_locked() {
+        let repo = init_repo_with_branch("master");
+        let wt = repo.path.join(".worktrees/task/7");
+        let p = wt.to_str().unwrap();
+        run_in(&repo.path, &["worktree", "add", "-b", "task/7-x", p]).unwrap();
+        let plan = scan_repo(&repo.path, &git_opts());
+        run_in(
+            &repo.path,
+            &["worktree", "lock", "--reason", "pinned by a human", p],
+        )
+        .unwrap();
+        let report = apply(
+            Some(&repo.path),
+            &repo.path,
+            &plan.items,
+            &HashSet::new(),
+            &mut |_| {},
+        );
+        assert_eq!(report.failed(), 1, "{:?}", report.outcomes);
+        assert!(wt.exists());
+        let listing = run_in(&repo.path, &["worktree", "list", "--porcelain"]).unwrap();
+        assert!(listing.contains("locked pinned by a human"), "{listing}");
+    }
+
+    // Review finding 8: a worktree outside `.worktrees` must not have its
+    // artifacts parked inside itself.
+    #[test]
+    fn worktree_outside_dot_worktrees_is_removed_with_its_artifacts() {
+        let repo = init_repo_with_branch("master");
+        std::fs::write(repo.path.join(".gitignore"), "target/\n").unwrap();
+        std::fs::write(repo.path.join("Cargo.toml"), "[package]\nname='x'\n").unwrap();
+        run_in(&repo.path, &["add", "."]).unwrap();
+        run_in(&repo.path, &["commit", "-m", "base"]).unwrap();
+        let elsewhere = tempfile::TempDir::new().unwrap();
+        let wt = elsewhere.path().join("side-checkout");
+        let p = wt.to_str().unwrap();
+        run_in(&repo.path, &["worktree", "add", "-b", "side", p]).unwrap();
+        std::fs::create_dir_all(wt.join("target")).unwrap();
+        std::fs::write(wt.join("target/a.o"), b"obj").unwrap();
+
+        let plan = scan_repo(&repo.path, &git_opts());
+        let report = apply(
+            Some(&repo.path),
+            &repo.path,
+            &plan.items,
+            &HashSet::new(),
+            &mut |_| {},
+        );
+        assert_eq!(report.failed(), 0, "{:?}", report.outcomes);
+        assert!(!wt.exists());
+        assert!(!has_branch(&repo.path, "side"));
+        purge(&report.parked);
     }
 }

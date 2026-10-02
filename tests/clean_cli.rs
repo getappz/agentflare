@@ -225,3 +225,77 @@ fn cleanup_alias_works() {
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(stdout(&out).contains("done"));
 }
+
+// Review finding 1: from inside a linked worktree, the worktree you are
+// standing in and the main checkout's branch are both left alone.
+#[test]
+fn run_from_a_linked_worktree_spares_it_and_the_main_checkouts_branch() {
+    let f = fixture();
+    let wt = f.repo.join(".worktrees/task/9");
+    git(
+        &f.repo,
+        &["worktree", "add", "-b", "task/9-x", wt.to_str().unwrap()],
+    );
+    git(&f.repo, &["branch", "done"]);
+    git(&f.repo, &["switch", "-c", "feature-x"]);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_agentflare"))
+        .current_dir(&wt)
+        .args(["clean", "-y"])
+        .env("HOME", &f.home)
+        .env("USERPROFILE", &f.home)
+        .env("AGENTFLARE_HOME_OVERRIDE", &f.home)
+        .env("AGENTFLARE_NO_INTERACTIVE", "1")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GH_TOKEN")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        !has_branch(&f.repo, "done"),
+        "a loose merged branch still goes"
+    );
+    assert!(
+        has_branch(&f.repo, "feature-x"),
+        "the main checkout's branch is protected"
+    );
+    assert!(
+        wt.exists(),
+        "the worktree holding the current directory stays"
+    );
+    assert!(has_branch(&f.repo, "task/9-x"));
+}
+
+// Review finding 1, second half: state that belongs to the main checkout
+// (orphaned worktree dirs, item state) is still found from a linked worktree.
+#[test]
+fn from_a_linked_worktree_the_main_checkout_is_what_gets_scanned() {
+    let f = fixture();
+    let wt = f.repo.join(".worktrees/task/9");
+    git(
+        &f.repo,
+        &["worktree", "add", "-b", "task/9-x", wt.to_str().unwrap()],
+    );
+    let orphan = f.repo.join(".worktrees/task/12");
+    std::fs::create_dir_all(&orphan).unwrap();
+    std::fs::write(orphan.join(".git"), "gitdir: /nonexistent/worktrees/12\n").unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_agentflare"))
+        .current_dir(&wt)
+        .args(["clean", "--dry-run", "--json"])
+        .env("HOME", &f.home)
+        .env("USERPROFILE", &f.home)
+        .env("AGENTFLARE_HOME_OVERRIDE", &f.home)
+        .env("AGENTFLARE_NO_INTERACTIVE", "1")
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {}", stdout(&out)));
+    let ids: Vec<&str> = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|i| i["id"].as_str())
+        .collect();
+    assert!(ids.contains(&"orphan:12"), "{ids:?}");
+}

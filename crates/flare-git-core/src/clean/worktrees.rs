@@ -1,6 +1,6 @@
 //! Which worktrees (and loose merged branches) can go.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use super::merged::{BranchInfo, Verdict};
@@ -21,18 +21,32 @@ fn rel_label(root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
-/// Why a merged worktree still cannot be removed, if anything.
-fn blocker(input: &ScanInput, path: &Path, canon: &Path, locked: Option<&str>) -> Option<String> {
+/// Why a merged worktree still cannot be removed, if anything. Used at scan
+/// and again at apply, so a worktree that was dirtied, entered, locked or
+/// claimed after the plan is refused the same way.
+pub(super) fn blocker(
+    live: &[LiveProc],
+    claimed_items: &HashSet<String>,
+    path: &Path,
+    canon: &Path,
+    locked: Option<&str>,
+) -> Option<String> {
     if !path.is_dir() {
         return Some("worktree directory is missing (run `git worktree prune`)".into());
     }
-    match run_in(path, &["status", "--porcelain"]) {
-        Ok(out) if out.trim().is_empty() => {}
+    // `--untracked-files` is explicit: `status.showUntrackedFiles=no` would
+    // otherwise hide untracked work and let it be deleted.
+    match run_in(path, &["status", "--porcelain", "--untracked-files=normal"]) {
+        Ok(out) if out.is_empty() => {}
         Ok(_) => return Some("uncommitted changes".into()),
-        Err(e) => return Some(format!("cannot read status: {}", e.trim())),
+        Err(e) => return Some(format!("cannot read status: {e}")),
     }
-    if let Some(p) = occupant(canon, input.live) {
+    if let Some(p) = occupant(canon, live) {
         return Some(format!("live process: {} (pid {})", p.name, p.pid));
+    }
+    // The invoking shell is excluded from `live`, so check it separately.
+    if std::env::current_dir().is_ok_and(|cwd| cwd.starts_with(canon)) {
+        return Some("the current directory is inside it".into());
     }
     match locked {
         None => None,
@@ -50,8 +64,7 @@ fn blocker(input: &ScanInput, path: &Path, canon: &Path, locked: Option<&str>) -
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or_default();
-            input
-                .claimed_items
+            claimed_items
                 .contains(dir_name)
                 .then(|| "claimed by a live session".into())
         }
@@ -74,11 +87,26 @@ pub(super) fn candidates(
         branches.into_iter().map(|b| (b.name.clone(), b)).collect();
 
     let listing = run_in(repo_root, &["worktree", "list", "--porcelain"]).unwrap_or_default();
-    // The first entry is the main checkout: never a candidate.
-    for entry in crate::doctor::parse_worktree_list(&listing)
+    for (index, entry) in crate::doctor::parse_worktree_list(&listing)
         .into_iter()
-        .skip(1)
+        .enumerate()
     {
+        if index == 0 {
+            // The main checkout is never a candidate, and its branch is not
+            // loose either -- whichever worktree this runs from.
+            if let Some(info) = entry.branch.and_then(|b| by_name.remove(&b))
+                && input.opts.branches
+            {
+                skipped.push(Skipped {
+                    label: info.name,
+                    reason: match info.verdict {
+                        Verdict::Skip(reason) => reason,
+                        Verdict::Merged(_) => "checked out in the main worktree".into(),
+                    },
+                });
+            }
+            continue;
+        }
         let path = Path::new(&entry.path);
         let label = rel_label(&canon_root, path);
         let Some(branch) = entry.branch else {
@@ -104,7 +132,8 @@ pub(super) fn candidates(
                 continue;
             }
         };
-        if let Some(reason) = blocker(input, path, &canon, entry.locked.as_deref()) {
+        let locked = entry.locked.as_deref();
+        if let Some(reason) = blocker(input.live, input.claimed_items, path, &canon, locked) {
             skipped.push(Skipped { label, reason });
             continue;
         }
@@ -313,5 +342,51 @@ mod tests {
             reason_for(&skipped, "task/7").starts_with("not merged"),
             "{skipped:?}"
         );
+    }
+
+    // Review finding 1: run from a linked worktree, the main checkout's
+    // branch must stay protected.
+    #[test]
+    fn main_checkout_branch_is_never_a_candidate_from_a_linked_worktree() {
+        let repo = init_repo_with_branch("master");
+        let wt = add_worktree(&repo, ".worktrees/task/7", "task/7-x");
+        run_in(&repo.path, &["switch", "-c", "feature-x"]).unwrap();
+        let opts = CleanOptions {
+            branches: true,
+            worktrees: true,
+            ..Default::default()
+        };
+        let (claimed, states) = (HashSet::new(), HashMap::new());
+        let input = ScanInput {
+            repo_root: Some(&wt),
+            scan_root: &wt,
+            opts: &opts,
+            prs: &NoPrLookup,
+            pr_lookup_available: true,
+            claimed_items: &claimed,
+            item_states: &states,
+            live: &[],
+        };
+        let branches = classify_local(&input, &wt, "master");
+        let (items, _) = candidates(&input, &wt, branches);
+        assert!(
+            !items
+                .iter()
+                .any(|i| i.branch.as_deref() == Some("feature-x")),
+            "{items:?}"
+        );
+    }
+
+    // Review minor, re-graded: `status.showUntrackedFiles=no` must not hide
+    // untracked work from the cleanliness check.
+    #[test]
+    fn untracked_files_block_removal_even_when_status_hides_them() {
+        let repo = init_repo_with_branch("master");
+        let wt = add_worktree(&repo, ".worktrees/task/7", "task/7-x");
+        run_in(&repo.path, &["config", "status.showUntrackedFiles", "no"]).unwrap();
+        std::fs::write(wt.join("notes.txt"), "unsaved work").unwrap();
+        let (items, skipped) = plan(&repo, &HashSet::new(), &[]);
+        assert!(items.iter().all(|i| i.kind != Kind::Worktree), "{items:?}");
+        assert_eq!(reason_for(&skipped, "task/7"), "uncommitted changes");
     }
 }

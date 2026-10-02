@@ -179,7 +179,11 @@ pub(super) fn find_dirs(root: &Path, kinds: &[String]) -> Vec<(PathBuf, &'static
             continue;
         };
         if let Some(kind) = match_kind(parent, &name, kinds) {
-            found.push((entry.path().to_path_buf(), kind));
+            // Its own repository (a deploy clone in `dist/`, say) can hold
+            // commits that exist nowhere else: never an artifact.
+            if std::fs::symlink_metadata(entry.path().join(".git")).is_err() {
+                found.push((entry.path().to_path_buf(), kind));
+            }
             walk.skip_current_dir();
         }
     }
@@ -463,5 +467,36 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), k.len());
+    }
+
+    // Review finding 6: an ignored directory that is its own git repository
+    // (a deploy clone in `dist/`) may hold unpushed commits.
+    #[test]
+    fn directory_that_is_its_own_git_repo_is_never_a_candidate() {
+        let repo = init_repo_with_branch("master");
+        let r = &repo.path;
+        touch(&r.join("package.json"));
+        touch(&r.join("node_modules/a/index.js"));
+        std::fs::write(r.join(".gitignore"), "dist/\nnode_modules/\n").unwrap();
+        let dist = r.join("dist");
+        std::fs::create_dir_all(&dist).unwrap();
+        run_in(&dist, &["init", "-b", "gh-pages"]).unwrap();
+        touch(&dist.join("index.html"));
+        let (l, _) = labels(r, Some(r), &all(), &[]);
+        assert_eq!(l, ["node_modules"]);
+    }
+
+    // Review Focus 4, strengthened: a committed directory with an
+    // unambiguous artifact name is still not an artifact.
+    #[test]
+    fn tracked_unambiguous_dir_is_never_a_candidate() {
+        let repo = init_repo_with_branch("master");
+        let r = &repo.path;
+        touch(&r.join("package.json"));
+        touch(&r.join("node_modules/vendored.js"));
+        run_in(r, &["add", "-f", "."]).unwrap();
+        run_in(r, &["commit", "-m", "vendored deps"]).unwrap();
+        let (l, _) = labels(r, Some(r), &all(), &[]);
+        assert!(l.is_empty(), "{l:?}");
     }
 }

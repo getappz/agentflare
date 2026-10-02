@@ -251,8 +251,8 @@ fn print_plan(plan: &Plan) {
     print_notes_and_skipped(plan);
 }
 
-/// One push: every delete is guarded by a lease on the SHA seen at plan
-/// time, so a remote branch that moved since is refused, not deleted.
+/// One all-or-nothing push: every delete is guarded by a lease on the SHA
+/// seen at plan time, so a remote branch that moved since is refused.
 fn remote_delete_args(items: &[&Item]) -> Vec<String> {
     let branch = |i: &Item| i.branch.clone().unwrap_or_default();
     let leases = items.iter().map(|i| {
@@ -263,7 +263,10 @@ fn remote_delete_args(items: &[&Item]) -> Vec<String> {
         )
     });
     let deletes = items.iter().map(|i| format!(":refs/heads/{}", branch(i)));
-    ["push".to_string(), "origin".to_string()]
+    // `--atomic`: one refused lease refuses the whole push, so the single
+    // exit status is the truth for every branch.
+    ["push", "--atomic", "origin"]
+        .map(String::from)
         .into_iter()
         .chain(leases)
         .chain(deletes)
@@ -333,7 +336,10 @@ fn fail(message: &str) -> ! {
 fn roots(path: Option<&Path>) -> Result<(PathBuf, Option<PathBuf>), String> {
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let start = path.unwrap_or(&cwd);
-    let repo_root = flare_git_core::branch::repo_toplevel(start);
+    // Always the main checkout, even when run from a linked worktree: that
+    // is where `.worktrees`, item state and claims are keyed.
+    let repo_root = flare_git_core::branch::repo_toplevel(start)
+        .map(|top| flare_git_core::branch::main_worktree_root(&top).unwrap_or(top));
     let scan_root = match (path, &repo_root) {
         (Some(p), _) => p.to_path_buf(),
         (None, Some(r)) => r.clone(),
@@ -464,7 +470,11 @@ pub fn run(args: CleanArgs) {
         chosen.into_iter().partition(|i| i.kind == Kind::Remote);
     let local: Vec<Item> = local.into_iter().cloned().collect();
     let progress = human.then(|| ui::Progress::start(local.len() as u64, "Removing"));
-    let mut report = clean::apply(repo_root, &scan_root, &local, &mut |o| {
+    // Read again, not reused from the scan: the picker may have sat open.
+    let claimed = repo_root
+        .map(super::git::claimed_sequence_ids)
+        .unwrap_or_default();
+    let mut report = clean::apply(repo_root, &scan_root, &local, &claimed, &mut |o| {
         if let Some(p) = &progress {
             p.inc(&o.id);
         }
@@ -639,6 +649,7 @@ mod tests {
             remote_delete_args(&[&a, &b]),
             [
                 "push",
+                "--atomic",
                 "origin",
                 "--force-with-lease=refs/heads/a:111",
                 "--force-with-lease=refs/heads/b:222",
@@ -646,5 +657,53 @@ mod tests {
                 ":refs/heads/b",
             ]
         );
+    }
+
+    // Review finding 7: one stale lease must not leave the other branch
+    // deleted while the run reports everything as failed.
+    #[test]
+    fn remote_delete_is_all_or_nothing_when_one_lease_is_stale() {
+        let git = |dir: &Path, args: &[&str]| run_in(dir, args).unwrap();
+        let remote = tempfile::TempDir::new().unwrap();
+        git(remote.path(), &["init", "--bare", "-b", "master"]);
+        let local = tempfile::TempDir::new().unwrap();
+        let repo = local.path();
+        git(repo, &["init", "-b", "master"]);
+        git(repo, &["config", "user.email", "t@t"]);
+        git(repo, &["config", "user.name", "T"]);
+        git(repo, &["commit", "--allow-empty", "-m", "initial"]);
+        git(
+            repo,
+            &["remote", "add", "origin", remote.path().to_str().unwrap()],
+        );
+        git(repo, &["branch", "a"]);
+        git(repo, &["branch", "b"]);
+        git(repo, &["push", "origin", "master", "a", "b"]);
+        let tip = git(repo, &["rev-parse", "master"]);
+        let item = |b: &str, sha: &str| Item {
+            id: format!("remote:{b}"),
+            kind: Kind::Remote,
+            label: format!("origin/{b}"),
+            path: None,
+            branch: Some(b.into()),
+            sha: Some(sha.into()),
+            size_bytes: 0,
+            reason: String::new(),
+        };
+        // `b` moved on the remote since the plan: its lease names a stale sha.
+        let stale = "1111111111111111111111111111111111111111";
+        let (a, b) = (item("a", &tip), item("b", stale));
+        let (outcomes, restore) = delete_remote(repo, &[&a, &b]);
+        assert!(outcomes.iter().all(|o| !o.ok), "{outcomes:?}");
+        assert!(restore.is_empty());
+        let heads = git(
+            remote.path(),
+            &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+        );
+        assert!(heads.lines().any(|l| l == "a"), "a must survive: {heads}");
+
+        let (outcomes, restore) = delete_remote(repo, &[&a]);
+        assert!(outcomes[0].ok, "{outcomes:?}");
+        assert_eq!(restore[0].name, "a");
     }
 }
