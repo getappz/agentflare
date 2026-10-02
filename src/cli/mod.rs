@@ -154,7 +154,7 @@ pub enum Commands {
     Docs(docs::DocsArgs),
     /// Run and inspect durable agent pipelines through the workflow engine.
     Workflow(workflow::WorkflowArgs),
-    /// Unified observability for AI coding sessions (Claude/Codex/OpenCode/Cursor/Gemini) — local-first.
+    /// Unified observability for AI coding sessions (Claude/Codex/OpenCode) — local-first.
     Insights(insights::InsightsArgs),
     /// Run and manage AgentFlare Apps — self-contained agentic domain modules.
     Apps(apps::AppsArgs),
