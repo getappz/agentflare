@@ -91,9 +91,7 @@ pub(crate) fn sdd_role_spec(role: SddRole) -> agent_registry::RoleSpec {
         role: name.to_string(),
         system_prompt: Some(system_prompt.to_string()),
         disallowed_tools,
-        json_schema: (role == SddRole::Judge)
-            .then(judge_json_schema)
-            .flatten(),
+        json_schema: (role == SddRole::Judge).then(judge_json_schema).flatten(),
         ..agent_registry::RoleSpec::default()
     }
 }

@@ -52,10 +52,7 @@ impl QuotaWindowKind {
 }
 
 fn infer_quota_window_kind(lower: &str) -> QuotaWindowKind {
-    if lower.contains("monthly")
-        || lower.contains("per month")
-        || lower.contains("this month")
-    {
+    if lower.contains("monthly") || lower.contains("per month") {
         QuotaWindowKind::Monthly
     } else if lower.contains("weekly")
         || lower.contains("7-day")
@@ -64,10 +61,7 @@ fn infer_quota_window_kind(lower: &str) -> QuotaWindowKind {
         || lower.contains("seven-day")
     {
         QuotaWindowKind::Weekly
-    } else if lower.contains("daily")
-        || lower.contains("per day")
-        || lower.contains("day limit")
-    {
+    } else if lower.contains("daily") || lower.contains("per day") || lower.contains("day limit") {
         QuotaWindowKind::Daily
     } else if lower.contains("5-hour")
         || lower.contains("5 hour")
@@ -215,7 +209,11 @@ const TRANSIENT_PATTERNS: &[&str] = &["overloaded", "temporarily unavailable", "
 
 /// Human-readable schedule line for item comments when a quota window
 /// exhausted the agent (pairs agentflare's UTC retry with how it was derived).
-pub(crate) fn quota_schedule_blurb(failure: &AgentFailure, now: i64, wait_secs: u64) -> Option<String> {
+pub(crate) fn quota_schedule_blurb(
+    failure: &AgentFailure,
+    now: i64,
+    wait_secs: u64,
+) -> Option<String> {
     let AgentFailure::QuotaWindowExhausted { resets_at, window } = failure else {
         return None;
     };
@@ -631,6 +629,25 @@ mod classify_tests {
     }
 
     #[test]
+    fn savings_this_month_does_not_infer_monthly_window() {
+        // Codex-style savings blurb mentions "this month" incidental to a
+        // usage-limit hit with no reset and no named window — must not park
+        // for the monthly fallback (8-day clamp).
+        let text = "ActionRequiredError: You've hit your usage limit You've saved $51 on API model usage this month with Start. Switch to a different model.";
+        assert_eq!(
+            classify(text),
+            AgentFailure::QuotaWindowExhausted {
+                resets_at: None,
+                window: QuotaWindowKind::Unknown,
+            }
+        );
+        assert_eq!(
+            classify(text).wait_secs(at().timestamp()),
+            Some(QUOTA_WINDOW_DEFAULT_SECS)
+        );
+    }
+
+    #[test]
     fn quota_reset_time_is_parsed_when_printed() {
         let now = at().timestamp();
         // Legacy Claude format: unix timestamp after a pipe.
@@ -810,7 +827,9 @@ mod classify_tests {
     fn step_retry_is_skipped_for_exhaustion_auth_and_stalls_only() {
         assert!(skips_step_retry("Credit balance is too low"));
         assert!(skips_step_retry("You've hit your weekly limit"));
-        assert!(skips_step_retry("Error: session expired, please re-authenticate"));
+        assert!(skips_step_retry(
+            "Error: session expired, please re-authenticate"
+        ));
         assert!(skips_step_retry(&format!(
             "Codex {} for 2700s while its output repeated",
             crate::agent_launch::STALLED_MARKER

@@ -10,7 +10,8 @@ fn parses_valid_decision() {
 
 #[test]
 fn parses_string_null_task_model_tier_as_none() {
-    let reply = r#"{"action":"advance_task","rationale":"x","ledger_line":"x","task_model_tier":"null"}"#;
+    let reply =
+        r#"{"action":"advance_task","rationale":"x","ledger_line":"x","task_model_tier":"null"}"#;
     let decision = parse_judge_decision(reply).expect("string null tier");
     assert_eq!(decision.task_model_tier, None);
 }
