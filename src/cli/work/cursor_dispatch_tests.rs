@@ -10,6 +10,8 @@ fn build_extra_args_gives_cursor_stream_json_but_no_claude_only_flags() {
         args,
         vec![
             "--force".to_string(),
+            "--trust".to_string(),
+            "--approve-mcps".to_string(),
             "--output-format".to_string(),
             "stream-json".to_string(),
         ]
