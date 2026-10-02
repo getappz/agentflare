@@ -6,6 +6,7 @@ mod auth;
 mod browser;
 mod channel;
 mod claim;
+mod clean;
 mod coaching;
 mod code;
 mod config;
@@ -136,6 +137,9 @@ pub enum Commands {
     Channel(channel::ChannelArgs),
     /// Claim a work item for the current agent session.
     Claim(claim::ClaimArgs),
+    /// Clean up merged branches, worktrees and build artifacts: shows a plan, then asks.
+    #[command(visible_alias = "cleanup")]
+    Clean(clean::CleanArgs),
     /// Review a diff, PR, or branch for correctness and simplification.
     Review(review::ReviewArgs),
     /// Discover, install, and manage skills for coding agents.
@@ -197,6 +201,7 @@ impl Commands {
             Self::About(cmd) => crate::about::run(cmd),
             Self::Channel(cmd) => cmd.run(),
             Self::Claim(cmd) => cmd.run(),
+            Self::Clean(cmd) => clean::run(cmd),
             Self::Review(cmd) => cmd.run(),
             Self::Skill(cmd) => cmd.run(),
             Self::Memory(cmd) => cmd.run(),

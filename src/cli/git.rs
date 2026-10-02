@@ -650,7 +650,7 @@ fn doctor_cmd(args: DoctorArgs) {
 /// Fails CLOSED: if the claim state can't be read, every worktree dir under
 /// `.worktrees/task` is reported as claimed, so a prune on top of it removes
 /// nothing rather than treating "couldn't check" as "nothing is claimed".
-fn claimed_sequence_ids(repo_root: &Path) -> HashSet<String> {
+pub(crate) fn claimed_sequence_ids(repo_root: &Path) -> HashSet<String> {
     fn read(repo_root: &Path) -> Result<HashSet<String>, String> {
         // Never used on this machine: no items, so nothing is claimed.
         let Some((conn, project_id)) = backend_for_repo(repo_root)? else {
@@ -734,7 +734,7 @@ fn backend_for_repo(
 /// finished `#N` must never mark this repo's live `#N` worktree orphaned.
 /// Best-effort: an empty map (no project match, or any DB error) means
 /// orphan detection finds nothing -- the safe direction.
-fn item_state_groups(repo_root: &Path) -> HashMap<String, String> {
+pub(crate) fn item_state_groups(repo_root: &Path) -> HashMap<String, String> {
     let read = || -> Result<HashMap<String, String>, String> {
         let Some((conn, Some(project_id))) = backend_for_repo(repo_root)? else {
             return Ok(HashMap::new());
