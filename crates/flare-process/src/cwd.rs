@@ -20,7 +20,12 @@ pub fn live_procs() -> Vec<LiveProc> {
     sys.refresh_processes_specifics(
         ProcessesToUpdate::All,
         true,
-        ProcessRefreshKind::nothing().with_cwd(UpdateKind::Always),
+        // Processes only: a thread ("task") has its own id and name, which
+        // would slip past the ancestor exclusion and name a thread in the
+        // "in use by ..." message.
+        ProcessRefreshKind::nothing()
+            .with_cwd(UpdateKind::Always)
+            .without_tasks(),
     );
     let mut skip = std::collections::HashSet::new();
     let mut pid = Some(Pid::from_u32(std::process::id()));
@@ -77,6 +82,37 @@ mod tests {
         assert!(
             procs.iter().all(|p| p.pid != std::process::id()),
             "the current process must be excluded"
+        );
+    }
+
+    /// A thread has its own id and name (`tokio-rt-worker`, `libuv-worker`),
+    /// which is useless in a "this directory is in use by ..." message and
+    /// slips past the ancestor exclusion.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lists_processes_not_their_threads() {
+        let tgid = |pid: u32| -> Option<u32> {
+            let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+            let line = status.lines().find(|l| l.starts_with("Tgid:"))?;
+            line.split_whitespace().nth(1)?.parse().ok()
+        };
+        // Hold a named thread open so this test binary itself has one.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::Builder::new()
+            .name("cwd-test-worker".into())
+            .spawn(move || rx.recv().ok())
+            .unwrap();
+        let procs = live_procs();
+        drop(tx);
+        worker.join().unwrap();
+        let threads: Vec<_> = procs
+            .iter()
+            .filter(|p| tgid(p.pid).is_some_and(|leader| leader != p.pid))
+            .map(|p| format!("{} ({})", p.name, p.pid))
+            .collect();
+        assert!(
+            threads.is_empty(),
+            "threads listed as processes: {threads:?}"
         );
     }
 }
