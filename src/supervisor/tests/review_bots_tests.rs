@@ -666,6 +666,52 @@ fn sweep_replies_then_resolves_a_fixed_thread_once_the_sha_is_on_the_remote() {
 }
 
 #[test]
+fn sweep_settles_a_fixed_thread_when_resolve_fails_like_body_level_findings() {
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
+    record_result(
+        &mcp,
+        &item_id,
+        "PRRT_1",
+        &ReviewResult {
+            round: 1,
+            outcome: ReviewOutcome::Fixed,
+            sha: Some("abc1234".into()),
+            note: "addressed outside the diff".into(),
+            test: None,
+        },
+    );
+    let server = MockServer::start(vec![
+        MockResponse::json(
+            200,
+            &threads_page(&[("PRRT_1", false, vec![(11, BOT, MAJOR_BODY.into())])]),
+        ),
+        MockResponse::json(200, r#"[{"sha":"abc1234deadbeef"}]"#),
+        MockResponse::json(201, r#"{"id":99}"#),
+        MockResponse::json(
+            200,
+            r#"{"errors":[{"message":"resolveReviewThread is not supported"}]}"#,
+        ),
+    ]);
+    let state = sweep(
+        &server,
+        &mcp,
+        &queue,
+        &item_id,
+        None,
+        &ReviewBotConfig::default(),
+    );
+    assert_eq!(state.replied, 1, "reply must land even when resolve fails");
+    assert!(state.to_dispatch.is_empty());
+    let meta = item_meta(&mcp, &item_id);
+    assert!(
+        thread_result(&meta, "PRRT_1").is_none(),
+        "metadata must clear once the fix sha is on the PR"
+    );
+}
+
+#[test]
 fn sweep_waits_while_a_fixed_sha_is_not_on_the_remote_and_a_job_still_runs() {
     let mcp = test_mcp();
     let queue = test_queue();
@@ -714,6 +760,85 @@ fn sweep_waits_while_a_fixed_sha_is_not_on_the_remote_and_a_job_still_runs() {
     assert!(state.blocks_merge());
     assert_eq!(server.requests().len(), 2, "no reply, no resolve");
     assert!(thread_result(&item_meta(&mcp, &item_id), "PRRT_1").is_some());
+}
+
+#[test]
+fn sweep_retains_pending_body_level_fixed_result_without_posting_detached_comment() {
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
+    record_result(
+        &mcp,
+        &item_id,
+        "body:src/lib.rs:1",
+        &ReviewResult {
+            round: 1,
+            outcome: ReviewOutcome::Fixed,
+            sha: Some("abc1234".into()),
+            note: "fixed in module docs".into(),
+            test: None,
+        },
+    );
+    let server = MockServer::start(vec![
+        MockResponse::json(200, &threads_page(&[])),
+        MockResponse::json(200, r#"[{"sha":"0000000unrelated"}]"#),
+    ]);
+    let _state = sweep(
+        &server,
+        &mcp,
+        &queue,
+        &item_id,
+        None,
+        &ReviewBotConfig::default(),
+    );
+    let reqs = server.requests();
+    assert!(
+        !reqs
+            .iter()
+            .any(|r| r.method == "POST" && r.path.contains("/issues/7/comments")),
+        "pending fixed body-level results must not be posted or cleared: {reqs:?}"
+    );
+    assert!(
+        thread_result(&item_meta(&mcp, &item_id), "body:src/lib.rs:1").is_some(),
+        "metadata must stay until the fix sha is on the PR branch"
+    );
+}
+
+#[test]
+fn sweep_drops_a_body_level_fixed_result_once_its_sha_is_on_the_pr() {
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
+    record_result(
+        &mcp,
+        &item_id,
+        "body:src/lib.rs:1",
+        &ReviewResult {
+            round: 1,
+            outcome: ReviewOutcome::Fixed,
+            sha: Some("abc1234".into()),
+            note: "fixed in module docs".into(),
+            test: None,
+        },
+    );
+    let server = MockServer::start(vec![
+        MockResponse::json(200, &threads_page(&[])),
+        MockResponse::json(200, r#"[{"sha":"abc1234deadbeef"}]"#),
+    ]);
+    let _state = sweep(
+        &server,
+        &mcp,
+        &queue,
+        &item_id,
+        None,
+        &ReviewBotConfig::default(),
+    );
+    let reqs = server.requests();
+    assert_eq!(reqs.len(), 2, "threads, then the commit list: {reqs:?}");
+    assert!(
+        thread_result(&item_meta(&mcp, &item_id), "body:src/lib.rs:1").is_none(),
+        "a body-level fix whose sha is on the PR must not stay pending forever"
+    );
 }
 
 #[test]

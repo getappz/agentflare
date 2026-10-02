@@ -155,25 +155,6 @@ pub fn resolve_review_thread(client: &Client, thread_id: &str) -> Result<(), Git
     Ok(())
 }
 
-/// Replies on a thread and then, only once the reply has landed, resolves
-/// it. The order is the point: a thread resolved without its reply reads as
-/// silently dismissed, while a reply without the resolve is merely untidy
-/// and the next sweep finishes the job. Returns the reply's id.
-pub fn reply_then_resolve(
-    client: &Client,
-    repo: &RepoId,
-    number: u64,
-    thread: &ReviewThread,
-    body: &str,
-) -> Result<u64, GitHubError> {
-    let root = thread
-        .root()
-        .ok_or_else(|| GitHubError::Parse("thread has no root comment".to_string()))?;
-    let reply_id = reply_to_review_comment(client, repo, number, root.database_id, body)?;
-    resolve_review_thread(client, &thread.id)?;
-    Ok(reply_id)
-}
-
 /// Every commit sha on the PR, oldest first -- how a sweep confirms an
 /// agent's "fixed in <sha>" actually reached the remote before it replies.
 pub fn pr_commit_shas(
@@ -334,38 +315,6 @@ mod tests {
             "must be spaced as a mutation"
         );
         assert_eq!(sent["variables"]["id"], "PRRT_1");
-    }
-
-    #[test]
-    fn reply_then_resolve_replies_first_and_resolves_second() {
-        let server = MockServer::start(vec![
-            MockResponse::json(201, r#"{"id":78}"#),
-            MockResponse::json(200, r#"{"data":{"resolveReviewThread":{"thread":{}}}}"#),
-        ]);
-        let client = server.client(Some("tok"));
-        let thread = parse_thread(&serde_json::from_str(ROOT_THREAD).unwrap());
-        let id = reply_then_resolve(&client, &repo(), 5, &thread, "Fixed in abc.").unwrap();
-        assert_eq!(id, 78);
-        let reqs = server.requests();
-        assert_eq!(reqs.len(), 2);
-        assert_eq!(reqs[0].path, "/repos/o/r/pulls/5/comments/11/replies");
-        assert_eq!(reqs[1].path, "/graphql");
-    }
-
-    #[test]
-    fn reply_then_resolve_never_resolves_when_the_reply_fails() {
-        let server = MockServer::start(vec![MockResponse::json(
-            422,
-            r#"{"message":"Validation Failed"}"#,
-        )]);
-        let client = server.client(Some("tok"));
-        let thread = parse_thread(&serde_json::from_str(ROOT_THREAD).unwrap());
-        assert!(reply_then_resolve(&client, &repo(), 5, &thread, "x").is_err());
-        assert_eq!(
-            server.requests().len(),
-            1,
-            "a failed reply must not be followed by a resolve"
-        );
     }
 
     #[test]
