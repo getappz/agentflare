@@ -145,6 +145,103 @@
         });
     }
 
+    /// Item #322: orphan-restart release must keep a clean mid-work checkout.
+    /// Without `preserve_worktree`, `item_release`'s #335 cleanup deletes it
+    /// and reclaim reincarnates an empty-looking lane.
+    #[test]
+    fn reconcile_orphaned_jobs_preserves_a_clean_item_worktree() {
+        crate::paths::test_support::with_temp_home(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo_root).unwrap();
+            init_test_repo(&repo_root);
+
+            let mcp = crate::mcp_server::AgentflareMcp::for_project_dir(repo_root.clone());
+            let item = mcp
+                .with_backend_db(|conn| {
+                    let project = mcp.resolve_project(conn).unwrap();
+                    let state = agentflare_backend::state::list_by_project(conn, &project.id)
+                        .unwrap()
+                        .into_iter()
+                        .find(|s| s.is_default)
+                        .unwrap();
+                    agentflare_backend::item::create(
+                        conn,
+                        agentflare_backend::item::CreateItem {
+                            project_id: project.id,
+                            state_id: state.id,
+                            name: "orphan preserve worktree".into(),
+                            description: Some("mid-work".into()),
+                            priority: None,
+                            parent_id: None,
+                            assignee_agent: None,
+                            sort_order: None,
+                            external_source: None,
+                            external_id: None,
+                            metadata: None,
+                            label_ids: vec![],
+                            assignee_ids: vec![],
+                            dependency_ids: vec![],
+                            start_date: None,
+                            due_date: None,
+                        },
+                    )
+                    .unwrap()
+                })
+                .unwrap();
+
+            let job = agentflare_jobs::AgentJob::new("agentflare-work")
+                .args([
+                    item.id.clone(),
+                    "claude-code".to_string(),
+                    repo_root.to_string_lossy().to_string(),
+                ])
+                .in_process();
+            let queue = test_queue();
+            let info = queue.enqueue(&job).unwrap();
+
+            let worktree_path = crate::claims::with_owner_override(
+                format!("claude-code:{}", info.id),
+                || {
+                    let claim_json = mcp
+                        .item_claim(crate::mcp_server::types::ItemRequest {
+                            action: "claim".to_string(),
+                            id: Some(item.id.clone()),
+                            ..Default::default()
+                        })
+                        .unwrap();
+                    let claim: serde_json::Value = serde_json::from_str(&claim_json).unwrap();
+                    assert_eq!(claim["status"], "acquired");
+                    let path = std::path::PathBuf::from(claim["worktree_path"].as_str().unwrap());
+                    assert!(path.exists(), "claim must create the worktree");
+                    std::fs::write(path.join("mid_work.txt"), "committed mid-work").unwrap();
+                    let run = |args: &[&str]| {
+                        std::process::Command::new("git")
+                            .args(args)
+                            .current_dir(&path)
+                            .output()
+                            .unwrap()
+                    };
+                    run(&["add", "mid_work.txt"]);
+                    run(&["commit", "-m", "mid-work"]);
+                    path
+                },
+            );
+
+            queue.dequeue().unwrap();
+            reconcile_orphaned_jobs(&queue);
+
+            assert!(
+                worktree_path.exists(),
+                "orphan reconcile must not delete a clean mid-work checkout"
+            );
+            assert!(
+                worktree_path.join("mid_work.txt").exists(),
+                "committed mid-work must survive orphan restart release"
+            );
+        });
+    }
+
     /// Items #185/#187: `reconcile_orphaned_jobs`'s earlier release (via
     /// `release_and_comment` under `with_owner_override`) is best-effort
     /// (`let _ = ...`) -- if it silently doesn't take, `restore_ready_for_work`
