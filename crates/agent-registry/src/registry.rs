@@ -367,9 +367,11 @@ pub fn autonomous_args(agent: Agent) -> Option<&'static [&'static str]> {
         // `opencode run --auto`: "auto-approve permissions that are not
         // explicitly denied" — confirmed via `opencode run --help`.
         Agent::Opencode => Some(&["--auto"]),
-        // `cursor-agent --force`: "Force allow commands unless explicitly
-        // denied" — confirmed via `cursor-agent --help`.
-        Agent::Cursor => Some(&["--force"]),
+        // Cursor headless: `--force` auto-allows commands; `--trust` skips
+        // the workspace-trust prompt; `--approve-mcps` skips MCP approval.
+        // Omit `--sandbox` — jobs already run under agentflare bwrap; a
+        // second Cursor sandbox would double-constrain or fight user prefs.
+        Agent::Cursor => Some(&["--force", "--trust", "--approve-mcps"]),
         // `cline --auto-approve <boolean>`: "Set tool auto-approval for all
         // tools (default: true)" — confirmed via `cline --help`. Passed
         // explicitly rather than relying on the default, same as every
@@ -530,8 +532,11 @@ mod tests {
     }
 
     #[test]
-    fn autonomous_args_maps_cursor_to_force() {
-        assert_eq!(autonomous_args(Agent::Cursor), Some(&["--force"][..]));
+    fn autonomous_args_maps_cursor_to_force_trust_and_approve_mcps() {
+        assert_eq!(
+            autonomous_args(Agent::Cursor),
+            Some(&["--force", "--trust", "--approve-mcps"][..])
+        );
     }
 
     #[test]
