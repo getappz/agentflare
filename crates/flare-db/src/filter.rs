@@ -1,4 +1,4 @@
-use sea_query::{Condition, Expr, ExprTrait, LikeExpr, SimpleExpr};
+use sea_query::{Condition, Expr, ExprTrait, SimpleExpr};
 
 /// One filter condition on a single column, generated per-field on `{Entity}Filter`
 /// structs by the `Crud` derive. Mirrors Medusa's dynamic filter operator set.
@@ -42,13 +42,16 @@ pub fn escape_like(s: &str) -> String {
 pub fn ilike_expr(column: &'static str, pattern: String) -> SimpleExpr {
     #[cfg(feature = "postgres")]
     {
+        // No `ESCAPE` clause: backslash is already Postgres's default escape
+        // character for `LIKE`/`ILIKE`. sea-query renders `ILIKE` plus a
+        // `LikeExpr` escape as `ILIKE ($1 ESCAPE E'\\')`, which Postgres rejects.
         use sea_query::extension::postgres::PgExpr as _;
-        Expr::col(column).ilike(LikeExpr::new(pattern).escape('\\'))
+        Expr::col(column).ilike(pattern)
     }
     #[cfg(not(feature = "postgres"))]
     {
         sea_query::Func::lower(Expr::col(column))
-            .like(LikeExpr::new(pattern.to_ascii_lowercase()).escape('\\'))
+            .like(sea_query::LikeExpr::new(pattern.to_ascii_lowercase()).escape('\\'))
     }
 }
 
@@ -162,10 +165,10 @@ mod tests {
     #[test]
     fn ilike_uses_native_ilike_with_escape_on_postgres() {
         let sql = render(FilterOp::ILike::<String>("a\\_%".into()).into_expr("t"));
-        assert!(
-            sql.contains(r#""t" ILIKE "#) && sql.ends_with(r"ESCAPE E'\\')"),
-            "{sql}"
-        );
+        // A bare `ILIKE <pattern>`: backslash is Postgres's default escape, and an
+        // `ESCAPE` clause wrapped in parentheses is a syntax error there.
+        assert!(sql.ends_with(r#"WHERE "t" ILIKE E'a\\_%'"#), "{sql}");
+        assert!(!sql.contains("ESCAPE"), "{sql}");
     }
 
     #[cfg(not(feature = "postgres"))]
