@@ -1,9 +1,12 @@
 //! `agentflare clean` engine: builds a cleanup [`Plan`] and applies selected
 //! items. No terminal or network I/O; callers pass in what needs either.
 
+mod apply;
 pub mod artifacts;
 mod merged;
 mod worktrees;
+
+pub use apply::{Outcome, Report, RestoreEntry, apply, purge};
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -109,6 +112,54 @@ pub struct ScanInput<'a> {
     pub live: &'a [flare_process::cwd::LiveProc],
 }
 
+fn wanted(opts: &CleanOptions, label: &str) -> bool {
+    (opts.only.is_empty() || opts.only.iter().any(|g| glob_match(g, label)))
+        && !opts.exclude.iter().any(|g| glob_match(g, label))
+}
+
+/// Builds the plan. Read-only: nothing is deleted, moved or fetched.
+#[must_use]
+pub fn scan(input: &ScanInput) -> Plan {
+    let mut plan = Plan::default();
+    let opts = input.opts;
+    let git = opts.branches || opts.worktrees || opts.remote;
+    if let Some(repo_root) = input.repo_root {
+        let default = crate::branch::resolve_default_branch(repo_root);
+        if opts.branches || opts.worktrees {
+            let branches = merged::classify_local(input, repo_root, &default);
+            let (items, skipped) = worktrees::candidates(input, repo_root, branches);
+            plan.items.extend(items);
+            plan.skipped.extend(skipped);
+        }
+        if opts.remote {
+            let (items, skipped) = merged::classify_remote(input, repo_root, &default);
+            plan.items.extend(items);
+            plan.skipped.extend(skipped);
+        }
+        if git && !input.pr_lookup_available {
+            plan.notes.push(
+                "GitHub lookup unavailable: squash-merged branches could not be verified and \
+                 are listed as not merged"
+                    .into(),
+            );
+        }
+    } else if git {
+        plan.notes
+            .push("not a git repository: branch and worktree cleanup skipped".into());
+    }
+    if let Some(kinds) = &opts.artifacts {
+        let (items, skipped) = artifacts::scan(input, kinds);
+        plan.items.extend(items);
+        plan.skipped.extend(skipped);
+    }
+    plan.items.retain(|i| wanted(opts, &i.label));
+    plan.skipped.retain(|s| wanted(opts, &s.label));
+    plan.items
+        .sort_by(|a, b| (a.kind, b.size_bytes, &a.label).cmp(&(b.kind, a.size_bytes, &b.label)));
+    plan.skipped.sort_by(|a, b| a.label.cmp(&b.label));
+    plan
+}
+
 /// `f` over `items` on a bounded worker pool, results in input order.
 pub(crate) fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     let workers = std::thread::available_parallelism()
@@ -162,6 +213,93 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shell::test_support::init_repo_with_branch;
+    use crate::shell::{run_in, run_in_ok};
+
+    pub(super) fn git_opts() -> CleanOptions {
+        CleanOptions {
+            branches: true,
+            worktrees: true,
+            ..Default::default()
+        }
+    }
+
+    pub(super) fn scan_repo(repo: &Path, opts: &CleanOptions) -> Plan {
+        let (claimed, states) = (HashSet::new(), HashMap::new());
+        scan(&ScanInput {
+            repo_root: Some(repo),
+            scan_root: repo,
+            opts,
+            prs: &NoPrLookup,
+            pr_lookup_available: false,
+            claimed_items: &claimed,
+            item_states: &states,
+            live: &[],
+        })
+    }
+
+    #[test]
+    fn scan_is_read_only_and_notes_missing_pr_lookup() {
+        let repo = init_repo_with_branch("master");
+        run_in(&repo.path, &["branch", "done"]).unwrap();
+        let plan = scan_repo(&repo.path, &git_opts());
+        let ids: Vec<&str> = plan.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, ["branch:done"]);
+        assert!(
+            plan.notes.iter().any(|n| n.contains("squash")),
+            "{:?}",
+            plan.notes
+        );
+        assert!(
+            run_in_ok(&repo.path, &["rev-parse", "--verify", "refs/heads/done"]),
+            "scan deletes nothing"
+        );
+    }
+
+    #[test]
+    fn only_and_exclude_filter_by_label() {
+        let repo = init_repo_with_branch("master");
+        for b in ["task/1-a", "task/2-b", "keep"] {
+            run_in(&repo.path, &["branch", b]).unwrap();
+        }
+        let labels = |o: CleanOptions| -> Vec<String> {
+            let plan = scan_repo(&repo.path, &o);
+            plan.items.into_iter().map(|i| i.label).collect()
+        };
+        let only = CleanOptions {
+            only: vec!["task/*".into()],
+            ..git_opts()
+        };
+        assert_eq!(labels(only), ["task/1-a", "task/2-b"]);
+        let exclude = CleanOptions {
+            exclude: vec!["task/1*".into()],
+            ..git_opts()
+        };
+        assert_eq!(labels(exclude), ["keep", "task/2-b"]);
+    }
+
+    #[test]
+    fn outside_a_repo_git_cleanup_is_noted_not_fatal() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (claimed, states) = (HashSet::new(), HashMap::new());
+        let opts = git_opts();
+        let plan = scan(&ScanInput {
+            repo_root: None,
+            scan_root: dir.path(),
+            opts: &opts,
+            prs: &NoPrLookup,
+            pr_lookup_available: true,
+            claimed_items: &claimed,
+            item_states: &states,
+            live: &[],
+        });
+        assert!(plan.items.is_empty());
+        assert!(
+            plan.notes
+                .iter()
+                .any(|n| n.contains("not a git repository"))
+        );
+    }
 
     #[test]
     fn glob_match_star_spans_slashes() {
