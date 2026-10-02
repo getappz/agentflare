@@ -132,12 +132,21 @@ pub(super) fn coderabbit_repair_capped_unresolved(
         .is_some_and(|completed| completed == fingerprint)
 }
 
-fn cap_comment_fingerprint(body: &str) -> Option<&str> {
+fn cap_comment_fingerprint(body: &str) -> Option<String> {
     if !body.starts_with(CODERABBIT_REPAIR_CAP_MARKER) {
         return None;
     }
-    body.lines()
-        .find_map(|line| line.strip_prefix("findings fingerprint: "))
+    let mut lines = body.lines();
+    let header = lines.find_map(|line| line.strip_prefix("findings fingerprint: "))?;
+    let mut fingerprint = header.to_string();
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        fingerprint.push('\n');
+        fingerprint.push_str(line);
+    }
+    Some(fingerprint)
 }
 
 fn coderabbit_cap_announced_for(
@@ -155,7 +164,7 @@ fn coderabbit_cap_announced_for(
         .is_some_and(|comments| {
             comments
                 .iter()
-                .any(|c| cap_comment_fingerprint(&c.body) == Some(fingerprint))
+                .any(|c| cap_comment_fingerprint(&c.body).as_deref() == Some(fingerprint))
         })
 }
 
