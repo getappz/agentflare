@@ -1,3 +1,0 @@
-=== git status ===
-git status status=Some(1) stdout= stderr=error launching git: The system cannot find the path specified.
-
