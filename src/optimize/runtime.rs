@@ -240,19 +240,24 @@ pub fn has_fresh_passing_verification(
 ///
 /// Known gap: uncommitted edits inside initialized submodules are not
 /// reflected (the superproject tree stores submodule commit IDs only).
+/// Per-`git` step budget inside [`tree_fingerprint`]. Sized so several steps
+/// still fit under PreToolUse's hook wall clock when Windows doesn't reap
+/// the child after the host timeout (#695).
+const TREE_FINGERPRINT_GIT_TIMEOUT_SECS: u64 = 2;
+
 pub fn tree_fingerprint() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
     let run = |args: &[&str], index: Option<&std::path::Path>| -> Option<String> {
-        let mut cmd = std::process::Command::new("git");
-        cmd.env_remove("GIT_DIR");
-        cmd.env_remove("GIT_WORK_TREE");
-        cmd.args(args);
-        if let Some(i) = index {
-            cmd.env("GIT_INDEX_FILE", i);
-        }
-        let out = cmd.output().ok()?;
-        out.status
-            .success()
-            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        let extra_env: &[(&str, &std::ffi::OsStr)] = match index {
+            Some(i) => &[("GIT_INDEX_FILE", i.as_os_str())],
+            None => &[],
+        };
+        flare_git_core::worktree::run_git_opt_timeout(
+            &cwd,
+            args,
+            TREE_FINGERPRINT_GIT_TIMEOUT_SECS,
+            extra_env,
+        )
     };
     let real = run(
         &["rev-parse", "--path-format=absolute", "--git-path", "index"],
