@@ -274,6 +274,27 @@ fn retire_legacy_cargo_config_removes_generated_sccache_config() {
 }
 
 #[test]
+fn retire_legacy_cargo_config_keeps_user_edits_under_the_marker() {
+    let tmp = TempDir::new().unwrap();
+    let wt = tmp.path().join("1");
+    let config = wt.join(".cargo").join("config.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(
+        &config,
+        format!(
+            "[build]\n# {LEGACY_CARGO_CONFIG_MARKER}.\ntarget-dir = \"target\"\n\
+             jobs = 2\n"
+        ),
+    )
+    .unwrap();
+    retire_legacy_cargo_config(&wt);
+    assert!(
+        config.exists(),
+        "a marked config with local edits must stay"
+    );
+}
+
+#[test]
 fn retire_legacy_cargo_config_keeps_intentional_override() {
     let tmp = TempDir::new().unwrap();
     let wt = tmp.path().join("1");

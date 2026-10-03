@@ -260,7 +260,18 @@ fn retire_legacy_cargo_config(worktree_path: &Path) {
     let Ok(content) = std::fs::read_to_string(&config_path) else {
         return;
     };
-    if !content.contains(LEGACY_CARGO_CONFIG_MARKER) {
+    // Marker alone isn't enough: a user may have appended overrides under it.
+    // Only a file made purely of the lines #133/#139 generated is retired.
+    let only_generated = content.lines().map(str::trim).all(|l| {
+        l.is_empty()
+            || l.starts_with('#')
+            || matches!(
+                l,
+                "[build]" | "[env]" | "target-dir = \"target\"" | "rustc-wrapper = \"sccache\""
+            )
+            || l.starts_with("SCCACHE_BASEDIRS = ")
+    });
+    if !content.contains(LEGACY_CARGO_CONFIG_MARKER) || !only_generated {
         return;
     }
     if let Err(e) = std::fs::remove_file(&config_path) {

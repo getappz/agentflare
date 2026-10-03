@@ -10,7 +10,10 @@ pub const INSTALL_HINT: &str = "cargo install mbx --locked";
 /// Directory holding mbx's standalone `cargo` shim (`mbx setup`), if installed.
 fn shim_dir_in(data_dir: &Path) -> Option<PathBuf> {
     let dir = data_dir.join("mbx").join("bin");
-    dir.join("cargo").is_file().then_some(dir)
+    // `mbx setup` installs `cargo.exe` on Windows.
+    dir.join(format!("cargo{}", std::env::consts::EXE_SUFFIX))
+        .is_file()
+        .then_some(dir)
 }
 
 /// `path` with `shim` prepended; `None` when there is nothing to change.
@@ -20,11 +23,14 @@ fn prepend_dir(shim: Option<PathBuf>, path: Option<OsString>) -> Option<OsString
     std::env::join_paths(std::iter::once(shim).chain(std::env::split_paths(&rest))).ok()
 }
 
-/// `PATH` for a launched agent so plain `cargo` resolves to mbx's shim. `None`
-/// (leave `PATH` untouched, plain cargo) when the shim isn't installed. The
-/// sandbox inherits the child's environment, so it sees the same value.
-pub fn agent_path() -> Option<OsString> {
-    prepend_dir(shim_dir_in(&dirs::data_dir()?), std::env::var_os("PATH"))
+/// `base` (the agent's effective `PATH`) with mbx's shim prepended so plain
+/// `cargo` resolves to it. `None` (leave `PATH` untouched, plain cargo) when
+/// the shim isn't installed or mbx itself is gone (an orphaned shim would fail
+/// instead of falling back). The sandbox inherits the child's environment, so
+/// it sees the same value.
+pub fn agent_path(base: Option<OsString>) -> Option<OsString> {
+    installed()?;
+    prepend_dir(shim_dir_in(&dirs::data_dir()?), base)
 }
 
 fn installed() -> Option<PathBuf> {
@@ -42,7 +48,7 @@ fn installed() -> Option<PathBuf> {
 fn cache_dir() -> Option<PathBuf> {
     std::env::var_os("MBX_CACHE_DIR")
         .map(PathBuf::from)
-        .or_else(|| Some(dirs::home_dir()?.join(".cache/mbx")))
+        .or_else(|| Some(dirs::cache_dir()?.join("mbx")))
 }
 
 #[derive(Debug, Serialize)]
@@ -76,7 +82,7 @@ impl MbxStatus {
             cache_dir,
             cache_writable_in_sandbox: writable,
             sandboxed,
-            shim_active: agent_path().is_some(),
+            shim_active: agent_path(std::env::var_os("PATH")).is_some(),
         }
     }
 
@@ -133,7 +139,11 @@ mod tests {
         let bin = tmp.path().join("mbx").join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         assert_eq!(shim_dir_in(tmp.path()), None);
-        std::fs::write(bin.join("cargo"), "").unwrap();
+        std::fs::write(
+            bin.join(format!("cargo{}", std::env::consts::EXE_SUFFIX)),
+            "",
+        )
+        .unwrap();
         assert_eq!(shim_dir_in(tmp.path()), Some(bin));
     }
 
