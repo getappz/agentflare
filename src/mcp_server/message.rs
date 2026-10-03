@@ -185,9 +185,9 @@ impl AgentflareMcp {
 
     /// For another tool's result: this session's pending messages inlined
     /// (and so delivered) when small, else a pointer to `message
-    /// action=inbox`. The delivery path for hosts whose hooks can't inject
-    /// context (Codex, Cursor, ...). `None` -- and no db work beyond one
-    /// indexed probe -- when nothing is waiting.
+    /// action=inbox`. Backup delivery when hooks have not yet taken the
+    /// mail (or for hosts that still can't inject). `None` -- and no db
+    /// work beyond one indexed probe -- when nothing is waiting.
     pub(crate) fn message_piggyback(&self) -> Option<String> {
         let conn = messages::open_fast()?;
         let now = crate::claims::now();

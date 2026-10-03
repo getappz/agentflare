@@ -531,7 +531,8 @@ fn wire_cursor() {
     // - `postToolUseFailure` is first-class and accepts `additional_context`
     // - tool matchers are JS regex over Write|Shell|Task|MCP:<name>
     // Response-shape adaptation for inject (Claude `hookSpecificOutput` vs
-    // Cursor flat fields) is #320 — this task only installs the events.
+    // Cursor flat `additional_context` / `followup_message`) lives in
+    // `hook_messages` / hook handlers (#320).
     let tool_matcher = cursor_tool_use_matcher();
     let failure_matcher = cursor_post_tool_failure_matcher();
     let mut added = false;

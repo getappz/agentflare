@@ -104,7 +104,11 @@ fn item_action_succeeded(action: &str, response: Option<&Value>) -> Option<bool>
 /// process exit code.
 fn parse_post_tool_use(input: &str) -> Option<PostToolUseInput> {
     let v: serde_json::Value = serde_json::from_str(input).ok()?;
-    let session_id = v.get("session_id")?.as_str()?.to_string();
+    let session_id = v
+        .get("session_id")
+        .or_else(|| v.get("conversation_id"))
+        .and_then(|s| s.as_str())?
+        .to_string();
     let raw_tool_name = v.get("tool_name")?.as_str()?.to_string();
     let raw_tool_input = v.get("tool_input").cloned();
     // Unwrap flare-gateway `action="execute"` calls (item #559) -- a
@@ -300,6 +304,44 @@ fn shows_finishing_branch_menu(tool_name: &str, action: &str, item_success: Opti
 /// patch/ctx_patch/...) runs, so evidence from before this edit can't cover
 /// a since-changed tree -- diagnosis evidence is deliberately NOT cleared
 /// here, see `SessionRecord::last_diagnosis`'s doc comment.
+
+/// Holds Cursor mid-turn mail until the hook exits so every return path
+/// emits flat `additional_context` exactly once (Cursor's preToolUse
+/// allow-path cannot inject).
+struct PendingCursorMail {
+    mail: Option<String>,
+    emitted: bool,
+}
+
+impl PendingCursorMail {
+    fn new(mail: Option<String>) -> Self {
+        Self {
+            mail,
+            emitted: false,
+        }
+    }
+
+    fn take_merged(&mut self, extra: &str) -> String {
+        self.emitted = true;
+        match self.mail.take() {
+            Some(m) => format!("{extra}\n\n{m}"),
+            None => extra.to_string(),
+        }
+    }
+}
+
+impl Drop for PendingCursorMail {
+    fn drop(&mut self) {
+        if self.emitted {
+            return;
+        }
+        if let Some(mail) = self.mail.take() {
+            let out = crate::hook_messages::context_output("cursor", "PostToolUse", &mail);
+            println!("{out}");
+        }
+    }
+}
+
 pub fn post_tool_use(agent: &str) {
     let Some(input) = read_stdin_or_skip("PostToolUse") else {
         return;
@@ -307,6 +349,21 @@ pub fn post_tool_use(agent: &str) {
     let Some(parsed) = parse_post_tool_use(&input) else {
         return;
     };
+
+    // Cursor mid-turn mail rides on postToolUse (`additional_context`);
+    // preToolUse cannot inject on the allow path (cursor.com/docs/hooks).
+    let mut cursor_mail = PendingCursorMail::new(if agent == "cursor" {
+        let msgs = crate::hook_messages::sync(
+            agent,
+            &crate::hook_messages::parse_session(&input),
+            false,
+            crate::hook_messages::Delivery::MidTurn,
+            crate::hook_messages::MailSurface::PostToolUse,
+        );
+        (!msgs.is_empty()).then(|| crate::messages::format_delivery(&msgs))
+    } else {
+        None
+    });
 
     // Codex has no PostToolUseFailure event. Its shell tool reports nonzero
     // exits through PostToolUse, so classify those here. Codex does not run
@@ -325,12 +382,8 @@ pub fn post_tool_use(agent: &str) {
     if let Some(action) = &parsed.item_action
         && shows_finishing_branch_menu(&parsed.tool_name, action, parsed.item_success)
     {
-        let out = json!({
-            "hookSpecificOutput": {
-                "hookEventName": "PostToolUse",
-                "additionalContext": finishing_branch_menu(action),
-            }
-        });
+        let ctx = cursor_mail.take_merged(&finishing_branch_menu(action));
+        let out = crate::hook_messages::context_output(agent, "PostToolUse", &ctx);
         println!("{out}");
         return;
     }
@@ -432,6 +485,14 @@ pub fn post_tool_use(agent: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_post_tool_use_accepts_cursor_conversation_id() {
+        let input = r#"{"conversation_id":"c1","tool_name":"Shell","tool_input":{"command":"ls"},"tool_response":{"exit_code":0}}"#;
+        let parsed = parse_post_tool_use(input).unwrap();
+        assert_eq!(parsed.session_id, "c1");
+        assert_eq!(parsed.tool_name, "Shell");
+    }
 
     #[test]
     fn parse_post_tool_use_reads_bash_command_and_exit_code() {
