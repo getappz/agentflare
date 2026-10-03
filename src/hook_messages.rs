@@ -41,13 +41,14 @@ pub(crate) enum MailSurface {
 /// `beforeSubmitPrompt` and allow-path `preToolUse` have no model-visible
 /// inject field, so taking there would lose the message.
 pub(crate) fn takes_mail_on(agent: &str, surface: MailSurface) -> bool {
-    if !host_injects_context(agent) {
-        return false;
-    }
-    match (agent, surface) {
-        ("cursor", MailSurface::BeforeSubmitPrompt | MailSurface::PreToolUse) => false,
-        _ => true,
-    }
+    host_injects_context(agent)
+        && !matches!(
+            (agent, surface),
+            (
+                "cursor",
+                MailSurface::BeforeSubmitPrompt | MailSurface::PreToolUse
+            )
+        )
 }
 
 /// The fields every hook's stdin JSON shares.
@@ -142,15 +143,16 @@ pub(crate) fn sync(
     };
     let cwd = session.cwd.as_deref();
     let take = takes_mail_on(agent, surface);
-    sync_with_take(&conn, agent, &key, cwd, register, policy, now(), take)
+    sync_with_take(&conn, &key, cwd, register, policy, now(), take)
         .or_else(|_| {
             // A table not created yet on a db an older binary made.
             let conn = crate::db::open()?;
-            sync_with_take(&conn, agent, &key, cwd, register, policy, now(), take)
+            sync_with_take(&conn, &key, cwd, register, policy, now(), take)
         })
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 pub(crate) fn sync_with(
     conn: &rusqlite::Connection,
     agent: &str,
@@ -162,7 +164,6 @@ pub(crate) fn sync_with(
 ) -> rusqlite::Result<Vec<Message>> {
     sync_with_take(
         conn,
-        agent,
         key,
         cwd,
         register,
@@ -174,7 +175,6 @@ pub(crate) fn sync_with(
 
 pub(crate) fn sync_with_take(
     conn: &rusqlite::Connection,
-    _agent: &str,
     key: &str,
     cwd: Option<&str>,
     register: bool,
@@ -479,18 +479,9 @@ mod tests {
         let c = conn();
         messages::send(&c, "a:1", "cursor:s", "hi", None, 1, no_item).unwrap();
         assert_eq!(
-            sync_with_take(
-                &c,
-                "cursor",
-                "cursor:s",
-                None,
-                true,
-                Delivery::TurnStart,
-                2,
-                true,
-            )
-            .unwrap()
-            .len(),
+            sync_with_take(&c, "cursor:s", None, true, Delivery::TurnStart, 2, true)
+                .unwrap()
+                .len(),
             1
         );
         assert!(!messages::has_undelivered(&c, "cursor:s").unwrap());
@@ -501,18 +492,9 @@ mod tests {
         let c = conn();
         messages::send(&c, "a:1", "cursor:s", "hi", None, 1, no_item).unwrap();
         assert!(
-            sync_with_take(
-                &c,
-                "cursor",
-                "cursor:s",
-                None,
-                false,
-                Delivery::TurnStart,
-                2,
-                false,
-            )
-            .unwrap()
-            .is_empty(),
+            sync_with_take(&c, "cursor:s", None, false, Delivery::TurnStart, 2, false)
+                .unwrap()
+                .is_empty(),
             "beforeSubmitPrompt / allow-path preToolUse must not take"
         );
         assert!(messages::has_undelivered(&c, "cursor:s").unwrap());

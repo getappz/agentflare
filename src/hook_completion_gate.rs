@@ -4,7 +4,7 @@
 // "no install/consent logic here, just runtime reinforcement" convention
 // this follows too.
 use crate::hook::read_stdin_or_skip;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 struct PostToolUseInput {
     session_id: String,
@@ -286,25 +286,6 @@ fn shows_finishing_branch_menu(tool_name: &str, action: &str, item_success: Opti
         && item_success != Some(false)
 }
 
-/// PostToolUse (success) command hook. Five independent jobs, all closing
-/// gaps from item #169's completion gate (extended to cover review evidence
-/// by item #182, and diagnosis evidence by item #203): (1) records
-/// verification evidence for the session when a Bash-family call's command
-/// matches `optimize::is_verification_command`; (2) records diagnosis
-/// evidence the same way when it matches `optimize::is_diagnosis_command`
-/// (both checks run off the same parsed command -- not mutually exclusive);
-/// (3) records review evidence when `ReportFindings` succeeds or the flare
-/// review tool confirms a submission (see `optimize::is_review_completion`
-/// for why a `Skill`/`Task`/`Agent` dispatch alone is insufficient) -- these
-/// are the ONLY places their respective evidence is ever
-/// recorded, so `hook_redirect::completion_gate_reason` has something to
-/// check; (4) surfaces the finishing-a-development-branch decision menu once
-/// `item done`/`check_merge` actually succeeds; (5) invalidates recorded
-/// verification/review evidence when a mutating tool (Write/Edit/MultiEdit/
-/// patch/ctx_patch/...) runs, so evidence from before this edit can't cover
-/// a since-changed tree -- diagnosis evidence is deliberately NOT cleared
-/// here, see `SessionRecord::last_diagnosis`'s doc comment.
-
 /// Holds Cursor mid-turn mail until the hook exits so every return path
 /// emits flat `additional_context` exactly once (Cursor's preToolUse
 /// allow-path cannot inject).
@@ -342,6 +323,24 @@ impl Drop for PendingCursorMail {
     }
 }
 
+/// PostToolUse (success) command hook. Five independent jobs, all closing
+/// gaps from item #169's completion gate (extended to cover review evidence
+/// by item #182, and diagnosis evidence by item #203): (1) records
+/// verification evidence for the session when a Bash-family call's command
+/// matches `optimize::is_verification_command`; (2) records diagnosis
+/// evidence the same way when it matches `optimize::is_diagnosis_command`
+/// (both checks run off the same parsed command -- not mutually exclusive);
+/// (3) records review evidence when `ReportFindings` succeeds or the flare
+/// review tool confirms a submission (see `optimize::is_review_completion`
+/// for why a `Skill`/`Task`/`Agent` dispatch alone is insufficient) -- these
+/// are the ONLY places their respective evidence is ever
+/// recorded, so `hook_redirect::completion_gate_reason` has something to
+/// check; (4) surfaces the finishing-a-development-branch decision menu once
+/// `item done`/`check_merge` actually succeeds; (5) invalidates recorded
+/// verification/review evidence when a mutating tool (Write/Edit/MultiEdit/
+/// patch/ctx_patch/...) runs, so evidence from before this edit can't cover
+/// a since-changed tree -- diagnosis evidence is deliberately NOT cleared
+/// here, see `SessionRecord::last_diagnosis`'s doc comment.
 pub fn post_tool_use(agent: &str) {
     let Some(input) = read_stdin_or_skip("PostToolUse") else {
         return;
@@ -485,6 +484,7 @@ pub fn post_tool_use(agent: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn parse_post_tool_use_accepts_cursor_conversation_id() {
