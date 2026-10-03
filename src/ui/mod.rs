@@ -19,9 +19,9 @@ mod log;
 mod prompt;
 mod spinner;
 
-pub use log::{error, info, intro, outro, skip, step, success, warning};
-pub use prompt::{confirm, password, select};
-pub use spinner::with_spinner;
+pub use log::{error, info, intro, note, outro, skip, step, success, warning};
+pub use prompt::{confirm, multiselect, password, select};
+pub use spinner::{Progress, with_spinner};
 
 use std::io::IsTerminal;
 

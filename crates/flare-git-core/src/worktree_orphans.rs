@@ -235,6 +235,74 @@ fn trash_root(path: &Path) -> Option<PathBuf> {
 /// Parked copies younger than this are left to whichever call parked them.
 const TRASH_SWEEP_MIN_AGE: Duration = Duration::from_secs(300);
 
+/// Atomically move `path` into a trash directory and return where it went,
+/// leaving the delete to the caller. Tries `preferred_trash` first (it only
+/// works on `path`'s own volume), then [`trash_root`]. On `Err`, `path` is
+/// fully intact.
+pub(crate) fn park_dir(
+    path: &Path,
+    name: &str,
+    preferred_trash: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let default_trash =
+        trash_root(path).ok_or_else(|| format!("{} has no parent", path.display()))?;
+    let mut last_err = String::new();
+    for trash in preferred_trash.into_iter().chain([default_trash.as_path()]) {
+        match park_dir_in(path, name, trash) {
+            Ok(parked) => return Ok(parked),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
+}
+
+/// [`park_dir`] into exactly this trash directory, with no fallback -- for a
+/// caller that must keep the parked copy out of some tree (a worktree about
+/// to be removed cannot hold its own trash).
+pub(crate) fn park_dir_in(path: &Path, name: &str, trash: &Path) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(trash)
+        .map_err(|e| format!("cannot create {}: {e}", trash.display()))?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let safe_name = name.replace(['/', '\\'], "-");
+    let mut parked = trash.join(format!("{safe_name}-{stamp}"));
+    let mut n = 0;
+    while parked.exists() {
+        n += 1;
+        parked = trash.join(format!("{safe_name}-{stamp}-{n}"));
+    }
+    let mut last_err = String::new();
+    for delay_ms in [100u64, 200, 400, 800, 1600, 0] {
+        match std::fs::rename(path, &parked) {
+            // A rename moves the whole tree or none of it; if the path is
+            // still there, this one did not (a copy+delete fallback, or
+            // someone recreated it). Delete nothing then.
+            Ok(()) if path.exists() => {
+                return Err(format!(
+                    "moving it aside left {} behind, nothing deleted (parked copy kept at {})",
+                    path.display(),
+                    parked.display()
+                ));
+            }
+            Ok(()) => return Ok(parked),
+            Err(e) => {
+                last_err = e.to_string();
+                // No retry fixes a missing source or another volume.
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::CrossesDevices
+                ) {
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(delay_ms));
+    }
+    let _ = std::fs::remove_dir(trash);
+    Err(last_err)
+}
+
 /// Remove a worktree directory: rename it aside, then delete the copy.
 ///
 /// Deleting in place is not atomic. On Windows any open handle under the
@@ -248,48 +316,14 @@ const TRASH_SWEEP_MIN_AGE: Duration = Duration::from_secs(300);
 /// Once the tree is parked, `path` is free and deleting the parked copy is
 /// best-effort. Reports the locking process via handle64.exe when present.
 pub(super) fn remove_worktree_dir(path: &Path, name: &str) -> bool {
-    let Some(trash) = trash_root(path) else {
-        return false;
-    };
-    if let Err(e) = std::fs::create_dir_all(&trash) {
-        eprintln!(
-            "worktree: failed to remove orphan '{name}': cannot create {}: {e}",
-            trash.display()
-        );
-        return false;
-    }
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    let safe_name = name.replace(['/', '\\'], "-");
-    let mut parked = trash.join(format!("{safe_name}-{stamp}"));
-    let mut n = 0;
-    while parked.exists() {
-        n += 1;
-        parked = trash.join(format!("{safe_name}-{stamp}-{n}"));
-    }
-
-    let mut last_err = String::new();
-    for delay_ms in [100u64, 200, 400, 800, 1600, 0] {
-        match std::fs::rename(path, &parked) {
-            Ok(()) => {
-                // A rename moves the whole tree or none of it; if the path is
-                // still there, this one did not (a copy+delete fallback, or
-                // someone recreated it). Delete nothing then.
-                if path.exists() {
-                    eprintln!(
-                        "worktree: moving '{name}' aside left {} behind, nothing deleted \
-                         (parked copy kept at {})",
-                        path.display(),
-                        parked.display()
-                    );
-                    return false;
-                }
-                delete_parked(&parked);
-                // Sweep copies an earlier call could not delete -- but not
-                // fresh ones, which another call may be deleting right now --
-                // then drop the trash directory itself once it is empty.
-                for stale in std::fs::read_dir(&trash).into_iter().flatten().flatten() {
+    let last_err = match park_dir(path, name, None) {
+        Ok(parked) => {
+            delete_parked(&parked);
+            // Sweep copies an earlier call could not delete -- but not
+            // fresh ones, which another call may be deleting right now --
+            // then drop the trash directory itself once it is empty.
+            if let Some(trash) = parked.parent() {
+                for stale in std::fs::read_dir(trash).into_iter().flatten().flatten() {
                     let settled = stale
                         .metadata()
                         .and_then(|m| m.modified())
@@ -300,14 +334,12 @@ pub(super) fn remove_worktree_dir(path: &Path, name: &str) -> bool {
                         let _ = std::fs::remove_dir_all(stale.path());
                     }
                 }
-                let _ = std::fs::remove_dir(&trash);
-                return true;
+                let _ = std::fs::remove_dir(trash);
             }
-            Err(e) => last_err = e.to_string(),
+            return true;
         }
-        std::thread::sleep(Duration::from_millis(delay_ms));
-    }
-    let _ = std::fs::remove_dir(&trash);
+        Err(e) => e,
+    };
 
     #[cfg(windows)]
     {
@@ -335,7 +367,7 @@ pub(super) fn remove_worktree_dir(path: &Path, name: &str) -> bool {
 
 /// Best-effort delete of a directory already moved into the trash; a
 /// leftover is swept by the next successful removal.
-fn delete_parked(parked: &Path) {
+pub(crate) fn delete_parked(parked: &Path) {
     if std::fs::remove_dir_all(parked).is_ok() {
         return;
     }
@@ -383,11 +415,52 @@ fn delete_parked(parked: &Path) {
 }
 
 /// Recursive directory size in bytes.
-fn dir_size(path: &Path) -> u64 {
+pub(crate) fn dir_size(path: &Path) -> u64 {
     walkdir::WalkDir::new(path)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
         .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::park_dir;
+    use tempfile::TempDir;
+
+    #[test]
+    fn park_dir_moves_the_whole_tree_and_frees_the_path() {
+        let root = TempDir::new().unwrap();
+        let victim = root.path().join("proj").join("target");
+        std::fs::create_dir_all(victim.join("debug")).unwrap();
+        std::fs::write(victim.join("debug").join("a.o"), b"x").unwrap();
+        let parked = park_dir(&victim, "target", None).unwrap();
+        assert!(!victim.exists(), "original path must be free");
+        assert!(
+            parked.join("debug").join("a.o").exists(),
+            "tree moved intact"
+        );
+        assert_eq!(
+            parked.parent().unwrap(),
+            root.path().join("proj").join(".trash")
+        );
+    }
+
+    #[test]
+    fn park_dir_prefers_the_given_trash_dir() {
+        let root = TempDir::new().unwrap();
+        let victim = root.path().join("proj").join("node_modules");
+        std::fs::create_dir_all(&victim).unwrap();
+        let trash = root.path().join(".worktrees").join(".trash");
+        let parked = park_dir(&victim, "node_modules", Some(&trash)).unwrap();
+        assert_eq!(parked.parent().unwrap(), trash);
+    }
+
+    #[test]
+    fn park_dir_leaves_a_missing_path_as_an_error() {
+        let root = TempDir::new().unwrap();
+        let err = park_dir(&root.path().join("gone"), "gone", None);
+        assert!(err.is_err());
+    }
 }

@@ -234,6 +234,7 @@ dependencies = [
  "agentflare-agent-registry",
  "agentflare-workspace-hack",
  "dirs",
+ "dunce",
  "tempfile",
 ]
 
@@ -1603,6 +1604,7 @@ name = "flare-git-core"
 version = "0.1.0"
 dependencies = [
  "agentflare-backend",
+ "agentflare-config",
  "agentflare-shim",
  "agentflare-workspace-hack",
  "dirs",
@@ -1639,6 +1641,7 @@ dependencies = [
  "agent-detector",
  "agentflare-workspace-hack",
  "sysinfo",
+ "tempfile",
  "windows-sys 0.59.0",
 ]
 

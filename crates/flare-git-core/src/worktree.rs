@@ -24,8 +24,10 @@ mod process;
 #[path = "worktree_wipe_guard.rs"]
 mod wipe_guard;
 
+pub(crate) use heal::AGENTFLARE_LOCK_REASON;
 use heal::*;
 pub use orphans::{OrphanWorktree, audit_orphans, gc_orphans};
+pub(crate) use orphans::{delete_parked, dir_size, park_dir, park_dir_in};
 use orphans::{is_structurally_broken, remove_worktree_dir};
 pub(crate) use process::run_output_timeout;
 pub use process::run_output_timeout_env;
@@ -839,7 +841,7 @@ fn remove_stale_registration_for(repo_root: &Path, branch: &str) -> bool {
 /// that directory is actually absent — verified twice with a short pause
 /// between checks so a teardown still in flight isn't mistaken for genuinely
 /// gone (item #633). Never touches a live directory.
-fn remove_stale_registration_for_path(repo_root: &Path, worktree_path: &Path) -> bool {
+pub(crate) fn remove_stale_registration_for_path(repo_root: &Path, worktree_path: &Path) -> bool {
     let Ok(common_dir) = run_git_in(repo_root, &["rev-parse", "--git-common-dir"]) else {
         return false;
     };
