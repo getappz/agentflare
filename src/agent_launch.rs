@@ -79,6 +79,10 @@ pub fn run_launch_env(
     // runs. `env` overrides (e.g. from a project's `.dev.vars`) are filtered
     // so they can't reintroduce the var we just stripped.
     cmd.env_remove("CARGO_TARGET_DIR");
+    // Item #330: plain `cargo` in the agent resolves to mbx's shim when installed.
+    if let Some(path) = crate::mbx::agent_path() {
+        cmd.env("PATH", path);
+    }
     for (k, v) in env {
         if k == "CARGO_TARGET_DIR" {
             continue;
@@ -1139,6 +1143,11 @@ fn run_headless_impl(
     // See the matching strip in `run_launch_env` above (item #139) — same
     // rationale applies to headless child processes.
     cmd.env_remove("CARGO_TARGET_DIR");
+    // Item #330: same mbx shim PATH as `run_launch_env`; the bwrap wrapper
+    // inherits this env, so the sandbox sees the identical PATH.
+    if let Some(path) = crate::mbx::agent_path() {
+        cmd.env("PATH", path);
+    }
     // Explicit, not inherited from this process's own ambient env: when the
     // agent shells out to `git`, the `flare-git-shim` on its PATH classifies
     // bypass eligibility by `AGENTFLARE_AGENT` (see `flare-git-core::classify`).

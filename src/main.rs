@@ -50,6 +50,7 @@ mod init;
 mod ipc;
 mod job_controls;
 mod jsonc;
+mod mbx;
 mod mcp_prompts;
 mod mcp_server;
 mod memory;

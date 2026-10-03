@@ -102,18 +102,42 @@ concurrent worktrees don't collide. Run `agentflare browser --help` for the
 full subcommand list (also: type/press/hover/select/check/uncheck/back/
 forward/reload/tabs/cookies/storage/network/dialog/state/wait/pdf/extract).
 
-## Cargo target-dir isolation (item #133/#139)
+## Rust builds — mbx shared cache (item #330, replaces #133/#139's sccache)
 
-Each claimed worktree gets its own `.cargo/config.toml` (relative
-`target-dir = "target"`) so its build artifacts don't leak into a sibling
-worktree. An ambient `CARGO_TARGET_DIR` env var always outranks that config
-file, so `agentflare run` / `agentflare agents launch` (src/agent_launch.rs)
-strip `CARGO_TARGET_DIR` from the launched agent's child env before it can
-shadow the isolation, and CI's `target-dir-guard` job
-(.github/workflows/ci.yml) fails the build outright if the var is set
-project-wide. The residual gap is a bare shell opened inside a worktree
-without going through `agentflare run` — `cargo` there will still honor an
-ambient `CARGO_TARGET_DIR`. If `sccache` is on `PATH`, the isolated config also sets it as `rustc-wrapper` with `SCCACHE_BASEDIRS` pointed at the worktree's own path, so registry-dependency compiles still share a cache across worktrees.
+Claimed worktrees and dispatched agents build Rust through
+[mbx](https://crates.io/crates/mbx) (`cargo install mbx --locked`). mbx keeps
+compiled crates in one content-addressed store shared by every checkout and
+replaces each checkout's `target/` with a symlink into its own managed
+directory (`~/.cache/mbx/targets`), so a worktree whose store is warm builds in
+seconds (`cargo build -p flare-git-core`, cold target: plain 310 s, sccache
+147 s, mbx warm 48 s). Local workspace crates are still keyed by content, so
+worktrees never see each other's stale artifacts.
+
+- **No generated cargo config.** Worktrees get no `.cargo/config.toml` — no
+  `rustc-wrapper = "sccache"` (mbx is the wrapper; two on one build is
+  unsupported) and no `target-dir` (mbx owns `target`). Pre-#330 generated
+  configs are removed on the next claim of that worktree.
+- **Cache location.** `~/.cache/mbx` (override: `MBX_CACHE_DIR`). The bwrap job
+  sandbox binds `~/.cache/mbx` read-write over its otherwise read-only
+  `~/.cache` (created if missing); a `MBX_CACHE_DIR` outside that path or
+  `~/.agentflare` is not writable in the sandbox.
+- **Agent PATH.** `agentflare run` / `agents launch` prepend mbx's standalone
+  cargo shim dir (`~/.local/share/mbx/bin`, installed by `mbx setup`) to the
+  agent's `PATH`; the sandbox inherits it. No shim installed: use
+  `mbx build|test|clippy` explicitly. They still strip an ambient
+  `CARGO_TARGET_DIR`, which would bypass mbx's managed target.
+- **Doctor.** `agentflare doctor` reports whether mbx is installed, its cache
+  path, whether that path is writable inside the sandbox profile, and prints
+  the install hint when missing.
+- **Opt out / fallback.** Without `mbx` installed everything falls back to
+  plain cargo (no sccache). To opt out with it installed, uninstall mbx or run
+  `cargo` by absolute path (`~/.cargo/bin/cargo`).
+- **Disk.** Defaults are kept (`gc.min_free_size` = 10 % of disk; mbx GC prunes
+  its store and managed targets itself). Inspect with `mbx gc --dry-run`;
+  `mbx settings set gc.min_free_size …` only if that is unworkable.
+  `agentflare clean --artifacts` is the manual lever for other build dirs; it
+  never offers a managed `target` symlink — use `mbx gc` / `mbx clean` for those.
+- CI keeps its own sccache setup (no remote mbx cache yet).
 
 ## Git
 
