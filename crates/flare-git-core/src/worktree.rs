@@ -817,7 +817,7 @@ fn remove_stale_registration_for(repo_root: &Path, branch: &str) -> bool {
 /// that directory is actually absent — verified twice with a short pause
 /// between checks so a teardown still in flight isn't mistaken for genuinely
 /// gone (item #633). Never touches a live directory.
-fn remove_stale_registration_for_path(repo_root: &Path, worktree_path: &Path) -> bool {
+pub(crate) fn remove_stale_registration_for_path(repo_root: &Path, worktree_path: &Path) -> bool {
     let Ok(common_dir) = run_git_in(repo_root, &["rev-parse", "--git-common-dir"]) else {
         return false;
     };

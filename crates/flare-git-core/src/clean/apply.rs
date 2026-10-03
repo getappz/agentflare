@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use super::{Item, Kind, artifacts, par_map, worktrees};
 use crate::shell::{run_in, run_in_ok};
 use crate::worktree::{audit_orphans, delete_parked, gc_orphans, park_dir, park_dir_in};
+use agentflare_config::paths;
 use flare_process::cwd::LiveProc;
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -60,10 +61,8 @@ fn delete_branch(repo_root: &Path, name: &str, sha: &str) -> Result<(), String> 
 
 /// `path` resolves to somewhere strictly inside `root`.
 fn inside(root: &Path, path: &Path) -> bool {
-    matches!(
-        (root.canonicalize(), path.canonicalize()),
-        (Ok(r), Ok(p)) if p != r && p.starts_with(&r)
-    )
+    let (root, path) = (paths::canonical(root), paths::canonical(path));
+    path != root && path.starts_with(&root)
 }
 
 fn has_tracked_files(dir_parent: &Path, name: &str) -> bool {
@@ -97,7 +96,7 @@ fn remove_worktree(
     let listing = run_in(repo, &["worktree", "list", "--porcelain"])?;
     let entry = crate::doctor::parse_worktree_list(&listing)
         .into_iter()
-        .find(|e| Path::new(&e.path).canonicalize().is_ok_and(|p| p == path))
+        .find(|e| paths::canonical(Path::new(&e.path)) == path)
         .ok_or("no longer a registered worktree")?;
     if entry.branch.as_deref() != Some(name) {
         return Err("worktree switched branch since the plan".into());

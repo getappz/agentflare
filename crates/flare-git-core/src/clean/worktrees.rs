@@ -7,6 +7,7 @@ use super::merged::{BranchInfo, Verdict};
 use super::{Item, Kind, ScanInput, Skipped};
 use crate::shell::run_in;
 use crate::worktree::{AGENTFLARE_LOCK_REASON, audit_orphans, dir_size};
+use agentflare_config::paths;
 use flare_process::cwd::LiveProc;
 
 /// The first live process whose cwd is at or under `dir`.
@@ -45,7 +46,7 @@ pub(super) fn blocker(
         return Some(format!("live process: {} (pid {})", p.name, p.pid));
     }
     // The invoking shell is excluded from `live`, so check it separately.
-    if std::env::current_dir().is_ok_and(|cwd| cwd.starts_with(canon)) {
+    if std::env::current_dir().is_ok_and(|cwd| paths::is_within(canon, &cwd)) {
         return Some("the current directory is inside it".into());
     }
     match locked {
@@ -80,9 +81,7 @@ pub(super) fn candidates(
     branches: Vec<BranchInfo>,
 ) -> (Vec<Item>, Vec<Skipped>) {
     let (mut items, mut skipped) = (Vec::new(), Vec::new());
-    let canon_root = repo_root
-        .canonicalize()
-        .unwrap_or_else(|_| repo_root.to_path_buf());
+    let canon_root = paths::canonical(repo_root);
     let mut by_name: HashMap<String, BranchInfo> =
         branches.into_iter().map(|b| (b.name.clone(), b)).collect();
 
@@ -124,7 +123,7 @@ pub(super) fn candidates(
         if !input.opts.worktrees {
             continue;
         }
-        let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let canon = paths::canonical(path);
         let merged = match info.verdict {
             Verdict::Merged(reason) => reason,
             Verdict::Skip(reason) => {
@@ -200,6 +199,7 @@ mod tests {
     use crate::clean::{CleanOptions, Kind, NoPrLookup, ScanInput};
     use crate::shell::run_in;
     use crate::shell::test_support::{Repo, init_repo_with_branch};
+    use agentflare_config::paths;
     use flare_process::cwd::LiveProc;
     use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
@@ -210,7 +210,7 @@ mod tests {
         let path = repo.path.join(rel);
         let p = path.to_str().unwrap();
         run_in(&repo.path, &["worktree", "add", "-b", branch, p]).unwrap();
-        path.canonicalize().unwrap()
+        paths::canonical(&path)
     }
 
     fn plan(

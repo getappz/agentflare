@@ -5,6 +5,8 @@
 // AGENTFLARE_HOME_OVERRIDE is agentflare's own escape hatch for tests/CI.
 use std::path::PathBuf;
 
+pub mod paths;
+
 /// Fallible twin of `home()` below, for the rare caller that needs to
 /// degrade gracefully (e.g. a sandbox wrapper that just skips a bind mount)
 /// instead of panicking when no home directory can be resolved at all.

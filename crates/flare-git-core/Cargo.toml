@@ -14,6 +14,7 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 agentflare-backend = { package = "agentflare-backend", path = "../agentflare-backend" }
 agentflare-shim = { path = "../agentflare-shim" }
 walkdir = "2"
+agentflare-config = { path = "../agentflare-config" }
 dirs = "6"
 which = "6"
 fs2 = "0.4"
