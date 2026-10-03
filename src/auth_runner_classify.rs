@@ -253,7 +253,9 @@ pub(crate) fn extract_limit_snippet(text: &str) -> Option<String> {
         .filter(|l| !l.is_empty())
         .find(|line| {
             let l = line.to_lowercase();
-            NEEDLES.iter().any(|n| l.contains(n))
+            NEEDLES.iter().any(|n| {
+                l.contains(n) && (*n != "per day" || l.contains("limit"))
+            })
         })?;
     let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
     const MAX: usize = 320;
