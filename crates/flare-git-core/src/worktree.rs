@@ -962,6 +962,19 @@ pub fn push_branch(
                 item.id
             );
         }
+        RebaseOutcome::FollowedRemote => {
+            eprintln!(
+                "worktree: item {}'s branch followed its remote copy (already pushed; not rebased)",
+                item.id
+            );
+        }
+        RebaseOutcome::Diverged => {
+            eprintln!(
+                "worktree: item {}'s branch and its remote copy both moved; left as-is, the push \
+                 below integrates the remote side",
+                item.id
+            );
+        }
         RebaseOutcome::Skipped | RebaseOutcome::UpToDate | RebaseOutcome::Dirty => {}
     }
     let branch = resolve_item_task_branch(item, repo_root);
@@ -1018,6 +1031,14 @@ pub enum RebaseOutcome {
     /// it was before this call. Carries `git rebase`'s stderr for whoever
     /// surfaces this to a human.
     Conflict(String),
+    /// The branch is already on `origin` and the remote copy had moved ahead
+    /// (GitHub's update-branch merge, a fixup pushed from elsewhere): the
+    /// worktree was fast-forwarded to it. Nothing was rewritten.
+    FollowedRemote,
+    /// The branch is already on `origin` and both copies have commits the
+    /// other lacks. Left untouched: `push_branch` integrates the remote side
+    /// when it next pushes.
+    Diverged,
 }
 
 /// Fetches the current tip of `target_branch` and rebases `item`'s worktree
@@ -1037,6 +1058,15 @@ pub enum RebaseOutcome {
 /// rather than leaving the worktree mid-rebase or resolving anything
 /// automatically. Soft-fails (`Skipped`) on no worktree / no reachable
 /// remote, matching every other network step in this file.
+///
+/// A branch that already exists on `origin` is never rebased (item #331):
+/// its PR is where base drift gets handled -- the supervisor's
+/// `pulls::update_branch` merges the base in on GitHub -- and rewriting the
+/// local copy here only fights that merge (the local history and the remote
+/// history diverge, and the next push has to merge the original commits
+/// back on top of their rewritten copies). Instead the worktree follows the
+/// remote: fast-forwarded when the remote moved (`FollowedRemote`), left
+/// alone when both sides moved (`Diverged`), `UpToDate` otherwise.
 pub fn rebase_item_worktree(item: &Item, repo_root: &Path, target_branch: &str) -> RebaseOutcome {
     let worktree_path = item_worktree_path(repo_root, item.sequence_id);
     if !worktree_path.is_dir() {
@@ -1065,6 +1095,9 @@ pub fn rebase_item_worktree(item: &Item, repo_root: &Path, target_branch: &str) 
         Ok(out) if out.trim().is_empty() => {}
         _ => return RebaseOutcome::Dirty,
     }
+    if let Some(outcome) = follow_pushed_branch(&worktree_path, fetch_timeout_secs) {
+        return outcome;
+    }
     if run_git_in_ok(
         &worktree_path,
         &["merge-base", "--is-ancestor", &remote_ref, "HEAD"],
@@ -1090,6 +1123,45 @@ pub fn rebase_item_worktree(item: &Item, repo_root: &Path, target_branch: &str) 
 }
 
 const REBASE_TIMEOUT_SECS: u64 = 60;
+
+/// `Some(outcome)` when the worktree's branch already exists on `origin`:
+/// such a branch is followed, never rebased (see [`rebase_item_worktree`]).
+/// `None` when the branch was never pushed (or that cannot be established),
+/// so the caller rebases as before.
+fn follow_pushed_branch(worktree_path: &Path, fetch_timeout_secs: u64) -> Option<RebaseOutcome> {
+    let branch = run_git_in(worktree_path, &["symbolic-ref", "--short", "HEAD"]).ok()?;
+    // A fetch of a branch the remote does not have fails: that is the
+    // "never pushed" answer, and a stale remote-tracking ref must not be
+    // mistaken for a live remote branch, so the fetch has to succeed.
+    let fetched = fetch_with_retry(
+        crate::shell::git_binary(),
+        &["fetch", "origin", &branch],
+        worktree_path,
+        fetch_timeout_secs,
+    );
+    if !matches!(&fetched, Ok(out) if out.status.success()) {
+        return None;
+    }
+    let remote = format!("origin/{branch}");
+    if !run_git_in_ok(
+        worktree_path,
+        &["rev-parse", "--verify", "--quiet", &remote],
+    ) {
+        return None;
+    }
+    let is_ancestor =
+        |a: &str, b: &str| run_git_in_ok(worktree_path, &["merge-base", "--is-ancestor", a, b]);
+    Some(if is_ancestor(&remote, "HEAD") {
+        RebaseOutcome::UpToDate
+    } else if !is_ancestor("HEAD", &remote) {
+        RebaseOutcome::Diverged
+    } else {
+        match run_git_in(worktree_path, &["merge", "--ff-only", &remote]) {
+            Ok(_) => RebaseOutcome::FollowedRemote,
+            Err(e) => RebaseOutcome::Conflict(e),
+        }
+    })
+}
 
 /// Removes `item`'s own worktree once its work is done, if it's safe to.
 ///
@@ -1265,3 +1337,7 @@ mod heal_tests;
 #[cfg(test)]
 #[path = "worktree_wipe_tests.rs"]
 mod wipe_tests;
+
+#[cfg(test)]
+#[path = "worktree_rebase_tests.rs"]
+mod rebase_tests;
