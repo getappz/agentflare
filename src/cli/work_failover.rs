@@ -109,6 +109,23 @@ fn end_stopped_run(
     }
 }
 
+fn exhaustion_comment_detail(
+    failure: &crate::auth_runner::AgentFailure,
+    msg: &str,
+    now: i64,
+    wait: u64,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(blurb) = crate::auth_runner::quota_schedule_blurb(failure, now, wait) {
+        parts.push(blurb);
+    }
+    if let Some(snippet) = crate::auth_runner::extract_limit_snippet(msg) {
+        parts.push(format!("Agent said: {snippet}"));
+    }
+    parts.push(tail_str(msg, DIAGNOSTIC_TAIL_CHARS).to_string());
+    parts.join("\n\n")
+}
+
 /// Handles a run that failed because its agent is out (rate limited, out
 /// of credit, usage window used up -- see `auth_runner::AgentFailure`).
 /// `None` when `msg` isn't exhaustion-shaped, so the caller falls through
@@ -160,12 +177,13 @@ fn handle_agent_exhaustion(
         if release_claim(mcp, &item.id) {
             claim_guard.disarm();
         }
+        let detail = exhaustion_comment_detail(&failure, msg, now, wait);
         let body = format!(
             "{}\n\n{} is {} -- retrying the same agent in {wait}s.\n\n{}",
             crate::dispatch_failure_ceiling::AGENT_UNAVAILABLE_MARKER,
             agent.as_str(),
             failure.describe(),
-            tail_str(msg, DIAGNOSTIC_TAIL_CHARS)
+            detail
         );
         mcp.post_item_comment(&item.id, &body);
         if let Some(recipient) = notify_recipient {
@@ -219,13 +237,14 @@ fn handle_agent_exhaustion(
         }
     }
 
+    let detail = exhaustion_comment_detail(&failure, msg, now, wait);
     let body = format!(
         "{}\n\n{} is {reason}. No other agent is available, so this run retries on {} \
          then.\n\n{}",
         crate::dispatch_failure_ceiling::AGENT_UNAVAILABLE_MARKER,
         agent.as_str(),
         agent.as_str(),
-        tail_str(msg, DIAGNOSTIC_TAIL_CHARS)
+        detail
     );
     mcp.post_item_comment(&item.id, &body);
     if let Some(recipient) = notify_recipient {

@@ -258,6 +258,94 @@ fn add_hook_entry(
     true
 }
 
+/// True when `command` is the agentflare role identified by `marker`.
+/// Lifecycle markers like `"hook session-start"` are substrings of optimize
+/// markers (`"optimize code hook session-start"`), so a bare `contains`
+/// would let `wire_cursor` clobber an optimize co-tenant on the same event.
+fn cursor_command_matches_marker(command: &str, marker: &str) -> bool {
+    if !command.contains(marker) {
+        return false;
+    }
+    let is_optimize_marker = marker.contains("optimize code");
+    let is_optimize_command = command.contains("optimize code");
+    is_optimize_marker == is_optimize_command
+}
+
+/// Cursor's `hooks.json` is flat (`[{ command, type, timeout, matcher? }]`) —
+/// unlike Claude/Codex nested `{ hooks: [{ command, ... }] }` entries — so
+/// matcher refresh and idempotent backfill need a Cursor-shaped helper.
+/// Marker matching uses [`cursor_command_matches_marker`] so lifecycle installs
+/// do not clobber optimize co-tenants on the same event.
+fn add_cursor_hook_entry(
+    hooks_obj: &mut Map<String, Value>,
+    event: &str,
+    marker: &str,
+    matcher: Option<&str>,
+    command: String,
+    timeout: u64,
+) -> bool {
+    let arr = hooks_obj
+        .entry(event)
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .unwrap();
+    if let Some(idx) = arr.iter().position(|entry| {
+        entry
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(|existing| cursor_command_matches_marker(existing, marker))
+    }) {
+        let existing = arr[idx].as_object_mut().unwrap();
+        let mut changed = false;
+        if let Some(m) = matcher
+            && existing.get("matcher").and_then(Value::as_str) != Some(m)
+        {
+            existing.insert("matcher".to_string(), json!(m));
+            changed = true;
+        }
+        if existing.get("command").and_then(Value::as_str) != Some(command.as_str()) {
+            existing.insert("command".to_string(), json!(command));
+            changed = true;
+        }
+        if existing.get("timeout").and_then(Value::as_u64) != Some(timeout) {
+            existing.insert("timeout".to_string(), json!(timeout));
+            changed = true;
+        }
+        if existing.get("type").and_then(Value::as_str) != Some("command") {
+            existing.insert("type".to_string(), json!("command"));
+            changed = true;
+        }
+        return changed;
+    }
+    let mut entry = json!({
+        "command": command,
+        "type": "command",
+        "timeout": timeout,
+    });
+    if let Some(m) = matcher {
+        entry
+            .as_object_mut()
+            .unwrap()
+            .insert("matcher".to_string(), json!(m));
+    }
+    arr.push(entry);
+    true
+}
+
+/// Cursor tool-use matcher (JS regex). Write + Shell + Task cover the native
+/// tools agentflare's pre/post hooks care about; `MCP:.*` covers MCP tools
+/// Cursor exposes under the `MCP:<name>` matcher form (docs + create-hook).
+fn cursor_tool_use_matcher() -> &'static str {
+    r"Write|Shell|Task|MCP:.*"
+}
+
+/// Cursor failure-event matcher — Shell/Write are the Cursor analogues of
+/// Claude's Bash|Edit|Write set (`postToolUseFailure` stdin carries
+/// `error_message`/`is_interrupt` and stdout accepts `additional_context`).
+fn cursor_post_tool_failure_matcher() -> &'static str {
+    r"Shell|Write"
+}
+
 /// Removes any existing `event` entries containing `marker` — used to retire
 /// a hook a wiring change replaces (the old `PostToolUseFailure` prompt
 /// hook), so an install upgrading from an older agentflare version doesn't
@@ -436,43 +524,65 @@ fn wire_cursor() {
         .as_object_mut()
         .unwrap();
 
+    // Cursor camelCase events (confirmed against cursor.com/docs/hooks.md).
+    // Schema notes that matter for wiring depth vs Claude:
+    // - flat entry shape (not Claude's nested `hooks` array) — see
+    //   `add_cursor_hook_entry`
+    // - `postToolUseFailure` is first-class and accepts `additional_context`
+    // - tool matchers are JS regex over Write|Shell|Task|MCP:<name>
+    // Response-shape adaptation for inject (Claude `hookSpecificOutput` vs
+    // Cursor flat fields) is #320 — this task only installs the events.
+    let tool_matcher = cursor_tool_use_matcher();
+    let failure_matcher = cursor_post_tool_failure_matcher();
     let mut added = false;
-    if !hooks
-        .get("sessionStart")
-        .is_some_and(|v| v.to_string().contains("hook session-start"))
-    {
-        hooks.insert(
-            "sessionStart".to_string(),
-            json!([{ "command": format!("\"{bin}\" hook session-start"), "type": "command", "timeout": 30 }]),
+    for (event, marker, matcher, subcommand, timeout) in [
+        (
+            "sessionStart",
+            "hook session-start",
+            None,
+            "session-start",
+            30,
+        ),
+        (
+            "beforeSubmitPrompt",
+            "hook prompt-submit",
+            None,
+            "prompt-submit",
+            10,
+        ),
+        (
+            "preToolUse",
+            "hook pre-tool-use",
+            Some(tool_matcher),
+            "pre-tool-use",
+            5,
+        ),
+        ("stop", "hook stop", None, "stop", 5),
+        ("sessionEnd", "hook session-end", None, "session-end", 5),
+        ("preCompact", "hook pre-compact", None, "pre-compact", 5),
+        (
+            "postToolUse",
+            "hook post-tool-use",
+            Some(tool_matcher),
+            "post-tool-use",
+            5,
+        ),
+        (
+            "postToolUseFailure",
+            "hook post-tool-failure",
+            Some(failure_matcher),
+            "post-tool-failure",
+            5,
+        ),
+    ] {
+        added |= add_cursor_hook_entry(
+            hooks,
+            event,
+            marker,
+            matcher,
+            format!("\"{bin}\" hook {subcommand}"),
+            timeout,
         );
-        added = true;
-    }
-    if !hooks
-        .get("beforeSubmitPrompt")
-        .is_some_and(|v| v.to_string().contains("hook prompt-submit"))
-    {
-        hooks.insert(
-            "beforeSubmitPrompt".to_string(),
-            json!([{ "command": format!("\"{bin}\" hook prompt-submit"), "type": "command", "timeout": 10 }]),
-        );
-        added = true;
-    }
-    // preToolUse entries carry a `matcher` instead of `type`/`timeout` — Cursor's
-    // own hook schema for this event (Shell|Read|Write|Grep|Delete|Task|MCP:* are
-    // the only valid matchers; Cursor has no Glob/Edit/TodoWrite tools, so `Write`
-    // is the only matcher agentflare's redirect classifier needs here).
-    let pre_arr = hooks
-        .entry("preToolUse")
-        .or_insert_with(|| json!([]))
-        .as_array_mut()
-        .unwrap();
-    if !pre_arr
-        .iter()
-        .any(|v| v.to_string().contains("hook pre-tool-use"))
-    {
-        pre_arr
-            .push(json!({ "matcher": "Write", "command": format!("\"{bin}\" hook pre-tool-use") }));
-        added = true;
     }
 
     if !added {
@@ -726,17 +836,15 @@ fn wire_optimize_claude_code() {
 
 fn wire_optimize_cursor() {
     let path = cwd().join(".cursor").join("hooks.json");
-    let bin = agentflare_binary();
-
-    if path.exists() {
-        let existing = fs::read_to_string(&path).unwrap_or_default();
-        if existing.contains("optimize") {
-            ui::skip("optimize code hooks already wired in .cursor/hooks.json");
-            return;
-        }
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    // Preserve wholly-foreign hooks.json (no agentflare marker at all).
+    if !existing.is_empty() && !existing.contains("agentflare") {
+        ui::skip("optimize code hooks (.cursor/hooks.json exists, not agentflare's)");
+        return;
     }
 
     let mut content = read_json_object(&path, || json!({ "version": 1, "hooks": {} }));
+    let bin = agentflare_binary();
 
     let hooks = content
         .as_object_mut()
@@ -745,26 +853,41 @@ fn wire_optimize_cursor() {
         .or_insert_with(|| json!({}));
     let hooks_obj = hooks.as_object_mut().unwrap();
 
-    hooks_obj
-        .entry("sessionStart")
-        .or_insert_with(|| json!([]))
-        .as_array_mut()
-        .unwrap()
-        .push(json!({
-            "command": format!("\"{bin}\" optimize code hook session-start"),
-            "type": "command",
-            "timeout": 30
-        }));
-    hooks_obj
-        .entry("beforeSubmitPrompt")
-        .or_insert_with(|| json!([]))
-        .as_array_mut()
-        .unwrap()
-        .push(json!({
-            "command": format!("\"{bin}\" optimize code hook prompt-submit"),
-            "type": "command",
-            "timeout": 10
-        }));
+    let mut added = false;
+    for (event, marker, subcommand, timeout) in [
+        (
+            "sessionStart",
+            "optimize code hook session-start",
+            "session-start",
+            30,
+        ),
+        (
+            "beforeSubmitPrompt",
+            "optimize code hook prompt-submit",
+            "prompt-submit",
+            10,
+        ),
+        (
+            "subagentStart",
+            "optimize code hook subagent-start",
+            "subagent-start",
+            5,
+        ),
+    ] {
+        added |= add_cursor_hook_entry(
+            hooks_obj,
+            event,
+            marker,
+            None,
+            format!("\"{bin}\" optimize code hook {subcommand}"),
+            timeout,
+        );
+    }
+
+    if !added {
+        ui::skip("optimize code hooks already wired in .cursor/hooks.json");
+        return;
+    }
 
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -1222,8 +1345,133 @@ mod tests {
         with_temp_cwd(|| {
             wire_cursor();
             let content = fs::read_to_string(cwd().join(".cursor").join("hooks.json")).unwrap();
+            let parsed: Value = serde_json::from_str(&content).unwrap();
             assert!(content.contains("agentflare"));
-            assert!(content.contains("sessionStart"));
+            for event in [
+                "sessionStart",
+                "beforeSubmitPrompt",
+                "preToolUse",
+                "stop",
+                "sessionEnd",
+                "preCompact",
+                "postToolUse",
+                "postToolUseFailure",
+            ] {
+                assert_eq!(
+                    parsed["hooks"][event].as_array().unwrap().len(),
+                    1,
+                    "{event}"
+                );
+            }
+            assert_eq!(
+                parsed["hooks"]["preToolUse"][0]["matcher"],
+                cursor_tool_use_matcher()
+            );
+            assert_eq!(
+                parsed["hooks"]["postToolUse"][0]["matcher"],
+                cursor_tool_use_matcher()
+            );
+            assert_eq!(
+                parsed["hooks"]["postToolUseFailure"][0]["matcher"],
+                cursor_post_tool_failure_matcher()
+            );
+        });
+    }
+
+    #[test]
+    fn wire_cursor_backfills_missing_events_and_refreshes_matcher() {
+        with_temp_cwd(|| {
+            let path = cwd().join(".cursor").join("hooks.json");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            // Older agentflare install: only the three original events, Write-only
+            // preToolUse matcher, plus a foreign co-tenant on sessionStart.
+            fs::write(
+                &path,
+                serde_json::to_string_pretty(&json!({
+                    "version": 1,
+                    "hooks": {
+                        "sessionStart": [
+                            { "command": "foreign-session-hook", "type": "command", "timeout": 1 },
+                            { "command": "\"agentflare\" hook session-start", "type": "command", "timeout": 30 }
+                        ],
+                        "beforeSubmitPrompt": [
+                            { "command": "\"agentflare\" hook prompt-submit", "type": "command", "timeout": 10 }
+                        ],
+                        "preToolUse": [
+                            { "matcher": "Write", "command": "\"agentflare\" hook pre-tool-use" }
+                        ]
+                    }
+                })).unwrap(),
+            )
+            .unwrap();
+
+            wire_cursor();
+
+            let parsed: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(parsed["hooks"]["sessionStart"].as_array().unwrap().len(), 2);
+            assert_eq!(
+                parsed["hooks"]["sessionStart"][0]["command"],
+                "foreign-session-hook"
+            );
+            for event in [
+                "stop",
+                "sessionEnd",
+                "preCompact",
+                "postToolUse",
+                "postToolUseFailure",
+            ] {
+                assert_eq!(
+                    parsed["hooks"][event].as_array().unwrap().len(),
+                    1,
+                    "{event}"
+                );
+            }
+            assert_eq!(
+                parsed["hooks"]["preToolUse"][0]["matcher"],
+                cursor_tool_use_matcher()
+            );
+            assert_eq!(parsed["hooks"]["preToolUse"][0]["timeout"], 5);
+        });
+    }
+
+    #[test]
+    fn wire_optimize_cursor_adds_subagent_start_idempotently() {
+        with_temp_cwd(|| {
+            let path = cwd().join(".cursor").join("hooks.json");
+            // Seed a partial optimize install (pre-subagentStart era).
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(
+                &path,
+                serde_json::to_string_pretty(&json!({
+                    "version": 1,
+                    "hooks": {
+                        "sessionStart": [{
+                            "command": "\"agentflare\" optimize code hook session-start",
+                            "type": "command",
+                            "timeout": 30
+                        }],
+                        "beforeSubmitPrompt": [{
+                            "command": "\"agentflare\" optimize code hook prompt-submit",
+                            "type": "command",
+                            "timeout": 10
+                        }]
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            wire_optimize_cursor();
+            let first = fs::read_to_string(&path).unwrap();
+            let parsed: Value = serde_json::from_str(&first).unwrap();
+            assert_eq!(
+                parsed["hooks"]["subagentStart"].as_array().unwrap().len(),
+                1
+            );
+            assert!(first.contains("optimize code hook subagent-start"));
+
+            wire_optimize_cursor();
+            assert_eq!(fs::read_to_string(&path).unwrap(), first);
         });
     }
 
@@ -1299,6 +1547,66 @@ mod tests {
             wire_cursor();
             let second = fs::read_to_string(&path).unwrap();
             assert_eq!(first, second);
+        });
+    }
+
+    #[test]
+    fn wire_cursor_preserves_optimize_co_tenant_on_same_event() {
+        with_temp_cwd(|| {
+            let path = cwd().join(".cursor").join("hooks.json");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            // Optimize already owns sessionStart/beforeSubmitPrompt; lifecycle
+            // markers are substrings of those optimize commands.
+            fs::write(
+                &path,
+                serde_json::to_string_pretty(&json!({
+                    "version": 1,
+                    "hooks": {
+                        "sessionStart": [{
+                            "command": "\"agentflare\" optimize code hook session-start",
+                            "type": "command",
+                            "timeout": 30
+                        }],
+                        "beforeSubmitPrompt": [{
+                            "command": "\"agentflare\" optimize code hook prompt-submit",
+                            "type": "command",
+                            "timeout": 10
+                        }]
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            wire_cursor();
+
+            let parsed: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            let session = parsed["hooks"]["sessionStart"].as_array().unwrap();
+            assert_eq!(session.len(), 2);
+            assert!(
+                session[0]["command"]
+                    .as_str()
+                    .unwrap()
+                    .contains("optimize code hook session-start")
+            );
+            assert!(
+                session[1]["command"]
+                    .as_str()
+                    .unwrap()
+                    .contains("hook session-start")
+                    && !session[1]["command"]
+                        .as_str()
+                        .unwrap()
+                        .contains("optimize code")
+            );
+            let prompt = parsed["hooks"]["beforeSubmitPrompt"].as_array().unwrap();
+            assert_eq!(prompt.len(), 2);
+            assert!(
+                prompt[0]["command"]
+                    .as_str()
+                    .unwrap()
+                    .contains("optimize code hook prompt-submit")
+            );
         });
     }
 

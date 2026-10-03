@@ -711,12 +711,23 @@ pub(crate) fn build_sdd_loop_step(
                                 MAX_TASKS_PROCESSED
                             )));
                         }
+                        // Prompt asks for tier only on insert_task; missing/
+                        // string-"null" deserializes to None — retry the judge
+                        // rather than insert an untyped task.
+                        let Some(tier) = decision.task_model_tier else {
+                            // Retry re-runs the judge; drop this attempt's ledger line.
+                            ctx.data.ledger.pop();
+                            return Err(WorkflowError::StepFailed {
+                                step_id: StepId::new("sdd_loop"),
+                                message: "insert_task requires task_model_tier".to_string(),
+                            });
+                        };
                         let new_id = ctx.data.tasks.len();
                         ctx.data.tasks.push(SddTask {
                             id: new_id,
                             title: decision.rationale.clone(),
                             body: decision.rationale.clone(),
-                            model_tier: decision.task_model_tier,
+                            model_tier: Some(tier),
                         });
                     }
                     JudgeAction::CompletePipeline => {

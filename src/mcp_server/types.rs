@@ -1003,6 +1003,11 @@ pub(crate) struct ItemRequest {
     )]
     #[serde(default)]
     pub(crate) unestimated: Option<bool>,
+    #[schemars(
+        description = "release only: keep the item's worktree after releasing the claim (default false). Used by daemon orphan-restart reconcile so a clean mid-work checkout survives for rediscovery (item #322); plain abandon releases still clean (item #335)."
+    )]
+    #[serde(default)]
+    pub(crate) preserve_worktree: Option<bool>,
 }
 
 /// Decision-support signals computed server-side for a batch of items —
