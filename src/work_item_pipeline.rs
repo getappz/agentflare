@@ -715,6 +715,8 @@ pub(crate) fn build_sdd_loop_step(
                         // string-"null" deserializes to None — retry the judge
                         // rather than insert an untyped task.
                         let Some(tier) = decision.task_model_tier else {
+                            // Retry re-runs the judge; drop this attempt's ledger line.
+                            ctx.data.ledger.pop();
                             return Err(WorkflowError::StepFailed {
                                 step_id: StepId::new("sdd_loop"),
                                 message: "insert_task requires task_model_tier".to_string(),
