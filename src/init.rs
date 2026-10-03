@@ -185,9 +185,9 @@ fn confirm_gateway_integrations(agent: &str, yes: bool) {
 /// lets re-running `agentflare init` backfill newly-added hook types into
 /// installs wired by an older agentflare version, instead of the old
 /// all-or-nothing "SessionStart present? skip everything" gate.
-/// `marker` is a plain substring of `"hook <event>"`, matching both current
-/// flagless commands and older installs that still carry `--agent <host>`
-/// (upgrades stay idempotent either way). It must not match optimize code's own
+/// `marker` is a plain substring of `"hook <event>"`, matching both
+/// `--agent <host>` and flagless command forms (upgrades stay idempotent
+/// either way). It must not match optimize code's own
 /// hook commands (`"<bin>" optimize code hook X"`), so both can coexist per event.
 ///
 /// When the existing entry's `matcher` differs from `matcher` it is rewritten
@@ -393,6 +393,11 @@ pub(crate) struct ClaudeHookSpec {
     pub matcher: Option<String>,
     pub command: String,
     pub timeout: u64,
+    /// When true, the hook subprocess installs a wall-clock self-deadline
+    /// slightly under `timeout` (see `hook_deadline`). Slow gates (PostToolUse
+    /// verification, Stop messaging) keep the host timeout but must not
+    /// self-terminate early.
+    pub install_self_deadline: bool,
 }
 
 /// Every hook `agentflare init --agent claude-code` wires, in install order.
@@ -401,12 +406,14 @@ pub(crate) fn claude_hook_specs(bin: &str) -> Vec<ClaudeHookSpec> {
                 marker: &'static str,
                 matcher: Option<String>,
                 subcommand: &str,
-                timeout: u64| ClaudeHookSpec {
+                timeout: u64,
+                install_self_deadline: bool| ClaudeHookSpec {
         event,
         marker,
         matcher,
-        command: format!("\"{bin}\" hook {subcommand}"),
+        command: format!("\"{bin}\" hook {subcommand} --agent claude-code"),
         timeout,
+        install_self_deadline,
     };
     vec![
         spec(
@@ -415,6 +422,7 @@ pub(crate) fn claude_hook_specs(bin: &str) -> Vec<ClaudeHookSpec> {
             None,
             "session-start",
             10,
+            true,
         ),
         spec(
             "UserPromptSubmit",
@@ -422,21 +430,44 @@ pub(crate) fn claude_hook_specs(bin: &str) -> Vec<ClaudeHookSpec> {
             None,
             "prompt-submit",
             5,
+            true,
         ),
-        spec("PreToolUse", "hook pre-tool-use", None, "pre-tool-use", 5),
-        spec("PreCompact", "hook pre-compact", None, "pre-compact", 5),
+        spec(
+            "PreToolUse",
+            "hook pre-tool-use",
+            None,
+            "pre-tool-use",
+            5,
+            true,
+        ),
+        spec(
+            "PreCompact",
+            "hook pre-compact",
+            None,
+            "pre-compact",
+            5,
+            false,
+        ),
         // Inter-agent messaging: Stop blocks an about-to-idle agent to
         // deliver messages that arrived during its turn; SessionEnd takes
         // the session out of the live-session registry so it stops being
         // addressable.
-        spec("Stop", "hook stop", None, "stop", 5),
-        spec("SessionEnd", "hook session-end", None, "session-end", 5),
+        spec("Stop", "hook stop", None, "stop", 5, false),
+        spec(
+            "SessionEnd",
+            "hook session-end",
+            None,
+            "session-end",
+            5,
+            false,
+        ),
         spec(
             "PostToolUseFailure",
             "hook post-tool-failure",
             Some("Bash|Edit|Write".to_string()),
             "post-tool-failure",
             5,
+            false,
         ),
         // Completion gate (item #169): records verification evidence off
         // successful Bash-family calls, invalidates it off a successful
@@ -452,6 +483,7 @@ pub(crate) fn claude_hook_specs(bin: &str) -> Vec<ClaudeHookSpec> {
             Some(post_tool_use_matcher()),
             "post-tool-use",
             5,
+            false,
         ),
     ]
 }
@@ -1306,12 +1338,9 @@ mod tests {
 
             let content = fs::read_to_string(&path).unwrap();
             let parsed: Value = serde_json::from_str(&content).unwrap();
-            // Backfilled fresh, so it's the new flagless form...
-            assert!(content.contains("hook pre-tool-use"));
-            assert!(!content.contains("hook pre-tool-use --agent"));
+            assert!(content.contains("hook pre-tool-use --agent claude-code"));
             // Existing agentflare entries are refreshed without duplication.
-            assert!(content.contains("hook session-start"));
-            assert!(!content.contains("hook session-start --agent claude-code"));
+            assert!(content.contains("hook session-start --agent claude-code"));
             assert_eq!(parsed["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
         });
     }

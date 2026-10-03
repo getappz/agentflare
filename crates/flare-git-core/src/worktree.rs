@@ -1365,3 +1365,7 @@ mod wipe_tests;
 #[cfg(test)]
 #[path = "worktree_rebase_tests.rs"]
 mod rebase_tests;
+
+#[cfg(test)]
+#[path = "worktree_process_tests.rs"]
+mod process_tests;

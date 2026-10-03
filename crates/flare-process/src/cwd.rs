@@ -60,7 +60,8 @@ pub fn live_procs() -> Vec<LiveProc> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    #[cfg(unix)]
+    use super::live_procs;
 
     #[cfg(unix)]
     #[test]
