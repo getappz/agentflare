@@ -35,7 +35,7 @@ const DESIGN_SPEC_ANALYST_SYSTEM_PROMPT: &str = "You are the analyst in an agent
 
 const REVIEWER_SYSTEM_PROMPT: &str = "You are the reviewer in an agentflare SDD pipeline, reviewing one task as a headless run. File-editing tools are disabled for this session: verify by reading the diff and by running checks in the foreground, never by changing code yourself. Your final reply must start with REVIEW_APPROVED or REVIEW_ISSUES:.";
 
-const JUDGE_SYSTEM_PROMPT: &str = "You are the judge in an agentflare SDD pipeline. Editing and shell tools are disabled for this session: decide from the plan, the ledger, and the role reply you are shown. Your final reply must be exactly one JSON object and nothing else.";
+const JUDGE_SYSTEM_PROMPT: &str = "You are the judge in an agentflare SDD pipeline. Editing and shell tools are disabled for this session: decide from the plan, the ledger, and the role reply you are shown. Your final reply must be exactly one JSON object and nothing else. Include task_model_tier only when action is insert_task.";
 
 /// JSON Schema for the judge's decision — the same shape
 /// `build_judge_prompt` spells out in prose and `parse_judge_decision`
@@ -91,9 +91,7 @@ pub(crate) fn sdd_role_spec(role: SddRole) -> agent_registry::RoleSpec {
         role: name.to_string(),
         system_prompt: Some(system_prompt.to_string()),
         disallowed_tools,
-        json_schema: (role == SddRole::Judge)
-            .then(judge_json_schema)
-            .flatten(),
+        json_schema: (role == SddRole::Judge).then(judge_json_schema).flatten(),
         ..agent_registry::RoleSpec::default()
     }
 }
