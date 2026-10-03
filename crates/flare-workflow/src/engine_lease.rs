@@ -161,6 +161,14 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         }
     }
 
+    /// Re-apply any [`patch_run_data`] registered for `run_id` onto an
+    /// in-memory `data` copy. Call this immediately before building a
+    /// `StepInvocation` mid-step so a rebinding adopt lands in the turn's
+    /// `AGENTFLARE_CLAIM_OWNER` even though the step loaded `data` earlier.
+    pub fn refresh_registered_data_patch(&self, run_id: WorkflowRunId, data: &mut D) {
+        self.apply_data_patch(run_id, data);
+    }
+
     /// Mark `run_id` as driven by this engine. `None` if it already is; the
     /// returned guard un-marks it when dropped, so a caller that errors out
     /// before [`spawn_driven`](Self::spawn_driven) releases the claim.

@@ -8,20 +8,32 @@ use super::*;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+/// Shared log of every `(agent_name, prompt, args)` call made through a mock send.
+pub(crate) type SendCalls = Arc<Mutex<Vec<(String, String, Vec<String>)>>>;
+/// Shared log of each mock-send invocation's `owner`.
+pub(crate) type SendOwners = Arc<Mutex<Vec<Option<String>>>>;
+
 /// Records every `(agent_name, prompt, args)` call and returns queued
 /// replies in order.
-#[allow(clippy::type_complexity)]
 pub(crate) fn mock_send(
     replies: Vec<&'static str>,
-) -> (
-    flare_workflow::json::SendMessage,
-    Arc<Mutex<Vec<(String, String, Vec<String>)>>>,
-) {
+) -> (flare_workflow::json::SendMessage, SendCalls) {
+    let (send, calls, _) = mock_send_recording_owners(replies);
+    (send, calls)
+}
+
+/// Like [`mock_send`], but also records each invocation's `owner`.
+pub(crate) fn mock_send_recording_owners(
+    replies: Vec<&'static str>,
+) -> (flare_workflow::json::SendMessage, SendCalls, SendOwners) {
     let calls = Arc::new(Mutex::new(Vec::new()));
+    let owners = Arc::new(Mutex::new(Vec::new()));
     let queue = Arc::new(Mutex::new(replies.into_iter().collect::<VecDeque<_>>()));
     let calls_clone = calls.clone();
+    let owners_clone = owners.clone();
     let send: flare_workflow::json::SendMessage =
         Arc::new(move |inv: flare_workflow::json::StepInvocation| {
+            owners_clone.lock().unwrap().push(inv.owner.clone());
             calls_clone.lock().unwrap().push((
                 inv.agent.clone(),
                 inv.prompt.clone(),
@@ -30,7 +42,7 @@ pub(crate) fn mock_send(
             let reply = queue.lock().unwrap().pop_front().unwrap_or("").to_string();
             Box::pin(async move { Ok((reply, 10u64, 10u64)) })
         });
-    (send, calls)
+    (send, calls, owners)
 }
 
 pub(crate) fn one_task_data() -> WorkItemData {
