@@ -139,10 +139,12 @@ mod tests {
 
     #[test]
     fn prepend_dir_puts_shim_first_and_noops_without_one() {
-        let path = Some(OsString::from("/usr/bin:/bin"));
+        // Built with the platform's own separator: `:` on Unix, `;` on Windows.
+        let path = std::env::join_paths(["/usr/bin", "/bin"]).ok();
         assert_eq!(prepend_dir(None, path.clone()), None);
         let out = prepend_dir(Some(PathBuf::from("/shims")), path).unwrap();
-        assert_eq!(out, OsString::from("/shims:/usr/bin:/bin"));
+        let expected = std::env::join_paths(["/shims", "/usr/bin", "/bin"]).unwrap();
+        assert_eq!(out, expected);
     }
 
     #[test]
