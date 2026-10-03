@@ -126,7 +126,9 @@ fn task696_commit_push_pr() {
     assert!(branch != "main" && branch != "master");
 
     let hook_dirty = !git(&["diff", "--quiet", "src/hook.rs"]).status.success()
-        || !git(&["diff", "--cached", "--quiet", "src/hook.rs"]).status.success();
+        || !git(&["diff", "--cached", "--quiet", "src/hook.rs"])
+            .status
+            .success();
     log(&format!("hook_dirty={hook_dirty}"));
     if hook_dirty {
         assert_ok("git add", &git(&["add", "src/hook.rs"]));
@@ -161,6 +163,9 @@ fn task696_commit_push_pr() {
             pr_body,
         ]),
     );
-    assert_ok("gh pr view", &gh(&["pr", "view", "--json", "url", "-q", ".url"]));
+    assert_ok(
+        "gh pr view",
+        &gh(&["pr", "view", "--json", "url", "-q", ".url"]),
+    );
     log("done");
 }
