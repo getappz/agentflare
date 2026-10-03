@@ -48,7 +48,7 @@ All external OSS projects, docs, and APIs referenced to build `flare-insights` (
 |-----|------|
 | Flare optimize module | `AGENTS.md` — `agentflare optimize` (output/code/context/runtime) |
 | lean-ctx | `~/.config/opencode/skills/lean-ctx` — `ctx_*` shadow mode, `ctx_compose` first |
-| Cargo target-dir isolation | `AGENTS.md` — `CARGO_TARGET_DIR` stripping, `sccache` |
+| Rust build cache | `AGENTS.md` — mbx shared store, `CARGO_TARGET_DIR` stripping |
 | Workspace hack | `agentflare-workspace-hack` |
 | Existing crates | `crates/flare-output`, `flare-process`, `flare-workflow`, `agentflare-store`, `flare-search-kit` — patterns copied for `flare-insights` |
 

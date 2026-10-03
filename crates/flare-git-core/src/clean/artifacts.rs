@@ -385,6 +385,18 @@ mod tests {
         assert!(d.path().join("store/real/i.js").exists());
     }
 
+    // Item #330: mbx's managed `target` is a symlink into its shared store.
+    #[cfg(unix)]
+    #[test]
+    fn mbx_managed_target_symlink_is_never_offered() {
+        let d = tempfile::TempDir::new().unwrap();
+        touch(&d.path().join("store/debug/x"));
+        touch(&d.path().join("svc/Cargo.toml"));
+        std::os::unix::fs::symlink(d.path().join("store"), d.path().join("svc/target")).unwrap();
+        assert!(labels(d.path(), None, &all(), &[]).0.is_empty());
+        assert!(d.path().join("store/debug/x").exists());
+    }
+
     // Review Focus 4
     #[test]
     fn nested_repo_tracked_dist_is_safe() {
