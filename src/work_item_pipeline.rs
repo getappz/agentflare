@@ -1434,9 +1434,9 @@ async fn adopt_existing_run(
     owner: &str,
     incoming_tasks: &[SddTask],
 ) -> Result<(), String> {
-    let repair_body = latest_repair_dispatch_body(mcp, item_id);
+    let repair_dispatch = latest_repair_dispatch_body(mcp, item_id);
     let owner_changed = state.context.data.owner != owner;
-    let repair_redispatch = repair_body.is_some();
+    let repair_redispatch = repair_dispatch.is_some();
     if owner_changed || repair_redispatch {
         if owner_changed {
             eprintln!(
@@ -1450,22 +1450,36 @@ async fn adopt_existing_run(
             );
         }
         let new_owner = owner.to_string();
-        let repair_body = repair_body.clone();
-        let incoming_tasks = incoming_tasks.to_vec();
         eng.patch_run_data(run_id, move |data: &mut WorkItemData| {
             data.owner = new_owner.clone();
-            if let Some(body) = repair_body.clone() {
-                data.tasks = vec![repair_dispatch_task(body)];
-                data.current_task_index = 0;
-                data.review_issues = None;
-                data.last_report = None;
-                data.fix_round = 0;
-            } else if data.tasks.is_empty() {
-                data.tasks = incoming_tasks.clone();
-            }
         })
         .await
         .map_err(|e| e.to_string())?;
+
+        if let Some((body, adopted_at)) = repair_dispatch {
+            eng.state_store()
+                .update(run_id, |s| {
+                    let data = &mut s.context.data;
+                    data.tasks = vec![repair_dispatch_task(body)];
+                    data.current_task_index = 0;
+                    data.review_issues = None;
+                    data.last_report = None;
+                    data.fix_round = 0;
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            persist_repair_dispatch_adopted_at(mcp, item_id, adopted_at);
+        } else if state.context.data.tasks.is_empty() && !incoming_tasks.is_empty() {
+            let incoming_tasks = incoming_tasks.to_vec();
+            eng.state_store()
+                .update(run_id, |s| {
+                    if s.context.data.tasks.is_empty() {
+                        s.context.data.tasks = incoming_tasks;
+                    }
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+        }
     }
     if !eng.is_driving(run_id)
         && !eng.is_leased_elsewhere(state)

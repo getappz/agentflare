@@ -160,3 +160,219 @@ fn adopt_existing_run_injects_repair_findings_into_task_prompt() {
         );
     });
 }
+
+const UNIQUE_FINDING_2: &str = "UNIQUE_CODERABBIT_FINDING_687_B: second repair round";
+
+#[test]
+fn repair_dispatch_comment_not_re_adopted_without_new_marker_comment() {
+    crate::paths::test_support::with_temp_home(|| {
+        let (mcp, _backend_tmp, _repo_tmp, item_id, _project_id, worktree) =
+            crate::mcp_server::tests::mcp_with_claimed_item("Adopt repair once");
+        let mcp = Arc::new(mcp);
+        let eng = engine();
+        let hang_send: flare_workflow::json::SendMessage =
+            Arc::new(|_inv| Box::pin(std::future::pending::<Result<(String, u64, u64), String>>()));
+        eng.register_workflow(build_work_item_pipeline_with_sender(mcp.clone(), hang_send))
+            .unwrap();
+        let run_id = crate::workflow::blocking_runtime()
+            .block_on(eng.start_workflow(
+                WorkflowId::new(WORKFLOW_ID),
+                WorkItemData {
+                    item_id: item_id.clone(),
+                    agent_name: agent_registry::Agent::ClaudeCode.as_str().to_string(),
+                    judge_agent_name: agent_registry::Agent::ClaudeCode.as_str().to_string(),
+                    owner: "claude-code:stale".into(),
+                    worktree_path: worktree.display().to_string(),
+                    tasks: vec![SddTask {
+                        id: 0,
+                        title: "Original".into(),
+                        body: "work".into(),
+                        model_tier: None,
+                    }],
+                    current_task_index: 0,
+                    fix_round: 0,
+                    ..Default::default()
+                },
+                String::new(),
+            ))
+            .unwrap();
+        persist_run_id(&mcp, &item_id, run_id).unwrap();
+
+        mcp.comment_impl(crate::mcp_server::types::CommentRequest {
+            action: "create".into(),
+            item_id: Some(item_id.clone()),
+            body: Some(format!("{REPAIR_MARKER}\n\n{UNIQUE_FINDING}\n")),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let incoming = load_or_synthesize_tasks("work", None);
+        let adopt = |owner: &str| {
+            let state = crate::workflow::blocking_runtime()
+                .block_on(eng.get_status(run_id))
+                .unwrap();
+            crate::workflow::blocking_runtime()
+                .block_on(adopt_existing_run(
+                    eng, &mcp, &item_id, run_id, &state, owner, &incoming,
+                ))
+                .unwrap();
+        };
+        adopt("claude-code:job-1");
+
+        crate::workflow::blocking_runtime()
+            .block_on(eng.state_store().update(run_id, |s| {
+                s.context.data.current_task_index = 1;
+                s.context.data.fix_round = 2;
+            }))
+            .unwrap();
+
+        assert!(
+            latest_repair_dispatch_body(&mcp, &item_id).is_none(),
+            "consumed repair comment must not be offered again"
+        );
+
+        adopt("claude-code:job-2");
+
+        let data = crate::workflow::blocking_runtime()
+            .block_on(eng.get_status(run_id))
+            .unwrap()
+            .context
+            .data;
+        assert_eq!(
+            data.current_task_index, 1,
+            "second adopt must not reset index"
+        );
+        assert_eq!(data.fix_round, 2, "second adopt must not reset fix_round");
+    });
+}
+
+#[test]
+fn newer_repair_dispatch_comment_is_adopted_on_redispatch() {
+    crate::paths::test_support::with_temp_home(|| {
+        let (mcp, _backend_tmp, _repo_tmp, item_id, _project_id, worktree) =
+            crate::mcp_server::tests::mcp_with_claimed_item("Adopt newer repair");
+        let mcp = Arc::new(mcp);
+        let eng = engine();
+        let hang_send: flare_workflow::json::SendMessage =
+            Arc::new(|_inv| Box::pin(std::future::pending::<Result<(String, u64, u64), String>>()));
+        eng.register_workflow(build_work_item_pipeline_with_sender(mcp.clone(), hang_send))
+            .unwrap();
+        let run_id = crate::workflow::blocking_runtime()
+            .block_on(eng.start_workflow(
+                WorkflowId::new(WORKFLOW_ID),
+                WorkItemData {
+                    item_id: item_id.clone(),
+                    agent_name: agent_registry::Agent::ClaudeCode.as_str().to_string(),
+                    judge_agent_name: agent_registry::Agent::ClaudeCode.as_str().to_string(),
+                    owner: "claude-code:stale".into(),
+                    worktree_path: worktree.display().to_string(),
+                    ..Default::default()
+                },
+                String::new(),
+            ))
+            .unwrap();
+        persist_run_id(&mcp, &item_id, run_id).unwrap();
+
+        mcp.comment_impl(crate::mcp_server::types::CommentRequest {
+            action: "create".into(),
+            item_id: Some(item_id.clone()),
+            body: Some(format!("{REPAIR_MARKER}\n\n{UNIQUE_FINDING}\n")),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let incoming = load_or_synthesize_tasks("work", None);
+        let adopt = |owner: &str| {
+            let state = crate::workflow::blocking_runtime()
+                .block_on(eng.get_status(run_id))
+                .unwrap();
+            crate::workflow::blocking_runtime()
+                .block_on(adopt_existing_run(
+                    eng, &mcp, &item_id, run_id, &state, owner, &incoming,
+                ))
+                .unwrap();
+        };
+        adopt("claude-code:job-1");
+
+        mcp.comment_impl(crate::mcp_server::types::CommentRequest {
+            action: "create".into(),
+            item_id: Some(item_id.clone()),
+            body: Some(format!("{REPAIR_MARKER}\n\n{UNIQUE_FINDING_2}\n")),
+            ..Default::default()
+        })
+        .unwrap();
+        mcp.with_backend_db(|conn| {
+            conn.execute(
+                "UPDATE item_comments SET created_at = created_at + 10 WHERE item_id = ?1 AND body LIKE ?2",
+                rusqlite::params![&item_id, &format!("%{UNIQUE_FINDING_2}%")],
+            )
+        })
+        .unwrap()
+        .unwrap();
+
+        adopt("claude-code:job-2");
+
+        let body = crate::workflow::blocking_runtime()
+            .block_on(eng.get_status(run_id))
+            .unwrap()
+            .context
+            .data
+            .tasks
+            .first()
+            .map(|t| t.body.clone())
+            .unwrap_or_default();
+        assert!(
+            body.contains(UNIQUE_FINDING_2),
+            "newer repair comment must replace task body, got: {body}"
+        );
+    });
+}
+
+#[test]
+fn owner_data_patch_does_not_reset_sdd_progress_fields() {
+    crate::paths::test_support::with_temp_home(|| {
+        let hang_send: flare_workflow::json::SendMessage =
+            Arc::new(|_inv| Box::pin(std::future::pending::<Result<(String, u64, u64), String>>()));
+        let eng = engine();
+        eng.register_workflow(
+            flare_workflow::WorkflowDefinition::new(WORKFLOW_ID, "sdd work item")
+                .add_step(build_sdd_loop_step(hang_send)),
+        )
+        .unwrap();
+        let run_id = crate::workflow::blocking_runtime()
+            .block_on(eng.start_workflow(
+                WorkflowId::new(WORKFLOW_ID),
+                WorkItemData {
+                    agent_name: "implementer-agent".to_string(),
+                    judge_agent_name: "judge-agent".to_string(),
+                    owner: "claude-code:old".into(),
+                    current_task_index: 2,
+                    fix_round: 3,
+                    review_issues: Some("still open".into()),
+                    last_report: Some("prior report".into()),
+                    tasks: one_task_data().tasks,
+                    ..Default::default()
+                },
+                String::new(),
+            ))
+            .unwrap();
+
+        crate::workflow::blocking_runtime()
+            .block_on(eng.patch_run_data(run_id, |data: &mut WorkItemData| {
+                data.owner = "claude-code:new".into();
+            }))
+            .unwrap();
+
+        let mut ctx = crate::workflow::blocking_runtime()
+            .block_on(eng.get_status(run_id))
+            .unwrap()
+            .context;
+        eng.refresh_registered_data_patch(run_id, &mut ctx.data);
+
+        assert_eq!(ctx.data.current_task_index, 2);
+        assert_eq!(ctx.data.fix_round, 3);
+        assert_eq!(ctx.data.review_issues.as_deref(), Some("still open"));
+        assert_eq!(ctx.data.last_report.as_deref(), Some("prior report"));
+        assert_eq!(ctx.data.owner, "claude-code:new");
+    });
+}
