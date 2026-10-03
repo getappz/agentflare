@@ -61,6 +61,7 @@ pub fn session_start(agent: &str) {
         &session,
         true,
         crate::hook_messages::Delivery::TurnStart,
+        crate::hook_messages::MailSurface::SessionStart,
     );
     let context = if pending.is_empty() {
         msg.clone()
@@ -92,18 +93,22 @@ pub fn session_start(agent: &str) {
         Err(_) => eprintln!("[agentflare] vent: consolidate panicked — skipping this turn"),
     }
 
-    // Plain stdout reaches Claude's context for this event (see module
-    // comment) but is NOT shown to the user in the terminal. `systemMessage`
-    // is the only field that renders visibly, so emit both: the user sees
-    // it, and Claude still gets it via additionalContext.
-    let out = json!({
-        "systemMessage": msg,
-        "hookSpecificOutput": {
-            "hookEventName": "SessionStart",
-            "additionalContext": context,
-        }
-    });
-    println!("{out}");
+    // Claude/Codex: `systemMessage` is user-visible; nested
+    // `additionalContext` reaches the model. Cursor: flat
+    // `additional_context` only (no systemMessage / hookSpecificOutput).
+    if agent == "cursor" {
+        let out = crate::hook_messages::context_output(agent, "SessionStart", &context);
+        println!("{out}");
+    } else {
+        let out = json!({
+            "systemMessage": msg,
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": context,
+            }
+        });
+        println!("{out}");
+    }
 }
 
 fn session_start_message(agent: &str) -> String {
@@ -258,7 +263,11 @@ struct PreToolUseInput {
 
 fn parse_pre_tool_use(input: &str) -> Option<PreToolUseInput> {
     let v: serde_json::Value = serde_json::from_str(input).ok()?;
-    let session_id = v.get("session_id")?.as_str()?.to_string();
+    let session_id = v
+        .get("session_id")
+        .or_else(|| v.get("conversation_id"))
+        .and_then(|s| s.as_str())?
+        .to_string();
     let raw_tool_name = v.get("tool_name")?.as_str()?.to_string();
     let raw_tool_input = v.get("tool_input").cloned();
     // Unwrap flare-gateway `action="execute"` calls to the real tool they
@@ -618,6 +627,7 @@ pub fn pre_tool_use(agent: &str) {
         &crate::hook_messages::parse_session(&input),
         false,
         crate::hook_messages::Delivery::MidTurn,
+        crate::hook_messages::MailSurface::PreToolUse,
     );
     if let Some(out) = crate::hook_messages::pre_tool_use_output(&msgs, &nudges) {
         println!("{out}");
@@ -720,6 +730,7 @@ pub fn prompt_submit(agent: &str) {
         .ok()
         .and_then(|v| {
             v.get("session_id")
+                .or_else(|| v.get("conversation_id"))
                 .and_then(|s| s.as_str())
                 .map(String::from)
         });
@@ -728,13 +739,15 @@ pub fn prompt_submit(agent: &str) {
 
     if prompt == "/agentflare" || prompt == "/agentflare status" {
         let state = if s.active { "ACTIVE" } else { "off" };
-        let out = json!({
-            "hookSpecificOutput": {
-                "hookEventName": "UserPromptSubmit",
-                "additionalContext": format!("agentflare is {state}. Use /agentflare on | off | status."),
-            }
-        });
-        println!("{out}");
+        if agent != "cursor" {
+            let out = json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": format!("agentflare is {state}. Use /agentflare on | off | status."),
+                }
+            });
+            println!("{out}");
+        }
         return;
     }
     if prompt == "/agentflare off" || prompt == "/agentflare stop" {
@@ -753,10 +766,11 @@ pub fn prompt_submit(agent: &str) {
         &crate::hook_messages::parse_session(&input),
         false,
         crate::hook_messages::Delivery::TurnStart,
+        crate::hook_messages::MailSurface::BeforeSubmitPrompt,
     );
 
     if !s.active {
-        if !agent_msgs.is_empty() {
+        if !agent_msgs.is_empty() && agent != "cursor" {
             let out = json!({
                 "hookSpecificOutput": {
                     "hookEventName": "UserPromptSubmit",
@@ -919,6 +933,12 @@ pub fn prompt_submit(agent: &str) {
         context.push_str("\n\n");
         context.push_str(&crate::messages::format_delivery(&agent_msgs));
     }
+    // Cursor beforeSubmitPrompt accepts only continue/user_message — no
+    // model-visible inject. Skip emit; sessionStart/postToolUse/stop
+    // carry Cursor mail instead.
+    if agent == "cursor" {
+        return;
+    }
     let out = json!({
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
@@ -972,6 +992,14 @@ mod tests {
     #[test]
     fn extract_prompt_returns_empty_when_no_known_key() {
         assert_eq!(extract_prompt(r#"{"other": "value"}"#), "");
+    }
+
+    #[test]
+    fn parse_pre_tool_use_accepts_cursor_conversation_id() {
+        let input = r#"{"conversation_id":"c1","tool_name":"Shell","tool_input":{"command":"ls"}}"#;
+        let parsed = parse_pre_tool_use(input).unwrap();
+        assert_eq!(parsed.session_id, "c1");
+        assert_eq!(parsed.tool_name, "Shell");
     }
 
     #[test]
