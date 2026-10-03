@@ -10,6 +10,10 @@ use std::time::Duration;
 
 pub const DEFAULT_COOLDOWN: Duration = Duration::from_secs(300);
 
+/// UserPromptSubmit reminders (PM mode, setup) — long enough to stop nagging;
+/// tracked sessions still bypass once on turn zero via `submit_nudge_bypass_cooldown`.
+pub(crate) const SUBMIT_NUDGE_COOLDOWN: Duration = Duration::from_secs(1800);
+
 /// Comfortably larger than any `cooldown_secs` a coaching rule is expected to
 /// configure, so `mark_fired`'s opportunistic pruning never erases a key
 /// before its own (possibly custom, unbounded) cooldown has elapsed.
@@ -100,7 +104,10 @@ fn save(map: &HashMap<String, String>) {
 /// True if `key` has never fired, or its last recorded fire is older than
 /// `cooldown`. Fails open (returns true) on any read/parse error.
 pub fn should_fire(key: &str, cooldown: Duration) -> bool {
-    let map = load();
+    key_may_fire(&load(), key, cooldown)
+}
+
+fn key_may_fire(map: &HashMap<String, String>, key: &str, cooldown: Duration) -> bool {
     let Some(last) = map.get(key) else {
         return true;
     };
@@ -110,6 +117,16 @@ pub fn should_fire(key: &str, cooldown: Duration) -> bool {
     let last = last.with_timezone(&chrono::Utc);
     let now = chrono::Utc::now();
     now < last || (now - last).num_seconds() as u64 >= cooldown.as_secs()
+}
+
+fn record_fire(map: &mut HashMap<String, String>, key: &str) {
+    let now = chrono::Utc::now();
+    map.retain(|_, ts| {
+        chrono::DateTime::parse_from_rfc3339(ts)
+            .map(|t| (now - t.with_timezone(&chrono::Utc)).num_seconds() < MAX_RETENTION_SECS)
+            .unwrap_or(false)
+    });
+    map.insert(key.to_string(), now.to_rfc3339());
 }
 
 /// Records `key` as having fired now. Best-effort: write failures (including
@@ -122,14 +139,39 @@ pub fn mark_fired(key: &str) {
         return;
     };
     let mut map = load();
-    let now = chrono::Utc::now();
-    map.retain(|_, ts| {
-        chrono::DateTime::parse_from_rfc3339(ts)
-            .map(|t| (now - t.with_timezone(&chrono::Utc)).num_seconds() < MAX_RETENTION_SECS)
-            .unwrap_or(false)
-    });
-    map.insert(key.to_string(), now.to_rfc3339());
+    record_fire(&mut map, key);
     save(&map);
+}
+
+/// Lock-protected check-and-mark: returns true only when `key` may fire under
+/// `cooldown`, and records the fire in the same critical section. Fails open
+/// (returns true) if the lock cannot be acquired.
+pub fn try_acquire_fire(key: &str, cooldown: Duration) -> bool {
+    let Ok(_lock) = PaceLock::acquire() else {
+        return true;
+    };
+    let mut map = load();
+    if !key_may_fire(&map, key, cooldown) {
+        return false;
+    }
+    record_fire(&mut map, key);
+    save(&map);
+    true
+}
+
+pub(crate) fn submit_nudge_bypass_cooldown(session_id: Option<&str>, first_turn: bool) -> bool {
+    session_id.is_some() && first_turn
+}
+
+pub(crate) fn paced_submit_nudge(bypass_cooldown: bool, key: &str, text: String) -> Option<String> {
+    if bypass_cooldown {
+        mark_fired(key);
+        Some(text)
+    } else if try_acquire_fire(key, SUBMIT_NUDGE_COOLDOWN) {
+        Some(text)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -184,6 +226,121 @@ mod tests {
             mark_fired("coaching:hygiene");
             assert!(should_fire("coaching:other-rule", Duration::from_secs(300)));
             assert!(!should_fire("coaching:hygiene", Duration::from_secs(300)));
+        });
+    }
+
+    #[test]
+    fn submit_nudge_bypass_cooldown_requires_session_id() {
+        assert!(submit_nudge_bypass_cooldown(Some("sid"), true));
+        assert!(!submit_nudge_bypass_cooldown(Some("sid"), false));
+        assert!(
+            !submit_nudge_bypass_cooldown(None, true),
+            "missing session_id must not bypass reminder cooldown"
+        );
+        assert!(!submit_nudge_bypass_cooldown(None, false));
+    }
+
+    #[test]
+    fn paced_submit_nudge_paces_when_session_id_absent() {
+        with_temp_home(|| {
+            let key = "pm-mode-nudge:no-session";
+            let text = "PM MODE ACTIVE".to_string();
+            assert_eq!(
+                paced_submit_nudge(false, key, text.clone()),
+                Some(text.clone())
+            );
+            assert_eq!(
+                paced_submit_nudge(false, key, text.clone()),
+                None,
+                "without session_id, reminders must respect nudge_pace on every turn"
+            );
+        });
+    }
+
+    #[test]
+    fn paced_submit_nudge_fires_on_first_turn_then_paces_pm_mode_key() {
+        with_temp_home(|| {
+            let key = "pm-mode-nudge:claude-code";
+            let text = "PM MODE ACTIVE".to_string();
+
+            assert_eq!(
+                paced_submit_nudge(true, key, text.clone()),
+                Some(text.clone()),
+                "first turn must always surface the nudge"
+            );
+            assert_eq!(
+                paced_submit_nudge(false, key, text.clone()),
+                None,
+                "second prompt within cooldown must be suppressed"
+            );
+
+            let path = state_path();
+            let mut map = HashMap::new();
+            map.insert(
+                key.to_string(),
+                (chrono::Utc::now() - chrono::Duration::seconds(2000)).to_rfc3339(),
+            );
+            std::fs::write(&path, serde_json::to_string(&map).unwrap()).unwrap();
+
+            assert_eq!(
+                paced_submit_nudge(false, key, text.clone()),
+                Some(text.clone()),
+                "nudge must return once cooldown has elapsed"
+            );
+        });
+    }
+
+    #[test]
+    fn paced_submit_nudge_paces_setup_nudge_key_independently() {
+        with_temp_home(|| {
+            let key = "setup-nudge:codex";
+            let text = "@setup: agentflare init --agent codex".to_string();
+
+            assert_eq!(
+                paced_submit_nudge(true, key, text.clone()),
+                Some(text.clone()),
+                "first turn must always surface the nudge"
+            );
+            assert_eq!(
+                paced_submit_nudge(false, key, text.clone()),
+                None,
+                "second prompt within cooldown must be suppressed"
+            );
+
+            let path = state_path();
+            let mut map = HashMap::new();
+            map.insert(
+                key.to_string(),
+                (chrono::Utc::now() - chrono::Duration::seconds(2000)).to_rfc3339(),
+            );
+            std::fs::write(&path, serde_json::to_string(&map).unwrap()).unwrap();
+
+            assert_eq!(
+                paced_submit_nudge(false, key, text.clone()),
+                Some(text.clone()),
+                "nudge must return once cooldown has elapsed"
+            );
+        });
+    }
+
+    #[test]
+    fn try_acquire_fire_allows_only_one_winner_per_key_under_concurrency() {
+        with_temp_home(|| {
+            let wins = std::sync::Mutex::new(0);
+            std::thread::scope(|scope| {
+                for _ in 0..8 {
+                    scope.spawn(|| {
+                        if try_acquire_fire("submit:shared", Duration::from_secs(300)) {
+                            *wins.lock().unwrap() += 1;
+                        }
+                    });
+                }
+            });
+            assert_eq!(
+                *wins.lock().unwrap(),
+                1,
+                "only one concurrent caller may acquire the same key within cooldown"
+            );
         });
     }
 

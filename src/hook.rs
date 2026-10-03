@@ -719,23 +719,6 @@ fn identity_bits(components: &[crate::components::Component]) -> Vec<String> {
     bits
 }
 
-/// Cooldown for UserPromptSubmit reminders that would otherwise repeat every
-/// turn (PM mode, setup). Shorter than a typical session but long enough to
-/// stop nagging; `first_turn` still bypasses so each session gets one upfront.
-const SUBMIT_NUDGE_COOLDOWN: Duration = Duration::from_secs(1800);
-
-/// Paces a prompt-submit reminder line; `first_turn` bypasses cooldown so a
-/// fresh session still gets the nudge even when the global pace file says
-/// otherwise.
-fn paced_submit_nudge(first_turn: bool, key: &str, text: String) -> Option<String> {
-    if first_turn || crate::nudge_pace::should_fire(key, SUBMIT_NUDGE_COOLDOWN) {
-        crate::nudge_pace::mark_fired(key);
-        Some(text)
-    } else {
-        None
-    }
-}
-
 pub fn prompt_submit(agent: &str) {
     let Some(input) = read_stdin_or_skip("UserPromptSubmit") else {
         return;
@@ -884,10 +867,12 @@ pub fn prompt_submit(agent: &str) {
     } else {
         vec![]
     };
+    let nudge_bypass =
+        crate::nudge_pace::submit_nudge_bypass_cooldown(session_id.as_deref(), first_turn);
     if crate::pm_mode::is_active() {
         let pace_key = format!("pm-mode-nudge:{agent}");
-        if let Some(nudge) = paced_submit_nudge(
-            first_turn,
+        if let Some(nudge) = crate::nudge_pace::paced_submit_nudge(
+            nudge_bypass,
             &pace_key,
             "PM MODE ACTIVE — delegate & dispatch only, don't implement directly (see the `pm` skill, Part 2). /pm mode off to exit."
                 .to_string(),
@@ -901,8 +886,8 @@ pub fn prompt_submit(agent: &str) {
     let pending = components.iter().any(|c| c.needs_consent && !(c.check)());
     if pending {
         let pace_key = format!("setup-nudge:{agent}");
-        if let Some(nudge) = paced_submit_nudge(
-            first_turn,
+        if let Some(nudge) = crate::nudge_pace::paced_submit_nudge(
+            nudge_bypass,
             &pace_key,
             format!("@setup: agentflare init --agent {agent}"),
         ) {
@@ -1263,74 +1248,6 @@ second line
             let bodies = crate::coaching::rule_bodies_for_tool("mcp__flare__review");
             assert_eq!(bodies, vec!["Every finding needs a diff.".to_string()]);
             assert!(crate::coaching::rule_bodies_for_tool("mcp__flare__comment").is_empty());
-        });
-    }
-
-    #[test]
-    fn paced_submit_nudge_fires_on_first_turn_then_paces_pm_mode_key() {
-        use crate::paths::test_support::with_temp_home;
-        with_temp_home(|| {
-            let key = "pm-mode-nudge:claude-code";
-            let text = "PM MODE ACTIVE".to_string();
-
-            assert_eq!(
-                paced_submit_nudge(true, key, text.clone()),
-                Some(text.clone()),
-                "first turn must always surface the nudge"
-            );
-            assert_eq!(
-                paced_submit_nudge(false, key, text.clone()),
-                None,
-                "second prompt within cooldown must be suppressed"
-            );
-
-            let path = crate::state::state_dir().join("nudge-pace.json");
-            let mut map = std::collections::HashMap::new();
-            map.insert(
-                key.to_string(),
-                (chrono::Utc::now() - chrono::Duration::seconds(2000)).to_rfc3339(),
-            );
-            std::fs::write(&path, serde_json::to_string(&map).unwrap()).unwrap();
-
-            assert_eq!(
-                paced_submit_nudge(false, key, text.clone()),
-                Some(text.clone()),
-                "nudge must return once cooldown has elapsed"
-            );
-        });
-    }
-
-    #[test]
-    fn paced_submit_nudge_paces_setup_nudge_key_independently() {
-        use crate::paths::test_support::with_temp_home;
-        with_temp_home(|| {
-            let key = "setup-nudge:codex";
-            let text = "@setup: agentflare init --agent codex".to_string();
-
-            assert_eq!(
-                paced_submit_nudge(true, key, text.clone()),
-                Some(text.clone()),
-                "first turn must always surface the nudge"
-            );
-            assert_eq!(
-                paced_submit_nudge(false, key, text.clone()),
-                None,
-                "second prompt within cooldown must be suppressed"
-            );
-
-            let path = crate::state::state_dir().join("nudge-pace.json");
-            let mut map = std::collections::HashMap::new();
-            map.insert(
-                key.to_string(),
-                (chrono::Utc::now() - chrono::Duration::seconds(2000)).to_rfc3339(),
-            );
-            std::fs::write(&path, serde_json::to_string(&map).unwrap()).unwrap();
-
-            assert_eq!(
-                paced_submit_nudge(false, key, text.clone()),
-                Some(text.clone()),
-                "nudge must return once cooldown has elapsed"
-            );
         });
     }
 
