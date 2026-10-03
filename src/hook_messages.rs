@@ -2,21 +2,53 @@
 //!
 //! Every hook invocation registers/refreshes the session it fires for (see
 //! [`crate::messages::identity`]). On hosts whose hooks feed text back to the
-//! model, pending messages are delivered on the spot: `PreToolUse` (every
-//! tool call -- near-realtime while the agent works), `UserPromptSubmit`,
-//! `SessionStart`, and `Stop`, which blocks the stop so an agent about to go
-//! idle reads the messages that arrived during its turn.
+//! model, pending messages are delivered on inject-capable surfaces:
+//! Claude/Codex use `PreToolUse` / `UserPromptSubmit` / `SessionStart` /
+//! `Stop` (block reason); Cursor uses `sessionStart` / `postToolUse` /
+//! `stop` (`followup_message`) -- its `beforeSubmitPrompt` and allow-path
+//! `preToolUse` have no model-visible inject field, so mail is held there.
 
 use crate::messages::{self, Message, identity};
 use serde_json::{Value, json};
 
-/// Hosts whose hook output reaches the model (`additionalContext`, a Stop
-/// hook's block `reason`). Elsewhere a hook only registers the session and
-/// never takes a message -- taking marks it delivered, so taking one the
-/// host would drop would lose it; those hosts get messages through the MCP
-/// result piggyback instead.
+/// Hosts that can put hook output in front of the model on at least one
+/// lifecycle surface (`additionalContext` / Cursor `additional_context` /
+/// Stop block `reason` / Cursor `followup_message`). Elsewhere a hook only
+/// registers the session and never takes a message -- taking marks it
+/// delivered, so taking one the host would drop would lose it; those hosts
+/// get messages through the MCP result piggyback instead.
+///
+/// Cursor is included: docs (cursor.com/docs/hooks) confirm model-visible
+/// inject on `sessionStart` / `postToolUse` / `stop`. Surfaces without an
+/// inject field (`beforeSubmitPrompt`, allow-path `preToolUse`) must pass
+/// [`takes_mail_on`] = false so mail is not taken and dropped.
 pub(crate) fn host_injects_context(agent: &str) -> bool {
-    matches!(agent, "claude-code" | "codex")
+    matches!(agent, "claude-code" | "codex" | "cursor")
+}
+
+/// Hook surface that may or may not be allowed to take undelivered mail for
+/// a given host (see [`takes_mail_on`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MailSurface {
+    SessionStart,
+    BeforeSubmitPrompt,
+    PreToolUse,
+    PostToolUse,
+    Stop,
+}
+
+/// Whether this host+surface may take undelivered mail. Cursor's
+/// `beforeSubmitPrompt` and allow-path `preToolUse` have no model-visible
+/// inject field, so taking there would lose the message.
+pub(crate) fn takes_mail_on(agent: &str, surface: MailSurface) -> bool {
+    host_injects_context(agent)
+        && !matches!(
+            (agent, surface),
+            (
+                "cursor",
+                MailSurface::BeforeSubmitPrompt | MailSurface::PreToolUse
+            )
+        )
 }
 
 /// The fields every hook's stdin JSON shares.
@@ -33,9 +65,17 @@ pub(crate) fn parse_session(input: &str) -> HookSession {
             .map(str::to_string)
             .filter(|s| !s.is_empty())
     };
+    let cwd = s("cwd").or_else(|| {
+        v.get("workspace_roots")
+            .and_then(Value::as_array)
+            .and_then(|roots| roots.first())
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|s| !s.is_empty())
+    });
     HookSession {
         session_id: s("session_id").or_else(|| s("conversation_id")),
-        cwd: s("cwd"),
+        cwd,
     }
 }
 
@@ -86,6 +126,7 @@ pub(crate) fn sync(
     session: &HookSession,
     register: bool,
     policy: Delivery,
+    surface: MailSurface,
 ) -> Vec<Message> {
     let key = match (&session.session_id, identity::job_owner()) {
         (_, Some(owner)) => owner,
@@ -101,15 +142,17 @@ pub(crate) fn sync(
         None => return vec![],
     };
     let cwd = session.cwd.as_deref();
-    sync_with(&conn, agent, &key, cwd, register, policy, now())
+    let take = takes_mail_on(agent, surface);
+    sync_with_take(&conn, &key, cwd, register, policy, now(), take)
         .or_else(|_| {
             // A table not created yet on a db an older binary made.
             let conn = crate::db::open()?;
-            sync_with(&conn, agent, &key, cwd, register, policy, now())
+            sync_with_take(&conn, &key, cwd, register, policy, now(), take)
         })
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 pub(crate) fn sync_with(
     conn: &rusqlite::Connection,
     agent: &str,
@@ -119,13 +162,33 @@ pub(crate) fn sync_with(
     policy: Delivery,
     now: i64,
 ) -> rusqlite::Result<Vec<Message>> {
+    sync_with_take(
+        conn,
+        key,
+        cwd,
+        register,
+        policy,
+        now,
+        host_injects_context(agent),
+    )
+}
+
+pub(crate) fn sync_with_take(
+    conn: &rusqlite::Connection,
+    key: &str,
+    cwd: Option<&str>,
+    register: bool,
+    policy: Delivery,
+    now: i64,
+    take: bool,
+) -> rusqlite::Result<Vec<Message>> {
     identity::touch_hook_session(conn, key, cwd, register, now)?;
     // A submitted prompt starts a turn; a session start (`register`) is a
     // session idling at its prompt, not a turn (spec §5.4).
     if policy == Delivery::TurnStart && !register {
         crate::sessions::set_busy(conn, key, true, now)?;
     }
-    let taken = if !host_injects_context(agent) || !messages::has_undelivered(conn, key)? {
+    let taken = if !take || !messages::has_undelivered(conn, key)? {
         vec![]
     } else {
         let markers = markers_for(conn, key, policy)?;
@@ -137,6 +200,22 @@ pub(crate) fn sync_with(
         crate::sessions::set_busy(conn, key, false, now)?;
     }
     Ok(taken)
+}
+
+/// Model-visible context JSON for a host. Claude/Codex use nested
+/// `hookSpecificOutput.additionalContext`; Cursor uses flat
+/// `additional_context` (cursor.com/docs/hooks).
+pub(crate) fn context_output(agent: &str, event: &str, context: &str) -> Value {
+    if agent == "cursor" {
+        json!({ "additional_context": context })
+    } else {
+        json!({
+            "hookSpecificOutput": {
+                "hookEventName": event,
+                "additionalContext": context,
+            }
+        })
+    }
 }
 
 /// Ends the hook's session (SessionEnd). A dispatched job's session is
@@ -178,14 +257,20 @@ pub(crate) fn pre_tool_use_output(msgs: &[Message], nudges: &[String]) -> Option
     Some(out)
 }
 
-/// Stop output: block the stop with the messages as the reason, so the
-/// agent keeps going and handles them. Nothing pending -> let it stop.
-pub(crate) fn stop_output(msgs: &[Message]) -> Option<Value> {
+/// Stop output: Claude/Codex block the stop with the messages as the
+/// reason; Cursor auto-submits them as `followup_message` (its stop schema
+/// has no decision/reason fields). Nothing pending -> let it stop.
+pub(crate) fn stop_output(agent: &str, msgs: &[Message]) -> Option<Value> {
     (!msgs.is_empty()).then(|| {
-        json!({
-            "decision": "block",
-            "reason": messages::format_delivery(msgs),
-        })
+        let text = messages::format_delivery(msgs);
+        if agent == "cursor" {
+            json!({ "followup_message": text })
+        } else {
+            json!({
+                "decision": "block",
+                "reason": text,
+            })
+        }
     })
 }
 
@@ -228,8 +313,14 @@ pub fn stop(agent: &str) {
     let Some(input) = crate::hook::read_stdin_or_skip("Stop") else {
         return;
     };
-    let msgs = sync(agent, &parse_session(&input), false, Delivery::TurnEnd);
-    if let Some(out) = stop_output(&msgs) {
+    let msgs = sync(
+        agent,
+        &parse_session(&input),
+        false,
+        Delivery::TurnEnd,
+        MailSurface::Stop,
+    );
+    if let Some(out) = stop_output(agent, &msgs) {
         println!("{out}");
     }
 }
@@ -331,11 +422,11 @@ mod tests {
         seed(&c, key, "fyi", 3);
         let got = sync_with(&c, "claude-code", key, None, true, Delivery::TurnEnd, 200).unwrap();
         assert!(got.is_empty());
-        assert!(stop_output(&got).is_none());
+        assert!(stop_output("claude-code", &got).is_none());
         seed(&c, key, "status", 1);
         let got = sync_with(&c, "claude-code", key, None, false, Delivery::TurnEnd, 201).unwrap();
         assert_eq!(got.len(), 1);
-        assert!(stop_output(&got).is_some());
+        assert!(stop_output("claude-code", &got).is_some());
     }
 
     #[test]
@@ -384,15 +475,69 @@ mod tests {
     }
 
     #[test]
-    fn sync_never_takes_on_a_host_that_drops_hook_context() {
+    fn sync_takes_on_cursor_when_the_surface_can_inject() {
+        let c = conn();
+        messages::send(&c, "a:1", "cursor:s", "hi", None, 1, no_item).unwrap();
+        assert_eq!(
+            sync_with_take(&c, "cursor:s", None, true, Delivery::TurnStart, 2, true)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(!messages::has_undelivered(&c, "cursor:s").unwrap());
+    }
+
+    #[test]
+    fn sync_does_not_take_on_cursor_surfaces_without_inject_fields() {
         let c = conn();
         messages::send(&c, "a:1", "cursor:s", "hi", None, 1, no_item).unwrap();
         assert!(
-            sync_with(&c, "cursor", "cursor:s", None, true, Delivery::TurnStart, 2)
+            sync_with_take(&c, "cursor:s", None, false, Delivery::TurnStart, 2, false)
                 .unwrap()
-                .is_empty()
+                .is_empty(),
+            "beforeSubmitPrompt / allow-path preToolUse must not take"
         );
         assert!(messages::has_undelivered(&c, "cursor:s").unwrap());
+    }
+
+    #[test]
+    fn cursor_stop_output_uses_followup_message() {
+        assert!(stop_output("cursor", &[]).is_none());
+        let out = stop_output("cursor", &[msg(3)]).unwrap();
+        assert!(out.get("decision").is_none());
+        assert!(out["followup_message"].as_str().unwrap().contains("id=3"));
+    }
+
+    #[test]
+    fn cursor_context_output_is_flat_additional_context() {
+        let out = context_output("cursor", "SessionStart", "hello");
+        assert_eq!(out["additional_context"], "hello");
+        assert!(out.get("hookSpecificOutput").is_none());
+        let claude = context_output("claude-code", "SessionStart", "hello");
+        assert_eq!(claude["hookSpecificOutput"]["additionalContext"], "hello");
+    }
+
+    #[test]
+    fn parse_session_reads_cursor_workspace_roots_as_cwd() {
+        let s = parse_session(r#"{"conversation_id":"c1","workspace_roots":["/repo"]}"#);
+        assert_eq!(
+            (s.session_id.as_deref(), s.cwd.as_deref()),
+            (Some("c1"), Some("/repo"))
+        );
+    }
+
+    #[test]
+    fn takes_mail_on_cursor_only_for_inject_surfaces() {
+        assert!(takes_mail_on("cursor", MailSurface::SessionStart));
+        assert!(takes_mail_on("cursor", MailSurface::PostToolUse));
+        assert!(takes_mail_on("cursor", MailSurface::Stop));
+        assert!(!takes_mail_on("cursor", MailSurface::BeforeSubmitPrompt));
+        assert!(!takes_mail_on("cursor", MailSurface::PreToolUse));
+        assert!(takes_mail_on(
+            "claude-code",
+            MailSurface::BeforeSubmitPrompt
+        ));
+        assert!(!takes_mail_on("windsurf", MailSurface::Stop));
     }
 
     #[test]
@@ -547,8 +692,8 @@ mod tests {
 
     #[test]
     fn stop_output_blocks_only_with_messages() {
-        assert!(stop_output(&[]).is_none());
-        let out = stop_output(&[msg(3)]).unwrap();
+        assert!(stop_output("claude-code", &[]).is_none());
+        let out = stop_output("claude-code", &[msg(3)]).unwrap();
         assert_eq!(out["decision"], "block");
         assert!(out["reason"].as_str().unwrap().contains("id=3"));
     }
