@@ -1309,9 +1309,28 @@ second line
 
             assert_eq!(
                 paced_submit_nudge(true, key, text.clone()),
-                Some(text.clone())
+                Some(text.clone()),
+                "first turn must always surface the nudge"
             );
-            assert_eq!(paced_submit_nudge(false, key, text.clone()), None);
+            assert_eq!(
+                paced_submit_nudge(false, key, text.clone()),
+                None,
+                "second prompt within cooldown must be suppressed"
+            );
+
+            let path = crate::state::state_dir().join("nudge-pace.json");
+            let mut map = std::collections::HashMap::new();
+            map.insert(
+                key.to_string(),
+                (chrono::Utc::now() - chrono::Duration::seconds(2000)).to_rfc3339(),
+            );
+            std::fs::write(&path, serde_json::to_string(&map).unwrap()).unwrap();
+
+            assert_eq!(
+                paced_submit_nudge(false, key, text.clone()),
+                Some(text.clone()),
+                "nudge must return once cooldown has elapsed"
+            );
         });
     }
 
