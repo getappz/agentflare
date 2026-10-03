@@ -5,12 +5,29 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+/// Same set `flare_git_core::shell` strips: inherited values would steer
+/// these helpers at an external repository instead of the fixture.
+const GIT_LOCATION_ENV: [&str; 7] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_PREFIX",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_NAMESPACE",
+];
+
+fn git_command(dir: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(dir);
+    for var in GIT_LOCATION_ENV {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 fn git(dir: &Path, args: &[&str]) {
-    let out = Command::new("git")
-        .current_dir(dir)
-        .args(args)
-        .output()
-        .unwrap();
+    let out = git_command(dir).args(args).output().unwrap();
     assert!(
         out.status.success(),
         "git {args:?} failed: {}",
@@ -19,8 +36,7 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 fn has_branch(dir: &Path, name: &str) -> bool {
-    Command::new("git")
-        .current_dir(dir)
+    git_command(dir)
         .args([
             "rev-parse",
             "--verify",

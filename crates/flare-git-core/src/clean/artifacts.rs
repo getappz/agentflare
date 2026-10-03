@@ -193,7 +193,7 @@ pub(super) fn find_dirs(root: &Path, kinds: &[String]) -> Vec<(PathBuf, &'static
 
 /// A process that is plausibly building in `project`: cwd inside it, not
 /// under a nested `.worktrees` (those are separate checkouts), not a shell.
-fn builder<'a>(project: &Path, live: &'a [LiveProc]) -> Option<&'a LiveProc> {
+pub(super) fn builder<'a>(project: &Path, live: &'a [LiveProc]) -> Option<&'a LiveProc> {
     let nested = project.join(".worktrees");
     live.iter().find(|p| {
         p.cwd.starts_with(project)

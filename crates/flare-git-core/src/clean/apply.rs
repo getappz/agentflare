@@ -44,9 +44,18 @@ impl Report {
     }
 }
 
-/// Compare-and-delete: refuses when the branch no longer points at `sha`.
+/// Compare-and-delete: refuses when the branch no longer points at `sha`,
+/// or when any worktree has it checked out (`update-ref -d` has no such
+/// guard, unlike `git branch -d`).
 fn delete_branch(repo_root: &Path, name: &str, sha: &str) -> Result<(), String> {
     let full = format!("refs/heads/{name}");
+    let listing = run_in(repo_root, &["worktree", "list", "--porcelain"])?;
+    if crate::doctor::parse_worktree_list(&listing)
+        .iter()
+        .any(|e| e.branch.as_deref() == Some(name))
+    {
+        return Err("branch is checked out in a worktree; left untouched".into());
+    }
     if run_in(repo_root, &["rev-parse", "--verify", "--quiet", &full]).as_deref() != Ok(sha) {
         return Err("branch moved since the plan; left untouched".into());
     }
@@ -168,7 +177,10 @@ fn remove_artifact(
     if std::fs::symlink_metadata(path.join(".git")).is_ok() {
         return Err("is its own git repository".into());
     }
-    if let Some(p) = worktrees::occupant(path, &ctx.live) {
+    // Builds usually run from the project root, not inside the artifact dir.
+    if let Some(p) =
+        artifacts::builder(parent, &ctx.live).or_else(|| worktrees::occupant(path, &ctx.live))
+    {
         return Err(format!("in use: {} (pid {})", p.name, p.pid));
     }
     report
@@ -330,6 +342,30 @@ mod tests {
         assert_eq!(report.failed(), 1);
         assert!(
             report.outcomes[0].detail.contains("moved"),
+            "{:?}",
+            report.outcomes
+        );
+        assert!(has_branch(&repo.path, "done"));
+        assert!(report.restore.is_empty());
+    }
+
+    #[test]
+    fn branch_checked_out_after_the_plan_is_not_deleted() {
+        let repo = init_repo_with_branch("master");
+        run_in(&repo.path, &["branch", "done"]).unwrap();
+        let plan = scan_repo(&repo.path, &git_opts());
+        // SHA unchanged — only the checkout moves onto the planned branch.
+        run_in(&repo.path, &["switch", "done"]).unwrap();
+        let report = apply(
+            Some(&repo.path),
+            &repo.path,
+            &plan.items,
+            &HashSet::new(),
+            &mut |_| {},
+        );
+        assert_eq!(report.failed(), 1);
+        assert!(
+            report.outcomes[0].detail.contains("checked out"),
             "{:?}",
             report.outcomes
         );
