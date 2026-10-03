@@ -345,11 +345,12 @@ fn roots(path: Option<&Path>) -> Result<(PathBuf, Option<PathBuf>), String> {
         (None, Some(r)) => r.clone(),
         (None, None) => cwd,
     };
-    let scan_root = scan_root
-        .canonicalize()
-        .map_err(|e| format!("{}: {e}", scan_root.display()))?;
-    let home = crate::paths::home();
-    if scan_root.parent().is_none() || home.canonicalize().is_ok_and(|h| h == scan_root) {
+    if !scan_root.is_dir() {
+        return Err(format!("{}: not a directory", scan_root.display()));
+    }
+    let scan_root = agentflare_config::paths::canonical(&scan_root);
+    let home = agentflare_config::paths::canonical(&crate::paths::home());
+    if scan_root.parent().is_none() || home == scan_root {
         return Err(
             "refusing to scan the filesystem root or your home directory; pass a project directory"
                 .into(),

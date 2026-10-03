@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime};
 use super::{Item, Kind, ScanInput, Skipped, par_map};
 use crate::shell::{run_in, run_in_ok};
 use crate::worktree::dir_size;
+use agentflare_config::paths;
 use flare_process::cwd::LiveProc;
 
 pub struct Rule {
@@ -223,10 +224,7 @@ fn human_age(age: Duration) -> String {
 
 /// Artifact candidates under the scan root, after the safety filters.
 pub(super) fn scan(input: &ScanInput, kinds: &[String]) -> (Vec<Item>, Vec<Skipped>) {
-    let root = input
-        .scan_root
-        .canonicalize()
-        .unwrap_or_else(|_| input.scan_root.to_path_buf());
+    let root = paths::canonical(input.scan_root);
     let label = |p: &Path| {
         p.strip_prefix(&root)
             .unwrap_or(p)
@@ -407,7 +405,7 @@ mod tests {
     #[test]
     fn busy_project_is_skipped_but_shells_and_nested_worktrees_do_not_count() {
         let d = tempfile::TempDir::new().unwrap();
-        let r = d.path().canonicalize().unwrap();
+        let r = paths::canonical(d.path());
         touch(&r.join("Cargo.toml"));
         touch(&r.join("target/x"));
         let proc_ = |pid, name: &str, cwd: std::path::PathBuf| LiveProc {

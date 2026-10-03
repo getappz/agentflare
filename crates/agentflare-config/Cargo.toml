@@ -10,6 +10,7 @@ publish = false
 
 [dependencies]
 dirs = "6"
+dunce = "1"
 tempfile = "3"
 agent-registry = { package = "agentflare-agent-registry", path = "../agent-registry" }
 agentflare-workspace-hack = { version = "0.1", path = "../../agentflare-workspace-hack" }
