@@ -11,7 +11,15 @@ const UNIQUE_FINDING: &str = "UNIQUE_CODERABBIT_FINDING_687: null deref in parse
 #[test]
 fn sdd_loop_turn_uses_registered_owner_patch_at_spawn() {
     crate::paths::test_support::with_temp_home(|| {
+        let hang_send: flare_workflow::json::SendMessage =
+            Arc::new(|_inv| Box::pin(std::future::pending::<Result<(String, u64, u64), String>>()));
         let eng = engine();
+        eng.register_workflow(
+            flare_workflow::WorkflowDefinition::new(WORKFLOW_ID, "sdd work item").add_step(
+                build_sdd_loop_step(hang_send),
+            ),
+        )
+        .unwrap();
         let run_id = crate::workflow::blocking_runtime()
             .block_on(eng.start_workflow(
                 WorkflowId::new(WORKFLOW_ID),
