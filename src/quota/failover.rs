@@ -361,6 +361,7 @@ mod tests {
             let now = chrono::Utc::now().timestamp();
             let long = AgentFailure::QuotaWindowExhausted {
                 resets_at: Some(now + 3 * 3600),
+                window: crate::auth_runner::QuotaWindowKind::Unknown,
             };
             assert_eq!(mark_unavailable("codex", &long, now), Some(3 * 3600));
             let (until, reason) = unavailable_until("codex").expect("recorded");

@@ -19,12 +19,70 @@ const TRANSIENT_RETRY_SECS: u64 = 60;
 /// top-up needs a human, so there is no reset time to parse; this is only
 /// how often the daemon is willing to find out again.
 pub(crate) const CREDIT_EXHAUSTED_SECS: u64 = 6 * 60 * 60;
-/// Wait assumed for a usage window that printed no parseable reset time --
-/// Claude's rolling window is five hours.
+/// Wait assumed for a usage window that printed no parseable reset time when
+/// the message does not name a window -- Claude's rolling window is five hours.
 pub(crate) const QUOTA_WINDOW_DEFAULT_SECS: u64 = 5 * 60 * 60;
+const QUOTA_WINDOW_DAILY_SECS: u64 = 24 * 60 * 60;
+const QUOTA_WINDOW_WEEKLY_SECS: u64 = 7 * 24 * 60 * 60;
+const QUOTA_WINDOW_MONTHLY_SECS: u64 = 30 * 24 * 60 * 60;
 /// Upper bound on any parsed wait: a garbled reset time must not park an
 /// agent for months.
 const MAX_UNAVAILABLE_SECS: u64 = 8 * 24 * 60 * 60;
+
+/// Which subscription usage window the agent's message named, when any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuotaWindowKind {
+    FiveHour,
+    Daily,
+    Weekly,
+    Monthly,
+    Unknown,
+}
+
+impl QuotaWindowKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            QuotaWindowKind::FiveHour => "5-hour",
+            QuotaWindowKind::Daily => "daily",
+            QuotaWindowKind::Weekly => "weekly",
+            QuotaWindowKind::Monthly => "monthly",
+            QuotaWindowKind::Unknown => "usage",
+        }
+    }
+}
+
+fn infer_quota_window_kind(lower: &str) -> QuotaWindowKind {
+    if lower.contains("monthly") || lower.contains("per month") {
+        QuotaWindowKind::Monthly
+    } else if lower.contains("weekly")
+        || lower.contains("7-day")
+        || lower.contains("7 day")
+        || lower.contains("seven day")
+        || lower.contains("seven-day")
+    {
+        QuotaWindowKind::Weekly
+    } else if lower.contains("daily") || lower.contains("per day") || lower.contains("day limit") {
+        QuotaWindowKind::Daily
+    } else if lower.contains("5-hour")
+        || lower.contains("5 hour")
+        || lower.contains("five hour")
+        || lower.contains("five-hour")
+    {
+        QuotaWindowKind::FiveHour
+    } else {
+        QuotaWindowKind::Unknown
+    }
+}
+
+fn quota_window_fallback_secs(kind: QuotaWindowKind) -> u64 {
+    let raw = match kind {
+        QuotaWindowKind::FiveHour | QuotaWindowKind::Unknown => QUOTA_WINDOW_DEFAULT_SECS,
+        QuotaWindowKind::Daily => QUOTA_WINDOW_DAILY_SECS,
+        QuotaWindowKind::Weekly => QUOTA_WINDOW_WEEKLY_SECS,
+        QuotaWindowKind::Monthly => QUOTA_WINDOW_MONTHLY_SECS,
+    };
+    raw.clamp(1, MAX_UNAVAILABLE_SECS)
+}
 
 /// Why an agent CLI run failed, as far as its own output says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,10 +94,11 @@ pub(crate) enum AgentFailure {
     /// Out of prepaid credit / billing blocked (Claude "Credit balance is
     /// too low", OpenAI `insufficient_quota`, HTTP 402, a spend limit).
     CreditExhausted,
-    /// A usage window (5-hour, daily, weekly) is used up; `resets_at` (unix
-    /// seconds) when the agent printed when it resets.
+    /// A usage window (5-hour, daily, weekly, monthly) is used up; `resets_at`
+    /// (unix seconds) when the agent printed when it resets.
     QuotaWindowExhausted {
         resets_at: Option<i64>,
+        window: QuotaWindowKind,
     },
     /// The credential itself is dead -- see `AUTH_EXPIRED_PATTERNS`.
     AuthExpired,
@@ -55,9 +114,9 @@ impl AgentFailure {
                 retry_after_secs.unwrap_or(DEFAULT_RATE_LIMIT_SECS)
             }
             AgentFailure::CreditExhausted => CREDIT_EXHAUSTED_SECS,
-            AgentFailure::QuotaWindowExhausted { resets_at } => resets_at
+            AgentFailure::QuotaWindowExhausted { resets_at, window } => resets_at
                 .map(|t| (t - now).max(60) as u64)
-                .unwrap_or(QUOTA_WINDOW_DEFAULT_SECS),
+                .unwrap_or_else(|| quota_window_fallback_secs(window)),
             AgentFailure::AuthExpired | AgentFailure::Other => return None,
         };
         Some(secs.clamp(1, MAX_UNAVAILABLE_SECS))
@@ -148,6 +207,63 @@ const THROTTLE_PATTERNS: &[&str] = &[
 /// Transient server-side trouble worth a quick same-agent retry.
 const TRANSIENT_PATTERNS: &[&str] = &["overloaded", "temporarily unavailable", "try again"];
 
+/// Human-readable schedule line for item comments when a quota window
+/// exhausted the agent (pairs agentflare's UTC retry with how it was derived).
+pub(crate) fn quota_schedule_blurb(
+    failure: &AgentFailure,
+    now: i64,
+    wait_secs: u64,
+) -> Option<String> {
+    let AgentFailure::QuotaWindowExhausted { resets_at, window } = failure else {
+        return None;
+    };
+    let retry_at = crate::quota::failover::format_unix(now + wait_secs as i64);
+    Some(match resets_at {
+        Some(_) => format!(
+            "Reset time parsed from agent output → agentflare retry scheduled about {retry_at} UTC."
+        ),
+        None => format!(
+            "No parseable reset in agent output; inferred {} window → retry about {retry_at} UTC.",
+            window.label()
+        ),
+    })
+}
+
+/// Best-effort single-line excerpt from the agent's limit message for comments.
+pub(crate) fn extract_limit_snippet(text: &str) -> Option<String> {
+    const NEEDLES: &[&str] = &[
+        "usage limit",
+        "hit your limit",
+        "you've hit your",
+        "you\u{2019}ve hit your",
+        "weekly limit",
+        "monthly limit",
+        "daily limit",
+        "per day",
+        "day limit",
+        "5-hour limit",
+        "try again in",
+        "resets at",
+        "resets in",
+        "reset in",
+    ];
+    let line = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .find(|line| {
+            let l = line.to_lowercase();
+            NEEDLES.iter().any(|n| l.contains(n))
+        })?;
+    let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    const MAX: usize = 320;
+    Some(if collapsed.len() <= MAX {
+        collapsed
+    } else {
+        format!("{}…", collapsed.chars().take(MAX).collect::<String>())
+    })
+}
+
 /// Classifies `text` (a failure message, possibly carrying the agent's own
 /// output tail) against the current time.
 pub(crate) fn classify_failure(text: &str) -> AgentFailure {
@@ -167,6 +283,7 @@ pub(crate) fn classify_failure_at(text: &str, now: chrono::DateTime<chrono::Utc>
     } else if has(QUOTA_WINDOW_PATTERNS) {
         AgentFailure::QuotaWindowExhausted {
             resets_at: parse_reset_at(&lower, now, hint),
+            window: infer_quota_window_kind(&lower),
         }
     } else if is_auth_expired(text) {
         AgentFailure::AuthExpired
@@ -515,6 +632,25 @@ mod classify_tests {
     }
 
     #[test]
+    fn savings_this_month_does_not_infer_monthly_window() {
+        // Codex-style savings blurb mentions "this month" incidental to a
+        // usage-limit hit with no reset and no named window — must not park
+        // for the monthly fallback (8-day clamp).
+        let text = "ActionRequiredError: You've hit your usage limit You've saved $51 on API model usage this month with Start. Switch to a different model.";
+        assert_eq!(
+            classify(text),
+            AgentFailure::QuotaWindowExhausted {
+                resets_at: None,
+                window: QuotaWindowKind::Unknown,
+            }
+        );
+        assert_eq!(
+            classify(text).wait_secs(at().timestamp()),
+            Some(QUOTA_WINDOW_DEFAULT_SECS)
+        );
+    }
+
+    #[test]
     fn quota_reset_time_is_parsed_when_printed() {
         let now = at().timestamp();
         // Legacy Claude format: unix timestamp after a pipe.
@@ -522,41 +658,49 @@ mod classify_tests {
         assert_eq!(
             classify(&format!("Claude AI usage limit reached|{ts}")),
             AgentFailure::QuotaWindowExhausted {
-                resets_at: Some(ts)
+                resets_at: Some(ts),
+                window: QuotaWindowKind::Unknown,
             }
         );
         // Codex relative form.
         assert_eq!(
             classify("You've hit your usage limit. Try again in 4 days 3 hours 12 minutes."),
             AgentFailure::QuotaWindowExhausted {
-                resets_at: Some(now + 4 * 86_400 + 3 * 3600 + 12 * 60)
+                resets_at: Some(now + 4 * 86_400 + 3 * 3600 + 12 * 60),
+                window: QuotaWindowKind::Unknown,
             }
         );
         // ISO timestamp.
         assert_eq!(
             classify("usage limit reached; resets at 2026-09-24T18:30:00Z"),
             AgentFailure::QuotaWindowExhausted {
-                resets_at: Some(now + 6 * 3600 + 30 * 60)
+                resets_at: Some(now + 6 * 3600 + 30 * 60),
+                window: QuotaWindowKind::Unknown,
             }
         );
         // Clock time in UTC: 3pm today is 3h after noon.
         assert_eq!(
             classify("You've hit your limit \u{00b7} resets 3pm (UTC)"),
             AgentFailure::QuotaWindowExhausted {
-                resets_at: Some(now + 3 * 3600)
+                resets_at: Some(now + 3 * 3600),
+                window: QuotaWindowKind::Unknown,
             }
         );
         // Clock time already past today rolls to tomorrow.
         assert_eq!(
             classify("weekly limit reached, resets at 9:15 am (utc)"),
             AgentFailure::QuotaWindowExhausted {
-                resets_at: Some(now + 21 * 3600 + 15 * 60)
+                resets_at: Some(now + 21 * 3600 + 15 * 60),
+                window: QuotaWindowKind::Weekly,
             }
         );
-        // No reset printed.
+        // No reset printed — window name drives fallback, not always 5h.
         assert_eq!(
             classify("You've hit your weekly limit"),
-            AgentFailure::QuotaWindowExhausted { resets_at: None }
+            AgentFailure::QuotaWindowExhausted {
+                resets_at: None,
+                window: QuotaWindowKind::Weekly,
+            }
         );
     }
 
@@ -637,7 +781,13 @@ mod classify_tests {
     fn failover_policy_by_class() {
         let now = at().timestamp();
         assert!(AgentFailure::CreditExhausted.warrants_failover(now));
-        assert!(AgentFailure::QuotaWindowExhausted { resets_at: None }.warrants_failover(now));
+        assert!(
+            AgentFailure::QuotaWindowExhausted {
+                resets_at: None,
+                window: QuotaWindowKind::Weekly,
+            }
+            .warrants_failover(now)
+        );
         assert!(
             AgentFailure::RateLimited {
                 retry_after_secs: None
@@ -655,10 +805,19 @@ mod classify_tests {
         assert!(!AgentFailure::Other.warrants_failover(now));
         assert_eq!(
             AgentFailure::QuotaWindowExhausted {
-                resets_at: Some(now + 7200)
+                resets_at: Some(now + 7200),
+                window: QuotaWindowKind::Unknown,
             }
             .wait_secs(now),
             Some(7200)
+        );
+        assert_eq!(
+            classify("You've hit your weekly limit").wait_secs(now),
+            Some(QUOTA_WINDOW_WEEKLY_SECS)
+        );
+        assert_eq!(
+            classify("You've hit your monthly limit").wait_secs(now),
+            Some(QUOTA_WINDOW_MONTHLY_SECS.clamp(1, MAX_UNAVAILABLE_SECS))
         );
         assert_eq!(
             AgentFailure::CreditExhausted.wait_secs(now),
@@ -671,13 +830,43 @@ mod classify_tests {
     fn step_retry_is_skipped_for_exhaustion_auth_and_stalls_only() {
         assert!(skips_step_retry("Credit balance is too low"));
         assert!(skips_step_retry("You've hit your weekly limit"));
-        assert!(skips_step_retry("Error: session expired, please re-authenticate"));
+        assert!(skips_step_retry(
+            "Error: session expired, please re-authenticate"
+        ));
         assert!(skips_step_retry(&format!(
             "Codex {} for 2700s while its output repeated",
             crate::agent_launch::STALLED_MARKER
         )));
         assert!(!skips_step_retry("429 Too Many Requests; Retry-After: 30"));
         assert!(!skips_step_retry("judge reply was not valid JSON"));
+    }
+
+    #[test]
+    fn extract_limit_snippet_finds_codex_style_line() {
+        let msg = "codex exited non-zero\nYou've hit your usage limit. Try again in 3 hours.";
+        let snippet = extract_limit_snippet(msg).expect("snippet");
+        assert!(snippet.contains("Try again in 3 hours"));
+    }
+
+    #[test]
+    fn extract_limit_snippet_finds_daily_limit_line() {
+        let msg = "agent exited\nRESOURCE_EXHAUSTED: daily limit reached; try tomorrow.";
+        let snippet = extract_limit_snippet(msg).expect("daily snippet");
+        assert!(snippet.to_lowercase().contains("daily limit"));
+    }
+
+    #[test]
+    fn quota_schedule_blurb_distinguishes_parsed_vs_inferred() {
+        let now = at().timestamp();
+        let parsed = classify("usage limit; try again in 2 hours");
+        let wait = parsed.wait_secs(now).unwrap();
+        let blurb = quota_schedule_blurb(&parsed, now, wait).unwrap();
+        assert!(blurb.contains("parsed"));
+        let inferred = classify("You've hit your weekly limit");
+        let wait = inferred.wait_secs(now).unwrap();
+        let blurb = quota_schedule_blurb(&inferred, now, wait).unwrap();
+        assert!(blurb.contains("weekly"));
+        assert!(blurb.contains("No parseable reset"));
     }
 
     #[test]
