@@ -284,6 +284,41 @@ pub(crate) fn is_stale_session_error(message: &str) -> bool {
     message.contains("no conversation found") || message.contains("session not found")
 }
 
+/// Sends `invocation`; when it carried a `--resume <id>` pair and the agent
+/// reports that session gone (see [`is_stale_session_error`]), sends the same
+/// dispatch once more without the pair, inside the same call. Returns the
+/// outcome and whether the resumed session turned out stale.
+///
+/// Item #333: under the job sandbox each headless turn is its own process and
+/// its `~/.claude` writes are discarded, so a session saved by one turn is gone
+/// by the next. Failing the attempt for that (and relying on the step's
+/// `RetryPolicy`) spent one attempt per stale resume until the run died after
+/// hours of real work; the retry budget is for real failures.
+async fn send_with_stale_fallback(
+    send: &flare_workflow::json::SendMessage,
+    invocation: flare_workflow::json::StepInvocation,
+    resume_pair_len: usize,
+) -> (Result<(String, u64, u64), String>, bool) {
+    let fresh = (resume_pair_len > 0).then(|| {
+        let mut fresh = invocation.clone();
+        fresh.args.drain(..resume_pair_len.min(fresh.args.len()));
+        fresh
+    });
+    match send(invocation).await {
+        Err(message) if is_stale_session_error(&message) => match fresh {
+            Some(fresh) => {
+                eprintln!(
+                    "work_item_pipeline: resumed {} session is gone; re-sending without --resume",
+                    fresh.agent
+                );
+                (send(fresh).await, true)
+            }
+            None => (Err(message), true),
+        },
+        other => (other, false),
+    }
+}
+
 /// Cap on fix rounds for a single SDD task before the loop gives up on it —
 /// mirrors `MAX_REVIEW_CYCLES`'s existing cap-constant pattern for the
 /// `coder`/`review_or_fix` pipeline.
@@ -529,6 +564,7 @@ pub(crate) fn build_sdd_loop_step(
                 // same policy it started with.
                 let mut role_invocation_args =
                     resume_args_for(&role_agent, &ctx.data.agent_sessions);
+                let role_resume_len = role_invocation_args.len();
                 role_invocation_args.extend(role_args);
 
                 let cwd = (!ctx.data.worktree_path.is_empty())
@@ -540,7 +576,12 @@ pub(crate) fn build_sdd_loop_step(
                     owner: Some(ctx.data.owner.clone()),
                     ..flare_workflow::json::StepInvocation::simple(role_agent.clone(), role_prompt)
                 };
-                let (raw_role_reply, in_tok, out_tok) = match send(role_invocation).await {
+                let (role_outcome, role_session_stale) =
+                    send_with_stale_fallback(&send, role_invocation, role_resume_len).await;
+                if role_session_stale {
+                    ctx.data.agent_sessions.remove(&role_agent);
+                }
+                let (raw_role_reply, in_tok, out_tok) = match role_outcome {
                     Ok(v) => v,
                     Err(message) => {
                         // Item #164's incident: an expired credential fails
@@ -561,15 +602,6 @@ pub(crate) fn build_sdd_loop_step(
                             || message == agentflare_jobs::cancel::CANCELLED_MESSAGE
                         {
                             return Ok(StepResult::Failed(message));
-                        }
-                        // A dead resumed session would otherwise fail the
-                        // same way on every one of this step's retry
-                        // attempts (same session_id -> same `--resume`
-                        // failure) until `RetryPolicy` gives up — clearing
-                        // it here makes the very next attempt fall back to
-                        // a fresh prompt instead.
-                        if is_stale_session_error(&message) {
-                            ctx.data.agent_sessions.remove(&role_agent);
                         }
                         return Err(WorkflowError::StepFailed {
                             step_id: StepId::new("sdd_loop"),
@@ -624,6 +656,7 @@ pub(crate) fn build_sdd_loop_step(
                     compile_sdd_role(&judge_agent_name, SddRole::Judge, &judge_prompt);
                 let mut judge_invocation_args =
                     resume_args_for(&judge_agent_name, &ctx.data.agent_sessions);
+                let judge_resume_len = judge_invocation_args.len();
                 judge_invocation_args.extend(judge_args);
                 refresh_patched_run_data(ctx);
                 let judge_invocation = flare_workflow::json::StepInvocation {
@@ -635,7 +668,12 @@ pub(crate) fn build_sdd_loop_step(
                         judge_prompt,
                     )
                 };
-                let (raw_judge_reply, jin_tok, jout_tok) = match send(judge_invocation).await {
+                let (judge_outcome, judge_session_stale) =
+                    send_with_stale_fallback(&send, judge_invocation, judge_resume_len).await;
+                if judge_session_stale {
+                    ctx.data.agent_sessions.remove(&judge_agent_name);
+                }
+                let (raw_judge_reply, jin_tok, jout_tok) = match judge_outcome {
                     Ok(v) => v,
                     Err(message) => {
                         // See the matching arm on the role dispatch above —
@@ -648,9 +686,6 @@ pub(crate) fn build_sdd_loop_step(
                             || message == agentflare_jobs::cancel::CANCELLED_MESSAGE
                         {
                             return Ok(StepResult::Failed(message));
-                        }
-                        if is_stale_session_error(&message) {
-                            ctx.data.agent_sessions.remove(&judge_agent_name);
                         }
                         return Err(WorkflowError::StepFailed {
                             step_id: StepId::new("sdd_loop"),

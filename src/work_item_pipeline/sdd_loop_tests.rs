@@ -635,8 +635,16 @@ async fn crash_mid_sdd_loop_resumes_against_the_persisted_item_and_agent() {
 /// the stale entry from `ctx.data.agent_sessions` on that specific error, so
 /// the very next attempt (same in-memory `ctx`, mirroring `execute_loop`'s
 /// retry) falls back to a fresh, non-resumed prompt instead.
+///
+/// Item #333: under the job sandbox every headless turn is a separate process
+/// whose `~/.claude` writes are discarded on exit, so a session saved by one
+/// turn is gone by the next and *every* resume is stale. Clearing the id and
+/// failing the attempt spent one of the step's `RetryPolicy` attempts per
+/// stale resume until the whole run died after hours of real work. The
+/// fallback therefore happens inside the same attempt: the same dispatch is
+/// re-sent once without `--resume`, and the attempt never fails over it.
 #[tokio::test]
-async fn stale_resumed_session_is_cleared_so_the_retry_sends_a_fresh_prompt() {
+async fn stale_resumed_session_falls_back_to_a_fresh_prompt_in_the_same_attempt() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -690,23 +698,22 @@ async fn stale_resumed_session_is_cleared_so_the_retry_sends_a_fresh_prompt() {
     let step = build_sdd_loop_step(send);
     let mut ctx = WorkflowContext::new(Default::default(), data);
 
-    let err = step
-        .executor
-        .execute(&mut ctx)
-        .await
-        .expect_err("dispatch against a dead session must surface as a retryable Err");
-    assert!(matches!(err, WorkflowError::StepFailed { .. }));
-    assert!(
-        !ctx.data.agent_sessions.contains_key("claude-code"),
-        "stale session must be cleared on the not-found signature"
-    );
-
     let result = step
         .executor
         .execute(&mut ctx)
         .await
-        .expect("retry with a fresh prompt must succeed");
+        .expect("a dead resumed session must not fail the attempt");
     assert!(matches!(result, StepResult::Success));
+    assert!(
+        !ctx.data.agent_sessions.contains_key("dead-session")
+            && ctx.data.agent_sessions.get("claude-code") != Some(&"dead-session".to_string()),
+        "the dead session id must not be kept"
+    );
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        3,
+        "stale resume + fresh re-send + judge, all inside one attempt"
+    );
 }
 
 #[tokio::test]
