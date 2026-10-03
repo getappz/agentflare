@@ -59,11 +59,11 @@ pub struct HookArgs {
     pub event: HookEvent,
 }
 
+const AGENT_DETECT_HOOK_BUDGET: Duration = Duration::from_millis(500);
+
 /// Explicit `--agent` wins; otherwise auto-detect the host that invoked this
 /// hook the same way the MCP server resolves its own identity (parent
 /// process walk + agent env fingerprints, via `flare_process::agent`).
-const AGENT_DETECT_HOOK_BUDGET: Duration = Duration::from_millis(500);
-
 fn resolve_agent(explicit: Option<agent_registry::Agent>) -> String {
     if let Some(a) = explicit {
         return a.as_str().to_string();

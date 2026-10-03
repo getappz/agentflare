@@ -231,6 +231,11 @@ pub fn has_fresh_passing_verification(
         .is_some_and(|v| v.passed && evidence_fresh(v.ts, v.tree.as_deref(), now, current_tree))
 }
 
+/// Per-`git` step budget inside [`tree_fingerprint`]. Sized so several steps
+/// still fit under PreToolUse's hook wall clock when Windows doesn't reap
+/// the child after the host timeout (#695).
+const TREE_FINGERPRINT_GIT_TIMEOUT_SECS: u64 = 2;
+
 /// Content identity of the working tree (tracked + untracked, gitignore
 /// respected) as a git tree hash, computed in the current directory via a
 /// throwaway index so the real one is untouched. Unlike `HEAD` + diff, it is
@@ -240,11 +245,6 @@ pub fn has_fresh_passing_verification(
 ///
 /// Known gap: uncommitted edits inside initialized submodules are not
 /// reflected (the superproject tree stores submodule commit IDs only).
-/// Per-`git` step budget inside [`tree_fingerprint`]. Sized so several steps
-/// still fit under PreToolUse's hook wall clock when Windows doesn't reap
-/// the child after the host timeout (#695).
-const TREE_FINGERPRINT_GIT_TIMEOUT_SECS: u64 = 2;
-
 pub fn tree_fingerprint() -> Option<String> {
     let cwd = std::env::current_dir().ok()?;
     let run = |args: &[&str], index: Option<&std::path::Path>| -> Option<String> {
