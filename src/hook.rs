@@ -867,18 +867,32 @@ pub fn prompt_submit(agent: &str) {
     } else {
         vec![]
     };
+    let nudge_bypass =
+        crate::nudge_pace::submit_nudge_bypass_cooldown(session_id.as_deref(), first_turn);
     if crate::pm_mode::is_active() {
-        bits.push(
+        let pace_key = format!("pm-mode-nudge:{agent}");
+        if let Some(nudge) = crate::nudge_pace::paced_submit_nudge(
+            nudge_bypass,
+            &pace_key,
             "PM MODE ACTIVE — delegate & dispatch only, don't implement directly (see the `pm` skill, Part 2). /pm mode off to exit."
                 .to_string(),
-        );
+        ) {
+            bits.push(nudge);
+        }
     }
     if let Some(block) = crate::mentions::expand(prompt) {
         bits.push(block);
     }
     let pending = components.iter().any(|c| c.needs_consent && !(c.check)());
     if pending {
-        bits.push(format!("@setup: agentflare init --agent {agent}"));
+        let pace_key = format!("setup-nudge:{agent}");
+        if let Some(nudge) = crate::nudge_pace::paced_submit_nudge(
+            nudge_bypass,
+            &pace_key,
+            format!("@setup: agentflare init --agent {agent}"),
+        ) {
+            bits.push(nudge);
+        }
     }
     bits.extend(session_bits);
     bits.extend(crate::coaching::rule_bodies_for_prompt(prompt));
