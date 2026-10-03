@@ -80,16 +80,8 @@ fn resolve_agent(explicit: Option<agent_registry::Agent>) -> String {
 
 impl HookArgs {
     pub fn run(self) {
-        let agent = resolve_agent(match self.event {
-            HookEvent::SessionStart { agent } => agent,
-            HookEvent::PromptSubmit { agent } => agent,
-            HookEvent::PreToolUse { agent } => agent,
-            HookEvent::PostToolFailure { agent } => agent,
-            HookEvent::PostToolUse { agent } => agent,
-            HookEvent::SessionEnd { agent } => agent,
-            HookEvent::Stop { agent } => agent,
-            HookEvent::PreCompact { agent } => agent,
-        });
+        // Install the wall-clock deadline first so agent auto-detection counts
+        // against the event's budget instead of running before it starts.
         let deadline = crate::hook_deadline::install(match self.event {
             HookEvent::SessionStart { .. } => crate::hook_deadline::Event::SessionStart,
             HookEvent::PromptSubmit { .. } => crate::hook_deadline::Event::PromptSubmit,
@@ -99,6 +91,16 @@ impl HookArgs {
             HookEvent::SessionEnd { .. } => crate::hook_deadline::Event::SessionEnd,
             HookEvent::Stop { .. } => crate::hook_deadline::Event::Stop,
             HookEvent::PreCompact { .. } => crate::hook_deadline::Event::PreCompact,
+        });
+        let agent = resolve_agent(match self.event {
+            HookEvent::SessionStart { agent } => agent,
+            HookEvent::PromptSubmit { agent } => agent,
+            HookEvent::PreToolUse { agent } => agent,
+            HookEvent::PostToolFailure { agent } => agent,
+            HookEvent::PostToolUse { agent } => agent,
+            HookEvent::SessionEnd { agent } => agent,
+            HookEvent::Stop { agent } => agent,
+            HookEvent::PreCompact { agent } => agent,
         });
         match self.event {
             HookEvent::SessionStart { .. } => crate::hook::session_start(&agent),

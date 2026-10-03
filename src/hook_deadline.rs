@@ -27,7 +27,10 @@ impl Event {
         match self {
             Self::PreToolUse | Self::PromptSubmit => Duration::from_millis(4_500),
             Self::SessionStart => Duration::from_millis(9_500),
-            Self::PostToolFailure | Self::PostToolUse | Self::SessionEnd | Self::Stop
+            Self::PostToolFailure
+            | Self::PostToolUse
+            | Self::SessionEnd
+            | Self::Stop
             | Self::PreCompact => Duration::from_millis(4_500),
         }
     }
@@ -44,9 +47,7 @@ pub(crate) fn install(event: Event) -> Guard {
     let budget = event.wall_clock();
     let thread = std::thread::spawn(move || {
         std::thread::sleep(budget);
-        eprintln!(
-            "[agentflare] hook: exceeded wall-clock budget ({budget:?}) — exiting"
-        );
+        eprintln!("[agentflare] hook: exceeded wall-clock budget ({budget:?}) — exiting");
         std::process::exit(0);
     });
     Guard { _thread: thread }
