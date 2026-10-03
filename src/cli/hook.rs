@@ -1,4 +1,5 @@
 use clap::{Args, Subcommand};
+use std::time::Duration;
 
 #[derive(Subcommand)]
 pub enum HookEvent {
@@ -61,26 +62,56 @@ pub struct HookArgs {
 /// Explicit `--agent` wins; otherwise auto-detect the host that invoked this
 /// hook the same way the MCP server resolves its own identity (parent
 /// process walk + agent env fingerprints, via `flare_process::agent`).
+const AGENT_DETECT_HOOK_BUDGET: Duration = Duration::from_millis(500);
+
 fn resolve_agent(explicit: Option<agent_registry::Agent>) -> String {
-    explicit
-        .map(|a| a.as_str().to_string())
-        .or_else(flare_process::agent_name)
-        .unwrap_or_else(|| "unknown".to_string())
+    if let Some(a) = explicit {
+        return a.as_str().to_string();
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(flare_process::agent_name());
+    });
+    match rx.recv_timeout(AGENT_DETECT_HOOK_BUDGET) {
+        Ok(Some(name)) => name,
+        _ => "unknown".to_string(),
+    }
 }
 
 impl HookArgs {
     pub fn run(self) {
+        // Install the wall-clock deadline first so agent auto-detection counts
+        // against the event's budget instead of running before it starts.
+        let deadline = crate::hook_deadline::install(match self.event {
+            HookEvent::SessionStart { .. } => crate::hook_deadline::Event::SessionStart,
+            HookEvent::PromptSubmit { .. } => crate::hook_deadline::Event::PromptSubmit,
+            HookEvent::PreToolUse { .. } => crate::hook_deadline::Event::PreToolUse,
+            HookEvent::PostToolFailure { .. } => crate::hook_deadline::Event::PostToolFailure,
+            HookEvent::PostToolUse { .. } => crate::hook_deadline::Event::PostToolUse,
+            HookEvent::SessionEnd { .. } => crate::hook_deadline::Event::SessionEnd,
+            HookEvent::Stop { .. } => crate::hook_deadline::Event::Stop,
+            HookEvent::PreCompact { .. } => crate::hook_deadline::Event::PreCompact,
+        });
+        let agent = resolve_agent(match self.event {
+            HookEvent::SessionStart { agent } => agent,
+            HookEvent::PromptSubmit { agent } => agent,
+            HookEvent::PreToolUse { agent } => agent,
+            HookEvent::PostToolFailure { agent } => agent,
+            HookEvent::PostToolUse { agent } => agent,
+            HookEvent::SessionEnd { agent } => agent,
+            HookEvent::Stop { agent } => agent,
+            HookEvent::PreCompact { agent } => agent,
+        });
         match self.event {
-            HookEvent::SessionStart { agent } => crate::hook::session_start(&resolve_agent(agent)),
-            HookEvent::PromptSubmit { agent } => crate::hook::prompt_submit(&resolve_agent(agent)),
-            HookEvent::PreToolUse { agent } => crate::hook::pre_tool_use(&resolve_agent(agent)),
-            HookEvent::PostToolFailure { agent } => {
-                crate::hook::post_tool_failure(&resolve_agent(agent))
-            }
-            HookEvent::PostToolUse { agent } => crate::hook::post_tool_use(&resolve_agent(agent)),
-            HookEvent::SessionEnd { agent } => crate::hook::session_end(&resolve_agent(agent)),
-            HookEvent::Stop { agent } => crate::hook_messages::stop(&resolve_agent(agent)),
-            HookEvent::PreCompact { agent } => crate::hook::pre_compact(&resolve_agent(agent)),
+            HookEvent::SessionStart { .. } => crate::hook::session_start(&agent),
+            HookEvent::PromptSubmit { .. } => crate::hook::prompt_submit(&agent),
+            HookEvent::PreToolUse { .. } => crate::hook::pre_tool_use(&agent),
+            HookEvent::PostToolFailure { .. } => crate::hook::post_tool_failure(&agent),
+            HookEvent::PostToolUse { .. } => crate::hook::post_tool_use(&agent),
+            HookEvent::SessionEnd { .. } => crate::hook::session_end(&agent),
+            HookEvent::Stop { .. } => crate::hook_messages::stop(&agent),
+            HookEvent::PreCompact { .. } => crate::hook::pre_compact(&agent),
         }
+        drop(deadline);
     }
 }

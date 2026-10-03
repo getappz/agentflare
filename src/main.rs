@@ -43,6 +43,7 @@ mod handoff;
 mod hook;
 mod hook_claim_guard;
 mod hook_completion_gate;
+mod hook_deadline;
 mod hook_messages;
 mod hook_redirect;
 mod init;

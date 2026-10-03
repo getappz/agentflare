@@ -63,6 +63,18 @@ pub(crate) fn run_output_timeout(
     cwd: &Path,
     timeout_secs: u64,
 ) -> Result<std::process::Output, String> {
+    run_output_timeout_env(program, args, cwd, timeout_secs, &[])
+}
+
+/// Like [`run_output_timeout`], with extra environment entries applied after
+/// the filtered PATH (e.g. `GIT_INDEX_FILE` for throwaway-index git steps).
+pub fn run_output_timeout_env(
+    program: impl AsRef<std::ffi::OsStr>,
+    args: &[&str],
+    cwd: &Path,
+    timeout_secs: u64,
+    extra_env: &[(&str, &std::ffi::OsStr)],
+) -> Result<std::process::Output, String> {
     let program = program.as_ref().to_owned();
     let mut cmd = flare_process::command(&program);
     cmd.args(args)
@@ -71,6 +83,9 @@ pub(crate) fn run_output_timeout(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     crate::shell::apply_filtered_path(&mut cmd);
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

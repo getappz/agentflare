@@ -28,8 +28,32 @@ use heal::*;
 pub use orphans::{OrphanWorktree, audit_orphans, gc_orphans};
 use orphans::{is_structurally_broken, remove_worktree_dir};
 pub(crate) use process::run_output_timeout;
+pub use process::run_output_timeout_env;
 use process::*;
 use wipe_guard::restore_mass_deleted_worktree;
+
+/// Bounded `git` invocation for hook-time work (tree fingerprint, etc.).
+/// Kills the process tree on timeout so a hung credential helper cannot
+/// outlive the hook budget (#695).
+#[must_use]
+pub fn run_git_opt_timeout(
+    repo_root: &Path,
+    args: &[&str],
+    timeout_secs: u64,
+    extra_env: &[(&str, &std::ffi::OsStr)],
+) -> Option<String> {
+    let out = run_output_timeout_env(
+        crate::shell::git_binary(),
+        args,
+        repo_root,
+        timeout_secs,
+        extra_env,
+    )
+    .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
 pub use wipe_guard::{
     ALLOW_MASS_DELETION_LABEL, MASS_DELETION_MARKER, MassDeletion, branch_mass_deletion,
     worktree_mass_deletion,
