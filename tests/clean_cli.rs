@@ -41,7 +41,9 @@ struct Fixture {
 
 fn fixture() -> Fixture {
     let tmp = tempfile::TempDir::new().unwrap();
-    let root = tmp.path().canonicalize().unwrap();
+    // Not canonicalized: on Windows that yields a `\\?\` verbatim path, which
+    // `git worktree add` rejects. The binary canonicalizes what it compares.
+    let root = tmp.path().to_path_buf();
     let (home, repo) = (root.join("home"), root.join("repo"));
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&repo).unwrap();
