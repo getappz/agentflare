@@ -533,6 +533,7 @@ pub(crate) fn build_sdd_loop_step(
 
                 let cwd = (!ctx.data.worktree_path.is_empty())
                     .then(|| std::path::PathBuf::from(&ctx.data.worktree_path));
+                refresh_patched_run_data(ctx);
                 let role_invocation = flare_workflow::json::StepInvocation {
                     args: role_invocation_args,
                     cwd: cwd.clone(),
@@ -624,6 +625,7 @@ pub(crate) fn build_sdd_loop_step(
                 let mut judge_invocation_args =
                     resume_args_for(&judge_agent_name, &ctx.data.agent_sessions);
                 judge_invocation_args.extend(judge_args);
+                refresh_patched_run_data(ctx);
                 let judge_invocation = flare_workflow::json::StepInvocation {
                     args: judge_invocation_args,
                     cwd,
@@ -927,6 +929,12 @@ fn build_work_item_pipeline_with_sender(
 /// engine per call (the pattern `src/workflow.rs`'s JSON pipeline uses)
 /// would work for isolated JSON runs but would defeat `recover()`'s
 /// "definition must already be registered on this engine" requirement here.
+/// Re-apply any `patch_run_data` for this run before spawning an agent turn
+/// inside a long-lived `sdd_loop` step iteration.
+fn refresh_patched_run_data(ctx: &mut WorkflowContext<WorkItemData>) {
+    engine().refresh_registered_data_patch(ctx.run_id, &mut ctx.data);
+}
+
 pub(crate) fn engine() -> &'static WorkflowEngine<WorkItemData, SqliteStore<WorkItemData>> {
     static ENGINE: std::sync::LazyLock<WorkflowEngine<WorkItemData, SqliteStore<WorkItemData>>> =
         std::sync::LazyLock::new(|| {
@@ -1013,6 +1021,7 @@ async fn poll_pending_corrections(
 }
 
 include!("work_item_pipeline/agent_messages.rs");
+include!("work_item_pipeline/adopt_dispatch.rs");
 
 /// Mirrors an advanced comment cursor onto the item's own metadata (the
 /// same merge-then-`item_update` pattern as `persist_run_id`) so it
@@ -1233,7 +1242,7 @@ pub(crate) fn run_or_resume_with_sender(
                 // still running in this same live process, or left behind
                 // by a process that died. Never start a second run against
                 // it — adopt it (see `adopt_existing_run`) and await it.
-                adopt_existing_run(eng, run_id, &state, &owner).await?;
+                adopt_existing_run(eng, &mcp, &item.id, run_id, &state, &owner, &tasks).await?;
                 run_id
             }
             _ => {
@@ -1418,21 +1427,59 @@ const MAX_RUN_TAKEOVERS: u32 = 3;
 ///    (e.g. a concurrent `agentflare work`) is left to that process.
 async fn adopt_existing_run(
     eng: &WorkflowEngine<WorkItemData, SqliteStore<WorkItemData>>,
+    mcp: &AgentflareMcp,
+    item_id: &str,
     run_id: flare_workflow::WorkflowRunId,
     state: &flare_workflow::WorkflowState<WorkItemData>,
     owner: &str,
+    incoming_tasks: &[SddTask],
 ) -> Result<(), String> {
-    if state.context.data.owner != owner {
-        eprintln!(
-            "work_item_pipeline: rebinding run {run_id}'s claim owner {:?} -> {owner:?}",
-            state.context.data.owner
-        );
+    let repair_dispatch = latest_repair_dispatch_body(mcp, item_id);
+    let owner_changed = state.context.data.owner != owner;
+    let repair_redispatch = repair_dispatch.is_some();
+    if owner_changed || repair_redispatch {
+        if owner_changed {
+            eprintln!(
+                "work_item_pipeline: rebinding run {run_id}'s claim owner {:?} -> {owner:?}",
+                state.context.data.owner
+            );
+        }
+        if repair_redispatch {
+            eprintln!(
+                "work_item_pipeline: run {run_id} adopting repair dispatch onto item {item_id}"
+            );
+        }
         let new_owner = owner.to_string();
         eng.patch_run_data(run_id, move |data: &mut WorkItemData| {
             data.owner = new_owner.clone();
         })
         .await
         .map_err(|e| e.to_string())?;
+
+        if let Some((body, adopted_at)) = repair_dispatch {
+            eng.state_store()
+                .update(run_id, |s| {
+                    let data = &mut s.context.data;
+                    data.tasks = vec![repair_dispatch_task(body)];
+                    data.current_task_index = 0;
+                    data.review_issues = None;
+                    data.last_report = None;
+                    data.fix_round = 0;
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            persist_repair_dispatch_adopted_at(mcp, item_id, adopted_at);
+        } else if state.context.data.tasks.is_empty() && !incoming_tasks.is_empty() {
+            let incoming_tasks = incoming_tasks.to_vec();
+            eng.state_store()
+                .update(run_id, |s| {
+                    if s.context.data.tasks.is_empty() {
+                        s.context.data.tasks = incoming_tasks;
+                    }
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+        }
     }
     if !eng.is_driving(run_id)
         && !eng.is_leased_elsewhere(state)
@@ -1569,6 +1616,8 @@ include!("work_item_pipeline/task_sourcing.rs");
 include!("work_item_pipeline/prompt_builders.rs");
 include!("work_item_pipeline/roles.rs");
 
+#[cfg(test)]
+mod adopt_dispatch_tests;
 #[cfg(test)]
 mod cancel_tests;
 #[cfg(test)]
