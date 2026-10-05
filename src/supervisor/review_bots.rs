@@ -478,9 +478,10 @@ pub(crate) fn sweep_review_threads(
             state.escalated += 1;
             continue;
         }
-        if record.round >= next {
-            // This exact finding was already handed to an agent. An unresolved
-            // GitHub thread alone does not prove the fix needs another run.
+        if record.round >= next && in_flight {
+            // Dispatched for this round and the agent is still on it. Once
+            // that job is over, a thread the head commit has not answered goes
+            // back out (the head-date check below skips one that was fixed).
             continue;
         }
         if let Some(head) = input.head_sha
@@ -884,17 +885,12 @@ pub(super) fn coderabbit_repair_or_gate(
     {
         return SelfRepairOutcome::Skipped;
     }
+    // Only a merged PR ends repair. Armed auto-merge does not: a CI-green PR
+    // with real unresolved findings must still be repaired, never merged
+    // untouched (see `supervisor::merge`).
     if matches!(
         crate::worktree::pr_ci_status(item, std::path::Path::new(folder_path)),
         crate::worktree::PrCiStatus::Merged
-            | crate::worktree::PrCiStatus::Passing {
-                auto_merge: crate::worktree::AutoMergeRef { enabled: true, .. },
-                ..
-            }
-            | crate::worktree::PrCiStatus::AwaitingReview {
-                auto_merge: crate::worktree::AutoMergeRef { enabled: true, .. },
-                ..
-            }
     ) {
         return SelfRepairOutcome::Skipped;
     }

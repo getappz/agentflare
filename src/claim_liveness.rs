@@ -144,6 +144,33 @@ pub(crate) fn sweep(
     })
 }
 
+/// The items `sweep_with` will release this tick: owner dead now AND already
+/// suspected on the previous sweep. Lets `run_sweep` look up their PR state
+/// before taking the DB lock for the sweep itself.
+fn confirmed_dead_items(
+    backend: &Connection,
+    sessions: Option<&Connection>,
+    queue: Option<&agentflare_jobs::Queue>,
+    memory: &SweepMemory,
+    now: i64,
+) -> Vec<agentflare_backend::item::Item> {
+    let ttl = crate::mcp_server::types::backend_claim_ttl_secs();
+    let claims = agentflare_backend::claim::list_all(backend, now, ttl).unwrap_or_default();
+    claims
+        .into_iter()
+        .filter(|c| c.status == "claimed" && c.key.len() == 1)
+        .filter(|c| {
+            matches!(
+                judge_owner(&c.owner, c.heartbeat_at, now, sessions, queue),
+                OwnerLiveness::Dead(_)
+            ) && memory
+                .suspects
+                .contains(&(c.key[0].clone(), c.owner.clone()))
+        })
+        .filter_map(|c| agentflare_backend::item::get(backend, &c.key[0]).ok())
+        .collect()
+}
+
 fn sweep_with(
     backend: &Connection,
     sessions: Option<&Connection>,
@@ -301,6 +328,24 @@ pub(crate) fn run_sweep(
         let _ = crate::sessions::prune(conn, now);
     }
     let mut memory = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    // PR state is a GitHub round-trip: fetch it for the claims about to be
+    // released BEFORE the sweep takes the backend DB lock, never inside it.
+    let repo_root = mcp.worktree_repo_root();
+    let candidates = mcp
+        .with_backend_db(|conn| {
+            confirmed_dead_items(conn, sessions.as_ref(), Some(queue), &memory, now)
+        })
+        .unwrap_or_default();
+    let statuses: std::cell::RefCell<std::collections::HashMap<_, _>> = candidates
+        .iter()
+        .map(|item| {
+            (
+                item.id.clone(),
+                crate::worktree::pr_ci_status(item, &repo_root),
+            )
+        })
+        .collect::<std::collections::HashMap<_, _>>()
+        .into();
     let released = mcp
         .with_backend_db(|conn| {
             sweep_with(
@@ -309,7 +354,12 @@ pub(crate) fn run_sweep(
                 Some(queue),
                 &mut memory,
                 now,
-                |item| crate::worktree::pr_ci_status(item, &mcp.worktree_repo_root()),
+                |item| {
+                    statuses
+                        .borrow_mut()
+                        .remove(&item.id)
+                        .unwrap_or(crate::worktree::PrCiStatus::Unknown)
+                },
             )
         })
         .unwrap_or_default();

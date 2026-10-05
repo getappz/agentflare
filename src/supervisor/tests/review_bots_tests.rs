@@ -610,7 +610,46 @@ fn sweep(
 }
 
 #[test]
-fn unresolved_thread_already_dispatched_this_round_does_not_start_another_repair() {
+fn unresolved_thread_dispatched_this_round_waits_while_its_job_still_runs() {
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
+    let item = mcp
+        .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
+        .unwrap();
+    enqueue_work_job(
+        &queue,
+        &item,
+        agent_registry::Agent::ClaudeCode,
+        Some("/repo"),
+        None,
+    )
+    .unwrap();
+    mcp.with_backend_db(|conn| {
+        crate::mcp_server::merge_item_metadata(conn, &item_id, |m| {
+            set_thread_round(m, "PRRT_1", 1);
+        })
+        .unwrap();
+    })
+    .unwrap();
+    let server = MockServer::start(vec![MockResponse::json(
+        200,
+        &threads_page(&[("PRRT_1", false, vec![(11, BOT, MAJOR_BODY.into())])]),
+    )]);
+    let state = sweep(
+        &server,
+        &mcp,
+        &queue,
+        &item_id,
+        None,
+        &ReviewBotConfig::default(),
+    );
+    assert!(state.to_dispatch.is_empty());
+    assert_eq!(state.blocking, 1, "review still holds the merge");
+}
+
+#[test]
+fn unresolved_thread_dispatched_this_round_goes_back_out_once_its_job_is_gone() {
     let mcp = test_mcp();
     let queue = test_queue();
     let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
@@ -633,8 +672,11 @@ fn unresolved_thread_already_dispatched_this_round_does_not_start_another_repair
         None,
         &ReviewBotConfig::default(),
     );
-    assert!(state.to_dispatch.is_empty());
-    assert_eq!(state.blocking, 1, "review still holds the merge");
+    assert_eq!(
+        state.to_dispatch.len(),
+        1,
+        "a dead job must not strand an unanswered thread"
+    );
 }
 
 #[test]

@@ -814,7 +814,7 @@ fn merge_or_repair_findings_never_merges_a_ci_green_approved_pr_with_unresolved_
 }
 
 #[test]
-fn armed_auto_merge_with_green_checks_does_not_dispatch_review_repair() {
+fn armed_auto_merge_with_green_checks_still_repairs_unresolved_findings() {
     let repo = throwaway_repo();
     let mcp = test_mcp_with_repo(repo.path().to_path_buf());
     let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
@@ -840,11 +840,14 @@ fn armed_auto_merge_with_green_checks_does_not_dispatch_review_repair() {
         "/repo",
         allowed(None, &auto_merge),
     );
-    assert!(matches!(outcome, PassingPrOutcome::NotMerged));
-    assert!(
+    // Auto-merge is disarmed and the findings are repaired: never left
+    // stranded with nobody working on them, never merged untouched.
+    assert!(matches!(outcome, PassingPrOutcome::Repair(_)));
+    assert_eq!(
         queue
             .list(Some(agentflare_jobs::JobState::Queued))
             .unwrap()
-            .is_empty()
+            .len(),
+        1
     );
 }
