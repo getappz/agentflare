@@ -85,7 +85,7 @@ pub fn trace(msg: &str) {
 fn is_cargo_target_profile_dir(p: &Path) -> bool {
     let comps: Vec<_> = p.components().collect();
     comps.windows(2).any(|w| {
-        w[0].as_os_str() == "target"
+        (w[0].as_os_str() == "target" || w[0].as_os_str() == "cargo-target")
             && (w[1].as_os_str() == "debug" || w[1].as_os_str() == "release")
     })
 }
@@ -192,6 +192,13 @@ mod tests {
             Path::new("/home/user/.agentflare/shims"),
             Path::new("/home/user/.cargo/bin")
         ));
+    }
+
+    #[test]
+    fn excludes_lean_ctx_cargo_target_from_real_binary_search() {
+        assert!(is_cargo_target_profile_dir(Path::new(
+            "cache/cargo-target/debug/deps"
+        )));
     }
 
     #[cfg(windows)]
