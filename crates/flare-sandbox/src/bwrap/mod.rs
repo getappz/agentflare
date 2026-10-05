@@ -33,6 +33,26 @@ const HOME_CACHE_DIRS: &[&str] = &[".cargo", ".rustup", ".cache", ".npm"];
 /// first sandboxed build can populate it.
 pub const MBX_CACHE_DIR: &str = ".cache/mbx";
 
+/// `$HOME`-relative path of mbx's effective cache dir: `MBX_CACHE_DIR`, else
+/// `$XDG_CACHE_HOME/mbx`, when that lies under `home`; otherwise the default.
+/// A path outside `home` can't be bound (doctor reports it as not writable).
+fn mbx_cache_rel(
+    home: &Path,
+    mbx_cache_dir: Option<std::ffi::OsString>,
+    xdg_cache_home: Option<std::ffi::OsString>,
+) -> String {
+    mbx_cache_dir
+        .map(PathBuf::from)
+        .or_else(|| xdg_cache_home.map(|x| PathBuf::from(x).join("mbx")))
+        .and_then(|p| {
+            p.strip_prefix(home)
+                .ok()
+                .map(|r| r.to_string_lossy().into_owned())
+        })
+        .filter(|r| !r.is_empty())
+        .unwrap_or_else(|| MBX_CACHE_DIR.to_string())
+}
+
 /// `git_writable` controls whether `cwd/.git` is re-protected read-only
 /// (the default, `false` -- appropriate for an arbitrary job command that
 /// has no business rewriting git history) or left writable under the same
@@ -193,8 +213,15 @@ fn build_bwrap_args_with_home(
             }
         }
 
-        let _ = std::fs::create_dir_all(home_path.join(MBX_CACHE_DIR));
-        if let Some(resolved) = paths::resolve_existing_home_dir(home_path, MBX_CACHE_DIR) {
+        let mbx_cache = mbx_cache_rel(
+            home_path,
+            std::env::var_os("MBX_CACHE_DIR"),
+            std::env::var_os("XDG_CACHE_HOME"),
+        );
+        if let Some(dir) = paths::join_validated_home_dir(home_path, &mbx_cache) {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Some(resolved) = paths::resolve_existing_home_dir(home_path, &mbx_cache) {
             let path_str = path_to_string(&resolved);
             bwrap_args.push("--bind-try".to_string());
             bwrap_args.push(path_str.clone());
@@ -826,6 +853,20 @@ mod tests {
             .position(|a| a == &cargo_path)
             .expect(".cargo cache dir bound");
         assert_eq!(args[idx - 1], "--ro-bind-try");
+    }
+
+    #[test]
+    fn mbx_cache_rel_follows_effective_cache_dir_under_home() {
+        let home = Path::new("/home/u");
+        let os = |s: &str| Some(std::ffi::OsString::from(s));
+        assert_eq!(mbx_cache_rel(home, None, None), MBX_CACHE_DIR);
+        assert_eq!(mbx_cache_rel(home, os("/home/u/x/mbx"), None), "x/mbx");
+        assert_eq!(mbx_cache_rel(home, None, os("/home/u/xdg")), "xdg/mbx");
+        // MBX_CACHE_DIR outranks XDG_CACHE_HOME.
+        assert_eq!(mbx_cache_rel(home, os("/home/u/a"), os("/home/u/b")), "a");
+        // Outside home (or relative): can't bind, fall back to the default.
+        assert_eq!(mbx_cache_rel(home, os("/var/mbx"), None), MBX_CACHE_DIR);
+        assert_eq!(mbx_cache_rel(home, os("rel"), None), MBX_CACHE_DIR);
     }
 
     #[test]

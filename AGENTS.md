@@ -117,11 +117,11 @@ worktrees never see each other's stale artifacts.
   `rustc-wrapper = "sccache"` (mbx is the wrapper; two on one build is
   unsupported) and no `target-dir` (mbx owns `target`). Pre-#330 generated
   configs are removed on the next claim of that worktree.
-- **Cache location.** The platform cache dir + `mbx` (`~/.cache/mbx` on Linux;
-  override: `MBX_CACHE_DIR`). The bwrap job sandbox binds `~/.cache/mbx`
-  read-write over its otherwise read-only
-  `~/.cache` (created if missing); a `MBX_CACHE_DIR` outside that path or
-  `~/.agentflare` is not writable in the sandbox.
+- **Cache location.** `MBX_CACHE_DIR`, else `$XDG_CACHE_HOME/mbx`, else the
+  platform default (`~/.cache/mbx` on Linux). The bwrap job sandbox binds that
+  path read-write over its otherwise read-only `~/.cache` (created if missing)
+  when it lies under `$HOME`; a path outside `$HOME` is not writable in the
+  sandbox (`agentflare doctor` reports it).
 - **Agent PATH.** `agentflare run` / `agents launch` prepend mbx's standalone
   cargo shim dir (`~/.local/share/mbx/bin`, installed by `mbx setup`) to the
   agent's `PATH`; the sandbox inherits it. No shim installed: use
