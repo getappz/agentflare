@@ -111,8 +111,8 @@ pub(crate) enum AgentFailure {
     /// The credential itself is dead -- see `AUTH_EXPIRED_PATTERNS`.
     AuthExpired,
     /// The agent CLI rejected its own launch arguments (clap exit code 2:
-    /// "unexpected argument", "unrecognized subcommand", a bare `Usage:`
-    /// dump) -- a broken installed version or CLI-arg drift, not an
+    /// "unexpected argument", "unrecognized subcommand") -- a broken
+    /// installed version or CLI-arg drift, not an
     /// availability problem the binary will recover from on its own. See
     /// `LAUNCH_ARGV_PATTERNS`.
     LaunchArgvError,
@@ -194,15 +194,13 @@ const CREDIT_PATTERNS: &[&str] = &[
 
 /// Clap's own exit-code-2 wording for an argv the installed binary doesn't
 /// accept -- checked before every other pattern list since it is
-/// unambiguous and unrelated to availability (see item #307's codex
+/// unrelated to availability (see item #307's codex
 /// `--full-auto`, item #308).
 const LAUNCH_ARGV_PATTERNS: &[&str] = &[
     "unexpected argument",
     "unrecognized argument",
     "unrecognized subcommand",
-    "error: invalid value",
     "required arguments were not provided",
-    "usage: ",
 ];
 
 /// A usage window used up (5-hour, daily, weekly, monthly plan limits).
@@ -311,7 +309,9 @@ pub(crate) fn classify_failure_at(text: &str, now: chrono::DateTime<chrono::Utc>
     let hint = retry_hint_secs(&lower);
     let has = |patterns: &[&str]| patterns.iter().any(|p| lower.contains(p));
 
-    let classified = if has(LAUNCH_ARGV_PATTERNS) {
+    let classified = if has(LAUNCH_ARGV_PATTERNS)
+        || (lower.contains("error: invalid value") && lower.contains("for '--"))
+    {
         AgentFailure::LaunchArgvError
     } else if has(CREDIT_PATTERNS) || has_status_code(&lower, "402") {
         AgentFailure::CreditExhausted
@@ -805,6 +805,7 @@ mod classify_tests {
             "error: unexpected argument '--full-auto' found\n\nUsage: codex exec [OPTIONS]",
             "error: unrecognized subcommand 'exec-full'",
             "thor: error: the following required arguments were not provided:\n  <PROMPT>",
+            "error: invalid value 'fast' for '--mode <MODE>'",
         ] {
             assert_eq!(classify(text), AgentFailure::LaunchArgvError, "{text}");
         }
@@ -814,6 +815,24 @@ mod classify_tests {
             AgentFailure::LaunchArgvError.wait_secs(now),
             Some(LAUNCH_ARGV_ERROR_SECS)
         );
+    }
+
+    #[test]
+    fn quota_messages_with_usage_or_invalid_value_text_are_not_argv_errors() {
+        for text in [
+            "Usage: 95% of weekly limit. You've hit your weekly limit.",
+            "error: invalid value in usage report; weekly limit reached",
+        ] {
+            assert_eq!(
+                classify(text),
+                AgentFailure::QuotaWindowExhausted {
+                    resets_at: None,
+                    window: QuotaWindowKind::Weekly,
+                },
+                "{text}"
+            );
+        }
+        assert_eq!(classify("error: invalid value in response"), AgentFailure::Other);
     }
 
     #[test]

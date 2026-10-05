@@ -97,6 +97,20 @@ pub fn parse_failover_config(text: &str) -> Result<FailoverConfig, String> {
     let Some(raw) = file.failover else {
         return Ok(FailoverConfig::default());
     };
+    for (name, value) in [
+        ("usage_threshold_percent", raw.usage_threshold_percent),
+        ("five_hour_percent", raw.five_hour_percent),
+        ("seven_day_percent", raw.seven_day_percent),
+    ] {
+        if let Some(value) = value
+            && (!value.is_finite() || value <= 0.0 || value > 100.0)
+        {
+            let message =
+                format!("[failover] {name} must be finite and within (0, 100], got {value}");
+            eprintln!("{message}");
+            return Err(message);
+        }
+    }
     let agents: Vec<Agent> = raw.agents.iter().filter_map(|s| agent_by_name(s)).collect();
     let all_unknown = !raw.agents.is_empty() && agents.is_empty();
     Ok(FailoverConfig {
@@ -286,6 +300,23 @@ mod tests {
         assert_eq!(config.usage_threshold_percent, 70.0);
         assert_eq!(config.five_hour_threshold(), 90.0);
         assert_eq!(config.seven_day_threshold(), 85.0);
+    }
+
+    #[test]
+    fn invalid_usage_thresholds_name_the_field() {
+        for field in [
+            "usage_threshold_percent",
+            "five_hour_percent",
+            "seven_day_percent",
+        ] {
+            for value in ["nan", "-1.0", "0.0", "100.1", "inf"] {
+                let error = parse_failover_config(&format!("[failover]\n{field} = {value}\n"))
+                    .expect_err("invalid threshold must be rejected");
+                assert!(error.contains(field), "{error}");
+            }
+            parse_failover_config(&format!("[failover]\n{field} = 100.0\n"))
+                .expect("100 percent is valid");
+        }
     }
 
     #[test]
