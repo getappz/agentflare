@@ -215,6 +215,20 @@ pub fn get_secret(name: &str) -> Result<Option<Zeroizing<String>>, String> {
     get_secret_value(&body, &dek.dek, name).map_err(|e| e.to_string())
 }
 
+/// Session-only vault read: keyring-cached DEK or nothing. Never runs the
+/// passphrase-based KDF, so it is safe on latency-limited paths (hooks) where
+/// `get_secret`'s synchronous Argon2id could eat the caller's time budget.
+/// A locked or missing vault yields `None` (callers fall through to `~/.env`).
+pub fn get_secret_session(name: &str) -> Option<Zeroizing<String>> {
+    let path = vault_path();
+    if !path.exists() {
+        return None;
+    }
+    let dek = open_vault_with_dek(&path, APP_NAME).ok()?;
+    let body = read_vault_body(&path).ok()?;
+    get_secret_value(&body, &dek.dek, name).ok().flatten()
+}
+
 pub fn set_secret(name: &str, value: &str) -> Result<(), String> {
     let _guard = VAULT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _file_lock = lock_vault_file_cross_process()?;

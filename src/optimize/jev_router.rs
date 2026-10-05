@@ -106,6 +106,19 @@ fn nudge(tier: Tier, confidence: f64, current_model: Option<&str>) -> Option<Str
     }
 }
 
+/// Jev's effective target model in `baseline_label` terms (`haiku`/`opus`/
+/// `none`), so `decide report` compares like with like. Easy nudges toward a
+/// cheap model; hard nudges toward opus only when a nudge would actually be
+/// emitted (current model known and not already opus); medium stays silent.
+fn jev_label(tier: Tier, current_model: Option<&str>) -> &'static str {
+    match tier {
+        Tier::Easy => "haiku",
+        Tier::Medium => "none",
+        Tier::Hard if current_model.is_some_and(|m| !m.to_lowercase().contains("opus")) => "opus",
+        Tier::Hard => "none",
+    }
+}
+
 pub struct JevRouter;
 
 impl Router for JevRouter {
@@ -158,7 +171,7 @@ fn route_with(
         SITE,
         &prompt,
         baseline_label,
-        tier.model(),
+        jev_label(tier, ctx.current_model.as_deref()),
         confidence,
         outcome.elapsed_ms,
         outcome.response.usage.cost,
@@ -260,6 +273,28 @@ mod tests {
         });
         assert_eq!(nudge, None);
         assert_eq!(rows[0].baseline, "haiku"); // keyword router said haiku
+        assert_eq!(rows[0].jev.as_deref(), Some("none")); // medium never nudges
+    }
+
+    #[test]
+    fn shadow_labels_use_effective_target_models() {
+        // Hard with an unknown model emits no nudge, so it logs "none".
+        let (_, rows) = run(&ctx("redesign the scheduler", None), |_| {
+            answer("hard", Some(0.9))
+        });
+        assert_eq!(rows[0].jev.as_deref(), Some("none"));
+        // Hard with a known non-premium model nudges toward opus.
+        let (_, rows) = run(
+            &ctx("redesign the scheduler", Some("claude-sonnet-5-5")),
+            |_| answer("hard", Some(0.9)),
+        );
+        assert_eq!(rows[0].jev.as_deref(), Some("opus"));
+        // Hard on opus already: no nudge, logs "none".
+        let (_, rows) = run(
+            &ctx("redesign the scheduler", Some("claude-opus-5-5")),
+            |_| answer("hard", Some(0.9)),
+        );
+        assert_eq!(rows[0].jev.as_deref(), Some("none"));
     }
 
     #[test]

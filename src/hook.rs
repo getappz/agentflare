@@ -906,16 +906,39 @@ pub fn prompt_submit(agent: &str) {
             && let Ok(mut registry) = skill_registry::Registry::open_default(&db_path)
         {
             let _ = registry.ensure_fresh(crate::components::detected_skill_agents);
+            let limit = crate::skill_rerank::fetch_limit(3);
             if let Ok(skills) = crate::skill_detect::find_skills(
                 &intent,
                 &registry,
-                crate::skill_rerank::fetch_limit(3),
+                limit,
                 crate::memory::engine::embed_query,
                 crate::memory::engine::embed_doc,
-            ) && let Some(injection) =
-                crate::skill_detect::build_injection(&crate::skill_rerank::pick(prompt, skills, 3))
-            {
-                bits.push(injection);
+            ) {
+                // An expanded shadow/apply candidate set can reorder the top 3
+                // through embedding fusion, so the baseline logged (and
+                // injected in shadow mode) is fetched separately as the
+                // original 3-result set. Only costs a second lookup when
+                // reranking is enabled; the default path is untouched.
+                let injection = if limit == 3 {
+                    crate::skill_detect::build_injection(&crate::skill_rerank::pick(
+                        prompt, skills, 3,
+                    ))
+                } else {
+                    let baseline = crate::skill_detect::find_skills(
+                        &intent,
+                        &registry,
+                        3,
+                        crate::memory::engine::embed_query,
+                        crate::memory::engine::embed_doc,
+                    )
+                    .unwrap_or_default();
+                    crate::skill_detect::build_injection(&crate::skill_rerank::pick_with_baseline(
+                        prompt, skills, baseline, 3,
+                    ))
+                };
+                if let Some(injection) = injection {
+                    bits.push(injection);
+                }
             }
         }
     }

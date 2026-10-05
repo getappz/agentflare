@@ -19,6 +19,8 @@ pub enum DecideError {
         "no decision-backend credentials (OPENROUTER_API_KEY, or CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID)"
     )]
     NoCredentials,
+    #[error("invalid decision configuration: {0}")]
+    Config(String),
     #[error("decision request failed: {0}")]
     Transport(String),
     #[error("decision backend returned HTTP {0}: {1}")]
@@ -80,9 +82,13 @@ impl Config {
             None => openrouter().or_else(cloudflare),
         }
         .ok_or(DecideError::NoCredentials)?;
+        let url_override = match val("AGENTFLARE_JEV_BASE_URL") {
+            Some(u) => Some(validate_base_url(&u)?),
+            None => None,
+        };
         Ok(Self {
             provider,
-            url_override: val("AGENTFLARE_JEV_BASE_URL"),
+            url_override,
             model_override: val("AGENTFLARE_JEV_MODEL"),
             timeout: Duration::from_millis(
                 val("AGENTFLARE_JEV_TIMEOUT_MS")
@@ -133,6 +139,54 @@ impl Config {
             }
         }
     }
+}
+
+/// Validate `AGENTFLARE_JEV_BASE_URL` before any credential leaves the
+/// machine. HTTPS is allowed for any host; plain HTTP only for loopback, so a
+/// misconfigured URL cannot send the bearer key/token over unencrypted HTTP.
+/// Rejects userinfo (`http://127.0.0.1@evil`) and suffix tricks
+/// (`http://127.0.0.1.evil`) by comparing the parsed host exactly.
+fn validate_base_url(url: &str) -> Result<String, DecideError> {
+    let invalid =
+        |why: &str| DecideError::Config(format!("AGENTFLARE_JEV_BASE_URL {why}: rejected"));
+    let scheme_end = url
+        .find("://")
+        .ok_or_else(|| invalid("is not a valid URL"))?;
+    let scheme = url[..scheme_end].to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return Err(invalid("must use http or https"));
+    }
+    let rest = &url[scheme_end + 3..];
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..auth_end];
+    if authority.is_empty() {
+        return Err(invalid("is not a valid URL"));
+    }
+    // Userinfo (@) would let an attacker host hide behind a trusted prefix.
+    if authority.contains('@') {
+        return Err(invalid("must not contain userinfo"));
+    }
+    let host = if let Some(stripped) = authority.strip_prefix('[') {
+        // IPv6 literal: [::1] or [::1]:port
+        let end = stripped
+            .find(']')
+            .ok_or_else(|| invalid("is not a valid URL"))?;
+        stripped[..end].to_ascii_lowercase()
+    } else {
+        authority
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .trim_end_matches('.')
+            .to_ascii_lowercase()
+    };
+    if host.is_empty() {
+        return Err(invalid("is not a valid URL"));
+    }
+    if scheme == "http" && host != "127.0.0.1" && host != "::1" && host != "localhost" {
+        return Err(invalid("plain http is only allowed for loopback"));
+    }
+    Ok(url.to_string())
 }
 
 /// Parse a response body. Cloudflare's REST API wraps the payload in
@@ -318,6 +372,48 @@ mod tests {
         assert!(matches!(
             parse_response(r#"{"answers":{"x":{"type":"haiku"}}}"#).err(),
             Some(DecideError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn base_url_allows_https_anywhere_and_http_loopback_only() {
+        for ok in [
+            "https://openrouter.ai/api/alpha/decisions",
+            "https://127.0.0.1.evil.example/x",
+            "http://127.0.0.1:9/x",
+            "http://127.0.0.1/decisions",
+            "http://localhost:11434/x",
+            "http://[::1]:8080/x",
+        ] {
+            assert!(validate_base_url(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://example.com/x",
+            "http://127.0.0.1.evil/x",
+            "http://127.0.0.1@evil/x",
+            "http://user:pass@127.0.0.1/x",
+            "http://10.0.0.1/x",
+            "ftp://127.0.0.1/x",
+            "not-a-url",
+            "http://",
+        ] {
+            assert!(
+                matches!(validate_base_url(bad).err(), Some(DecideError::Config(_))),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_base_url_is_a_config_error_not_a_silent_fallback() {
+        let get = lookup(&[
+            ("AGENTFLARE_JEV", "1"),
+            ("OPENROUTER_API_KEY", "k"),
+            ("AGENTFLARE_JEV_BASE_URL", "http://example.com/x"),
+        ]);
+        assert!(matches!(
+            Config::from_lookup(&get).err(),
+            Some(DecideError::Config(_))
         ));
     }
 }

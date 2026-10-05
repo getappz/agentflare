@@ -90,8 +90,28 @@ fn real_source_lookup() -> impl Fn(&str) -> Option<(String, Source)> {
     )
 }
 
+/// Session-only variant for latency-limited callers (hooks): the vault layer
+/// never runs the passphrase-based KDF, so a locked vault just falls through
+/// to `~/.env` instead of spending the hook's time budget on Argon2id.
+fn session_source_lookup() -> impl Fn(&str) -> Option<(String, Source)> {
+    let dotenv = dirs::home_dir()
+        .and_then(|h| std::fs::read_to_string(h.join(".env")).ok())
+        .map(|c| crate::dev_vars::parse(&c))
+        .unwrap_or_default();
+    layered_source(
+        |k| std::env::var(k).ok(),
+        |k| crate::vault::get_secret_session(k).map(|v| v.to_string()),
+        dotenv,
+    )
+}
+
 fn env_lookup() -> impl Fn(&str) -> Option<String> {
     let find = real_source_lookup();
+    move |k| find(k).map(|(value, _)| value)
+}
+
+fn session_env_lookup() -> impl Fn(&str) -> Option<String> {
+    let find = session_source_lookup();
     move |k| find(k).map(|(value, _)| value)
 }
 
@@ -112,12 +132,14 @@ pub fn ask(state: &Value, questions: &BTreeMap<String, Question>) -> Result<Outc
 }
 
 /// `ask`, with the timeout capped, for callers on a latency budget (hooks).
+/// Uses a session-only vault lookup so a locked vault never spends the
+/// caller's budget on the passphrase-based KDF.
 pub fn ask_within(
     state: &Value,
     questions: &BTreeMap<String, Question>,
     cap: std::time::Duration,
 ) -> Result<Outcome, DecideError> {
-    let mut cfg = Config::from_lookup(&env_lookup())?;
+    let mut cfg = Config::from_lookup(&session_env_lookup())?;
     cfg.timeout = cfg.timeout.min(cap);
     ask_with(&cfg, state, questions)
 }

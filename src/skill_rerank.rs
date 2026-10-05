@@ -52,9 +52,24 @@ pub fn fetch_limit(inject: usize) -> usize {
 
 /// The skills to inject: at most `keep` of `ranked` (best first).
 pub fn pick(prompt: &str, ranked: Vec<RankedSkill>, keep: usize) -> Vec<RankedSkill> {
-    pick_with(
+    let baseline: Vec<RankedSkill> = ranked.iter().take(keep).cloned().collect();
+    pick_with_baseline(prompt, ranked, baseline, keep)
+}
+
+/// Like [`pick`], but the shadow baseline is the caller's original top-`keep`
+/// set instead of the first `keep` of the expanded candidates. Hook callers
+/// that fetched an expanded candidate set pass the separately fetched
+/// unexpanded result here so shadow mode logs (and injects) the true default.
+pub fn pick_with_baseline(
+    prompt: &str,
+    candidates: Vec<RankedSkill>,
+    baseline: Vec<RankedSkill>,
+    keep: usize,
+) -> Vec<RankedSkill> {
+    pick_with_baseline_inner(
         prompt,
-        ranked,
+        candidates,
+        baseline,
         keep,
         mode(),
         &|state, qs| decide::ask_within(&serde_json::Value::from(state), qs, BUDGET),
@@ -88,6 +103,7 @@ fn names(skills: &[RankedSkill]) -> String {
         .join(",")
 }
 
+#[cfg(test)]
 fn pick_with(
     prompt: &str,
     ranked: Vec<RankedSkill>,
@@ -97,12 +113,24 @@ fn pick_with(
     record: &dyn Fn(&shadow::Row),
 ) -> Vec<RankedSkill> {
     let baseline: Vec<RankedSkill> = ranked.iter().take(keep).cloned().collect();
+    pick_with_baseline_inner(prompt, ranked, baseline, keep, mode, ask, record)
+}
+
+fn pick_with_baseline_inner(
+    prompt: &str,
+    candidates: Vec<RankedSkill>,
+    baseline: Vec<RankedSkill>,
+    keep: usize,
+    mode: Mode,
+    ask: &AskFn<'_>,
+    record: &dyn Fn(&shadow::Row),
+) -> Vec<RankedSkill> {
     let prompt = prompt.trim();
-    if mode == Mode::Off || ranked.is_empty() || prompt.is_empty() || prompt.starts_with('/') {
-        return baseline;
+    if mode == Mode::Off || candidates.is_empty() || prompt.is_empty() || prompt.starts_with('/') {
+        return baseline.into_iter().take(keep).collect();
     }
     let prompt: String = prompt.chars().take(MAX_PROMPT_CHARS).collect();
-    let candidates = &ranked[..ranked.len().min(TOP_N)];
+    let candidates = &candidates[..candidates.len().min(TOP_N)];
     let questions: BTreeMap<String, Question> = candidates
         .iter()
         .enumerate()
@@ -242,6 +270,36 @@ mod tests {
             reply(&[0.1, 0.9, 0.95, 0.8, 0.2])
         });
         assert_eq!(picked, ["skill1", "skill2", "skill3"]);
+    }
+
+    #[test]
+    fn explicit_baseline_survives_an_expanded_candidate_set() {
+        // The expanded fetch reordered the top 3; shadow must still inject
+        // and log the original 3-result set.
+        let candidates = vec![
+            skill("skill3"),
+            skill("skill4"),
+            skill("skill5"),
+            skill("skill0"),
+            skill("skill1"),
+        ];
+        let baseline = vec![skill("skill0"), skill("skill1"), skill("skill2")];
+        let rows = RefCell::new(vec![]);
+        let picked = pick_with_baseline_inner(
+            "fix the login bug",
+            candidates,
+            baseline,
+            3,
+            Mode::Shadow,
+            &|_, _| reply(&[0.9, 0.9, 0.9, 0.1, 0.1]),
+            &|r| rows.borrow_mut().push(r.clone()),
+        );
+        assert_eq!(
+            picked.into_iter().map(|s| s.name).collect::<Vec<_>>(),
+            ["skill0", "skill1", "skill2"]
+        );
+        assert_eq!(rows.borrow().len(), 1);
+        assert_eq!(rows.borrow()[0].baseline, "skill0,skill1,skill2");
     }
 
     #[test]
