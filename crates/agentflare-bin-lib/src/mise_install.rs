@@ -37,11 +37,65 @@ pub fn append_mise_path(base: Option<&OsStr>, cwd: &Path) -> Option<OsString> {
     static BINS: OnceLock<Mutex<std::collections::HashMap<PathBuf, Vec<PathBuf>>>> =
         OnceLock::new();
     let cache = BINS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
-    let bins = cache
-        .entry(cwd.to_path_buf())
-        .or_insert_with(|| mise_paths(cwd));
-    append_paths(base, bins)
+    let hit = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(cwd)
+        .cloned();
+    // Resolve outside the lock: `mise` is a subprocess (~100ms).
+    let bins = hit.unwrap_or_else(|| {
+        let bins = disk_cached_paths(&mise_cache_file(), cwd, MISE_PATH_TTL, || mise_paths(cwd));
+        cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(cwd.to_path_buf(), bins.clone());
+        bins
+    });
+    append_paths(base, &bins)
+}
+
+/// Every agentflare invocation (hooks included) resolves mise paths, so the
+/// per-process cache alone still costs one `mise bin-paths` spawn per command.
+const MISE_PATH_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+fn mise_cache_file() -> PathBuf {
+    agentflare_config::agentflare_dir().join("mise-bin-paths.json")
+}
+
+type PathCache = std::collections::HashMap<String, (u64, Vec<PathBuf>)>;
+
+/// `compute()`'s result for `cwd`, reused across processes for `ttl` via a
+/// small JSON file. Any read/write failure just falls through to `compute()`.
+fn disk_cached_paths(
+    file: &Path,
+    cwd: &Path,
+    ttl: std::time::Duration,
+    compute: impl FnOnce() -> Vec<PathBuf>,
+) -> Vec<PathBuf> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let key = cwd.to_string_lossy().into_owned();
+    let mut cache: PathCache = std::fs::read(file)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    if let Some((at, paths)) = cache.get(&key)
+        && now.saturating_sub(*at) < ttl.as_secs()
+    {
+        return paths.clone();
+    }
+    let paths = compute();
+    // Don't cache "mise missing/failed" for 5 minutes: installing mise should
+    // take effect on the next command.
+    if !paths.is_empty() {
+        cache.retain(|_, (at, _)| now.saturating_sub(*at) < ttl.as_secs());
+        cache.insert(key, (now, paths.clone()));
+        if let Ok(json) = serde_json::to_vec(&cache) {
+            let _ = std::fs::write(file, json);
+        }
+    }
+    paths
 }
 
 fn mise_paths(cwd: &Path) -> Vec<PathBuf> {
@@ -283,5 +337,26 @@ mod tests {
         );
         assert_eq!(append_paths(Some(&base), &[]), None);
         assert_eq!(append_paths(Some(&result), &bins), None);
+    }
+
+    #[test]
+    fn disk_cache_reuses_fresh_entry_and_skips_empty_results() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("c.json");
+        let cwd = Path::new("proj");
+        let ttl = std::time::Duration::from_secs(300);
+        let bins = vec![PathBuf::from("mise-bin")];
+        let first = disk_cached_paths(&file, cwd, ttl, || bins.clone());
+        assert_eq!(first, bins);
+        // Fresh hit: compute must not run again.
+        let second = disk_cached_paths(&file, cwd, ttl, || panic!("recomputed"));
+        assert_eq!(second, bins);
+        // Expired (ttl 0): recomputed.
+        let third = disk_cached_paths(&file, cwd, std::time::Duration::ZERO, Vec::new);
+        assert!(third.is_empty());
+        // Empty results are never persisted.
+        let other = tmp.path().join("d.json");
+        assert!(disk_cached_paths(&other, cwd, ttl, Vec::new).is_empty());
+        assert!(!other.exists());
     }
 }
