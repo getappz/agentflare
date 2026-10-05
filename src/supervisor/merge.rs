@@ -203,6 +203,21 @@ pub(super) fn handle_ci_green(
     // before paying for the fetch on every single tick for as long
     // as the PR sits gated or in-flight.
     if already_gated_or_in_flight(mcp, queue, item, label_id_by_name) {
+        // Item #341: a green, approved PR held only by a dispatch gate label
+        // (needs-manual-dispatch / needs-human) otherwise sits silently
+        // skipped every tick, with nothing telling the operator why.
+        if !label_missing
+            && item_gated(mcp, item, label_id_by_name)
+            && first_time_gated(&format!("pr-gated:{}", item.id))
+        {
+            notify_human_gate(
+                item,
+                &format!(
+                    "PR #{number} is green and approved but the sweep is skipping it: the item \
+                     carries a dispatch gate label (needs-manual-dispatch / needs-human)."
+                ),
+            );
+        }
         result.skipped += 1;
     } else {
         let head_sha = merge.head_sha();
