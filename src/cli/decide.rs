@@ -25,6 +25,22 @@ enum DecideCmd {
         #[arg(long)]
         site: Option<String>,
     },
+    /// The opt-in local training dataset (AGENTFLARE_DECIDE_CAPTURE=1). It
+    /// contains truncated, redacted user prompt text; it never leaves this
+    /// machine.
+    Dataset {
+        #[command(subcommand)]
+        cmd: DatasetCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum DatasetCmd {
+    /// Rows per site, label balance, date range, repetition rate and top-k
+    /// key coverage (where a deterministic engine would pay off).
+    Stats,
+    /// Delete the captured dataset.
+    Clear,
 }
 
 impl DecideArgs {
@@ -37,6 +53,22 @@ impl DecideArgs {
                     "{}",
                     decide::shadow::render(&decide::shadow::summarize(&rows, site.as_deref()))
                 );
+            }
+            DecideCmd::Dataset { cmd } => {
+                let path = decide::capture::dataset_path();
+                match cmd {
+                    DatasetCmd::Stats => {
+                        let rows = decide::capture::load(&path);
+                        print!(
+                            "{}",
+                            decide::capture::render(&decide::capture::summarize(&rows))
+                        );
+                    }
+                    DatasetCmd::Clear => {
+                        let n = decide::capture::clear(&path);
+                        println!("removed {n} dataset file(s)");
+                    }
+                }
             }
         }
     }

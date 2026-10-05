@@ -63,6 +63,14 @@ fn find_secret(text: &str) -> Option<&'static str> {
         .map(|p| p.name)
 }
 
+/// `text` with every secret-pattern match replaced by `[REDACTED]`; for
+/// callers that persist user text locally and must not store credentials.
+pub(crate) fn redact(text: &str) -> String {
+    PATTERNS.iter().fold(text.to_string(), |acc, p| {
+        p.re.replace_all(&acc, "[REDACTED]").into_owned()
+    })
+}
+
 /// Checks each `(field, text)` pair and fails on the first match — naming
 /// the field and pattern class in the error, never the matched text itself,
 /// so the secret doesn't round-trip back through the LLM that triggered
