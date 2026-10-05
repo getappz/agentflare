@@ -73,6 +73,7 @@ mod shell;
 mod shim_install;
 mod skill_detect;
 mod skill_proactive;
+mod skill_rerank;
 mod supervisor;
 mod tool_install;
 mod ui;

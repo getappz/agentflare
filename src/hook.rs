@@ -909,10 +909,11 @@ pub fn prompt_submit(agent: &str) {
             if let Ok(skills) = crate::skill_detect::find_skills(
                 &intent,
                 &registry,
-                3,
+                crate::skill_rerank::fetch_limit(3),
                 crate::memory::engine::embed_query,
                 crate::memory::engine::embed_doc,
-            ) && let Some(injection) = crate::skill_detect::build_injection(&skills)
+            ) && let Some(injection) =
+                crate::skill_detect::build_injection(&crate::skill_rerank::pick(prompt, skills, 3))
             {
                 bits.push(injection);
             }
