@@ -92,7 +92,17 @@ fn disk_cached_paths(
         cache.retain(|_, (at, _)| now.saturating_sub(*at) < ttl.as_secs());
         cache.insert(key, (now, paths.clone()));
         if let Ok(json) = serde_json::to_vec(&cache) {
-            let _ = std::fs::write(file, json);
+            // Temp file + rename so a concurrent reader never sees torn JSON.
+            if let Some(dir) = file.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.subsec_nanos());
+            let tmp = file.with_extension(format!("tmp{}.{nanos}", std::process::id()));
+            if std::fs::write(&tmp, json).is_err() || std::fs::rename(&tmp, file).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
         }
     }
     paths
