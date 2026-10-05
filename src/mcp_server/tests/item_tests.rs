@@ -2650,3 +2650,58 @@ fn item_claim_errors_for_second_claimant_but_own_reclaim_succeeds() {
     .unwrap();
     assert!(held.contains("\"status\":\"held\""), "{held}");
 }
+
+#[test]
+fn item_update_state_to_completed_removes_the_clean_worktree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_root = repo_dir.path().to_path_buf();
+    let run_git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo_root)
+            .output()
+            .unwrap()
+    };
+    run_git(&["init", "-b", "master"]);
+    run_git(&["config", "user.email", "test@test.com"]);
+    run_git(&["config", "user.name", "Test"]);
+    run_git(&["commit", "--allow-empty", "-m", "initial"]);
+    let s = AgentflareMcp {
+        backend_db_override: Some(tmp.path().join("backend.db")),
+        backend_project_link_override: Some(tmp.path().join("project.json")),
+        worktree_repo_root_override: Some(repo_root.clone()),
+        ..Default::default()
+    };
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+    let project_id = created["project_id"].as_str().unwrap().to_string();
+    let wt = repo_root.join(format!(".worktrees/task/{}", created["sequence_id"]));
+    crate::claims::with_owner_override("claude-code:job", || {
+        s.item_claim(ItemRequest {
+            action: "claim".into(),
+            id: Some(id.clone()),
+            ..Default::default()
+        })
+    })
+    .unwrap();
+    assert!(wt.exists(), "claim should create {}", wt.display());
+    let completed_state_id = {
+        let conn = backend_conn(&tmp);
+        agentflare_backend::state::list_by_project(&conn, &project_id)
+            .unwrap()
+            .into_iter()
+            .find(|st| st.group_name == "completed")
+            .unwrap()
+            .id
+    };
+    s.item(Parameters(ItemRequest {
+        action: "update_state".into(),
+        id: Some(id),
+        state_id: Some(completed_state_id),
+        ..Default::default()
+    }))
+    .unwrap();
+    assert!(!wt.exists(), "completed item left {}", wt.display());
+}
