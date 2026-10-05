@@ -17,7 +17,7 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", 
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = "2"
-notify = { version = "6", default-features = false }
+notify = { version = "6", default-features = false, features = ["macos_kqueue"] }
 walkdir = "2"
 regex = "1"
 sha2 = "0.10"
