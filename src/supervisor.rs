@@ -1948,13 +1948,10 @@ pub(super) fn branch_held_by_foreign_worktree(
     item: &agentflare_backend::item::Item,
     folder_path: &str,
 ) -> bool {
-    let Some(branch) = serde_json::from_str::<serde_json::Value>(&item.metadata)
-        .ok()
-        .and_then(|m| m["pr"]["branch"].as_str().map(str::to_owned))
-    else {
-        return false;
-    };
     let repo = std::path::Path::new(folder_path);
+    // The branch worktree creation would use, so legacy items without
+    // `metadata.pr.branch` are covered too.
+    let branch = flare_git_core::worktree::resolve_item_task_branch(item, repo);
     let own = flare_git_core::worktree::item_worktree_path(repo, item.sequence_id);
     is_foreign_worktree(
         flare_git_core::doctor::worktree_holding_branch(repo, &branch).as_deref(),
@@ -2027,9 +2024,6 @@ fn self_repair_or_gate(
     if already_gated_or_in_flight(mcp, queue, item, label_id_by_name) {
         return SelfRepairOutcome::Skipped;
     }
-    if branch_held_by_foreign_worktree(item, folder_path) {
-        return SelfRepairOutcome::Deferred;
-    }
 
     // Item #303: marker-comment counting alone stayed at 0 across hundreds of
     // real dispatches (`list_by_item` returning an empty/stale result, live
@@ -2098,6 +2092,12 @@ fn self_repair_or_gate(
             ),
         );
         return SelfRepairOutcome::Skipped;
+    }
+
+    // Item #341: after the cap handling above, so an exhausted item still
+    // reaches its human gate while the branch stays occupied.
+    if branch_held_by_foreign_worktree(item, folder_path) {
+        return SelfRepairOutcome::Deferred;
     }
 
     // Item #114: while the item's claim is still live (within its

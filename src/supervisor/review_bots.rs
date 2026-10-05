@@ -853,10 +853,6 @@ pub(super) fn coderabbit_repair_or_gate(
         return SelfRepairOutcome::Skipped;
     }
 
-    if !findings.is_empty() && super::branch_held_by_foreign_worktree(item, folder_path) {
-        return SelfRepairOutcome::Deferred;
-    }
-
     if findings.is_empty() {
         let summary = maybe_post_repair_complete_summary(
             mcp,
@@ -935,6 +931,11 @@ pub(super) fn coderabbit_repair_or_gate(
             );
         }
         return SelfRepairOutcome::Skipped;
+    }
+
+    // Item #341: after the cap handling above, as in `self_repair_or_gate`.
+    if super::branch_held_by_foreign_worktree(item, folder_path) {
+        return SelfRepairOutcome::Deferred;
     }
 
     // Same item #114 rationale as `self_repair_or_gate`: dispatching while
