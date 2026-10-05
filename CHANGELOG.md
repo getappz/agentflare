@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.0](https://github.com/getappz/agentflare/compare/v1.7.0...v1.8.0) - 2026-10-05
+
+### Added
+
+- **Autonomous supervisor**: auto-dispatch loop (#376), in-review sweep that polls PR checks, self-repairs failures and promotes on merge (#435), merge-conflict detection (#774), review-bot thread resolution (#813), auto-merge and merge queues (#809), redispatch for stuck items (#520), dependency-driven auto-dispatch (#621)
+- **Agent routing and failover**: task-attribute agent/model router (#380), registry-driven providers incl. Gemini and Cloudflare AI Gateway (#439), Cline CLI + ClinePass support (#564), usage-threshold failover for Claude and opencode-go (#533, #539), failover router with exhaustion signals (#674)
+- **Plan-approval and human gates**: plan-approval gate for claim/dispatch (#678), fail-closed command approval (#768), Telegram chat channel with approval cards and gate notifications (#615, #633, #675, #677)
+- **Durable workflow engine** (`flare-workflow`): embedded engine (#472), durable sleep/wait, saga rollback, loop resume, metrics (#497, #499, #502, #509, #567), SDD pipeline with TDD mode and review-only mode (#498, #592, #547)
+- **Sandboxing and safety**: bubblewrap job sandbox (#420), reusable `flare-sandbox` crate (#541), pre-handoff secret scan (#669), encrypted SQLite with bundled or external SQLCipher (#824), host resource gate and capacity governor (#417, #459)
+- **Multi-workstation coordination**: GitHub as coordination substrate (#379), claim markers across workstations (#632), observation sync over a shared git branch (#400), machine-name config (#434, #467), agent continuity and team chat (#674, #829)
+- **Search and skills**: local-first hybrid search with vectors, RRF and rerank, `sqlite-vec` scale lane, semantic skill search, category taxonomy (#617, #618)
+- **Decision layer** (`decide`): Jev-backed decisions with shadow router, skill rerank and SDD judge comparison (#851), one batched call per prompt shared by router and rerank (#862), opt-in local training-data capture (#709, #853)
+- **CLI and tooling**: `agentflare clean` (#844), `git ship` (#391), `code impact` (#397), `apps run` (#612), browser automation via agent-browser (#680), `/flare:pm` prompt and `pm` MCP tool (#676, #782), `/flare:resume`, SDD session resume (#563), mbx shared Rust build cache (#849), work-item status aggregator (#801)
+- Typed item relations (blocks/duplicate/relates_to), SQL-level paginated item listing, structural item filters and annotations (#797)
+
+### Fixed
+
+- **Dispatch reliability**: two process storms, including a dispatcher re-entry fork-bomb (#759), duplicate item and PR creation (#590, #595, #789, #852), orphan reconciliation races (#551, #582, #670, #839), worktree wipes and collisions (#832, #847, #856), stale claims and releases (#447, #470, #555, #783), idle-timeout and job-timeout mismatches (#395, #549, #671)
+- **Plan approval**: approval fields no longer reverted by unrelated metadata updates (#802), `submit_plan` unblocks `approve_plan` (#800), plan_required validation (#796)
+- **Sandbox and security**: path-traversal and hard-coded-crypto CodeQL alerts (#781), weak DEK file fallback removed (#799), canonical-mutate guard can no longer be self-cleared (#803), untrusted GitHub issue content gated and framed (#418)
+- **Windows**: console-window flashing across spawns (#407, #473, #477), git shim staging (#575), tree-kill hardening (#443), cursor-agent headless hang (#544)
+- **Updates and installs**: `update` and `dev-install` now verify the installed binary after a swap (#791, #795)
+- **Review sweep and CI**: CodeRabbit finding checks and caps (#760, #793, #833), `--resume` falls back to a fresh session when stale (#850), supervisor self-repair deferral and gated-green notifications (#488, #856)
+- `agentflare clean` keeps artifacts inside skipped worktrees out of the plan (#865)
+- Item id and relation scoping to the caller's project, auto-pick scoped to the current project (#859), plus many smaller dispatch, hook and workflow fixes
+
+### Changed
+
+- Extracted `agentflare-core` (#816) and `flare-sandbox` (#541); dispatch now runs work items in-process
+- Vault consolidated into `agentflare vault` (#378); `flare_git` renamed to `git` (#542)
+- Toolchain pinned to Rust 1.98.0 (#589); tests run with nextest and cargo-hakari (#399, #779)
+- Completion gate now requires fresh code-review evidence (#654, #581)
+- README, docs site and marketing site refreshed (#373)
+
 ## [1.7.0](https://github.com/getappz/agentflare/compare/v1.6.0...v1.7.0) - 2026-07-29
 
 ### Added
