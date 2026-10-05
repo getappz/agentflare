@@ -60,7 +60,7 @@ checksum = "9bfb5cc9405a158bc050668e34b3bbbd3ace4ff7c4e06036e7418417f90a9ab5"
 
 [[package]]
 name = "agentflare"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "aes-gcm",
  "agentflare-agent-registry",
