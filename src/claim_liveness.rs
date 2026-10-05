@@ -126,6 +126,9 @@ pub(crate) struct Released {
     pub redispatched: bool,
     /// A merged PR was found; finish promotion after releasing the DB lock.
     pub promote: bool,
+    /// Whether the dispatch-failure ceiling parked it on
+    /// `needs-manual-dispatch` instead -- an operator has to act.
+    pub parked_at_cap: bool,
 }
 
 /// One liveness sweep over every active item claim in `backend`. Releases a
@@ -218,7 +221,7 @@ fn sweep_with(
                 continue;
             }
         }
-        let (redispatched, promote) =
+        let (redispatched, promote, parked_at_cap) =
             restore_item(backend, &item_id, &claim.owner, &reason, &pr_status);
         released.push(Released {
             item_id,
@@ -226,6 +229,7 @@ fn sweep_with(
             reason,
             redispatched,
             promote,
+            parked_at_cap,
         });
     }
     memory.suspects = suspects;
@@ -240,16 +244,16 @@ fn sweep_with(
 /// items an operator parked (`paused`, `needs-manual-dispatch`). Once the
 /// any-reason dispatch-failure ceiling is reached the item goes to
 /// `needs-manual-dispatch` instead, same as the orphan reconcile does.
-/// Returns whether the item was re-armed.
+/// Returns `(re-armed, merged PR to promote, parked at the ceiling)`.
 fn restore_item(
     conn: &Connection,
     item_id: &str,
     owner: &str,
     reason: &str,
     pr_status: &impl Fn(&agentflare_backend::item::Item) -> crate::worktree::PrCiStatus,
-) -> (bool, bool) {
+) -> (bool, bool, bool) {
     let Ok(item) = agentflare_backend::item::get(conn, item_id) else {
-        return (false, false);
+        return (false, false, false);
     };
     let status = pr_status(&item);
     let promote = matches!(status, crate::worktree::PrCiStatus::Merged);
@@ -278,10 +282,12 @@ fn restore_item(
         .unwrap_or(false);
 
     let mut redispatched = false;
+    let mut parked_at_cap = false;
     let mut outcome = String::new();
     if finished || parked || item.assignee_agent.is_none() || promote || merging {
         // Nothing to re-queue; the release alone frees the item.
     } else if at_cap {
+        parked_at_cap = true;
         for name in [
             crate::supervisor::READY_LABEL,
             crate::supervisor::DISPATCHED_LABEL,
@@ -310,7 +316,7 @@ fn restore_item(
          ({reason}).{outcome}"
     );
     let _ = agentflare_backend::comment::create(conn, item_id, "agentflare-supervisor", &body);
-    (redispatched, promote)
+    (redispatched, promote, parked_at_cap)
 }
 
 /// The daemon's per-tick entry point (see `dashboard::server`'s discovery
@@ -372,6 +378,16 @@ pub(crate) fn run_sweep(
         }
     }
     for r in &released {
+        if r.parked_at_cap
+            && crate::supervisor::first_time_gated(&r.item_id)
+            && let Ok(Some(item)) =
+                mcp.with_backend_db(|conn| agentflare_backend::item::get(conn, &r.item_id).ok())
+        {
+            crate::supervisor::notify_human_gate(
+                &item,
+                "dispatch-failure ceiling reached — parked on needs-manual-dispatch",
+            );
+        }
         eprintln!(
             "agentflare-supervisor: released claim on item {} held by {} ({}){}",
             r.item_id,

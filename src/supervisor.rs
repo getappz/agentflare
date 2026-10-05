@@ -491,6 +491,7 @@ pub(crate) fn run_discovery_tick(
     // for workers this tick -- a lone project may use the whole pool.
     let contended = batches.iter().filter(|b| !b.items.is_empty()).count() > 1;
     let project_cap = per_project_work_cap();
+    let mut gate_held = 0usize;
 
     for batch in batches {
         let ProjectBatch {
@@ -571,12 +572,9 @@ pub(crate) fn run_discovery_tick(
                     // the host's own CPU-pressure tier, not agent identity.
                     // Both gates must pass before a dispatch proceeds.
                     if host_policy.blocks_dispatch() {
-                        eprintln!(
-                            "agentflare-supervisor: item #{} ({}) is ready-for-work but the host resource gate is {}",
-                            item.sequence_id,
-                            item.id,
-                            host_policy.as_str()
-                        );
+                        // Counted, not logged per item: the transition
+                        // summary below reports it once per tick.
+                        gate_held += 1;
                         result.waiting += 1;
                         continue;
                     }
@@ -630,6 +628,7 @@ pub(crate) fn run_discovery_tick(
             }
         }
     }
+    report_gate_state(host_policy, gate_held);
     result
 }
 

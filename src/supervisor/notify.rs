@@ -140,6 +140,54 @@ pub(crate) fn notify_quota_event(item: &agentflare_backend::item::Item, text: &s
     send_notify_card(&chat_id, &card, item.sequence_id);
 }
 
+/// Once-per-tick view of the host resource gate: logs a single summary line
+/// while it holds work, and sends a quota-style FYI only when the gate
+/// *transitions* (open -> held, held -> open), never per item per tick.
+pub(crate) fn report_gate_state(policy: agentflare_resource_gate::Policy, held: usize) {
+    use std::sync::atomic::AtomicBool;
+    static WAS_BLOCKED: AtomicBool = AtomicBool::new(false);
+    let blocked = policy.blocks_dispatch();
+    if blocked && held > 0 {
+        eprintln!(
+            "agentflare-supervisor: host resource gate is {}; {held} ready-for-work item(s) held",
+            policy.as_str()
+        );
+    }
+    if !gate_flipped(&WAS_BLOCKED, blocked, held) || test_notify_disabled() {
+        return;
+    }
+    let text = if blocked {
+        let why = policy
+            .pause_reason()
+            .map_or(String::new(), |r| format!(" ({})", r.as_str()));
+        let cpu = agentflare_resource_gate::Signals::sample().cpu_usage_pct;
+        format!(
+            "host resource gate {}{why}: cpu {cpu:.0}%, {held} ready-for-work item(s) held",
+            policy.as_str()
+        )
+    } else {
+        "host resource gate resumed: dispatch is flowing again".to_string()
+    };
+    if let Ok(Some(chat_id)) = crate::vault::get_secret(TELEGRAM_NOTIFY_CHAT_ID_SECRET) {
+        let card = format!(
+            "\u{2139}\u{FE0F} <b>agentflare</b> host\n{}",
+            html_escape(&text)
+        );
+        send_notify_card(&chat_id, &card, 0);
+    }
+}
+
+/// Whether the gate just changed between holding work and flowing. A gate
+/// that is closed with nothing waiting is not "held": it neither announces
+/// itself nor arms the later "resumed" notice.
+fn gate_flipped(was_blocked: &std::sync::atomic::AtomicBool, blocked: bool, held: usize) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if blocked && held == 0 {
+        return false;
+    }
+    was_blocked.swap(blocked, Relaxed) != blocked
+}
+
 /// True when `text` differs from the last one recorded for `key` (and
 /// records it). In-memory and per-process like [`first_time_gated`].
 pub(crate) fn changed_since_last(key: &str, text: &str) -> bool {
@@ -431,6 +479,18 @@ mod pr_approval_card_tests {
 #[cfg(test)]
 mod summarize_reason_tests {
     use super::*;
+
+    #[test]
+    fn gate_notifies_once_per_transition_and_only_when_work_is_held() {
+        use std::sync::atomic::AtomicBool;
+        let f = AtomicBool::new(false);
+        assert!(!gate_flipped(&f, true, 0), "closed with nothing held");
+        assert!(!gate_flipped(&f, false, 0), "still flowing");
+        assert!(gate_flipped(&f, true, 3), "now holding work");
+        assert!(!gate_flipped(&f, true, 5), "same state next tick");
+        assert!(gate_flipped(&f, false, 0), "resumed");
+        assert!(!gate_flipped(&f, false, 0));
+    }
 
     #[test]
     fn changed_since_last_fires_once_per_distinct_text() {
