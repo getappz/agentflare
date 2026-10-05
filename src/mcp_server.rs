@@ -271,24 +271,35 @@ impl AgentflareMcp {
     }
 
     #[tool(description = "Get a model routing suggestion for a given prompt.")]
-    fn get_routing_suggestion(
+    async fn get_routing_suggestion(
         &self,
-        Parameters(GetRoutingSuggestionRequest { prompt }): Parameters<GetRoutingSuggestionRequest>,
+        Parameters(GetRoutingSuggestionRequest { prompt, agent }): Parameters<
+            GetRoutingSuggestionRequest,
+        >,
     ) -> String {
-        let ctx = optimize::RouteContext {
-            prompt,
-            session_id: String::new(),
-            turn_count: 0,
-            recent_tool_calls: vec![],
-            current_model: None,
-        };
-        // Same router the CLI hook uses — honors AGENTFLARE_ROUTER.
-        let router = optimize::active_router();
-        let result = match router.route(&ctx) {
-            Some(nudge) => serde_json::json!({"suggestion": nudge}),
-            None => serde_json::json!({"suggestion": null}),
-        };
-        serde_json::to_string_pretty(&result).unwrap_or_default()
+        tokio::task::spawn_blocking(move || {
+            if let Some(agent) = agent {
+                let model = crate::decide::model_routing::launch_model(&agent, &prompt, &[]);
+                return serde_json::json!({"agent": agent, "model": model.as_ref().map(|s| &s.model), "effort": model.as_ref().and_then(|s| s.effort.as_deref()), "advisory": true})
+                    .to_string();
+            }
+            let ctx = optimize::RouteContext {
+                prompt,
+                session_id: String::new(),
+                turn_count: 0,
+                recent_tool_calls: vec![],
+                current_model: None,
+            };
+            // Same router the CLI hook uses — honors AGENTFLARE_ROUTER.
+            let router = optimize::active_router();
+            let result = match router.route(&ctx) {
+                Some(nudge) => serde_json::json!({"suggestion": nudge}),
+                None => serde_json::json!({"suggestion": null}),
+            };
+            serde_json::to_string_pretty(&result).unwrap_or_default()
+        })
+        .await
+        .unwrap_or_else(|_| "{\"model\":null,\"advisory\":true}".into())
     }
 
     /// Lock the persisted registry, lazily opening it on first use, refresh
@@ -1239,9 +1250,27 @@ impl AgentflareMcp {
         Ok((conn, repo))
     }
     #[tool(
-        description = "Review operations — submit findings, run consensus, list/clear/record rounds, check scores. Single consolidated tool with `action` field (clear|consensus|list|record|scores|submit)."
+        description = "Review operations — submit findings, run consensus, list/clear/record rounds, check scores; scan performs bounded advisory Jev screening of tracked diffs without submitting findings."
     )]
-    fn review(&self, Parameters(req): Parameters<ReviewRequest>) -> Result<String, ErrorData> {
+    async fn review(
+        &self,
+        Parameters(req): Parameters<ReviewRequest>,
+    ) -> Result<String, ErrorData> {
+        if req.action == "scan" {
+            return tokio::task::spawn_blocking(move || {
+                let report = crate::review::triage::scan(
+                    req.base.as_deref(),
+                    req.head.as_deref(),
+                    req.max_requests,
+                    req.max_input_bytes,
+                )
+                .map_err(|e| ErrorData::internal_error(e, None))?;
+                serde_json::to_string_pretty(&report)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+            })
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        }
         self.review_impl(req)
     }
     fn resolve_repo_or_err(repo: Option<String>) -> Result<String, ErrorData> {
