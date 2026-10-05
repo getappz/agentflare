@@ -13,7 +13,7 @@ const COOLDOWN: u64 = 60;
 #[derive(Default, Serialize, Deserialize)]
 struct State {
     failures: u32,
-    last_failure: u64,
+    first_failure: u64,
     open_until: u64,
     probe_until: u64,
 }
@@ -82,12 +82,12 @@ pub fn observe(path: &Path, now: u64, success: bool) {
             s.probe_until = 0;
             s.open_until = now.saturating_add(COOLDOWN);
         } else {
-            s.failures = if now.saturating_sub(s.last_failure) <= WINDOW {
-                s.failures.saturating_add(1)
+            if s.failures == 0 || now.saturating_sub(s.first_failure) > WINDOW {
+                s.failures = 1;
+                s.first_failure = now;
             } else {
-                1
-            };
-            s.last_failure = now;
+                s.failures = s.failures.saturating_add(1);
+            }
             if s.failures >= FAILURES {
                 s.open_until = now.saturating_add(COOLDOWN);
             }
@@ -163,6 +163,18 @@ mod tests {
         observe(&path, 161, false);
         let state: State = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         assert_eq!(state.failures, 1);
+    }
+
+    #[test]
+    fn spaced_failures_do_not_extend_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("breaker.json");
+        observe(&path, 100, false);
+        observe(&path, 159, false);
+        observe(&path, 218, false);
+        let state: State = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(state.failures, 1);
+        assert!(allow(&path, 219, Duration::from_secs(1)));
     }
 
     #[test]

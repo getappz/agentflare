@@ -110,7 +110,7 @@ pub fn credential_sources() -> Vec<(&'static str, Source)> {
 /// Ask the configured backend. Errors are meant to be swallowed by callers
 /// (fail open): they never contain credentials or the request URL.
 pub fn ask(state: &Value, questions: &BTreeMap<String, Question>) -> Result<Outcome, DecideError> {
-    ask_with(&Config::from_lookup(&env_lookup())?, state, questions)
+    ask_configured(&env_lookup(), state, questions, None)
 }
 
 /// `ask`, with the timeout capped, for callers on a latency budget (hooks).
@@ -119,8 +119,19 @@ pub fn ask_within(
     questions: &BTreeMap<String, Question>,
     cap: std::time::Duration,
 ) -> Result<Outcome, DecideError> {
-    let mut cfg = Config::from_lookup(&env_lookup())?;
-    cfg.timeout = cfg.timeout.min(cap);
+    ask_configured(&env_lookup(), state, questions, Some(cap))
+}
+
+fn ask_configured(
+    get: &dyn Fn(&str) -> Option<String>,
+    state: &Value,
+    questions: &BTreeMap<String, Question>,
+    cap: Option<std::time::Duration>,
+) -> Result<Outcome, DecideError> {
+    let mut cfg = Config::from_lookup(get)?;
+    if let Some(cap) = cap {
+        cfg.timeout = cfg.timeout.min(cap);
+    }
     ask_with(&cfg, state, questions)
 }
 
@@ -388,5 +399,56 @@ mod tests {
             .err()
             .unwrap();
         assert!(matches!(err, DecideError::Malformed(_)));
+    }
+
+    #[test]
+    fn config_errors_leave_breaker_state_unchanged() {
+        let path = breaker_path();
+        let now = breaker::current_time();
+        breaker::observe(&path, now, false);
+        breaker::observe(&path, now, false);
+        let before = std::fs::read(&path).unwrap();
+        for pairs in [
+            vec![],
+            vec![("AGENTFLARE_JEV", "1")],
+            vec![
+                ("AGENTFLARE_JEV", "1"),
+                ("AGENTFLARE_JEV_BASE_URL", "http://bad.example"),
+            ],
+        ] {
+            let get = |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| v.to_string())
+            };
+            assert!(matches!(
+                ask_configured(&get, &Value::Null, &questions(), None),
+                Err(DecideError::Disabled
+                    | DecideError::NoCredentials
+                    | DecideError::InvalidBaseUrl)
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn open_breaker_returns_unavailable_without_connecting() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/decisions", listener.local_addr().unwrap());
+        let path = breaker_path();
+        let now = breaker::current_time();
+        for _ in 0..3 {
+            breaker::observe(&path, now, false);
+        }
+        assert!(matches!(
+            ask_with(&cfg(url, "100"), &Value::Null, &questions()),
+            Err(DecideError::Unavailable)
+        ));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 }
