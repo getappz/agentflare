@@ -360,6 +360,7 @@ pub(crate) fn sweep_review_threads(
     let findings = classify_threads(&threads, cfg, &meta);
     let in_flight = job_in_flight(queue, &item.id);
     let mut commits: Option<Vec<String>> = None;
+    let mut head_commit_date: Option<Option<String>> = None;
 
     // A restart between a fix's reply and its resolve leaves the thread
     // open with our marker as its last word: finish the resolve, never
@@ -481,6 +482,32 @@ pub(crate) fn sweep_review_threads(
             // This exact finding was already handed to an agent. An unresolved
             // GitHub thread alone does not prove the fix needs another run.
             continue;
+        }
+        if let Some(head) = input.head_sha
+            && let Some(reviewed_at) = thread
+                .comments
+                .iter()
+                .rev()
+                .find(|c| cfg.is_bot(&c.login))
+                .map(|c| c.created_at.as_str())
+            && !reviewed_at.is_empty()
+        {
+            let committed_at = head_commit_date.get_or_insert_with(|| {
+                review_threads::commit_date(client, repo, head).unwrap_or_else(|e| {
+                    eprintln!(
+                        "agentflare-supervisor: could not check head commit date of PR #{}: {}",
+                        input.number,
+                        e.log_safe()
+                    );
+                    None
+                })
+            });
+            if committed_at
+                .as_deref()
+                .is_some_and(|date| date > reviewed_at)
+            {
+                continue;
+            }
         }
         state.to_dispatch.push(f.clone());
     }

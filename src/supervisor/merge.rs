@@ -487,6 +487,11 @@ pub(super) fn merge_or_repair_findings(
             "unresolved review-bot findings hold the merge",
         );
     }
+    if merge.auto_merge().enabled && (review.dispatch_needed() || review.blocks_merge()) {
+        // The green verdict saw auto-merge armed before the disarm above.
+        // Keep unresolved review findings as a merge gate without a repair job.
+        return PassingPrOutcome::NotMerged;
+    }
     if review.dispatch_needed() {
         return PassingPrOutcome::Repair(coderabbit_repair_or_gate(
             mcp,

@@ -638,6 +638,41 @@ fn unresolved_thread_already_dispatched_this_round_does_not_start_another_repair
 }
 
 #[test]
+fn unresolved_thread_with_a_newer_head_commit_does_not_start_repair() {
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
+    mcp.with_backend_db(|conn| {
+        merge_item_metadata(conn, &item_id, |m| {
+            m.insert(REVIEW_NUDGED_HEAD_KEY.into(), "head123".into());
+        })
+        .unwrap();
+    })
+    .unwrap();
+    let server = MockServer::start(vec![
+        MockResponse::json(
+            200,
+            &threads_page(&[("PRRT_1", false, vec![(11, BOT, MAJOR_BODY.into())])]),
+        ),
+        MockResponse::json(
+            200,
+            r#"{"commit":{"committer":{"date":"2026-09-02T00:00:00Z"}}}"#,
+        ),
+    ]);
+    let state = sweep(
+        &server,
+        &mcp,
+        &queue,
+        &item_id,
+        Some("head123"),
+        &ReviewBotConfig::default(),
+    );
+    assert!(state.to_dispatch.is_empty());
+    assert_eq!(state.blocking, 1, "unresolved review still holds the merge");
+    assert!(server.requests()[1].path.contains("/commits/head123"));
+}
+
+#[test]
 fn sweep_replies_then_resolves_a_fixed_thread_once_the_sha_is_on_the_remote() {
     let mcp = test_mcp();
     let queue = test_queue();

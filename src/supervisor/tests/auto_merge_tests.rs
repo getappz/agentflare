@@ -812,3 +812,39 @@ fn merge_or_repair_findings_never_merges_a_ci_green_approved_pr_with_unresolved_
         "an item with unresolved findings must not be promoted"
     );
 }
+
+#[test]
+fn armed_auto_merge_with_green_checks_does_not_dispatch_review_repair() {
+    let repo = throwaway_repo();
+    let mcp = test_mcp_with_repo(repo.path().to_path_buf());
+    let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
+    let item = mcp
+        .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
+        .unwrap();
+    let queue = test_queue();
+    let auto_merge = AutoMergeRef {
+        enabled: true,
+        ..Default::default()
+    };
+    let outcome = merge_or_repair_findings(
+        &mcp,
+        &queue,
+        &test_auth_conn(),
+        agentflare_resource_gate::Policy::Normal,
+        &item,
+        repo.path(),
+        42,
+        &ReviewBotState::for_dispatch(vec![coderabbit_finding(1, "coderabbitai[bot]")]),
+        &[PR_APPROVAL_LABEL.to_string()],
+        &seed_gate_label(&mcp),
+        "/repo",
+        allowed(None, &auto_merge),
+    );
+    assert!(matches!(outcome, PassingPrOutcome::NotMerged));
+    assert!(
+        queue
+            .list(Some(agentflare_jobs::JobState::Queued))
+            .unwrap()
+            .is_empty()
+    );
+}
