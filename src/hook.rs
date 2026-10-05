@@ -838,7 +838,7 @@ pub fn prompt_submit(agent: &str) {
             session_id: sid.clone(),
             turn_count: record.turn_count,
             recent_tool_calls: record.recent_tool_calls.clone(),
-            current_model: None,
+            current_model: crate::agent_model::detect(agent, &input),
         };
         if let Some(nudge) = router.route(&ctx) {
             session_bits.push(nudge);
@@ -854,7 +854,7 @@ pub fn prompt_submit(agent: &str) {
             session_id: String::new(),
             turn_count: 0,
             recent_tool_calls: vec![],
-            current_model: None,
+            current_model: crate::agent_model::detect(agent, &input),
         };
         if let Some(nudge) = router.route(&ctx) {
             session_bits.push(nudge);

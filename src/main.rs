@@ -1,6 +1,7 @@
 mod about;
 mod agent_install;
 mod agent_launch;
+mod agent_model;
 mod agents;
 mod alias;
 mod artifacts;
