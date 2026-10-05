@@ -7,8 +7,9 @@
 //!   publishes the v1 handoff body as an artifact addressed to the
 //!   receiving agent (`to`, defaulting to this runtime's own identity).
 //! - auto (no `session`): picks the latest session from the insights DB
-//!   (needs a prior `agentflare insights sync`), excluding sessions that
-//!   already belong to the receiver. Because an auto-pick can guess wrong,
+//!   (needs a prior `agentflare insights sync`), scoped to sessions whose cwd
+//!   is the current project and excluding the calling session (by
+//!   `CLAUDE_CODE_SESSION_ID`; without it, the receiver's whole source). Because an auto-pick can guess wrong,
 //!   the first call is confirm-gated: it returns `needs_confirm` with the
 //!   picked session and performs zero writes. Re-calling with
 //!   `confirm_session` (or `session`) set to that id performs the send.
@@ -23,6 +24,9 @@ pub(crate) const INSIGHTS_DB_ENV: &str = "AGENTFLARE_INSIGHTS_DB";
 /// Env override for the artifact store dir (tests point it at a temp dir so
 /// a confirmed send never publishes outside the test).
 pub(crate) const ARTIFACTS_DIR_ENV: &str = "AGENTFLARE_ARTIFACTS_DIR";
+
+/// Env var Claude Code sets to the calling session's id.
+const CURRENT_SESSION_ENV: &str = "CLAUDE_CODE_SESSION_ID";
 
 pub(crate) fn resume_insights_db() -> std::path::PathBuf {
     match std::env::var(INSIGHTS_DB_ENV) {
@@ -77,6 +81,14 @@ impl super::AgentflareMcp {
             ))
         })?;
         let target_canon = target.replace('-', "_");
+        // The calling session is excluded by id; when the runtime doesn't
+        // expose it, fall back to excluding the receiver's whole source.
+        let current = std::env::var(CURRENT_SESSION_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        // Scope to this project: the session's cwd is the project dir or
+        // below it (worktrees live under it).
+        let project = std::env::current_dir().ok();
         // Paginated: filters run per page so an eligible session past the
         // first page isn't hidden by newer ineligible rows.
         let picked = {
@@ -89,7 +101,14 @@ impl super::AgentflareMcp {
                 let found = page
                     .into_iter()
                     .filter(|s| from == "auto" || s.source.as_str() == from)
-                    .find(|s| s.source.as_str() != target_canon);
+                    .filter(|s| match &current {
+                        Some(id) => &s.id != id,
+                        None => s.source.as_str() != target_canon,
+                    })
+                    .find(|s| match (&project, &s.cwd) {
+                        (Some(p), Some(c)) => std::path::Path::new(c).starts_with(p),
+                        _ => false,
+                    });
                 if found.is_some() || page_len < 50 {
                     break found;
                 }
@@ -247,11 +266,26 @@ mod tests {
         }
     }
 
+    /// In-project session: its cwd is this process's cwd.
     fn seed_session(
         store: &flare_insights::store::InsightsStore,
         id: &str,
         source: flare_insights::model::SessionSource,
         updated_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        let cwd = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        seed_session_in(store, id, source, updated_at, cwd);
+    }
+
+    fn seed_session_in(
+        store: &flare_insights::store::InsightsStore,
+        id: &str,
+        source: flare_insights::model::SessionSource,
+        updated_at: chrono::DateTime<chrono::Utc>,
+        cwd: String,
     ) {
         let session = flare_insights::model::Session {
             id: id.into(),
@@ -280,7 +314,7 @@ mod tests {
             tags: vec![],
             starred: false,
             pid: None,
-            cwd: None,
+            cwd: Some(cwd),
         };
         store.upsert_session(&session).unwrap();
     }
@@ -423,14 +457,15 @@ mod tests {
         let db = tmp.path().join("observatory.db");
         let store = flare_insights::store::InsightsStore::open(&db).unwrap();
         let now = chrono::Utc::now();
-        // 50 newer ineligible rows (receiver's own source) push the one
-        // eligible session past the first page.
+        // 50 newer ineligible rows (other project) push the one eligible
+        // session past the first page.
         for i in 0..50 {
-            seed_session(
+            seed_session_in(
                 &store,
-                &format!("ses-opencode-{i}"),
+                &format!("ses-elsewhere-{i}"),
                 flare_insights::model::SessionSource::OpenCode,
                 now - chrono::Duration::seconds(i as i64),
+                "/nonexistent/other-project".into(),
             );
         }
         seed_session(
@@ -451,5 +486,37 @@ mod tests {
             })
             .unwrap();
         assert!(out.contains("ses-old-claude"), "{out}");
+    }
+
+    #[test]
+    fn auto_pick_skips_calling_session_and_other_projects() {
+        let _lock = env_lock().lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("observatory.db");
+        let store = flare_insights::store::InsightsStore::open(&db).unwrap();
+        let now = chrono::Utc::now();
+        let cc = flare_insights::model::SessionSource::ClaudeCode;
+        seed_session(&store, "ses-self", cc.clone(), now);
+        seed_session_in(
+            &store,
+            "ses-elsewhere",
+            cc.clone(),
+            now - chrono::Duration::seconds(10),
+            "/nonexistent/other-project".into(),
+        );
+        seed_session(&store, "ses-prev", cc, now - chrono::Duration::seconds(60));
+        let _db = EnvGuard::set(INSIGHTS_DB_ENV, &db);
+        let _me = EnvGuard::set(CURRENT_SESSION_ENV, std::path::Path::new("ses-self"));
+        let server = crate::mcp_server::AgentflareMcp::default();
+
+        let out = server
+            .resume_impl(crate::mcp_server::types::ResumeRequest {
+                from: Some("claude_code".into()),
+                to: Some("claude-code".into()),
+                dry_run: Some(true),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(out.contains("ses-prev"), "{out}");
     }
 }
