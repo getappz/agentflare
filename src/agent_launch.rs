@@ -94,7 +94,15 @@ pub fn run_launch_env(
         .find(|(k, _)| k == "PATH")
         .map(|(_, v)| v.into())
         .or_else(|| std::env::var_os("PATH"));
-    if let Some(path) = crate::mbx::agent_path(base_path) {
+    let mbx_path = crate::mbx::agent_path(base_path.clone());
+    let effective_path = mbx_path.as_ref().or(base_path.as_ref());
+    if let Some(path) = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| {
+            crate::mise_install::append_mise_path(effective_path.map(|p| p.as_os_str()), &cwd)
+        })
+        .or(mbx_path)
+    {
         cmd.env("PATH", path);
     }
 
@@ -1153,7 +1161,16 @@ fn run_headless_impl(
     cmd.env_remove("CARGO_TARGET_DIR");
     // Item #330: same mbx shim PATH as `run_launch_env`; the bwrap wrapper
     // inherits this env, so the sandbox sees the identical PATH.
-    if let Some(path) = crate::mbx::agent_path(std::env::var_os("PATH")) {
+    let base_path = std::env::var_os("PATH");
+    let mbx_path = crate::mbx::agent_path(base_path.clone());
+    let effective_path = mbx_path.as_ref().or(base_path.as_ref());
+    if let Some(path) = cwd
+        .as_deref()
+        .and_then(|cwd| {
+            crate::mise_install::append_mise_path(effective_path.map(|p| p.as_os_str()), cwd)
+        })
+        .or(mbx_path)
+    {
         cmd.env("PATH", path);
     }
     // Explicit, not inherited from this process's own ambient env: when the

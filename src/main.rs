@@ -91,6 +91,7 @@ use clap::Parser;
 
 fn main() {
     color_eyre::install().expect("color_eyre::install failed");
+    mise_install::init_mise_path();
     let cli = cli::Cli::parse();
     match cli.command {
         Some(command) => command.run(),
