@@ -16,6 +16,50 @@ pub(crate) fn tracked_pr_numbers(
         .collect()
 }
 
+/// The item whose own branch `branch` is: `task/<sequence_id>` or
+/// `task/<sequence_id>-<slug>` for an item in `items`, or the branch a
+/// previous PR was recorded against in `metadata.pr.branch`.
+fn item_owning_branch<'a>(
+    items: &'a [agentflare_backend::item::Item],
+    branch: &str,
+) -> Option<&'a agentflare_backend::item::Item> {
+    let task_seq = branch
+        .strip_prefix("task/")
+        .map(|rest| rest.split('-').next().unwrap_or(rest))
+        .and_then(|digits| digits.parse::<i64>().ok());
+    items.iter().find(|item| {
+        task_seq == Some(item.sequence_id)
+            || serde_json::from_str::<serde_json::Value>(&item.metadata)
+                .ok()
+                .is_some_and(|m| m["pr"]["branch"] == branch)
+    })
+}
+
+/// Records `number`/`branch` as `item`'s PR when it has none yet, so the next
+/// sweep tracks it by number like any PR opened through `item done`.
+fn attach_pr_to_item(
+    conn: &rusqlite::Connection,
+    item: &agentflare_backend::item::Item,
+    number: u64,
+    branch: &str,
+) {
+    if super::pr_number_from_metadata(item).is_some() {
+        return;
+    }
+    let result = crate::mcp_server::merge_item_metadata(conn, &item.id, |map| {
+        map.insert(
+            "pr".into(),
+            serde_json::json!({"number": number, "branch": branch}),
+        );
+    });
+    if let Err(e) = result {
+        eprintln!(
+            "worktree: could not attach PR #{number} to item {}: {e}",
+            item.sequence_id
+        );
+    }
+}
+
 /// The lowest-numbered (earliest) comment carrying a valid `Claim` marker,
 /// paired with its owner -- comment ids are monotonic, so this is the same
 /// tie-break `github::bridge`'s own issue-claim race resolves on.
@@ -155,6 +199,8 @@ pub(crate) fn discover_untracked_prs(
         }
     };
     let mut created = 0;
+    // Item #337: the items a PR's head branch can already belong to.
+    let items = agentflare_backend::item::list_by_project(conn, project_id).unwrap_or_default();
     for pr in prs {
         if pr.draft
             || known_pr_numbers.contains(&pr.number)
@@ -166,6 +212,16 @@ pub(crate) fn discover_untracked_prs(
         let Some(branch) = pr.head.as_ref().map(|h| h.git_ref.clone()) else {
             continue;
         };
+        // An agent that opens its own PR on its item's `task/<seq>-…` branch
+        // (plain `gh pr create`) never writes `metadata.pr`, so the number
+        // check above calls the PR untracked. The branch names its owner:
+        // attach the PR there instead of minting a second item that the
+        // supervisor would then dispatch repairs against, colliding with the
+        // owner's worktree (#334 beside #330).
+        if let Some(owning) = item_owning_branch(&items, &branch) {
+            attach_pr_to_item(conn, owning, pr.number, &branch);
+            continue;
+        }
         if !claim_pr_for_discovery(client, repo, pr.number, owner) {
             continue;
         }
@@ -669,6 +725,136 @@ mod tests {
             agentflare_backend::item::list_by_project(&conn, &project_id)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    fn create_owner_item(
+        conn: &rusqlite::Connection,
+        project_id: &str,
+        state_id: &str,
+    ) -> agentflare_backend::item::Item {
+        agentflare_backend::item::create(
+            conn,
+            agentflare_backend::item::CreateItem {
+                project_id: project_id.to_string(),
+                state_id: state_id.to_string(),
+                name: "Adopt mbx".to_string(),
+                description: None,
+                priority: None,
+                parent_id: None,
+                assignee_agent: None,
+                sort_order: None,
+                external_source: None,
+                external_id: None,
+                metadata: None,
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids: vec![],
+                start_date: None,
+                due_date: None,
+            },
+        )
+        .unwrap()
+    }
+
+    // Item #337: an agent that opens its own PR with `gh pr create` on its
+    // item's `task/<seq>-…` branch never writes `metadata.pr.number`, so the
+    // number-only `known_pr_numbers` check called the PR untracked and
+    // minted a second item for it (#334 beside #330). The branch names its
+    // owner; the PR attaches to that item and no item or claim is created --
+    // no responses are queued for a claim, so trying one would panic.
+    #[test]
+    fn discover_untracked_prs_attaches_a_pr_to_the_item_that_owns_its_branch() {
+        let conn = agentflare_backend::db::open_in_memory().unwrap();
+        let (project_id, in_review_state_id) = test_project_with_in_review_state(&conn);
+        let owner_item = create_owner_item(&conn, &project_id, &in_review_state_id);
+        let branch = format!(
+            "task/{}-adopt-mbx-as-the-shared-rust-build-cache",
+            owner_item.sequence_id
+        );
+        let server = crate::github::test_support::MockServer::start(vec![
+            crate::github::test_support::MockResponse::json(
+                200,
+                &format!(
+                    r#"[{{"number":849,"html_url":"u","state":"open","title":"feat: adopt mbx","body":"x","head":{{"ref":"{branch}","sha":"abc"}},"author_association":"OWNER"}}]"#
+                ),
+            ),
+        ]);
+        let client = server.client(Some("tok"));
+        let repo = crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+
+        let created = discover_untracked_prs(
+            &conn,
+            &client,
+            &repo,
+            &project_id,
+            &in_review_state_id,
+            &std::collections::HashSet::new(),
+            "flared:box-a",
+        );
+
+        assert_eq!(
+            created, 0,
+            "no duplicate item for a branch a live item owns"
+        );
+        let items = agentflare_backend::item::list_by_project(&conn, &project_id).unwrap();
+        assert_eq!(items.len(), 1);
+        let metadata: serde_json::Value = serde_json::from_str(&items[0].metadata).unwrap();
+        assert_eq!(
+            metadata["pr"]["number"], 849,
+            "the PR is attached to its owner"
+        );
+        assert_eq!(metadata["pr"]["branch"], branch.as_str());
+    }
+
+    #[test]
+    fn a_task_branch_with_no_matching_item_still_gets_a_tracking_item() {
+        let conn = agentflare_backend::db::open_in_memory().unwrap();
+        let (project_id, in_review_state_id) = test_project_with_in_review_state(&conn);
+        let ours = crate::github::bridge::marker::Marker {
+            action: crate::github::bridge::marker::Action::Claim,
+            owner: "flared:box-a".into(),
+            item: "pr-discovery".into(),
+            ts: 1,
+            hash: String::new(),
+        };
+        let server = crate::github::test_support::MockServer::start(vec![
+            crate::github::test_support::MockResponse::json(
+                200,
+                r#"[{"number":7,"html_url":"u","state":"open","title":"Other","body":"x","head":{"ref":"task/9999-some-other-box","sha":"abc"},"author_association":"OWNER"}]"#,
+            ),
+            crate::github::test_support::MockResponse::json(200, "[]"),
+            crate::github::test_support::MockResponse::json(201, r#"{"id":100}"#),
+            crate::github::test_support::MockResponse::json(
+                200,
+                &format!(
+                    r#"[{{"id":100,"user":{{"login":"bot"}},"body":"{}"}}]"#,
+                    ours.render()
+                ),
+            ),
+        ]);
+        let client = server.client(Some("tok"));
+        let repo = crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+
+        let created = discover_untracked_prs(
+            &conn,
+            &client,
+            &repo,
+            &project_id,
+            &in_review_state_id,
+            &std::collections::HashSet::new(),
+            "flared:box-a",
+        );
+
+        assert_eq!(
+            created, 1,
+            "another workstation's task branch is not ours to attach"
         );
     }
 }
