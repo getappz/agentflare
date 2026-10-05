@@ -136,6 +136,111 @@ pub(crate) use discovery::{discover_untracked_prs, tracked_pr_numbers};
 mod draft;
 pub(crate) use draft::{mark_pr_ready, pr_marked_ready};
 
+/// The branch an item's PR lives on, when one is recorded: the same
+/// `{"pr":{"branch":"..."}}` shape `persist_pr_identity` and
+/// `discover_untracked_prs` both write. `None` when the item has no tracked
+/// PR branch (never pushed, or predates the field).
+pub(crate) fn pr_branch_from_metadata(item: &agentflare_backend::item::Item) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(&item.metadata)
+        .ok()?
+        .get("pr")?
+        .get("branch")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// The sequence id a `task/<seq>[-<slug>]` branch name belongs to — the
+/// branch side of the ownership rule. `None` for any other branch shape
+/// (hand-opened `fix/...` branches carry no item number at all).
+pub(crate) fn task_branch_seq(branch: &str) -> Option<i64> {
+    branch
+        .strip_prefix("task/")?
+        .split(['-', '/'])
+        .next()?
+        .parse::<i64>()
+        .ok()
+}
+
+/// Which item owns `branch`: the one whose tracked PR branch names it, else
+/// the one whose sequence id its `task/<seq>[-<slug>]` name carries (item
+/// #339). Shared by PR discovery (attaching a discovered PR to the branch's
+/// owning item instead of minting a duplicate) and the repair-dispatch
+/// collision path (routing a repair whose branch is already checked out to
+/// the owner instead of failing the duplicate against the cap).
+///
+/// A metadata match wins over a sequence-id match: a rename recomputes
+/// `task/<seq>-<slug>` but the recorded PR branch is what GitHub actually
+/// has. At most one item should match either way; ties (two items tracking
+/// the same PR branch — the duplicate case itself) resolve to the lowest
+/// sequence id, the original item the branch was created for.
+pub(crate) fn item_owning_branch<'a>(
+    items: &'a [agentflare_backend::item::Item],
+    branch: &str,
+) -> Option<&'a agentflare_backend::item::Item> {
+    if let Some(hit) = items
+        .iter()
+        .filter(|i| pr_branch_from_metadata(i).as_deref() == Some(branch))
+        .min_by_key(|i| i.sequence_id)
+    {
+        return Some(hit);
+    }
+    let seq = task_branch_seq(branch)?;
+    items
+        .iter()
+        .filter(|i| i.sequence_id == seq)
+        .min_by_key(|i| i.sequence_id)
+}
+
+/// Marker prefix for the note a collided dispatch leaves on the branch owner
+/// (item #339) — the repair belongs to the owner, so the note says where it
+/// came from rather than recording a failure.
+pub(crate) const COLLIDED_REPAIR_ROUTED_MARKER: &str =
+    "## supervisor — repair routed to branch owner";
+
+/// Route a dispatch that collided with another item's live checkout to the
+/// branch owner (item #339): posts a note on the owner's item carrying
+/// `context` (what the repair was for), so the owner's own sweep run picks
+/// the repair up there instead of the duplicate burning cap slots on a
+/// branch it can never check out. Deduped per duplicate item — a repeat
+/// collision for the same duplicate does not stack another note. Returns
+/// the owner's sequence id when one was found.
+///
+/// `duplicate` itself is excluded from ownership: the colliding item usually
+/// tracks the same PR branch, so an unfiltered [`item_owning_branch`] would
+/// hand the repair straight back to it.
+pub(crate) fn route_collided_repair_to_owner(
+    mcp: &crate::mcp_server::AgentflareMcp,
+    conn: &rusqlite::Connection,
+    duplicate: &agentflare_backend::item::Item,
+    branch: &str,
+    context: &str,
+) -> Option<i64> {
+    let project = mcp.resolve_project(conn).ok()?;
+    let items = agentflare_backend::item::list_by_project(conn, &project.id).ok()?;
+    let candidates: Vec<agentflare_backend::item::Item> =
+        items.into_iter().filter(|i| i.id != duplicate.id).collect();
+    let owner = item_owning_branch(&candidates, branch).or_else(|| {
+        let seq = flare_git_core::worktree::collision_owner_seq(context)?;
+        candidates.iter().find(|i| i.sequence_id == seq)
+    })?;
+    let dupe_ref = format!("#{}", duplicate.sequence_id);
+    let already_routed = agentflare_backend::comment::list_by_item(conn, &owner.id)
+        .unwrap_or_default()
+        .iter()
+        .any(|c| c.body.starts_with(COLLIDED_REPAIR_ROUTED_MARKER) && c.body.contains(&dupe_ref));
+    if !already_routed {
+        let body = format!(
+            "{COLLIDED_REPAIR_ROUTED_MARKER}\n\nItem {dupe_ref}'s dispatch collided: branch \
+             `{branch}` is already checked out in this item's worktree, so the repair belongs \
+             here. {dupe_ref} was left un-gated with no failure recorded.\n\nRepair context: \
+             {context}"
+        );
+        let _ =
+            agentflare_backend::comment::create(conn, &owner.id, &crate::claims::owner_id(), &body);
+    }
+    Some(owner.sequence_id)
+}
+
 /// Checks whether `item`'s branch already has a merged PR — the promotion
 /// signal `check_merge` uses to move an item out of "in_review" (item
 /// #420). Soft-fails like `push_and_open_pr`: no GitHub credentials, no

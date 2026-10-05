@@ -73,6 +73,39 @@ pub trait Progress {
 /// `create_worktree` below.
 static WORKTREE_ADD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// True when a `git worktree add` failure means the branch is already
+/// checked out in a *different* worktree — e.g. `fatal: 'task/330-…​' is
+/// already used by worktree at '.worktrees/task/330'` (item #339: a
+/// duplicate item's repair dispatch colliding with the branch owner's live
+/// checkout).
+///
+/// This is a routing problem (the repair belongs to the branch owner), not a
+/// repair failure — callers must not count it toward the dispatch-failure
+/// ceiling or gate on it. Matched case-insensitively against the subprocess
+/// error text, same convention as [`is_retryable_worktree_race`]. Keep in
+/// sync with `dispatch_failure_ceiling::is_worktree_branch_collision_reason`
+/// (agentflare-bin-lib), which applies the same classification to failure
+/// comments when counting cap streaks.
+#[must_use]
+pub fn is_worktree_branch_collision(err: &str) -> bool {
+    err.to_lowercase().contains("already used by worktree")
+}
+
+/// The owning worktree's sequence id from a [`is_worktree_branch_collision`]
+/// error, parsed off the `.worktrees/task/<seq>` path git names in it —
+/// e.g. `'.worktrees/task/330'` → `330`. `None` when the message names no
+/// such path (a foreign checkout layout, or a differently-shaped error).
+#[must_use]
+pub fn collision_owner_seq(err: &str) -> Option<i64> {
+    let idx = err.find(".worktrees/task/")?;
+    err[idx + ".worktrees/task/".len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse::<i64>()
+        .ok()
+}
+
 /// True when a `git worktree add` failure looks transient — a registration/
 /// lock race with teardown/cleanup still in flight — rather than structural.
 ///
@@ -1353,6 +1386,10 @@ pub fn squash_since(worktree_path: &Path, base_sha: &str) -> Result<(), String> 
 #[cfg(test)]
 #[path = "worktree_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "worktree_collision_tests.rs"]
+mod collision_tests;
 
 #[cfg(test)]
 #[path = "worktree_heal_tests.rs"]

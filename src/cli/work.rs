@@ -549,6 +549,81 @@ fn release_and_comment_inner(
     }
 }
 
+/// Item #339: the claim succeeded but the item's branch is already checked
+/// out in another item's worktree — `fatal: 'task/330-…' is already used by
+/// worktree at '…'` — which is what a duplicate item's repair dispatch dies
+/// with. A routing problem, not a repair failure: release without posting
+/// `WORK_FAILURE_MARKER` (so neither dispatch-failure cap counts it — see
+/// `dispatch_failure_ceiling::is_worktree_branch_collision_reason`), route
+/// the repair to the branch owner, and fail terminal so the job doesn't
+/// retry what can never succeed for this item. Never gates: no
+/// `needs-manual-dispatch`, and the terminal-job hook's own collision check
+/// keeps it that way even if a legacy failure comment is what arrives there.
+fn handle_worktree_branch_collision(
+    mcp: &AgentflareMcp,
+    item_id: &str,
+    detail: &str,
+    notify_recipient: Option<&str>,
+    claim_guard: &mut ClaimGuard,
+    log: &mut dyn std::io::Write,
+) -> WorkOutcome {
+    // The branch this item would have checked out: its tracked PR branch when
+    // one is recorded, else its deterministic `task/<seq>[-slug]` name — the
+    // same precedence `create_worktree` itself uses (`resolve_worktree_branch`).
+    let routed_owner = mcp
+        .with_backend_db(|conn| {
+            let resolved = mcp.resolve_item_id(conn, item_id).ok()?;
+            let item = agentflare_backend::item::get(conn, &resolved).ok()?;
+            let branch = crate::worktree::pr_branch_from_metadata(&item)
+                .unwrap_or_else(|| flare_git_core::worktree::task_branch_name(&item));
+            Some(crate::worktree::route_collided_repair_to_owner(
+                mcp, conn, &item, &branch, detail,
+            ))
+        })
+        .ok()
+        .flatten()
+        .flatten();
+    let outcome = match routed_owner {
+        Some(owner_seq) => format!("routed to item #{owner_seq}, whose worktree owns the branch"),
+        None => "no owning item found; left un-gated".to_string(),
+    };
+    let _ = writeln!(log, "worktree branch collision: {detail} — {outcome}");
+    let body = format!(
+        "{}\n\nclaim succeeded but no worktree was created: {detail}\n\n\
+         The branch is already checked out in another item's worktree, so this \
+         repair belongs there, not here — {outcome}. No failure recorded, \
+         nothing gated.",
+        crate::dispatch_failure_ceiling::WORKTREE_COLLISION_MARKER,
+    );
+    mcp.post_item_comment(item_id, &body);
+    // Same release-then-disarm contract as `handle_duplicate_pr`: only disarm
+    // once `item_release` confirms success, so a failed release keeps
+    // `ClaimGuard`'s `Drop` backstop armed. (`item_claim_outcome` already
+    // rolled the claim back for a non-held claim, so this is usually a no-op.)
+    match mcp.item_release(ItemRequest {
+        action: "release".into(),
+        id: Some(item_id.into()),
+        ..Default::default()
+    }) {
+        Ok(_) => claim_guard.disarm(),
+        Err(e) => {
+            let _ = writeln!(
+                log,
+                "worktree collision: item_release failed for {item_id}: {e} -- \
+                 leaving claim armed so ClaimGuard's Drop retries it"
+            );
+        }
+    }
+    if let Some(recipient) = notify_recipient {
+        notify(recipient, &body, item_id);
+    }
+    WorkOutcome {
+        exit_code: 1,
+        retry_after_secs: None,
+        fatal: true,
+    }
+}
+
 pub(crate) fn notify(recipient: &str, body: &str, item_id: &str) {
     let outcome = crate::cli::handoff::HandoffArgs {
         recipient: Some(recipient.to_string()),
@@ -792,6 +867,21 @@ fn execute_work_impl(
         .as_str()
         .map(std::path::PathBuf::from);
     let Some(ref wpath) = worktree_path else {
+        // Item #339 first: a branch collision is a routing problem, not a
+        // repair failure — it must not post `WORK_FAILURE_MARKER` (which
+        // both dispatch-failure caps would count) or gate the item.
+        if let Some(detail) = claim["worktree_error"].as_str()
+            && flare_git_core::worktree::is_worktree_branch_collision(detail)
+        {
+            return handle_worktree_branch_collision(
+                &mcp,
+                item_id,
+                detail,
+                args.notify.as_deref(),
+                &mut claim_guard,
+                log,
+            );
+        }
         let msg = match claim["worktree_error"].as_str() {
             Some(detail) => format!("claim succeeded but no worktree was created: {detail}"),
             None => "claim succeeded but no worktree was created (bad git state?)".to_string(),

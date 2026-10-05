@@ -1147,6 +1147,194 @@
         });
     }
 
+    /// Item #339: a duplicate's repair dispatch dies colliding with the
+    /// branch owner's live checkout (`fatal: 'task/330-…' is already used by
+    /// worktree at '…'`). That is a routing problem, not a repair failure:
+    /// the terminal hook must neither gate the duplicate on
+    /// `needs-manual-dispatch` (which then freezes the PR's merge too) nor
+    /// count the cycle toward either cap — and the repair must be routed to
+    /// the branch owner. Five genuine failures plus one collision must still
+    /// read as five, not six (the any-reason cap), so the cap stays untripped.
+    #[test]
+    fn handle_terminal_job_failure_routes_a_branch_collision_to_the_owner_without_gating() {
+        crate::paths::test_support::with_temp_home(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo_root).unwrap();
+            init_test_repo(&repo_root);
+
+            let mcp = crate::mcp_server::AgentflareMcp::for_project_dir(repo_root.clone());
+            let label_ids = seed_labels(
+                &mcp,
+                &[
+                    crate::supervisor::READY_LABEL,
+                    crate::supervisor::DISPATCHED_LABEL,
+                    crate::supervisor::NEEDS_MANUAL_LABEL,
+                ],
+            );
+            let dispatched_id = &label_ids[crate::supervisor::DISPATCHED_LABEL];
+
+            // Owner first (lowest sequence id), then the duplicate tracking
+            // the same PR branch — the shape multi-workstation PR discovery
+            // produced live on PR #849 (items #330/#334).
+            let (owner_id, owner_seq, dupe_id, dupe_seq, branch) = mcp
+                .with_backend_db(|conn| {
+                    let project = mcp.resolve_project(conn).unwrap();
+                    let state = agentflare_backend::state::list_by_project(conn, &project.id)
+                        .unwrap()
+                        .into_iter()
+                        .find(|s| s.is_default)
+                        .unwrap();
+                    let mk = |name: &str, metadata: Option<String>| {
+                        agentflare_backend::item::create(
+                            conn,
+                            agentflare_backend::item::CreateItem {
+                                project_id: project.id.clone(),
+                                state_id: state.id.clone(),
+                                name: name.into(),
+                                description: Some("do the thing".into()),
+                                priority: None,
+                                parent_id: None,
+                                assignee_agent: None,
+                                sort_order: None,
+                                external_source: None,
+                                external_id: None,
+                                metadata,
+                                label_ids: vec![],
+                                assignee_ids: vec![],
+                                dependency_ids: vec![],
+                                start_date: None,
+                                due_date: None,
+                            },
+                        )
+                        .unwrap()
+                    };
+                    let owner = mk("owner item", None);
+                    let owner_seq =
+                        agentflare_backend::item::get(conn, &owner.id).unwrap().sequence_id;
+                    let branch = format!("task/{owner_seq}-fix-thing");
+                    let metadata = Some(format!(
+                        r#"{{"pr":{{"number":849,"branch":"{branch}"}}}}"#
+                    ));
+                    // Same tracked branch on both: the duplicate case.
+                    agentflare_backend::item::update(
+                        conn,
+                        &owner.id,
+                        agentflare_backend::item::UpdateItem {
+                            metadata: metadata.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                    let dupe = mk("duplicate item", metadata);
+                    let dupe_seq =
+                        agentflare_backend::item::get(conn, &dupe.id).unwrap().sequence_id;
+                    agentflare_backend::item::add_label(conn, &dupe.id, dispatched_id).unwrap();
+                    Some((owner.id, owner_seq, dupe.id, dupe_seq, branch))
+                })
+                .unwrap()
+                .unwrap();
+            assert!(owner_seq < dupe_seq);
+
+            // Five genuine failures with distinct reasons (one short of the
+            // any-reason cap, and never tripping the identical-reason one),
+            // then the collision cycle on top.
+            for i in 0..5 {
+                seed_dispatch_cycle_failures(
+                    &mcp,
+                    &dupe_id,
+                    1,
+                    &format!("genuine failure number {i}"),
+                );
+            }
+            seed_dispatch_cycle_failures(
+                &mcp,
+                &dupe_id,
+                1,
+                &format!(
+                    "claim succeeded but no worktree was created: worktree: creation skipped \
+                     for item {dupe_id} after 3 attempt(s): Preparing worktree (checking out \
+                     '{branch}'); fatal: '{branch}' is already used by worktree at \
+                     '/repo/.worktrees/task/{owner_seq}'"
+                ),
+            );
+
+            let comments = mcp
+                .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &dupe_id))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                crate::dispatch_failure_ceiling::consecutive_failure_count_any_reason(&comments),
+                5,
+                "the collision cycle must not advance the any-reason count"
+            );
+            assert!(
+                crate::dispatch_failure_ceiling::consecutive_identical_failure_count(&comments)
+                    < crate::dispatch_failure_ceiling::DISPATCH_FAILURE_CAP
+            );
+
+            let job = agentflare_jobs::AgentJob::new("agentflare-work")
+                .args([
+                    dupe_id.clone(),
+                    "claude-code".to_string(),
+                    repo_root.to_string_lossy().to_string(),
+                ])
+                .in_process();
+
+            handle_terminal_job_failure(&job);
+
+            let labels = mcp
+                .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &dupe_id))
+                .unwrap()
+                .unwrap();
+            assert!(
+                !labels.contains(&label_ids[crate::supervisor::NEEDS_MANUAL_LABEL]),
+                "a branch collision must never gate the duplicate: {labels:?}"
+            );
+            assert!(
+                !labels.contains(dispatched_id),
+                "the stale dispatched label must still be removed"
+            );
+            let comments = mcp
+                .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &dupe_id))
+                .unwrap()
+                .unwrap();
+            assert!(
+                !comments.iter().any(|c| c.body.starts_with(
+                    crate::dispatch_failure_ceiling::DISPATCH_FAILURE_CAP_MARKER
+                )),
+                "no cap trip may be reported for a collision"
+            );
+            let owner_comments = mcp
+                .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &owner_id))
+                .unwrap()
+                .unwrap();
+            assert!(
+                owner_comments.iter().any(|c| c
+                    .body
+                    .starts_with(crate::worktree::COLLIDED_REPAIR_ROUTED_MARKER)
+                    && c.body.contains(&format!("#{dupe_seq}"))),
+                "the repair must be routed to the branch owner: {owner_comments:?}"
+            );
+
+            // Repeat collision for the same duplicate: the owner's note is
+            // deduped, not stacked.
+            handle_terminal_job_failure(&job);
+            let owner_comments = mcp
+                .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &owner_id))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                owner_comments
+                    .iter()
+                    .filter(|c| c.body.starts_with(crate::worktree::COLLIDED_REPAIR_ROUTED_MARKER))
+                    .count(),
+                1,
+                "repeat collisions must not stack route notes: {owner_comments:?}"
+            );
+        });
+    }
+
     /// Same clean-failure path as above, but the project never created a
     /// `needs-manual-dispatch` label (that label is only ever added by hand
     /// -- unlike `ready-for-work`/`dispatched`, nothing seeds it). Below the

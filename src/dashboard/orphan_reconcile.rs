@@ -530,6 +530,11 @@ fn restore_after_terminal_failure(
         if state.group_name != "in_review"
             && crate::worktree::pr_number_from_metadata(&item).is_some()
             && !item_has_label(crate::supervisor::NEEDS_DECISION_LABEL)
+            && !crate::dispatch_failure_ceiling::is_worktree_branch_collision_reason(
+                crate::dispatch_failure_ceiling::latest_failure_reason(&comments)
+                    .as_deref()
+                    .unwrap_or(""),
+            )
         {
             let states = agentflare_backend::state::list_by_project(conn, &project.id)
                 .map_err(|e| e.to_string())?;
@@ -537,6 +542,55 @@ fn restore_after_terminal_failure(
                 agentflare_backend::item::update_state(conn, item_id, &in_review.id)
                     .map_err(|e| e.to_string())?;
             }
+        }
+        // Item #339: the job died colliding with another item's live checkout
+        // (`fatal: 'task/330-…' is already used by worktree at '…​'`) — a
+        // duplicate tracking the same PR, not a broken item. Never counts
+        // toward either cap (the counters already skip these segments — see
+        // `segment_ended_in_collision`), never lands on
+        // `needs-manual-dispatch`, and the repair is routed to the branch
+        // owner instead. The duplicate is deliberately NOT restored to
+        // `in_review` above either: it can never check the branch out, so
+        // handing it back to the sweep would just collide again every tick.
+        // It stays parked (un-gated) with the collision recorded in its
+        // comments until a human cleans it up; the owner carries the repair.
+        if let Some(reason) = crate::dispatch_failure_ceiling::latest_failure_reason(&comments)
+            && crate::dispatch_failure_ceiling::is_worktree_branch_collision_reason(&reason)
+        {
+            if let Some(dispatched_id) = find(crate::supervisor::DISPATCHED_LABEL) {
+                agentflare_backend::item::remove_label(conn, item_id, dispatched_id)
+                    .map_err(|e| e.to_string())?;
+            }
+            agentflare_backend::item::update(
+                conn,
+                item_id,
+                agentflare_backend::item::UpdateItem {
+                    assignee_agent: Some(
+                        item.assignee_agent
+                            .clone()
+                            .unwrap_or_else(|| agent.to_string()),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            let branch = crate::worktree::pr_branch_from_metadata(&item)
+                .unwrap_or_else(|| flare_git_core::worktree::task_branch_name(&item));
+            match crate::worktree::route_collided_repair_to_owner(
+                mcp, conn, &item, &branch, &reason,
+            ) {
+                Some(owner_seq) => eprintln!(
+                    "agentflare-supervisor: item #{0} collided with item #{1}'s checkout of \
+                     {branch}; repair routed to #{1}, #{0} left un-gated",
+                    item.sequence_id, owner_seq
+                ),
+                None => eprintln!(
+                    "agentflare-supervisor: item #{} hit a worktree-branch collision on \
+                     {branch} with no owning item found; left un-gated: {reason}",
+                    item.sequence_id
+                ),
+            }
+            return Ok(Some(false));
         }
         let identical_count =
             crate::dispatch_failure_ceiling::consecutive_identical_failure_count(&comments);

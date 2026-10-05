@@ -41,6 +41,24 @@ pub const DISPATCH_MARKER: &str = "## supervisor — dispatched";
 /// Prefix on the supervisor comment posted when the ceiling trips.
 pub const DISPATCH_FAILURE_CAP_MARKER: &str = "## supervisor — identical failure cap reached";
 
+/// Prefix on the comment `cli::work` (root crate) posts when a dispatch fails
+/// because its branch is already checked out in another item's worktree
+/// (item #339) — keep in sync with that formatter by hand. Neutral for both
+/// caps: the item isn't broken, the repair just belongs to the branch owner.
+pub const WORKTREE_COLLISION_MARKER: &str = "## agentflare work — worktree collision";
+
+/// Whether a dispatch-cycle failure reason is a worktree-branch collision
+/// (`fatal: 'task/330-…' is already used by worktree at '…​'`, item #339) —
+/// a routing problem, not evidence the item itself is broken. Matches the
+/// same signature as `flare_git_core::worktree::is_worktree_branch_collision`
+/// (this crate can't depend on it — keep the two in sync by hand); covers
+/// both the dedicated collision marker above and a legacy
+/// `WORK_FAILURE_MARKER` comment carrying the git error text.
+pub fn is_worktree_branch_collision_reason(reason: &str) -> bool {
+    reason.starts_with(WORKTREE_COLLISION_MARKER)
+        || reason.to_lowercase().contains("already used by worktree")
+}
+
 /// Prefix on the comment `cli::work` (root crate) posts when it moved an
 /// item to another agent because the one running it ran out of
 /// credit/quota or hit a long rate limit. Neutral for both caps: the agent
@@ -66,6 +84,24 @@ fn is_neutral_outcome(body: &str) -> bool {
     ]
     .iter()
     .any(|m| body.starts_with(m))
+}
+
+/// A segment whose latest outcome is a worktree-branch collision (item
+/// #339): skipped by both counts, exactly like [`is_neutral_outcome`] — the
+/// item isn't broken, the repair belongs to the branch owner, so the cycle
+/// neither adds to a streak nor breaks one.
+fn segment_ended_in_collision(segment: &[agentflare_backend::comment::ItemComment]) -> bool {
+    let latest_outcome = segment.iter().rev().find(|c| {
+        failure_reason(&c.body).is_some()
+            || is_neutral_outcome(&c.body)
+            || c.body.starts_with(WORKTREE_COLLISION_MARKER)
+            || c.body.starts_with(WORK_SUCCESS_MARKER)
+    });
+    match latest_outcome {
+        Some(c) if c.body.starts_with(WORKTREE_COLLISION_MARKER) => true,
+        Some(c) => failure_reason(&c.body).is_some_and(is_worktree_branch_collision_reason),
+        None => false,
+    }
 }
 
 /// A segment's latest outcome comment is a neutral one (a later real failure
@@ -172,6 +208,9 @@ fn dispatch_cycle_failure_reasons(
         if segment_ended_neutral(segment) {
             continue;
         }
+        if segment_ended_in_collision(segment) {
+            continue;
+        }
         let Some(reason) = segment
             .iter()
             .rev()
@@ -232,7 +271,7 @@ fn dispatch_cycle_coarse_outcomes(
                 .any(|c| c.body.starts_with(WORK_SUCCESS_MARKER))
             {
                 Some(CoarseOutcome::Success)
-            } else if segment_ended_neutral(segment) {
+            } else if segment_ended_neutral(segment) || segment_ended_in_collision(segment) {
                 None
             } else {
                 let cap_already_reported = segment
@@ -560,6 +599,43 @@ mod tests {
             comment(&format!("{WORK_FAILURE_MARKER}\n\nboom")),
         ];
         assert!(!stopped_on_request(&redispatched));
+    }
+
+    #[test]
+    fn worktree_collision_cycles_do_not_count_toward_either_cap() {
+        // Item #339: a duplicate's repair dispatch colliding with the branch
+        // owner's checkout is a routing problem, not item breakage.
+        let collision = "fatal: 'task/330-fix' is already used by worktree at \
+                         '/repo/.worktrees/task/330'";
+        let comments = vec![
+            comment(&format!("{DISPATCH_MARKER}\n\njob: a")),
+            comment(&format!("{WORK_FAILURE_MARKER}\n\n{collision}")),
+            comment(&format!("{DISPATCH_MARKER}\n\njob: b")),
+            comment(&format!(
+                "{WORKTREE_COLLISION_MARKER}\n\nduplicate of #330: {collision}"
+            )),
+        ];
+        assert_eq!(consecutive_identical_failure_count(&comments), 0);
+        assert_eq!(consecutive_failure_count_any_reason(&comments), 0);
+    }
+
+    #[test]
+    fn worktree_collision_cycles_neither_count_nor_break_a_genuine_streak() {
+        let err = "judge reply was not valid JSON";
+        let collision = "fatal: 'task/330-fix' is already used by worktree at \
+                         '/repo/.worktrees/task/330'";
+        let comments = vec![
+            comment(&format!("{DISPATCH_MARKER}\n\njob: a")),
+            comment(&format!("{WORK_FAILURE_MARKER}\n\n{err}")),
+            comment(&format!("{DISPATCH_MARKER}\n\njob: b")),
+            comment(&format!("{WORK_FAILURE_MARKER}\n\n{collision}")),
+            comment(&format!("{DISPATCH_MARKER}\n\njob: c")),
+            comment(&format!("{WORK_FAILURE_MARKER}\n\n{err}")),
+        ];
+        // Same bridging `is_neutral_outcome` cycles get: the collision in the
+        // middle is skipped, so the two genuine failures still chain.
+        assert_eq!(consecutive_identical_failure_count(&comments), 2);
+        assert_eq!(consecutive_failure_count_any_reason(&comments), 2);
     }
 
     #[test]

@@ -212,6 +212,53 @@
         assert_eq!(pr_number_from_metadata(&item), None);
     }
 
+    // Item #339: a duplicate tracking the same PR collides with the branch
+    // owner's checkout — ownership resolves by tracked PR branch first, then
+    // by the `task/<seq>` name, so the repair can be routed to the owner.
+    #[test]
+    fn item_owning_branch_prefers_the_tracked_pr_branch_over_the_seq_name() {
+        let owner = item_with_metadata(330, r#"{"pr":{"number":849,"branch":"task/330-fix"}}"#);
+        let dupe = item_with_metadata(334, r#"{"pr":{"number":849,"branch":"task/330-fix"}}"#);
+        let items = vec![dupe, owner];
+        // Both track the same branch (the duplicate case): lowest seq wins.
+        assert_eq!(
+            item_owning_branch(&items, "task/330-fix").map(|i| i.sequence_id),
+            Some(330)
+        );
+    }
+
+    #[test]
+    fn item_owning_branch_falls_back_to_the_task_seq_name() {
+        let owner = item_with_metadata(330, "{}");
+        let other = item_with_metadata(334, "{}");
+        let items = vec![other, owner];
+        assert_eq!(
+            item_owning_branch(&items, "task/330-fix-thing").map(|i| i.sequence_id),
+            Some(330)
+        );
+        assert_eq!(
+            item_owning_branch(&items, "task/330").map(|i| i.sequence_id),
+            Some(330)
+        );
+    }
+
+    #[test]
+    fn item_owning_branch_is_none_for_unknown_or_non_task_branches() {
+        let owner = item_with_metadata(330, "{}");
+        let items = vec![owner];
+        assert!(item_owning_branch(&items, "task/999-fix").is_none());
+        assert!(item_owning_branch(&items, "fix/hand-opened").is_none());
+        assert!(item_owning_branch(&[], "task/330-fix").is_none());
+    }
+
+    #[test]
+    fn task_branch_seq_parses_seq_with_and_without_slug() {
+        assert_eq!(task_branch_seq("task/330-fix-thing"), Some(330));
+        assert_eq!(task_branch_seq("task/330"), Some(330));
+        assert_eq!(task_branch_seq("fix/thing"), None);
+        assert_eq!(task_branch_seq("task/"), None);
+    }
+
     // Item #191: `check_merge` reported "PR not merged yet" for a PR that
     // was demonstrably merged, because `resolve_item_task_branch`
     // reconstructed a branch name that no longer matched what the PR was

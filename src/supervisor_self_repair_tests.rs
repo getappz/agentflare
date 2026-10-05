@@ -723,3 +723,88 @@ fn coderabbit_cap_announced_requires_exact_fingerprint_not_substring() {
         );
     });
 }
+
+/// Item #339: a green, approved PR whose item carries a gate label
+/// (`needs-manual-dispatch` — where a capped duplicate lands) must still not
+/// merge — but the sweep must say so once, naming the label, instead of just
+/// counting the skip silently every tick.
+#[test]
+fn green_approved_pr_behind_a_gate_label_notifies_once_and_never_merges() {
+    crate::paths::test_support::with_temp_home(|| {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        let auth_conn = test_auth_conn();
+        let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
+        // Gate the item the way a dispatch-cap trip does.
+        let label_id_by_name = mcp
+            .with_backend_db(|conn| {
+                let project = mcp.resolve_project(conn).unwrap();
+                let label = agentflare_backend::label::create(
+                    conn,
+                    agentflare_backend::label::CreateLabel {
+                        project_id: Some(project.id.clone()),
+                        workspace_id: project.workspace_id.clone(),
+                        name: NEEDS_MANUAL_LABEL.into(),
+                        color: None,
+                        parent_id: None,
+                        sort_order: None,
+                        external_source: None,
+                        external_id: None,
+                    },
+                )
+                .unwrap();
+                agentflare_backend::item::add_label(conn, &item_id, &label.id).unwrap();
+                agentflare_backend::label::list_by_project(conn, &project.id)
+                    .unwrap()
+                    .into_iter()
+                    .map(|l| (l.name, l.id))
+                    .collect::<std::collections::HashMap<String, String>>()
+            })
+            .unwrap();
+        let repo_root = Path::new("/repo");
+        let auto_merge = AutoMergeRef::default();
+        // Approved (label on the PR) and mergeable: without the item gate
+        // this tick would merge.
+        let pr_labels = vec![PR_APPROVAL_LABEL.to_string()];
+        let mut sweep = ReviewSweepResult {
+            promoted: 0,
+            self_repaired: 0,
+            review_repaired: 0,
+            skipped: 0,
+            waiting: 0,
+            updated: 0,
+            discovered: 0,
+            requeued: 0,
+        };
+        for _ in 0..2 {
+            let item = current_item(&mcp, &item_id);
+            handle_ci_green(
+                &mcp,
+                &queue,
+                &auth_conn,
+                agentflare_resource_gate::Policy::Normal,
+                &item,
+                849,
+                &pr_labels,
+                CiGreenMerge::Allowed {
+                    head_sha: None,
+                    auto_merge: &auto_merge,
+                },
+                &label_id_by_name,
+                "/repo",
+                repo_root,
+                &mut sweep,
+            );
+        }
+        assert_eq!(sweep.promoted, 0, "a gated PR must never merge");
+        assert_eq!(sweep.waiting, 0);
+        assert_eq!(sweep.skipped, 2, "each gated tick still counts its skip");
+        // The one-time notice fired on the first tick: its `first_time_gated`
+        // key is consumed, so a later tick stays quiet.
+        let item = current_item(&mcp, &item_id);
+        assert!(
+            !first_time_gated(&format!("gated-green:{}", item.id)),
+            "the gated-green notice must fire exactly once per item"
+        );
+    });
+}
