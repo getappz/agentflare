@@ -48,13 +48,18 @@ impl Tier {
             Self::Hard => "hard",
         }
     }
+}
 
-    fn model(self) -> &'static str {
-        match self {
-            Self::Easy => "haiku",
-            Self::Medium => "sonnet",
-            Self::Hard => "opus",
+/// The model a nudge would send the user to, if any. This one value drives both
+/// the nudge text and the shadow-log label, so the log compares what each
+/// router would actually do (haiku / opus / none) and never a raw tier.
+fn target(tier: Tier, current_model: Option<&str>) -> Option<&'static str> {
+    match tier {
+        Tier::Easy => Some("haiku"),
+        Tier::Hard if current_model.is_some_and(|m| !m.to_lowercase().contains("opus")) => {
+            Some("opus")
         }
+        Tier::Medium | Tier::Hard => None,
     }
 }
 
@@ -90,20 +95,17 @@ fn tier_of(resp: &Response) -> Option<(Tier, Option<f64>)> {
 }
 
 fn nudge(tier: Tier, confidence: f64, current_model: Option<&str>) -> Option<String> {
+    let model = target(tier, current_model)?;
     let rated = format!(
         "Jev rates this prompt {} (confidence {confidence:.2})",
         tier.label()
     );
-    match tier {
-        Tier::Easy => Some(format!(
-            "{rated} — consider routing it to {} (a cheap-model subagent) instead of running it inline.",
-            tier.model()
-        )),
-        Tier::Hard if current_model.is_some_and(|m| !m.to_lowercase().contains("opus")) => {
-            Some(format!("{rated} — consider {}.", tier.model()))
-        }
-        Tier::Medium | Tier::Hard => None,
-    }
+    Some(match tier {
+        Tier::Easy => format!(
+            "{rated} — consider routing it to {model} (a cheap-model subagent) instead of running it inline."
+        ),
+        Tier::Medium | Tier::Hard => format!("{rated} — consider {model}."),
+    })
 }
 
 pub struct JevRouter;
@@ -158,7 +160,7 @@ fn route_with(
         SITE,
         &prompt,
         baseline_label,
-        tier.model(),
+        target(tier, ctx.current_model.as_deref()).unwrap_or("none"),
         confidence,
         outcome.elapsed_ms,
         outcome.response.usage.cost,
@@ -260,6 +262,7 @@ mod tests {
         });
         assert_eq!(nudge, None);
         assert_eq!(rows[0].baseline, "haiku"); // keyword router said haiku
+        assert_eq!(rows[0].jev.as_deref(), Some("none")); // medium: no nudge, so "none"
     }
 
     #[test]
@@ -305,6 +308,29 @@ mod tests {
         });
         assert_eq!(nudge, None);
         assert_eq!(rows[0].error.as_deref(), Some("unexpected answer shape"));
+    }
+
+    #[test]
+    fn shadow_label_is_the_effective_target_not_the_raw_tier() {
+        let label = |tier: &str, model: Option<&str>| {
+            run(&ctx("redesign the scheduler", model), |_| {
+                answer(tier, Some(0.9))
+            })
+            .1[0]
+                .jev
+                .clone()
+        };
+        assert_eq!(label("easy", None).as_deref(), Some("haiku"));
+        assert_eq!(label("medium", None).as_deref(), Some("none"));
+        assert_eq!(label("hard", None).as_deref(), Some("none")); // model unknown: no nudge
+        assert_eq!(
+            label("hard", Some("claude-sonnet-5")).as_deref(),
+            Some("opus")
+        );
+        assert_eq!(
+            label("hard", Some("claude-opus-5")).as_deref(),
+            Some("none")
+        );
     }
 
     #[test]

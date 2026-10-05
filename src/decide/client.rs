@@ -81,7 +81,8 @@ fn real_source_lookup() -> impl Fn(&str) -> Option<(String, Source)> {
     layered_source(
         |k| std::env::var(k).ok(),
         |k| {
-            crate::vault::get_secret(k)
+            // Session-only: the passphrase KDF must never run inside a hook.
+            crate::vault::get_secret_session_only(k)
                 .ok()
                 .flatten()
                 .map(|v| v.to_string())

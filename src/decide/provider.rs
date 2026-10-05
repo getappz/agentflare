@@ -25,6 +25,8 @@ pub enum DecideError {
     Status(u16, String),
     #[error("decision response unusable: {0}")]
     Malformed(String),
+    #[error("AGENTFLARE_JEV_BASE_URL must be https, or http to a loopback IP address")]
+    InvalidBaseUrl,
 }
 
 pub enum Provider {
@@ -61,6 +63,12 @@ impl Config {
             return Err(DecideError::Disabled);
         }
         let val = |k: &str| get(k).filter(|v| !v.trim().is_empty());
+        // The bearer credential goes to this URL, so reject anything that could
+        // send it over plaintext HTTP to another host; never fall back silently.
+        let url_override = val("AGENTFLARE_JEV_BASE_URL");
+        if let Some(url) = &url_override {
+            check_base_url(url)?;
+        }
         // Lazy: a credential lookup may hit the vault, so only look up the
         // providers actually needed.
         let openrouter = || val("OPENROUTER_API_KEY").map(|key| Provider::OpenRouter { key });
@@ -82,7 +90,7 @@ impl Config {
         .ok_or(DecideError::NoCredentials)?;
         Ok(Self {
             provider,
-            url_override: val("AGENTFLARE_JEV_BASE_URL"),
+            url_override,
             model_override: val("AGENTFLARE_JEV_MODEL"),
             timeout: Duration::from_millis(
                 val("AGENTFLARE_JEV_TIMEOUT_MS")
@@ -132,6 +140,33 @@ impl Config {
                 }
             }
         }
+    }
+}
+
+/// Allow `https` to any host, and `http` only to an exact loopback IP. The
+/// authority is split by hand (no `starts_with`) so `http://127.0.0.1.evil` and
+/// `http://127.0.0.1@evil` are rejected: userinfo is refused outright, and the
+/// host must parse as an IP address.
+fn check_base_url(url: &str) -> Result<(), DecideError> {
+    let (scheme, rest) = url.split_once("://").ok_or(DecideError::InvalidBaseUrl)?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return Err(DecideError::InvalidBaseUrl);
+    }
+    match scheme.to_ascii_lowercase().as_str() {
+        "https" => Ok(()),
+        "http" => {
+            let host = match authority.strip_prefix('[') {
+                Some(v6) => v6.split(']').next().unwrap_or(""),
+                None => authority.rsplit_once(':').map_or(authority, |(h, _)| h),
+            };
+            host.parse::<std::net::IpAddr>()
+                .ok()
+                .filter(std::net::IpAddr::is_loopback)
+                .map(|_| ())
+                .ok_or(DecideError::InvalidBaseUrl)
+        }
+        _ => Err(DecideError::InvalidBaseUrl),
     }
 }
 
@@ -277,6 +312,47 @@ mod tests {
         let req = cfg.request(&json!(1), &qs());
         assert_eq!(req.url, "http://127.0.0.1:9/x");
         assert_eq!(req.body["model"], "typesafe/jev-latest");
+    }
+
+    #[test]
+    fn base_url_must_be_https_or_http_to_a_loopback_ip() {
+        for ok in [
+            "https://proxy.example.com/v1",
+            "HTTPS://example.com",
+            "http://127.0.0.1:8080/x",
+            "http://127.0.0.1/x",
+            "http://[::1]:9/x",
+        ] {
+            assert!(check_base_url(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://example.com/x",
+            "http://127.0.0.1.evil.com/x",
+            "http://127.0.0.1@evil.com/x",
+            "http://evil.com@127.0.0.1/x",
+            "http://localhost:1/x",
+            "http://10.0.0.5/x",
+            "http://0.0.0.0/x",
+            "ftp://127.0.0.1/x",
+            "127.0.0.1:8080",
+            "http://",
+            "https://",
+        ] {
+            assert!(check_base_url(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_bad_base_url_is_a_config_error_not_a_silent_fallback() {
+        let get = lookup(&[
+            ("AGENTFLARE_JEV", "1"),
+            ("OPENROUTER_API_KEY", "k"),
+            ("AGENTFLARE_JEV_BASE_URL", "http://evil.example/x"),
+        ]);
+        assert!(matches!(
+            Config::from_lookup(&get).err(),
+            Some(DecideError::InvalidBaseUrl)
+        ));
     }
 
     const OPENROUTER_BODY: &str = r#"{"id":"gen-dec-1","model":"typesafe/jev-1.13-20260917","provider":"TypeSafe",

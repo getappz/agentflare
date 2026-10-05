@@ -50,11 +50,20 @@ pub fn fetch_limit(inject: usize) -> usize {
     }
 }
 
-/// The skills to inject: at most `keep` of `ranked` (best first).
-pub fn pick(prompt: &str, ranked: Vec<RankedSkill>, keep: usize) -> Vec<RankedSkill> {
-    pick_with(
+/// The skills to inject: at most `keep`. `ranked` is the expanded candidate
+/// set; `baseline` is what the default path would inject on its own (fetched
+/// separately by the caller, because re-ranking a wider pool can reorder the
+/// top picks), so `shadow` mode injects exactly the default.
+pub fn pick(
+    prompt: &str,
+    ranked: Vec<RankedSkill>,
+    baseline: Vec<RankedSkill>,
+    keep: usize,
+) -> Vec<RankedSkill> {
+    pick_with_baseline(
         prompt,
         ranked,
+        baseline,
         keep,
         mode(),
         &|state, qs| decide::ask_within(&serde_json::Value::from(state), qs, BUDGET),
@@ -88,6 +97,8 @@ fn names(skills: &[RankedSkill]) -> String {
         .join(",")
 }
 
+/// Test convenience: the baseline is simply the first `keep` candidates.
+#[cfg(test)]
 fn pick_with(
     prompt: &str,
     ranked: Vec<RankedSkill>,
@@ -96,7 +107,19 @@ fn pick_with(
     ask: &AskFn<'_>,
     record: &dyn Fn(&shadow::Row),
 ) -> Vec<RankedSkill> {
-    let baseline: Vec<RankedSkill> = ranked.iter().take(keep).cloned().collect();
+    let baseline = ranked.iter().take(keep).cloned().collect();
+    pick_with_baseline(prompt, ranked, baseline, keep, mode, ask, record)
+}
+
+fn pick_with_baseline(
+    prompt: &str,
+    ranked: Vec<RankedSkill>,
+    baseline: Vec<RankedSkill>,
+    keep: usize,
+    mode: Mode,
+    ask: &AskFn<'_>,
+    record: &dyn Fn(&shadow::Row),
+) -> Vec<RankedSkill> {
     let prompt = prompt.trim();
     if mode == Mode::Off || ranked.is_empty() || prompt.is_empty() || prompt.starts_with('/') {
         return baseline;
@@ -234,6 +257,23 @@ mod tests {
         assert_eq!(rows[0].site, "skill_rerank");
         assert_eq!(rows[0].baseline, "skill0,skill1,skill2");
         assert_eq!(rows[0].jev.as_deref(), Some("skill1,skill2,skill3"));
+    }
+
+    #[test]
+    fn shadow_injects_the_supplied_baseline_not_the_expanded_candidates_first_three() {
+        let baseline = vec![skill("orig0"), skill("orig1"), skill("orig2")];
+        let rows = RefCell::new(vec![]);
+        let picked = pick_with_baseline(
+            "fix the login bug",
+            ranked(5),
+            baseline,
+            3,
+            Mode::Shadow,
+            &|_, _| reply(&[0.1, 0.9, 0.95, 0.8, 0.2]),
+            &|r| rows.borrow_mut().push(r.clone()),
+        );
+        assert_eq!(names(&picked), "orig0,orig1,orig2");
+        assert_eq!(rows.borrow()[0].baseline, "orig0,orig1,orig2");
     }
 
     #[test]

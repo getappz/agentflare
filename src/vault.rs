@@ -215,6 +215,19 @@ pub fn get_secret(name: &str) -> Result<Option<Zeroizing<String>>, String> {
     get_secret_value(&body, &dek.dek, name).map_err(|e| e.to_string())
 }
 
+/// Like `get_secret`, but only uses an already-unlocked session: it never falls
+/// back to the passphrase KDF (Argon2id), so it is bounded and safe for
+/// latency-limited callers such as hooks. `Err` when no session is unlocked.
+pub fn get_secret_session_only(name: &str) -> Result<Option<Zeroizing<String>>, String> {
+    let path = vault_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let dek = open_vault_with_dek(&path, APP_NAME).map_err(|e| e.to_string())?;
+    let body = read_vault_body(&path).map_err(|e| e.to_string())?;
+    get_secret_value(&body, &dek.dek, name).map_err(|e| e.to_string())
+}
+
 pub fn set_secret(name: &str, value: &str) -> Result<(), String> {
     let _guard = VAULT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _file_lock = lock_vault_file_cross_process()?;
@@ -282,6 +295,28 @@ mod tests {
             assert_eq!(val.as_ref().map(|s| s.as_str()), Some("my-value"));
 
             lock().unwrap();
+            clear_passphrase();
+        });
+    }
+
+    /// The session-only lookup must never run the passphrase KDF: with the
+    /// session cleared but a passphrase available, `get_secret` still succeeds
+    /// (via the KDF) while `get_secret_session_only` refuses.
+    #[test]
+    fn session_only_lookup_never_falls_back_to_the_passphrase_kdf() {
+        with_temp_home(|| {
+            set_passphrase("test-pass");
+            unlock("test-pass").unwrap();
+            set_secret("MY_KEY", "my-value").unwrap();
+            let live = get_secret_session_only("MY_KEY").unwrap();
+            assert_eq!(live.as_ref().map(|s| s.as_str()), Some("my-value"));
+
+            lock().unwrap(); // clears the session DEK and the cached passphrase
+            set_passphrase("test-pass"); // env passphrase would let get_secret derive the key
+            assert!(get_secret_session_only("MY_KEY").is_err());
+            let via_kdf = get_secret("MY_KEY").unwrap();
+            assert_eq!(via_kdf.as_ref().map(|s| s.as_str()), Some("my-value"));
+
             clear_passphrase();
         });
     }

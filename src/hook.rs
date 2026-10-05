@@ -906,16 +906,33 @@ pub fn prompt_submit(agent: &str) {
             && let Ok(mut registry) = skill_registry::Registry::open_default(&db_path)
         {
             let _ = registry.ensure_fresh(crate::components::detected_skill_agents);
+            let limit = crate::skill_rerank::fetch_limit(3);
             if let Ok(skills) = crate::skill_detect::find_skills(
                 &intent,
                 &registry,
-                crate::skill_rerank::fetch_limit(3),
+                limit,
                 crate::memory::engine::embed_query,
                 crate::memory::engine::embed_doc,
-            ) && let Some(injection) =
-                crate::skill_detect::build_injection(&crate::skill_rerank::pick(prompt, skills, 3))
-            {
-                bits.push(injection);
+            ) {
+                // Re-ranking a wider pool can reorder the top picks, so the
+                // default 3-result set is fetched on its own as the baseline.
+                let baseline = if limit == 3 {
+                    skills.clone()
+                } else {
+                    crate::skill_detect::find_skills(
+                        &intent,
+                        &registry,
+                        3,
+                        crate::memory::engine::embed_query,
+                        crate::memory::engine::embed_doc,
+                    )
+                    .unwrap_or_else(|_| skills.iter().take(3).cloned().collect())
+                };
+                if let Some(injection) = crate::skill_detect::build_injection(
+                    &crate::skill_rerank::pick(prompt, skills, baseline, 3),
+                ) {
+                    bits.push(injection);
+                }
             }
         }
     }
