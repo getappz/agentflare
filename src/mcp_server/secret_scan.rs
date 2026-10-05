@@ -63,6 +63,37 @@ fn find_secret(text: &str) -> Option<&'static str> {
         .map(|p| p.name)
 }
 
+/// `text` with every secret-pattern match replaced by `[REDACTED]`; for
+/// callers that persist user text locally and must not store credentials.
+pub(crate) fn redact(text: &str) -> String {
+    // Broader capture-only set first, so e.g. a private-key body is removed
+    // whole before the narrow header pattern could leave it behind.
+    CAPTURE_PATTERNS
+        .iter()
+        .chain(PATTERNS.iter().map(|p| &p.re))
+        .fold(text.to_string(), |acc, re| {
+            re.replace_all(&acc, "[REDACTED]").into_owned()
+        })
+}
+
+/// Broader than `PATTERNS` (more false positives): used only by `redact`,
+/// where over-redacting is harmless, never by the handoff-blocking scan.
+static CAPTURE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    [
+        r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(-----END [A-Z ]*PRIVATE KEY-----|\z)",
+        r"sk-[A-Za-z0-9_-]{20,}",
+        r"gh[opsur]_[A-Za-z0-9]{20,}",
+        r"AIza[0-9A-Za-z_-]{35}",
+        r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
+        r"(?i)bearer\s+[A-Za-z0-9\-._~+/=]+",
+        r"(?i)(password|passwd|secret|token|api[_-]?key)\s*[:=]\s*\S+",
+        r"[A-Za-z][A-Za-z0-9+.-]*://[^\s/:@]+:[^\s/@]+@",
+    ]
+    .iter()
+    .map(|r| Regex::new(r).unwrap())
+    .collect()
+});
+
 /// Checks each `(field, text)` pair and fails on the first match — naming
 /// the field and pattern class in the error, never the matched text itself,
 /// so the secret doesn't round-trip back through the LLM that triggered
@@ -159,6 +190,47 @@ mod tests {
             find_secret("aws_secret_access_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
             Some("AWS secret access key")
         );
+    }
+
+    #[test]
+    fn redact_covers_broad_capture_patterns() {
+        let cases = [
+            "-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkq
+-----END PRIVATE KEY-----",
+            "-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXk",
+            "sk-ant-api03-abcdefghijklmnopqrstuvwx",
+            "sk-proj-abcdefghijklmnopqrstuvwx",
+            "ghs_abcdefghijklmnopqrstuvwxyz0123",
+            "AIzaSyA1234567890abcdefghijklmnopqrstuv",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.c2lnbmF0dXJl",
+            "authorization: bEaReR abc.def-ghi",
+            "password: hunter2hunter2",
+            "API_KEY=abc123xyz",
+            "postgres://admin:s3cr3t@db.example.com/x",
+        ];
+        for c in cases {
+            let out = redact(&format!("pre {c} post"));
+            assert!(out.contains("[REDACTED]"), "{c} -> {out}");
+            for leak in [
+                "MIIEvQ",
+                "b3BlbnNz",
+                "abcdefghijklmnop",
+                "hunter2",
+                "abc123xyz",
+                "s3cr3t",
+                "c2lnbmF0",
+            ] {
+                assert!(!out.contains(leak), "{c} leaked {leak}: {out}");
+            }
+        }
+        assert_eq!(
+            redact("plain prose, nothing here"),
+            "plain prose, nothing here"
+        );
+        // The handoff scan stays narrow.
+        assert_eq!(find_secret("password: hunter2"), None);
     }
 
     #[test]

@@ -13,6 +13,7 @@
 //! - never use it for security/guard decisions (Jev doesn't treat state as hostile).
 #![allow(dead_code, unused_imports)] // consumers land in items #702-#705
 
+pub mod capture;
 mod client;
 mod provider;
 pub mod shadow;
