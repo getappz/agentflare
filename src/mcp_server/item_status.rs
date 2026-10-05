@@ -115,6 +115,54 @@ fn line_has_sequence_marker(line: &str, seq_marker: &str) -> bool {
     })
 }
 
+/// What is holding `item` back, from the checks `run_discovery_tick` makes:
+/// operator labels, the plan gate, the host resource gate, and the
+/// assignee's quota state. Pure so each rule is testable in isolation.
+fn blockers(
+    item: &agentflare_backend::item::Item,
+    labels: &[String],
+    policy: agentflare_resource_gate::Policy,
+    assignee_state: Option<String>,
+) -> Vec<serde_json::Value> {
+    use crate::supervisor::{NEEDS_DECISION_LABEL, NEEDS_MANUAL_LABEL, PAUSED_LABEL, READY_LABEL};
+    let has = |name: &str| labels.iter().any(|l| l == name);
+    let mut out = Vec::new();
+    if has(PAUSED_LABEL) {
+        out.push(serde_json::json!({"kind": "paused"}));
+    }
+    if has(NEEDS_MANUAL_LABEL) {
+        out.push(serde_json::json!({
+            "kind": "needs_manual_dispatch",
+            "detail": "parked: operator-set or dispatch-failure ceiling reached",
+        }));
+    }
+    if has(NEEDS_DECISION_LABEL) {
+        out.push(serde_json::json!({"kind": "needs_decision"}));
+    }
+    if let agentflare_backend::item::plan_gate::PlanGateStatus::Blocked(status) =
+        agentflare_backend::item::plan_gate::plan_gate_status(&item.metadata)
+    {
+        out.push(serde_json::json!({"kind": "plan_gate", "status": status}));
+    }
+    if has(READY_LABEL) && policy.blocks_dispatch() {
+        let why = policy
+            .pause_reason()
+            .map_or(String::new(), |r| format!(": {}", r.as_str()));
+        out.push(serde_json::json!({
+            "kind": "resource_gate",
+            "detail": format!("{}{why}", policy.as_str()),
+        }));
+    }
+    if let (Some(agent), Some(state)) = (&item.assignee_agent, assignee_state) {
+        out.push(serde_json::json!({
+            "kind": "agent_unavailable",
+            "agent": agent,
+            "detail": state,
+        }));
+    }
+    out
+}
+
 impl AgentflareMcp {
     pub(crate) fn item_status(&self, req: ItemRequest) -> Result<String, ErrorData> {
         let raw = req
@@ -138,6 +186,14 @@ impl AgentflareMcp {
             .unwrap_or(DEFAULT_STATUS_LOG_LINES)
             .clamp(1, MAX_STATUS_LOG_LINES) as usize;
         let log_lines = recent_daemon_log_lines(&item, log_limit);
+        let blocked_by = blockers(
+            &item,
+            &crate::quota::failover::item_label_names(self, &item.id),
+            agentflare_resource_gate::current_policy(),
+            item.assignee_agent
+                .as_deref()
+                .and_then(crate::quota::failover::availability_state),
+        );
 
         let resp = ItemStatusResponse {
             id: item.id,
@@ -150,6 +206,7 @@ impl AgentflareMcp {
             updated_at: item.updated_at,
             job,
             pr,
+            blocked_by,
             log_lines,
         };
         Ok(serde_json::to_string_pretty(&resp).unwrap_or_default())
@@ -185,6 +242,46 @@ mod status_log_line_tests {
             "due_date": null,
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn blockers_lists_each_reason_the_supervisor_would_hold_the_item() {
+        use agentflare_resource_gate::{PauseReason, Policy};
+        let mut item = item_fixture("a", 1);
+        let flowing = Policy::Normal;
+        let labels = |l: &[&str]| l.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert!(blockers(&item, &labels(&["ready-for-work"]), flowing, None).is_empty());
+
+        let paused = Policy::Paused {
+            reason: PauseReason::CpuPressure,
+        };
+        let b = blockers(&item, &labels(&["ready-for-work"]), paused, None);
+        assert_eq!(b[0]["kind"], "resource_gate");
+        assert_eq!(b[0]["detail"], "paused: cpu_pressure");
+        // The gate only matters to work that is waiting to dispatch.
+        assert!(blockers(&item, &labels(&[]), paused, None).is_empty());
+
+        let b = blockers(&item, &labels(&["needs-decision", "paused"]), flowing, None);
+        let kinds: Vec<_> = b.iter().map(|v| v["kind"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["paused", "needs_decision"]);
+
+        item.metadata = r#"{"plan_required": true}"#.into();
+        let b = blockers(&item, &labels(&[]), flowing, None);
+        assert_eq!(
+            b[0],
+            serde_json::json!({"kind": "plan_gate", "status": "none"})
+        );
+
+        item.metadata = "{}".into();
+        item.assignee_agent = Some("claude-code".into());
+        let b = blockers(
+            &item,
+            &labels(&[]),
+            flowing,
+            Some("over threshold (seven_day usage 74% >= threshold 70%)".into()),
+        );
+        assert_eq!(b[0]["kind"], "agent_unavailable");
+        assert_eq!(b[0]["agent"], "claude-code");
     }
 
     // `recent_log_lines_at` takes a path parameter specifically so this test
