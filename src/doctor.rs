@@ -222,13 +222,15 @@ pub fn run(agent: Option<&str>, json: bool) {
         checks.extend(channel_checks);
     }
 
-    let healthy = checks.iter().all(|r| r.ok) && stale.is_empty();
+    let mbx = crate::mbx::MbxStatus::collect();
+    let healthy = checks.iter().all(|r| r.ok) && stale.is_empty() && mbx.ok();
 
     if json {
         #[derive(Serialize)]
         struct Report<'a> {
             checks: &'a [CheckResult],
             stale_rules: &'a [StaleRule],
+            mbx: &'a crate::mbx::MbxStatus,
             healthy: bool,
         }
         println!(
@@ -236,6 +238,7 @@ pub fn run(agent: Option<&str>, json: bool) {
             serde_json::to_string_pretty(&Report {
                 checks: &checks,
                 stale_rules: &stale,
+                mbx: &mbx,
                 healthy,
             })
             .unwrap()
@@ -263,6 +266,7 @@ pub fn run(agent: Option<&str>, json: bool) {
             }
         }
 
+        println!("{}", mbx.format_text());
         println!();
         if healthy {
             println!("{passed}/{total} checks passed — all good.");
