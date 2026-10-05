@@ -22,7 +22,7 @@ pub fn load(dir: &Path, stage: Option<&str>) -> Option<(PathBuf, Vec<(String, St
 /// prefix, split on the first `=`, trim, and strip one layer of matching quotes
 /// from the value. Intentionally does not do trailing-comment or escape parsing
 /// — values with `#` stay intact.
-fn parse(content: &str) -> Vec<(String, String)> {
+pub(crate) fn parse(content: &str) -> Vec<(String, String)> {
     content
         .lines()
         .map(str::trim)

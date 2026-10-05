@@ -12,6 +12,7 @@ mod code;
 mod config;
 mod cost;
 mod daemon;
+mod decide;
 mod dev_install;
 mod docs;
 mod doctor;
@@ -87,6 +88,8 @@ pub enum Commands {
     Hook(hook::HookArgs),
     /// Show AI agent token/dollar cost, optionally broken down by project.
     Cost(cost::CostArgs),
+    /// Typed-decision layer (Jev): check that the connection works.
+    Decide(decide::DecideArgs),
     /// Build the current source tree and install it over the running binary.
     DevInstall(dev_install::DevInstallArgs),
     /// Diagnose agent config wiring and report problems.
@@ -178,6 +181,7 @@ impl Commands {
             Self::Init(cmd) => cmd.run(),
             Self::Hook(cmd) => cmd.run(),
             Self::Cost(cmd) => cmd.run(),
+            Self::Decide(cmd) => cmd.run(),
             Self::DevInstall(cmd) => cmd.run(),
             Self::Doctor(cmd) => cmd.run(),
             Self::Coaching(cmd) => cmd.run(),
