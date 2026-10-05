@@ -21,8 +21,8 @@ use std::sync::OnceLock;
 /// step, so resolving through it -- always excluding this process's own
 /// directory -- is immune to the same failure mode regardless of which
 /// binary this crate ends up linked into.
-/// `true` for a cargo build-profile directory (`.../target/debug` or
-/// `.../cargo-target/debug`) -- Cargo prepends this to PATH for every test/run
+/// `true` for a cargo build-profile directory (`.../{target,cargo-target}/
+/// {debug,release}`) -- Cargo prepends this to PATH for every test/run
 /// process (so build-script DLLs resolve), and any `[[bin]]` target in the
 /// same workspace lands directly in it. Excluding only "this process's own
 /// directory" isn't enough: a workspace that redirects `target-dir`
@@ -45,6 +45,17 @@ fn is_cargo_target_profile_dir(p: &Path) -> bool {
 fn excludes_lean_ctx_cargo_target_from_git_search() {
     assert!(is_cargo_target_profile_dir(Path::new(
         "cache/cargo-target/debug/deps"
+    )));
+    assert!(is_cargo_target_profile_dir(Path::new(
+        "cache/cargo-target/release"
+    )));
+    // Only the profile dirs: a bare `cargo-target` or a non-profile child is
+    // not a build-profile dir.
+    assert!(!is_cargo_target_profile_dir(Path::new(
+        "cache/cargo-target"
+    )));
+    assert!(!is_cargo_target_profile_dir(Path::new(
+        "cache/cargo-target/bin"
     )));
 }
 

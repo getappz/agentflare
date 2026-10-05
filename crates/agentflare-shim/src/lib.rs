@@ -199,6 +199,17 @@ mod tests {
         assert!(is_cargo_target_profile_dir(Path::new(
             "cache/cargo-target/debug/deps"
         )));
+        assert!(is_cargo_target_profile_dir(Path::new(
+            "cache/cargo-target/release"
+        )));
+        // Only the profile dirs: a bare `cargo-target` or a non-profile child
+        // is not a build-profile dir.
+        assert!(!is_cargo_target_profile_dir(Path::new(
+            "cache/cargo-target"
+        )));
+        assert!(!is_cargo_target_profile_dir(Path::new(
+            "cache/cargo-target/bin"
+        )));
     }
 
     #[cfg(windows)]
