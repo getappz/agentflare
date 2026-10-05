@@ -2,8 +2,10 @@
 // version manager. `agentflare run` uses it to launch agents with mise-managed
 // tools on PATH for the session, on machines that don't already have mise.
 use crate::paths::home;
-use std::path::PathBuf;
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Mutex, OnceLock};
 
 pub enum MiseOutcome {
     /// Already on the system (path to the binary).
@@ -27,6 +29,88 @@ pub fn mise_bin() -> Option<String> {
         .into_iter()
         .find(|p| p.exists())
         .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Append mise's shims and tool bins without changing the caller's PATH priority.
+/// Cache by cwd because project mise.toml files can select different tools.
+pub fn append_mise_path(base: Option<&OsStr>, cwd: &Path) -> Option<OsString> {
+    static BINS: OnceLock<Mutex<std::collections::HashMap<PathBuf, Vec<PathBuf>>>> =
+        OnceLock::new();
+    let cache = BINS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    let bins = cache
+        .entry(cwd.to_path_buf())
+        .or_insert_with(|| mise_paths(cwd));
+    append_paths(base, bins)
+}
+
+fn mise_paths(cwd: &Path) -> Vec<PathBuf> {
+    let Some(mise) = mise_bin() else {
+        return Vec::new();
+    };
+    let mut paths = dirs::data_local_dir()
+        .map(|dir| dir.join("mise").join("shims"))
+        .into_iter()
+        .collect::<Vec<_>>();
+    let output = flare_process::command(&mise)
+        .arg("bin-paths")
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .output();
+    if let Ok(output) = output
+        && output.status.success()
+    {
+        paths.extend(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
+        );
+    } else if let Ok(output) = flare_process::command(&mise)
+        .args(["env", "--json"])
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .output()
+        && output.status.success()
+        && let Ok(vars) =
+            serde_json::from_slice::<std::collections::HashMap<String, String>>(&output.stdout)
+        && let Some(path) = vars.get("PATH")
+    {
+        let inherited = std::env::var_os("PATH").unwrap_or_default();
+        paths.extend(
+            std::env::split_paths(OsStr::new(path))
+                .filter(|p| !std::env::split_paths(&inherited).any(|existing| existing == *p)),
+        );
+    }
+    paths
+}
+
+fn append_paths(base: Option<&OsStr>, bins: &[PathBuf]) -> Option<OsString> {
+    if bins.is_empty() {
+        return None;
+    }
+    let mut paths: Vec<_> = base.into_iter().flat_map(std::env::split_paths).collect();
+    let original_len = paths.len();
+    for bin in bins {
+        if !paths.iter().any(|path| path == bin) {
+            paths.push(bin.clone());
+        }
+    }
+    (paths.len() != original_len)
+        .then(|| std::env::join_paths(paths).ok())
+        .flatten()
+}
+
+/// Called before agentflare starts threads, so all ordinary child processes
+/// inherit mise tools even when the launching shell has not activated mise.
+pub fn init_mise_path() {
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    if let Some(path) = append_mise_path(std::env::var_os("PATH").as_deref(), &cwd) {
+        // SAFETY: main calls this before starting any threads.
+        unsafe { std::env::set_var("PATH", path) };
+    }
 }
 
 /// Ensure mise is available, installing it cross-platform if absent.
@@ -178,5 +262,26 @@ mod tests {
     #[test]
     fn which_returns_none_for_a_nonexistent_command() {
         assert!(which("definitely-not-a-real-binary-xyz-123").is_none());
+    }
+
+    #[test]
+    fn mise_paths_append_once_after_existing_path() {
+        let base = std::env::join_paths(["first", "second"]).unwrap();
+        let bins = vec![
+            PathBuf::from("second"),
+            PathBuf::from("mise"),
+            PathBuf::from("mise"),
+        ];
+        let result = append_paths(Some(&base), &bins).unwrap();
+        assert_eq!(
+            std::env::split_paths(&result).collect::<Vec<_>>(),
+            vec![
+                PathBuf::from("first"),
+                PathBuf::from("second"),
+                PathBuf::from("mise")
+            ]
+        );
+        assert_eq!(append_paths(Some(&base), &[]), None);
+        assert_eq!(append_paths(Some(&result), &bins), None);
     }
 }
