@@ -23,16 +23,9 @@ fn item_owning_branch<'a>(
     items: &'a [agentflare_backend::item::Item],
     branch: &str,
 ) -> Option<&'a agentflare_backend::item::Item> {
-    let task_seq = branch
-        .strip_prefix("task/")
-        .map(|rest| rest.split('-').next().unwrap_or(rest))
-        .and_then(|digits| digits.parse::<i64>().ok());
-    items.iter().find(|item| {
-        task_seq == Some(item.sequence_id)
-            || serde_json::from_str::<serde_json::Value>(&item.metadata)
-                .ok()
-                .is_some_and(|m| m["pr"]["branch"] == branch)
-    })
+    items
+        .iter()
+        .find(|item| super::item_owns_branch(item, branch))
 }
 
 /// Records `number`/`branch` as `item`'s PR when it has none yet, so the next
