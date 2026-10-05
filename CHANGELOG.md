@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Sandboxing and safety**: bubblewrap job sandbox (#420), reusable `flare-sandbox` crate (#541), pre-handoff secret scan (#669), encrypted SQLite with bundled or external SQLCipher (#824), host resource gate and capacity governor (#417, #459)
 - **Multi-workstation coordination**: GitHub as coordination substrate (#379), claim markers across workstations (#632), observation sync over a shared git branch (#400), machine-name config (#434, #467), agent continuity and team chat (#674, #829)
 - **Search and skills**: local-first hybrid search with vectors, RRF and rerank, `sqlite-vec` scale lane, semantic skill search, category taxonomy (#617, #618)
-- **Decision layer** (`decide`): Jev-backed decisions with shadow router, skill rerank and SDD judge comparison (#851), opt-in local training-data capture (#709, #853)
+- **Decision layer** (`decide`): Jev-backed decisions with shadow router, skill rerank and SDD judge comparison (#851), one batched call per prompt shared by router and rerank (#862), opt-in local training-data capture (#709, #853)
 - **CLI and tooling**: `agentflare clean` (#844), `git ship` (#391), `code impact` (#397), `apps run` (#612), browser automation via agent-browser (#680), `/flare:pm` prompt and `pm` MCP tool (#676, #782), `/flare:resume`, SDD session resume (#563), mbx shared Rust build cache (#849), work-item status aggregator (#801)
 - Typed item relations (blocks/duplicate/relates_to), SQL-level paginated item listing, structural item filters and annotations (#797)
 
@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Windows**: console-window flashing across spawns (#407, #473, #477), git shim staging (#575), tree-kill hardening (#443), cursor-agent headless hang (#544)
 - **Updates and installs**: `update` and `dev-install` now verify the installed binary after a swap (#791, #795)
 - **Review sweep and CI**: CodeRabbit finding checks and caps (#760, #793, #833), `--resume` falls back to a fresh session when stale (#850), supervisor self-repair deferral and gated-green notifications (#488, #856)
+- `agentflare clean` keeps artifacts inside skipped worktrees out of the plan (#865)
 - Item id and relation scoping to the caller's project, auto-pick scoped to the current project (#859), plus many smaller dispatch, hook and workflow fixes
 
 ### Changed
