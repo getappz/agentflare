@@ -147,8 +147,10 @@ Claiming a worktree no longer means a second `npm ci`. `create_worktree_for`
 (`package.json` + lockfile within two levels of the root) from
 `~/.agentflare/deps/<lockfile-sha256>-<os>-<arch>/`, seeding that entry from
 the main checkout's install when its lockfile is byte-identical. Files are
-hard-linked (zero extra bytes on ext4), falling back per file to
-`std::fs::copy` (reflink on btrfs/XFS, and the cross-device case).
+hard-linked from the store (zero extra bytes on ext4), falling back per file
+to `std::fs::copy` (reflink on btrfs/XFS, and the cross-device case). The store
+entry itself is seeded by a real copy of the main checkout's `node_modules`, so
+a later in-place edit or postinstall in main never reaches it.
 
 - **Share only on an identical lockfile.** Otherwise nothing is linked and the
   worktree log says `deps: <dir>: no shared install for this lockfile …`; run a
@@ -159,13 +161,17 @@ hard-linked (zero extra bytes on ext4), falling back per file to
   dirs carry a `node_modules/.agentflare-deps` marker and the bwrap sandbox
   overlays them (`--overlay-src`/`--tmp-overlay`): jobs read the shared bytes,
   their writes are private and discarded. `npm ci` recreates files and is safe.
-  Unsandboxed sessions get no overlay.
+  **Unsandboxed sessions get no overlay:** an in-place edit of a provisioned
+  worktree's `node_modules` reaches the store entry and every worktree on it.
 - **pnpm projects:** also set `virtualStoreType: global` in `pnpm-workspace.yaml`
   (`enableGlobalVirtualStore: true` before pnpm 11.23) so the store holds only
   symlinks. Not automated.
 - **Clean.** `agentflare clean --artifacts` never offers a marked
-  (hard-link-provisioned) or symlinked `node_modules`, and lists store entries
-  no checkout's lockfile hashes to as `deps store` items.
+  (hard-link-provisioned) or symlinked `node_modules`. It lists a store entry as
+  a `deps store` item only if no checkout it can see references the lockfile
+  *and* provisioning has not touched it for 14 days (the store is shared by all
+  projects, so other projects' checkouts are invisible to the scan); half-built
+  `<key>.tmp-<pid>` dirs from a crashed seeder are reclaimed after an hour.
 - Cargo `target/` is out of scope (see mbx above).
 
 ## Git

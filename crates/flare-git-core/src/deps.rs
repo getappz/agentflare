@@ -8,11 +8,16 @@
 //!
 //! Hard links share inodes, so in-place writes through a provisioned tree
 //! reach every sharer; sandboxed jobs therefore overlay it (see
-//! `flare-sandbox`), and `npm ci` (which recreates files) is safe.
+//! `flare-sandbox`), and `npm ci` (which recreates files) is safe. Unsandboxed
+//! sessions are NOT protected: an in-place edit of a provisioned worktree's
+//! `node_modules` reaches the store entry and every other worktree on it. The
+//! store entry itself is seeded by a real copy, so edits to the main
+//! checkout's own `node_modules` never leak into it.
 
 use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 
@@ -32,6 +37,12 @@ const DIR: &str = "node_modules";
 pub const MARKER: &str = ".agentflare-deps";
 /// Project dirs searched below a worktree root (root, `a`, `a/b`).
 const MAX_DEPTH: usize = 2;
+/// The store is shared by every project on the machine, so an entry no
+/// *visible* checkout references is only reclaimable once it has also sat
+/// unused (no provisioning touched it) this long.
+pub const STALE_AFTER: Duration = Duration::from_secs(14 * 24 * 3600);
+/// A `<key>.tmp-<pid>` dir this old belongs to a crashed seeder.
+const TMP_STALE_AFTER: Duration = Duration::from_secs(3600);
 
 #[must_use]
 pub fn store_root() -> PathBuf {
@@ -83,6 +94,10 @@ pub fn project_dirs(root: &Path) -> Vec<PathBuf> {
 /// Hard-links (else copies) the tree `src` to the new directory `dst`;
 /// symlinks are recreated, never followed.
 pub fn link_tree(src: &Path, dst: &Path) -> io::Result<()> {
+    walk_tree(src, dst, true)
+}
+
+fn walk_tree(src: &Path, dst: &Path, hard: bool) -> io::Result<()> {
     for entry in walkdir::WalkDir::new(src).follow_links(false) {
         let entry = entry.map_err(io::Error::other)?;
         let target = dst.join(entry.path().strip_prefix(src).map_err(io::Error::other)?);
@@ -94,7 +109,7 @@ pub fn link_tree(src: &Path, dst: &Path) -> io::Result<()> {
             std::os::unix::fs::symlink(std::fs::read_link(entry.path())?, &target)?;
             #[cfg(not(unix))]
             std::fs::copy(entry.path(), &target).map(drop)?;
-        } else if std::fs::hard_link(entry.path(), &target).is_err() {
+        } else if !hard || std::fs::hard_link(entry.path(), &target).is_err() {
             std::fs::copy(entry.path(), &target)?;
         }
     }
@@ -111,7 +126,9 @@ fn seed(entry: &Path, src: &Path) -> io::Result<()> {
     let tmp = entry.with_extension(format!("tmp-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;
-    let built = link_tree(src, &tmp.join(DIR));
+    // A real copy, not links: main's live `node_modules` may be edited in
+    // place later and must not reach the store.
+    let built = walk_tree(src, &tmp.join(DIR), false);
     let done = built.and_then(|()| std::fs::rename(&tmp, entry));
     if done.is_err() {
         let _ = std::fs::remove_dir_all(&tmp);
@@ -166,6 +183,10 @@ pub fn provision_in(store: &Path, main: &Path, worktree: &Path) -> Vec<String> {
                 continue;
             }
         }
+        // Mark the entry as recently used so `unreferenced` leaves it be.
+        if let Ok(f) = std::fs::File::open(&entry) {
+            let _ = f.set_modified(SystemTime::now());
+        }
         let dst = wt_dir.join(DIR);
         let linked = link_tree(&entry.join(DIR), &dst)
             .and_then(|()| std::fs::write(dst.join(MARKER), key.as_bytes()));
@@ -201,9 +222,15 @@ pub fn referenced_keys(checkouts: &[PathBuf]) -> HashSet<String> {
         .collect()
 }
 
-/// Store entries in `store` no checkout references, with their size.
+/// Store entries in `store` no checkout references and untouched for at least
+/// `min_age`, with their size. Half-built `<key>.tmp-<pid>` dirs are reclaimed
+/// once older than [`TMP_STALE_AFTER`] (their seeder crashed).
 #[must_use]
-pub fn unreferenced(store: &Path, referenced: &HashSet<String>) -> Vec<(PathBuf, u64)> {
+pub fn unreferenced(
+    store: &Path,
+    referenced: &HashSet<String>,
+    min_age: Duration,
+) -> Vec<(PathBuf, u64)> {
     let Ok(rd) = std::fs::read_dir(store) else {
         return Vec::new();
     };
@@ -211,8 +238,18 @@ pub fn unreferenced(store: &Path, referenced: &HashSet<String>) -> Vec<(PathBuf,
         .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
         .filter(|e| {
             let n = e.file_name().to_string_lossy().into_owned();
-            // Half-built `<key>.tmp-<pid>` dirs belong to a live seeder.
-            !n.contains(".tmp-") && !referenced.contains(&n)
+            let tmp = n.contains(".tmp-");
+            let age = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .unwrap_or_default();
+            if tmp {
+                age >= TMP_STALE_AFTER
+            } else {
+                !referenced.contains(&n) && age >= min_age
+            }
         })
         .map(|e| (e.path(), crate::worktree::dir_size(&e.path())))
         .collect()
@@ -251,9 +288,9 @@ mod tests {
         assert!(log[0].contains("shared"), "{log:?}");
         provision_in(&store, &main, &wt2);
         let f = |p: &Path| std::fs::metadata(p.join("node_modules/a/index.js")).unwrap();
-        assert_eq!(f(&wt1).ino(), f(&main).ino());
-        assert_eq!(f(&wt2).ino(), f(&main).ino());
-        assert!(f(&wt1).nlink() >= 4);
+        assert_eq!(f(&wt1).ino(), f(&wt2).ino());
+        assert_ne!(f(&wt1).ino(), f(&main).ino(), "store is seeded by copy");
+        assert!(f(&wt1).nlink() >= 3);
         assert!(is_provisioned(&wt1.join("node_modules")));
         assert!(!is_provisioned(&main.join("node_modules")));
         assert!(
@@ -291,10 +328,41 @@ mod tests {
         project(&wt, "L", false);
         provision_in(&store, &main, &wt);
         let used = referenced_keys(&[main.clone(), wt.clone()]);
-        assert!(unreferenced(&store, &used).is_empty());
+        assert!(unreferenced(&store, &used, Duration::ZERO).is_empty());
         project(&wt, "changed", false);
         std::fs::remove_dir_all(&main).unwrap();
-        let stale = unreferenced(&store, &referenced_keys(&[wt]));
-        assert_eq!(stale.len(), 1);
+        let none = referenced_keys(&[wt]);
+        assert_eq!(unreferenced(&store, &none, Duration::ZERO).len(), 1);
+        // Fresh entries survive the age threshold (other projects may use them).
+        assert!(unreferenced(&store, &none, STALE_AFTER).is_empty());
+    }
+
+    #[test]
+    fn crashed_seeder_tmp_dirs_are_reaped_by_age() {
+        let t = tempfile::tempdir().unwrap();
+        let tmp = t.path().join("abc-linux-x86_64.tmp-99");
+        std::fs::create_dir_all(tmp.join("node_modules")).unwrap();
+        let none = HashSet::new();
+        assert!(unreferenced(t.path(), &none, Duration::ZERO).is_empty());
+        let old = SystemTime::now() - 2 * TMP_STALE_AFTER;
+        std::fs::File::open(&tmp)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert_eq!(unreferenced(t.path(), &none, Duration::ZERO).len(), 1);
+    }
+
+    #[test]
+    fn main_edits_do_not_leak_into_store() {
+        let t = tempfile::tempdir().unwrap();
+        let (main, wt, store) = (t.path().join("m"), t.path().join("w"), t.path().join("s"));
+        project(&main, "L", true);
+        project(&wt, "L", false);
+        provision_in(&store, &main, &wt);
+        std::fs::write(main.join("node_modules/a/index.js"), "edited").unwrap();
+        assert_eq!(
+            std::fs::read(wt.join("node_modules/a/index.js")).unwrap(),
+            b"x"
+        );
     }
 }

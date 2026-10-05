@@ -293,7 +293,9 @@ pub(super) fn scan(input: &ScanInput, kinds: &[String]) -> (Vec<Item>, Vec<Skipp
 }
 
 /// Shared dependency store entries (`~/.agentflare/deps`) that no checkout
-/// of `repo_root` (or the scan root) references any more.
+/// of `repo_root` (or the scan root) references and that no provisioning has
+/// used for [`crate::deps::STALE_AFTER`]. The store is shared by every project
+/// on the machine, so the age gate protects entries only other projects use.
 pub(super) fn scan_deps_store(input: &ScanInput) -> Vec<Item> {
     let mut checkouts = vec![input.scan_root.to_path_buf()];
     if let Some(repo) = input.repo_root {
@@ -307,7 +309,7 @@ pub(super) fn scan_deps_store(input: &ScanInput) -> Vec<Item> {
         );
     }
     let used = crate::deps::referenced_keys(&checkouts);
-    crate::deps::unreferenced(&crate::deps::store_root(), &used)
+    crate::deps::unreferenced(&crate::deps::store_root(), &used, crate::deps::STALE_AFTER)
         .into_iter()
         .map(|(path, size_bytes)| {
             let name = path
@@ -321,7 +323,7 @@ pub(super) fn scan_deps_store(input: &ScanInput) -> Vec<Item> {
                 branch: None,
                 sha: None,
                 size_bytes,
-                reason: "shared dependency store · no checkout uses this lockfile".into(),
+                reason: "shared dependency store · unused lockfile, not touched recently (or crashed seed)".into(),
             }
         })
         .collect()

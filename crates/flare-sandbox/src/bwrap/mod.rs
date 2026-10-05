@@ -650,6 +650,9 @@ pub(super) fn is_executable(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::AgentProfile;
+
     #[test]
     fn provisioned_node_modules_gets_a_private_overlay() {
         let dir = tempfile::tempdir().unwrap();
@@ -662,8 +665,27 @@ mod tests {
         assert_eq!(shared_deps_dirs(&cwd), [cwd.join("node_modules")]);
     }
 
-    use super::*;
-    use crate::AgentProfile;
+    #[test]
+    fn provisioned_node_modules_overlay_lands_in_bwrap_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(cwd.join("node_modules")).unwrap();
+        std::fs::write(cwd.join("node_modules/.agentflare-deps"), "k").unwrap();
+        let args = build_bwrap_args_with_home(
+            Some(&cwd),
+            "/bin/true",
+            &[],
+            None,
+            false,
+            &SandboxConfig::default(),
+        );
+        let nm = path_to_string(&cwd.join("node_modules"));
+        let at = |flag: &str| args.iter().position(|a| a == flag).unwrap();
+        let (src, tmp) = (at("--overlay-src"), at("--tmp-overlay"));
+        assert_eq!(args[src + 1], nm);
+        assert_eq!(args[tmp + 1], nm);
+        assert!(src < tmp, "overlay-src must precede its --tmp-overlay");
+    }
 
     fn agent(binary_name: &'static str, mounts: &'static [AgentStateMount]) -> SandboxConfig {
         SandboxConfig {
