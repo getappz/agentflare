@@ -12,13 +12,14 @@
 //! premium model only when the current model is known and isn't already it;
 //! "medium" stays silent.
 use super::runtime::{KeywordRouter, RouteContext, Router};
-use crate::decide::{self, Answer, DecideError, Outcome, Question, Response, shadow};
+use crate::decide::{self, Answer, DecideError, Outcome, Question, shadow};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 const SITE: &str = "router";
 const QUESTION_ID: &str = "difficulty";
+const BATCH_QUESTION_ID: &str = "router.difficulty";
 const MIN_CONFIDENCE: f64 = 0.8;
 const MAX_PROMPT_CHARS: usize = 2000;
 /// Well inside the UserPromptSubmit hook's wall-clock budget.
@@ -65,28 +66,29 @@ fn target(tier: Tier, current_model: Option<&str>) -> Option<&'static str> {
 
 /// Options sort alphabetically on the wire (easy, hard, medium), and Jev leans
 /// toward the first option, hence the confidence gate and the shadow log.
-fn questions() -> BTreeMap<String, Question> {
-    BTreeMap::from([(
-        QUESTION_ID.to_string(),
-        Question::choice(
-            "How hard is this task for an AI coding agent?",
-            [
-                (
-                    "easy",
-                    "Lookup, rename, typo, small mechanical edit, or a simple question",
-                ),
-                ("medium", "A typical feature or bugfix touching a few files"),
-                (
-                    "hard",
-                    "Architecture, deep debugging, security, a large refactor, or an ambiguous design",
-                ),
-            ],
-        ),
-    )])
+fn question() -> Question {
+    Question::choice(
+        "How hard is this task for an AI coding agent?",
+        [
+            (
+                "easy",
+                "Lookup, rename, typo, small mechanical edit, or a simple question",
+            ),
+            ("medium", "A typical feature or bugfix touching a few files"),
+            (
+                "hard",
+                "Architecture, deep debugging, security, a large refactor, or an ambiguous design",
+            ),
+        ],
+    )
 }
 
-fn tier_of(resp: &Response) -> Option<(Tier, Option<f64>)> {
-    match resp.answers.get(QUESTION_ID)? {
+fn questions() -> BTreeMap<String, Question> {
+    BTreeMap::from([(QUESTION_ID.to_string(), question())])
+}
+
+fn tier_of_answer(answer: &Answer) -> Option<(Tier, Option<f64>)> {
+    match answer {
         Answer::Choice {
             choice, confidence, ..
         } => Some((Tier::from_choice(choice)?, *confidence)),
@@ -120,6 +122,56 @@ impl Router for JevRouter {
     }
 }
 
+pub fn enabled() -> bool {
+    std::env::var("AGENTFLARE_ROUTER").as_deref() == Ok("jev")
+}
+
+pub fn add_to_batch(ctx: &RouteContext, batch: &mut decide::Batch) -> bool {
+    let prompt = ctx.prompt.trim();
+    if prompt.is_empty() || prompt.starts_with("/") {
+        return false;
+    }
+    batch.add(BATCH_QUESTION_ID, question());
+    true
+}
+
+pub fn route_batch_success(
+    ctx: &RouteContext,
+    outcome: &Outcome,
+    record: &dyn Fn(&shadow::Row),
+) -> Option<String> {
+    route_answer(
+        ctx,
+        outcome.response.answers.get(BATCH_QUESTION_ID),
+        outcome.elapsed_ms,
+        outcome.response.usage.cost,
+        outcome.response.model.as_deref(),
+        record,
+    )
+}
+
+pub fn route_batch_error(
+    ctx: &RouteContext,
+    err: &DecideError,
+    record: &dyn Fn(&shadow::Row),
+) -> Option<String> {
+    let baseline = KeywordRouter.route(ctx);
+    match err {
+        DecideError::Disabled | DecideError::NoCredentials => baseline,
+        e => {
+            let prompt: String = ctx.prompt.trim().chars().take(MAX_PROMPT_CHARS).collect();
+            let baseline_label = if baseline.is_some() { "haiku" } else { "none" };
+            record(&shadow::Row::failed(
+                SITE,
+                &prompt,
+                baseline_label,
+                &e.to_string(),
+            ));
+            baseline
+        }
+    }
+}
+
 fn route_with(
     ctx: &RouteContext,
     ask: &dyn Fn(&str) -> Result<Outcome, DecideError>,
@@ -147,7 +199,28 @@ fn route_with(
             return baseline;
         }
     };
-    let Some((tier, confidence)) = tier_of(&outcome.response) else {
+    route_answer(
+        ctx,
+        outcome.response.answers.get(QUESTION_ID),
+        outcome.elapsed_ms,
+        outcome.response.usage.cost,
+        outcome.response.model.as_deref(),
+        record,
+    )
+}
+
+fn route_answer(
+    ctx: &RouteContext,
+    answer: Option<&Answer>,
+    elapsed_ms: u64,
+    cost: Option<f64>,
+    source_model: Option<&str>,
+    record: &dyn Fn(&shadow::Row),
+) -> Option<String> {
+    let baseline = KeywordRouter.route(ctx);
+    let prompt: String = ctx.prompt.trim().chars().take(MAX_PROMPT_CHARS).collect();
+    let baseline_label = if baseline.is_some() { "haiku" } else { "none" };
+    let Some((tier, confidence)) = answer.and_then(tier_of_answer) else {
         record(&shadow::Row::failed(
             SITE,
             &prompt,
@@ -162,15 +235,10 @@ fn route_with(
         baseline_label,
         target(tier, ctx.current_model.as_deref()).unwrap_or("none"),
         confidence,
-        outcome.elapsed_ms,
-        outcome.response.usage.cost,
+        elapsed_ms,
+        cost,
     ));
-    if let Some(answer) = outcome
-        .response
-        .answers
-        .get(QUESTION_ID)
-        .filter(|_| decide::capture::enabled())
-    {
+    if let Some(answer) = answer.filter(|_| decide::capture::enabled()) {
         decide::capture::record(decide::capture::Input {
             site: SITE,
             features: decide::capture::router_features(&prompt),
@@ -178,20 +246,18 @@ fn route_with(
             label: decide::capture::label_of(answer),
             confidence,
             baseline: baseline_label,
-            source_model: outcome.response.model.as_deref(),
+            source_model,
         });
     }
     match confidence {
         Some(c) if c >= MIN_CONFIDENCE => nudge(tier, c, ctx.current_model.as_deref()),
-        // Missing or low confidence means "don't rely on it": keep the heuristic.
         _ => baseline,
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decide::Usage;
+    use crate::decide::{Response, Usage};
     use std::cell::RefCell;
 
     fn ctx(prompt: &str, model: Option<&str>) -> RouteContext {
@@ -367,5 +433,31 @@ mod tests {
             answer("medium", Some(0.9))
         });
         assert_eq!(*seen.borrow(), MAX_PROMPT_CHARS);
+    }
+    #[test]
+    fn batched_answer_maps_back_to_router_question_id() {
+        let c = ctx("rename this variable", None);
+        let mut batch = decide::Batch::new("rename this variable");
+        assert!(add_to_batch(&c, &mut batch));
+        assert!(batch.questions().contains_key(BATCH_QUESTION_ID));
+        let outcome = Outcome {
+            response: Response {
+                answers: BTreeMap::from([(
+                    BATCH_QUESTION_ID.to_string(),
+                    Answer::Choice {
+                        choice: "easy".to_string(),
+                        confidence: Some(0.95),
+                        probabilities: BTreeMap::new(),
+                    },
+                )]),
+                model: None,
+                usage: Usage::default(),
+            },
+            elapsed_ms: 10,
+        };
+        let rows = RefCell::new(vec![]);
+        let nudge = route_batch_success(&c, &outcome, &|r| rows.borrow_mut().push(r.clone()));
+        assert!(nudge.unwrap().contains("haiku"));
+        assert_eq!(rows.borrow()[0].jev.as_deref(), Some("haiku"));
     }
 }
