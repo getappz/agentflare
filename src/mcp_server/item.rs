@@ -1924,7 +1924,7 @@ impl AgentflareMcp {
             let item = agentflare_backend::item::get(conn, &item_id).map_err(map_backend_err)?;
             let state =
                 agentflare_backend::state::get(conn, &item.state_id).map_err(map_backend_err)?;
-            let in_review = state.group_name == "in_review";
+            let in_review = matches!(state.group_name.as_str(), "in_review" | "started");
             Ok::<_, ErrorData>((item_id, item, in_review))
         })??;
         if !in_review && req.force == Some(true) {
@@ -1948,25 +1948,36 @@ impl AgentflareMcp {
             })
             .to_string());
         }
+        let promoted = self.promote_verified_merged_item(&item_id, &item, &repo_root)?;
+        Ok(serde_json::json!({"item_id": item_id, "promoted": promoted}).to_string())
+    }
+
+    pub(crate) fn promote_verified_merged_item(
+        &self,
+        item_id: &str,
+        item: &agentflare_backend::item::Item,
+        repo_root: &std::path::Path,
+    ) -> Result<bool, ErrorData> {
         let promoted = self.with_backend_db(|conn| {
             // Compare-and-set on the PR verified merged above: a redispatch +
             // new PR landing during that network check must not complete the
             // item off the old one.
             agentflare_backend::item::promote_in_review_to_completed_if_pr(
                 conn,
-                &item_id,
-                crate::worktree::pr_number_from_metadata(&item),
+                item_id,
+                crate::worktree::pr_number_from_metadata(item),
             )
             .map_err(map_backend_err)
         })??;
         if promoted {
+            self.cancel_all_jobs_for_item(item_id);
             self.with_backend_db(|conn| {
-                crate::supervisor::cascade_unblock_dependents(conn, &item_id);
+                crate::supervisor::cascade_unblock_dependents(conn, item_id);
             })?;
-            crate::worktree::cleanup_worktree(&item, &repo_root);
-            crate::worktree::relabel_pr_completed(&item, &repo_root);
+            crate::worktree::cleanup_worktree(item, repo_root);
+            crate::worktree::relabel_pr_completed(item, repo_root);
         }
-        Ok(serde_json::json!({"item_id": item_id, "promoted": promoted}).to_string())
+        Ok(promoted)
     }
 
     pub(super) fn item_cancel(&self, req: ItemRequest) -> Result<String, ErrorData> {

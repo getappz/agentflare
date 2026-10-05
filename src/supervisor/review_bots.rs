@@ -477,8 +477,9 @@ pub(crate) fn sweep_review_threads(
             state.escalated += 1;
             continue;
         }
-        if record.round >= next && in_flight {
-            // Dispatched for this round and the agent is still on it.
+        if record.round >= next {
+            // This exact finding was already handed to an agent. An unresolved
+            // GitHub thread alone does not prove the fix needs another run.
             continue;
         }
         state.to_dispatch.push(f.clone());
@@ -849,6 +850,27 @@ pub(super) fn coderabbit_repair_or_gate(
     label_id_by_name: &std::collections::HashMap<String, String>,
     folder_path: &str,
 ) -> SelfRepairOutcome {
+    if serde_json::from_str::<serde_json::Value>(&item.metadata)
+        .ok()
+        .and_then(|m| m["pr"]["status"].as_str().map(str::to_string))
+        .is_some_and(|s| s == "merged")
+    {
+        return SelfRepairOutcome::Skipped;
+    }
+    if matches!(
+        crate::worktree::pr_ci_status(item, std::path::Path::new(folder_path)),
+        crate::worktree::PrCiStatus::Merged
+            | crate::worktree::PrCiStatus::Passing {
+                auto_merge: crate::worktree::AutoMergeRef { enabled: true, .. },
+                ..
+            }
+            | crate::worktree::PrCiStatus::AwaitingReview {
+                auto_merge: crate::worktree::AutoMergeRef { enabled: true, .. },
+                ..
+            }
+    ) {
+        return SelfRepairOutcome::Skipped;
+    }
     if already_gated_or_in_flight(mcp, queue, item, label_id_by_name) {
         return SelfRepairOutcome::Skipped;
     }
@@ -866,6 +888,14 @@ pub(super) fn coderabbit_repair_or_gate(
         );
         clear_stale_coderabbit_repair_label(folder_path, pr_number, labels, summary.as_deref());
         clear_coderabbit_repair_cap(mcp, item);
+        return SelfRepairOutcome::Skipped;
+    }
+
+    let meta = current_metadata(mcp, item);
+    if findings
+        .iter()
+        .all(|f| thread_record(&meta, &f.thread_id).round >= f.round())
+    {
         return SelfRepairOutcome::Skipped;
     }
 
