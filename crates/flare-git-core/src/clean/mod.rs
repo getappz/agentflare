@@ -190,6 +190,28 @@ pub fn scan(input: &ScanInput) -> Plan {
                 .as_ref()
                 .is_some_and(|p| doomed.iter().any(|d| p.starts_with(d)))
     });
+    // ...and one that is kept (open PR, unmerged, live process) keeps its
+    // artifacts too: wiping an active checkout's build cache is a rebuild.
+    let mut held = Vec::new();
+    for i in std::mem::take(&mut plan.items) {
+        let owner = (i.kind == Kind::Artifact)
+            .then(|| {
+                plan.skipped.iter().find(|s| {
+                    i.label
+                        .strip_prefix(&s.label)
+                        .is_some_and(|r| r.starts_with('/'))
+                })
+            })
+            .flatten();
+        match owner {
+            Some(s) => held.push(Skipped {
+                label: i.label.clone(),
+                reason: format!("inside skipped {}: {}", s.label, s.reason),
+            }),
+            None => plan.items.push(i),
+        }
+    }
+    plan.skipped.extend(held);
     plan.items
         .sort_by(|a, b| (a.kind, b.size_bytes, &a.label).cmp(&(b.kind, a.size_bytes, &b.label)));
     plan.skipped.sort_by(|a, b| a.label.cmp(&b.label));
@@ -414,5 +436,34 @@ mod tests {
         let plan = scan_repo(r, &opts);
         let ids: Vec<&str> = plan.items.iter().map(|i| i.id.as_str()).collect();
         assert_eq!(ids, ["worktree:.worktrees/task/7"]);
+    }
+
+    // An unmerged (kept) worktree keeps its build cache too.
+    #[test]
+    fn artifacts_inside_a_skipped_worktree_are_skipped_too() {
+        let repo = init_repo_with_branch("master");
+        let r = &repo.path;
+        std::fs::write(r.join(".gitignore"), "target/\n.worktrees/\n").unwrap();
+        std::fs::write(r.join("Cargo.toml"), "[package]\nname='x'\n").unwrap();
+        run_in(r, &["add", "."]).unwrap();
+        run_in(r, &["commit", "-m", "base"]).unwrap();
+        let wt = add_worktree(r, ".worktrees/task/8", "task/8-x");
+        std::fs::write(wt.join("f.txt"), b"wip").unwrap();
+        run_in(&wt, &["add", "."]).unwrap();
+        run_in(&wt, &["commit", "-m", "unmerged"]).unwrap();
+        std::fs::create_dir_all(wt.join("target")).unwrap();
+        std::fs::write(wt.join("target/a.o"), b"obj").unwrap();
+        let opts = CleanOptions {
+            artifacts: Some(Vec::new()),
+            ..git_opts()
+        };
+        let plan = scan_repo(r, &opts);
+        assert!(plan.items.is_empty(), "{:?}", plan.items);
+        let held = plan
+            .skipped
+            .iter()
+            .find(|s| s.label == ".worktrees/task/8/target")
+            .expect("target skipped");
+        assert!(held.reason.starts_with("inside skipped .worktrees/task/8"));
     }
 }
