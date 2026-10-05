@@ -338,6 +338,44 @@ fn no_alternative_is_agent_wide(metadata: &str) -> bool {
     failover_enabled_for(metadata) && item_allowed_agents(metadata).is_none()
 }
 
+/// Pure wording for [`unavailability_warning`]: a recorded cooldown wins
+/// over a live usage reading (it is the harder fact).
+fn format_unavailability(
+    agent: &str,
+    cooldown: Option<(i64, String)>,
+    usage: Option<String>,
+) -> Option<String> {
+    let state = match (cooldown, usage) {
+        (Some((until, why)), _) => format!("is {why} -- unavailable until {}", format_unix(until)),
+        (None, Some(breach)) => breach,
+        (None, None) => return None,
+    };
+    Some(format!(
+        "{agent} {state}. Dispatch may fail over to another agent; pin the item with metadata \
+         \"{FAILOVER_KEY}\": false, or restrict it with \"{ALLOWED_AGENTS_KEY}\"."
+    ))
+}
+
+/// Heads-up for an MCP caller that is about to hand work to an agent that is
+/// `known_unavailable` (cooling down, out of credit, over its usage
+/// threshold). Informational only -- the call still goes through. `None`
+/// for an unknown name or an agent that is fine.
+pub(crate) fn unavailability_warning(agent_name: &str) -> Option<String> {
+    let agent = agent_registry::agent_by_name(&agentflare_backend::item::agent_part(agent_name))?;
+    format_unavailability(
+        agent.as_str(),
+        unavailable_until(agent.as_str()),
+        usage_threshold_reason(agent),
+    )
+}
+
+/// Adds a `warnings` array to a JSON object response when there is one.
+pub(crate) fn attach_warning(resp: &mut serde_json::Value, warning: Option<String>) {
+    if let (Some(w), Some(obj)) = (warning, resp.as_object_mut()) {
+        obj.insert("warnings".into(), serde_json::json!([w]));
+    }
+}
+
 /// `2026-09-24 15:00 UTC` for a unix timestamp.
 pub(crate) fn format_unix(ts: i64) -> String {
     chrono::DateTime::from_timestamp(ts, 0)
@@ -348,6 +386,35 @@ pub(crate) fn format_unix(ts: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unavailability_wording_names_the_reason_and_the_escape_hatch() {
+        assert_eq!(format_unavailability("cursor", None, None), None);
+        let usage = format_unavailability(
+            "claude-code",
+            None,
+            Some("seven_day usage 74% >= threshold 70%".into()),
+        )
+        .unwrap();
+        assert!(usage.starts_with("claude-code seven_day usage 74% >= threshold 70%."));
+        assert!(usage.contains("\"failover\": false") && usage.contains("allowed_agents"));
+        let cooldown = format_unavailability(
+            "cursor",
+            Some((0, "out of credit".into())),
+            Some("seven_day usage 74% >= threshold 70%".into()),
+        )
+        .unwrap();
+        assert!(cooldown.starts_with("cursor is out of credit -- unavailable until 1970-01-01"));
+    }
+
+    #[test]
+    fn attach_warning_adds_the_array_only_when_there_is_one() {
+        let mut v = serde_json::json!({"ok": true});
+        attach_warning(&mut v, None);
+        assert!(v.get("warnings").is_none());
+        attach_warning(&mut v, Some("w".into()));
+        assert_eq!(v["warnings"], serde_json::json!(["w"]));
+    }
 
     #[test]
     fn choose_alternative_skips_unavailable_and_disallowed_agents() {

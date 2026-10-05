@@ -536,7 +536,7 @@ impl AgentflareMcp {
 
             let mime_type = Self::infer_mime_type(ext);
 
-            let result = self.with_store(|store| -> Result<serde_json::Value, ErrorData> {
+            let mut result = self.with_store(|store| -> Result<serde_json::Value, ErrorData> {
                 let prefix = format!("item_attachment/{}", item.id);
                 let existing = store
                     .doc_list(&ws_id)
@@ -613,6 +613,10 @@ impl AgentflareMcp {
                 }
             }
 
+            crate::quota::failover::attach_warning(
+                &mut result,
+                crate::quota::failover::unavailability_warning(&recipient),
+            );
             Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
         })?
     }
