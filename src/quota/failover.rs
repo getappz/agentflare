@@ -210,45 +210,59 @@ pub(crate) fn record_failover(
     reason: &str,
 ) -> Result<(), String> {
     let author = crate::claims::owner_id();
-    mcp.with_backend_db(|conn| -> agentflare_backend::error::Result<()> {
-        let tx = conn.unchecked_transaction()?;
-        // A `metadata.model` pin names a model of the agent being left
-        // (e.g. a Claude model); handing it to the new agent would just fail
-        // its launch, so it is dropped (and said so) on the move.
-        let item = agentflare_backend::item::get(&tx, item_id)?;
-        let mut meta: serde_json::Value =
-            serde_json::from_str(&item.metadata).unwrap_or_else(|_| serde_json::json!({}));
-        let dropped_model = meta
-            .as_object_mut()
-            .and_then(|m| m.remove("model"))
-            .and_then(|m| m.as_str().map(str::to_string));
-        let mut body = format!(
-            "{}\n\nmoved from {} to {}: {reason}",
-            crate::dispatch_failure_ceiling::AGENT_FAILOVER_MARKER,
-            from.as_str(),
-            to.as_str()
-        );
-        if let Some(model) = &dropped_model {
-            body.push_str(&format!(
-                "\n\nDropped the item's model pin `{model}` (it was for {}).",
-                from.as_str()
-            ));
-        }
-        agentflare_backend::item::update(
-            &tx,
-            item_id,
-            agentflare_backend::item::UpdateItem {
-                assignee_agent: Some(to.as_str().to_string()),
-                metadata: dropped_model.is_some().then(|| meta.to_string()),
-                ..Default::default()
-            },
-        )?;
-        agentflare_backend::comment::create(&tx, item_id, &author, &body)?;
-        tx.commit()?;
-        Ok(())
-    })
-    .map_err(|e| e.to_string())?
-    .map_err(|e| e.to_string())
+    let line = format!("moved from {} to {}: {reason}", from.as_str(), to.as_str());
+    let notified = mcp
+        .with_backend_db(|conn| -> agentflare_backend::error::Result<_> {
+            let tx = conn.unchecked_transaction()?;
+            // A `metadata.model` pin names a model of the agent being left
+            // (e.g. a Claude model); handing it to the new agent would just fail
+            // its launch, so it is dropped (and said so) on the move.
+            let item = agentflare_backend::item::get(&tx, item_id)?;
+            let mut meta: serde_json::Value =
+                serde_json::from_str(&item.metadata).unwrap_or_else(|_| serde_json::json!({}));
+            let dropped_model = meta
+                .as_object_mut()
+                .and_then(|m| m.remove("model"))
+                .and_then(|m| m.as_str().map(str::to_string));
+            // One comment per distinct move: the same line as the latest failover
+            // comment (a retry within one dispatch) is not posted again.
+            let repeated = agentflare_backend::comment::list_by_item(&tx, item_id)?
+                .iter()
+                .rev()
+                .find(|c| {
+                    c.body
+                        .contains(crate::dispatch_failure_ceiling::AGENT_FAILOVER_MARKER)
+                })
+                .is_some_and(|c| c.body.contains(&line));
+            let mut body = format!(
+                "{}\n\n{line}",
+                crate::dispatch_failure_ceiling::AGENT_FAILOVER_MARKER
+            );
+            if let Some(model) = &dropped_model {
+                body.push_str(&format!(
+                    "\n\nDropped the item's model pin `{model}` (it was for {}).",
+                    from.as_str()
+                ));
+            }
+            agentflare_backend::item::update(
+                &tx,
+                item_id,
+                agentflare_backend::item::UpdateItem {
+                    assignee_agent: Some(to.as_str().to_string()),
+                    metadata: dropped_model.is_some().then(|| meta.to_string()),
+                    ..Default::default()
+                },
+            )?;
+            if !repeated {
+                agentflare_backend::comment::create(&tx, item_id, &author, &body)?;
+            }
+            tx.commit()?;
+            Ok(item)
+        })
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+    crate::supervisor::notify_quota_event(&notified, &format!("#{} {line}", notified.sequence_id));
+    Ok(())
 }
 
 /// Label names on `item_id`, for routing (empty on any lookup failure).

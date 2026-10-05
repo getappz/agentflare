@@ -102,21 +102,54 @@ pub(crate) fn notify_human_gate(item: &agentflare_backend::item::Item, reason: &
         html_escape(&item.name),
         html_escape(&reason),
     );
-    // Same per-chat lock `chat_channel::run_chat_turn` holds for its whole
-    // body -- without it, this side-channel send races an in-flight chat
-    // reply to the same chat with no ordering between the two Telegram API
-    // calls, so an unrelated notification can land interleaved with it
-    // (item #281).
-    let turn_lock = crate::chat_channel::chat_turn_lock(&chat_id);
+    send_notify_card(&chat_id, &text, item.sequence_id);
+}
+
+/// Same per-chat lock `chat_channel::run_chat_turn` holds for its whole
+/// body -- without it, a side-channel send races an in-flight chat reply to
+/// the same chat with no ordering between the two Telegram API calls, so an
+/// unrelated notification can land interleaved with it (item #281). A send
+/// failure only logs.
+fn send_notify_card(chat_id: &str, text: &str, seq: i64) {
+    let turn_lock = crate::chat_channel::chat_turn_lock(chat_id);
     let _turn_guard = turn_lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Err(e) = crate::channels::send_telegram_card(&chat_id, &text, &[]) {
-        eprintln!(
-            "agentflare-supervisor: telegram notify failed for item #{}: {e}",
-            item.sequence_id
-        );
+    if let Err(e) = crate::channels::send_telegram_card(chat_id, text, &[]) {
+        eprintln!("agentflare-supervisor: telegram notify failed for item #{seq}: {e}");
     }
+}
+
+/// FYI notification for a quota/failover event (nobody has to act): same
+/// opt-in and fail-open contract as [`notify_human_gate`], but `text` is sent
+/// as-is under a neutral headline, and at most once per `(item, text)` --
+/// an unchanged reason on a retry stays quiet, a changed one notifies again.
+pub(crate) fn notify_quota_event(item: &agentflare_backend::item::Item, text: &str) {
+    if test_notify_disabled() || !changed_since_last(&item.id, text) {
+        return;
+    }
+    let Ok(Some(chat_id)) = crate::vault::get_secret(TELEGRAM_NOTIFY_CHAT_ID_SECRET) else {
+        return;
+    };
+    let card = format!(
+        "\u{2139}\u{FE0F} <b>agentflare</b> quota\n<b>Item:</b> #{} \u{2014} {}\n{}",
+        item.sequence_id,
+        html_escape(&item.name),
+        html_escape(&summarize_reason(text)),
+    );
+    send_notify_card(&chat_id, &card, item.sequence_id);
+}
+
+/// True when `text` differs from the last one recorded for `key` (and
+/// records it). In-memory and per-process like [`first_time_gated`].
+pub(crate) fn changed_since_last(key: &str, text: &str) -> bool {
+    static LAST: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    LAST.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key.to_string(), text.to_string())
+        .is_none_or(|prev| prev != text)
 }
 
 /// Shared card-send half of [`notify_pr_approval_gate`] and
@@ -398,6 +431,14 @@ mod pr_approval_card_tests {
 #[cfg(test)]
 mod summarize_reason_tests {
     use super::*;
+
+    #[test]
+    fn changed_since_last_fires_once_per_distinct_text() {
+        assert!(changed_since_last("k-quota", "a"));
+        assert!(!changed_since_last("k-quota", "a"));
+        assert!(changed_since_last("k-quota", "b"));
+        assert!(changed_since_last("k-other", "b"));
+    }
 
     #[test]
     fn passes_short_single_line_reasons_through_unchanged() {
