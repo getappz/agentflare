@@ -152,6 +152,30 @@ pub fn get_by_name(conn: &Connection, project_id: &str, name: &str) -> Result<La
     })
 }
 
+/// Create a project label on first use, including inside a caller's transaction.
+pub fn ensure_project_label(conn: &Connection, project_id: &str, name: &str) -> Result<Label> {
+    match get_by_name(conn, project_id, name) {
+        Ok(label) => return Ok(label),
+        Err(crate::error::Error::NotFound(_)) => {}
+        Err(e) => return Err(e),
+    }
+    let project = crate::project::get(conn, project_id)?;
+    let ts = now();
+    conn.execute(
+        "INSERT INTO labels (id, project_id, workspace_id, name, color, sort_order, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, '#60646C', ?5, ?6, ?6) ON CONFLICT DO NOTHING",
+        rusqlite::params![
+            db_kit::ids::new_id(),
+            project_id,
+            &project.workspace_id,
+            name,
+            next_sort_order(conn, Some(project_id), &project.workspace_id)?,
+            ts,
+        ],
+    )?;
+    get_by_name(conn, project_id, name)
+}
+
 pub fn list_by_project(conn: &Connection, project_id: &str) -> Result<Vec<Label>> {
     let mut stmt = conn.prepare(
         "SELECT id, project_id, workspace_id, name, color, parent_id, sort_order, external_source, external_id, created_at, updated_at, deleted_at
