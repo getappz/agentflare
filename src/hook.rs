@@ -719,6 +719,18 @@ fn identity_bits(components: &[crate::components::Component]) -> Vec<String> {
     bits
 }
 
+fn append_prompt_context(
+    bits: &mut Vec<String>,
+    session_bits: Vec<String>,
+    prompt: &str,
+) -> crate::skill_detect::IntentClassification {
+    bits.extend(session_bits);
+    bits.extend(crate::coaching::rule_bodies_for_prompt(prompt));
+    let intent = crate::skill_detect::classify(prompt);
+    bits.push(crate::skill_detect::format_briefing_header(&intent));
+    intent
+}
+
 pub fn prompt_submit(agent: &str) {
     let Some(input) = read_stdin_or_skip("UserPromptSubmit") else {
         return;
@@ -815,6 +827,9 @@ pub fn prompt_submit(agent: &str) {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         crate::optimize::prune_stale_sessions(&mut runtime, now);
+        // Same agent-scoped key as pre_tool_use/post_tool_use (item #220) --
+        // must resolve to the same record for the completion gate to see
+        // this session's turn/tool-call history.
         let session_key = crate::optimize::scoped_session_key(agent, sid);
         let record =
             runtime
@@ -900,10 +915,7 @@ pub fn prompt_submit(agent: &str) {
             bits.push(nudge);
         }
     }
-    bits.extend(crate::coaching::rule_bodies_for_prompt(prompt));
-
-    let intent = crate::skill_detect::classify(prompt);
-    bits.push(crate::skill_detect::format_briefing_header(&intent));
+    let intent = append_prompt_context(&mut bits, session_bits, prompt);
 
     let mut skill_pick = None;
     let mut pending_rerank = None;
@@ -921,6 +933,8 @@ pub fn prompt_submit(agent: &str) {
                 crate::memory::engine::embed_query,
                 crate::memory::engine::embed_doc,
             ) {
+                // Re-ranking a wider pool can reorder the top picks, so the
+                // default 3-result set is fetched on its own as the baseline.
                 let baseline = if limit == 3 {
                     skills.clone()
                 } else {
@@ -945,12 +959,11 @@ pub fn prompt_submit(agent: &str) {
     let decisions =
         crate::hook_decide_batch::run(prompt, jev_route_ctx.as_ref(), pending_rerank.as_ref());
     if let Some(nudge) = decisions.route_nudge {
-        session_bits.push(nudge);
+        bits.push(nudge);
     }
     if decisions.skill_pick.is_some() {
         skill_pick = decisions.skill_pick;
     }
-    bits.extend(session_bits);
     if let Some(skills) = skill_pick
         && let Some(injection) = crate::skill_detect::build_injection(&skills)
     {
@@ -1309,6 +1322,36 @@ second line
                 vec!["Every review finding needs a diff.".to_string()]
             );
             assert!(crate::coaching::rule_bodies_for_prompt("what's for lunch").is_empty());
+        });
+    }
+
+    #[test]
+    fn prompt_context_keeps_keyword_nudge_before_rules_and_briefing_with_jev_off() {
+        use crate::coaching::rule::RuleTier;
+        use crate::paths::test_support::with_temp_home;
+        with_temp_home(|| {
+            crate::coaching::apply_rule(
+                "revorder",
+                "Review order",
+                "Review rule body.",
+                Some(crate::coaching::test_support::trigger(vec![], true)),
+                RuleTier::Override,
+                vec![],
+            )
+            .unwrap();
+
+            let prompt = "please review this PR";
+            let mut bits = vec![];
+            let intent =
+                append_prompt_context(&mut bits, vec!["keyword routing nudge".to_string()], prompt);
+            assert_eq!(
+                bits,
+                vec![
+                    "keyword routing nudge".to_string(),
+                    "Review rule body.".to_string(),
+                    crate::skill_detect::format_briefing_header(&intent),
+                ]
+            );
         });
     }
 

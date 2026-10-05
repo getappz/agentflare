@@ -46,28 +46,22 @@ fn run_with(
 
     match ask(&batch) {
         Ok(outcome) => Result {
-            route_nudge: batch_route
-                .then(|| {
-                    crate::optimize::jev_router::route_batch_success(
-                        jev_route_ctx.expect("batch_route requires route context"),
-                        &outcome,
-                        record,
-                    )
-                })
-                .flatten(),
+            route_nudge: match (batch_route, jev_route_ctx) {
+                (true, Some(ctx)) => {
+                    crate::optimize::jev_router::route_batch_success(ctx, &outcome, record)
+                }
+                _ => None,
+            },
             skill_pick: pending_rerank
                 .map(|pending| pending.finish_success(&outcome, "skill_rerank.", record)),
         },
         Err(err) => Result {
-            route_nudge: batch_route
-                .then(|| {
-                    crate::optimize::jev_router::route_batch_error(
-                        jev_route_ctx.expect("batch_route requires route context"),
-                        &err,
-                        record,
-                    )
-                })
-                .flatten(),
+            route_nudge: match (batch_route, jev_route_ctx) {
+                (true, Some(ctx)) => {
+                    crate::optimize::jev_router::route_batch_error(ctx, &err, record)
+                }
+                _ => None,
+            },
             skill_pick: pending_rerank.map(|pending| pending.finish_error(&err, record)),
         },
     }
