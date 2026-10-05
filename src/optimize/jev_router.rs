@@ -165,6 +165,22 @@ fn route_with(
         outcome.elapsed_ms,
         outcome.response.usage.cost,
     ));
+    if let Some(answer) = outcome
+        .response
+        .answers
+        .get(QUESTION_ID)
+        .filter(|_| decide::capture::enabled())
+    {
+        decide::capture::record(decide::capture::Input {
+            site: SITE,
+            features: decide::capture::router_features(&prompt),
+            norm_input: &prompt,
+            label: decide::capture::label_of(answer),
+            confidence,
+            baseline: baseline_label,
+            source_model: outcome.response.model.as_deref(),
+        });
+    }
     match confidence {
         Some(c) if c >= MIN_CONFIDENCE => nudge(tier, c, ctx.current_model.as_deref()),
         // Missing or low confidence means "don't rely on it": keep the heuristic.

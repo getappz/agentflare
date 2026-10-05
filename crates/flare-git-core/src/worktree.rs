@@ -207,7 +207,7 @@ fn worktree_already_checked_out(worktree_path: &Path, branch: &str) -> bool {
 /// sweep up any unrelated staged files, and any pre-existing uncommitted
 /// `.gitignore` edits, into a commit the agent didn't ask for).
 ///
-/// `.cargo/` joined `.worktrees/` here because `isolate_worktree_target_dir`
+/// `.cargo/` joined `.worktrees/` here because `retire_legacy_cargo_config`
 /// writes an untracked `.cargo/config.toml` into every worktree it creates;
 /// left unignored, `git status --porcelain` reports every freshly-created
 /// worktree as dirty before any real work happens in it, which is exactly
@@ -252,7 +252,7 @@ pub fn ensure_worktrees_ignored(repo_root: &Path) {
 /// developer who opens a bare shell inside a worktree and runs `cargo`
 /// directly, bypassing `agentflare run`. Per Cargo's precedence (CLI flag >
 /// env var > config file), an ambient `CARGO_TARGET_DIR` *always* wins over
-/// the `.cargo/config.toml` that `isolate_worktree_target_dir` writes, so in
+/// the `.cargo/config.toml` that `retire_legacy_cargo_config` writes, so in
 /// that bypass case the isolated `target/` is silently shadowed and the bug
 /// can still occur.
 ///
@@ -271,71 +271,48 @@ fn warn_if_ambient_target_dir() {
     }
 }
 
-/// Writes a per-worktree `.cargo/config.toml` so the worktree's `target/`
-/// resolves locally instead of inheriting a shared `CARGO_TARGET_DIR`.
+/// Marker comment of the `.cargo/config.toml` that items #133/#139 used to
+/// write into every claimed worktree.
+const LEGACY_CARGO_CONFIG_MARKER: &str = "Isolated per worktree (see item #133)";
+
+/// Build sharing is mbx's job now (item #330): it manages each checkout's
+/// `target/` (a symlink into its shared store, so a warm store builds in
+/// seconds) and is itself the compiler wrapper, so a claimed worktree needs no
+/// `.cargo/config.toml` — no `rustc-wrapper = "sccache"` (two wrappers on one
+/// build is unsupported) and no `target-dir` (mbx owns `target`). Cargo's
+/// default `target/` is still per-checkout, so isolation between worktrees is
+/// unchanged; an ambient `CARGO_TARGET_DIR` is still stripped for launched
+/// agents (src/agent_launch.rs).
 ///
-/// Caveat: this only takes effect when `CARGO_TARGET_DIR` is *unset* in the
-/// ambient environment — no config file can outrank the env var (Cargo's
-/// precedence is CLI flag > env var > config file). A bare shell that
-/// bypasses `agentflare run` still needs `warn_if_ambient_target_dir`'s
-/// warning; every agent-launched build IS covered, since item #139 made
-/// `run_launch_env`/`run_headless` (src/agent_launch.rs) strip the var from
-/// the child env before it ever reaches Cargo, and CI enforces the same
-/// invariant via the `target-dir-guard` job in ci.yml.
-///
-/// Local workspace crates must NOT be shared across worktrees (silent
-/// contamination); registry deps are safe but are better served by a shared
-/// sccache. A relative `target-dir = "target"` resolves per-checkout, giving
-/// each worktree its own isolated cache. When `sccache` is on `PATH`, also
-/// wires it up as the `rustc-wrapper` with `SCCACHE_BASEDIRS` set to this
-/// worktree's own absolute path — sccache hashes absolute source paths into
-/// its cache key by default, so without stripping that prefix, identical
-/// dependency source in a sibling worktree would never hit
-/// (mozilla/sccache#196; a `--remap-path-prefix` rustflag looks tempting but
-/// itself varies per worktree and defeats the cache key instead). Soft-fails
-/// (eprintln) — never blocks a claim.
-fn isolate_worktree_target_dir(worktree_path: &Path) {
-    let cargo_dir = worktree_path.join(".cargo");
-    let _ = std::fs::create_dir_all(&cargo_dir);
-    let config_path = cargo_dir.join("config.toml");
-    if config_path.exists() {
-        return; // don't clobber an intentional worktree-local override
+/// This only retires the legacy generated config left in worktrees created
+/// before #330 (it would otherwise keep wrapping rustc with sccache under
+/// mbx). A config without our marker is an intentional local override and is
+/// left alone. Soft-fails (eprintln) — never blocks a claim.
+fn retire_legacy_cargo_config(worktree_path: &Path) {
+    let config_path = worktree_path.join(".cargo").join("config.toml");
+    let Ok(content) = std::fs::read_to_string(&config_path) else {
+        return;
+    };
+    // Marker alone isn't enough: a user may have appended overrides under it.
+    // Only a file made purely of the lines #133/#139 generated is retired.
+    let only_generated = content.lines().map(str::trim).all(|l| {
+        l.is_empty()
+            || l.starts_with('#')
+            || matches!(
+                l,
+                "[build]" | "[env]" | "target-dir = \"target\"" | "rustc-wrapper = \"sccache\""
+            )
+            || l.starts_with("SCCACHE_BASEDIRS = ")
+    });
+    if !content.contains(LEGACY_CARGO_CONFIG_MARKER) || !only_generated {
+        return;
     }
-    let mut content = "[build]\n# Isolated per worktree (see item #133). Registry deps are\n\
-                   # better shared via sccache (RUSTC_WRAPPER + SCCACHE_BASEDIRS),\n\
-                   # not a shared CARGO_TARGET_DIR, which leaks artifacts across worktrees.\n\
-                   target-dir = \"target\"\n"
-        .to_string();
-    if sccache_available() {
-        // TOML literal strings ('...') can't escape a single quote, so a
-        // worktree path containing one (e.g. "C:\Users\John's PC\repo")
-        // would produce invalid TOML. Use a basic string instead, with
-        // backslashes and double quotes escaped.
-        let escaped_path = worktree_path
-            .to_string_lossy()
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"");
-        content.push_str(&format!(
-            "rustc-wrapper = \"sccache\"\n\n[env]\nSCCACHE_BASEDIRS = \"{escaped_path}\"\n"
-        ));
-    }
-    if let Err(e) = std::fs::write(&config_path, content) {
+    if let Err(e) = std::fs::remove_file(&config_path) {
         eprintln!(
-            "worktree: could not write isolated .cargo/config.toml for {}: {e}",
+            "worktree: could not remove legacy .cargo/config.toml for {}: {e}",
             worktree_path.display()
         );
     }
-}
-
-/// True when the `sccache` binary is reachable on `PATH`.
-fn sccache_available() -> bool {
-    flare_process::command("sccache")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
 }
 
 /// Max length of the slug portion of a `task/<sequence_id>-<slug>` branch
@@ -563,7 +540,7 @@ pub fn create_worktree_for(
             restore_mass_deleted_worktree(&worktree_path)?;
         }
         warn_if_ambient_target_dir();
-        isolate_worktree_target_dir(&worktree_path);
+        retire_legacy_cargo_config(&worktree_path);
         lock_item_worktree(repo_root, &worktree_path);
         return Ok(worktree_path);
     }
@@ -602,7 +579,7 @@ pub fn create_worktree_for(
                 )
             })?;
             warn_if_ambient_target_dir();
-            isolate_worktree_target_dir(&worktree_path);
+            retire_legacy_cargo_config(&worktree_path);
             lock_item_worktree(repo_root, &worktree_path);
             return Ok(worktree_path);
         }
@@ -786,7 +763,7 @@ pub fn create_worktree_for(
                 if let Some(p) = progress {
                     p.send(1.0, Some(1.0), Some("Worktree created".into()));
                 }
-                isolate_worktree_target_dir(&worktree_path);
+                retire_legacy_cargo_config(&worktree_path);
                 lock_item_worktree(repo_root, &worktree_path);
                 return Ok(worktree_path);
             }

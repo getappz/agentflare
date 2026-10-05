@@ -187,6 +187,27 @@ fn pick_with_baseline(
         outcome.elapsed_ms,
         outcome.response.usage.cost,
     ));
+    if decide::capture::enabled() {
+        let noul: BTreeMap<&str, f64> = candidates
+            .iter()
+            .map(|s| s.name.as_str())
+            .zip(probabilities.iter().copied())
+            .collect();
+        decide::capture::record(decide::capture::Input {
+            site: SITE,
+            features: decide::capture::rerank_features(
+                &prompt,
+                candidates
+                    .iter()
+                    .map(|s| (s.name.as_str(), s.description.as_str(), s.score)),
+            ),
+            norm_input: &prompt,
+            label: serde_json::json!({ "summary": names(&picks), "noul": noul }),
+            confidence: Some(certainty),
+            baseline: &baseline_names,
+            source_model: outcome.response.model.as_deref(),
+        });
+    }
     match mode {
         Mode::Apply => picks,
         Mode::Shadow | Mode::Off => baseline,
