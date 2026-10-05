@@ -23,6 +23,7 @@ const DROP_AT: f64 = 0.35;
 const MAX_PROMPT_CHARS: usize = 1500;
 const MAX_DESCRIPTION_CHARS: usize = 200;
 /// Well inside the UserPromptSubmit hook's wall-clock budget.
+#[allow(dead_code)]
 const BUDGET: Duration = Duration::from_millis(1500);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -54,6 +55,7 @@ pub fn fetch_limit(inject: usize) -> usize {
 /// set; `baseline` is what the default path would inject on its own (fetched
 /// separately by the caller, because re-ranking a wider pool can reorder the
 /// top picks), so `shadow` mode injects exactly the default.
+#[allow(dead_code)]
 pub fn pick(
     prompt: &str,
     ranked: Vec<RankedSkill>,
@@ -72,7 +74,192 @@ pub fn pick(
 }
 
 /// The backend call, injectable for tests.
+#[allow(dead_code)]
 type AskFn<'a> = dyn Fn(&str, &BTreeMap<String, Question>) -> Result<Outcome, DecideError> + 'a;
+
+pub struct Pending {
+    prompt: String,
+    candidates: Vec<RankedSkill>,
+    baseline: Vec<RankedSkill>,
+    keep: usize,
+    mode: Mode,
+}
+
+pub fn prepare(
+    prompt: &str,
+    ranked: Vec<RankedSkill>,
+    baseline: Vec<RankedSkill>,
+    keep: usize,
+) -> Result<Pending, Vec<RankedSkill>> {
+    prepare_with_mode(prompt, ranked, baseline, keep, mode())
+}
+
+#[cfg(test)]
+pub(crate) fn prepare_for_test(
+    prompt: &str,
+    ranked: Vec<RankedSkill>,
+    baseline: Vec<RankedSkill>,
+    keep: usize,
+) -> Result<Pending, Vec<RankedSkill>> {
+    prepare_with_mode(prompt, ranked, baseline, keep, Mode::Apply)
+}
+
+fn prepare_with_mode(
+    prompt: &str,
+    ranked: Vec<RankedSkill>,
+    baseline: Vec<RankedSkill>,
+    keep: usize,
+    mode: Mode,
+) -> Result<Pending, Vec<RankedSkill>> {
+    let prompt = prompt.trim();
+    if mode == Mode::Off || ranked.is_empty() || prompt.is_empty() || prompt.starts_with("/") {
+        return Err(baseline);
+    }
+    let prompt: String = prompt.chars().take(MAX_PROMPT_CHARS).collect();
+    let candidates = ranked[..ranked.len().min(TOP_N)].to_vec();
+    Ok(Pending {
+        prompt,
+        candidates,
+        baseline,
+        keep,
+        mode,
+    })
+}
+
+impl Pending {
+    #[allow(dead_code)]
+    pub fn prompt(&self) -> &str {
+        &self.prompt
+    }
+
+    pub fn add_to_batch(&self, batch: &mut decide::Batch, prefix: &str) {
+        for (id, question) in self.questions(prefix) {
+            batch.add(id, question);
+        }
+    }
+
+    fn questions(&self, prefix: &str) -> BTreeMap<String, Question> {
+        self.candidates
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (format!("{prefix}s{i}"), question_for(s)))
+            .collect()
+    }
+
+    pub fn finish_success(
+        &self,
+        outcome: &Outcome,
+        prefix: &str,
+        record: &dyn Fn(&shadow::Row),
+    ) -> Vec<RankedSkill> {
+        self.finish_answers(
+            &outcome.response.answers,
+            prefix,
+            outcome.elapsed_ms,
+            outcome.response.usage.cost,
+            outcome.response.model.as_deref(),
+            record,
+        )
+    }
+
+    pub fn finish_error(
+        &self,
+        err: &DecideError,
+        record: &dyn Fn(&shadow::Row),
+    ) -> Vec<RankedSkill> {
+        match err {
+            DecideError::Disabled | DecideError::NoCredentials => self.baseline.clone(),
+            e => {
+                record(&shadow::Row::failed(
+                    SITE,
+                    &self.prompt,
+                    &names(&self.baseline),
+                    &e.to_string(),
+                ));
+                self.baseline.clone()
+            }
+        }
+    }
+
+    fn finish_answers(
+        &self,
+        answers: &BTreeMap<String, Answer>,
+        prefix: &str,
+        elapsed_ms: u64,
+        cost: Option<f64>,
+        source_model: Option<&str>,
+        record: &dyn Fn(&shadow::Row),
+    ) -> Vec<RankedSkill> {
+        let baseline_names = names(&self.baseline);
+        let probabilities: Option<Vec<f64>> = (0..self.candidates.len())
+            .map(|i| match answers.get(&format!("{prefix}s{i}")) {
+                Some(Answer::Noul { noul }) => Some(*noul),
+                _ => None,
+            })
+            .collect();
+        let Some(probabilities) = probabilities else {
+            record(&shadow::Row::failed(
+                SITE,
+                &self.prompt,
+                &baseline_names,
+                "incomplete answers",
+            ));
+            return self.baseline.clone();
+        };
+        let in_baseline = |s: &RankedSkill| self.baseline.iter().any(|b| b.name == s.name);
+        let picks: Vec<RankedSkill> = self
+            .candidates
+            .iter()
+            .zip(&probabilities)
+            .filter(|(s, p)| match **p {
+                p if p >= KEEP_AT => true,
+                p if p <= DROP_AT => false,
+                _ => in_baseline(s),
+            })
+            .map(|(s, _)| s.clone())
+            .take(self.keep)
+            .collect();
+        let certainty = probabilities
+            .iter()
+            .map(|p| 2.0 * (p - 0.5).abs())
+            .fold(1.0, f64::min);
+        record(&shadow::Row::answered(
+            SITE,
+            &self.prompt,
+            &baseline_names,
+            &names(&picks),
+            Some(certainty),
+            elapsed_ms,
+            cost,
+        ));
+        if decide::capture::enabled() {
+            let noul: BTreeMap<&str, f64> = self
+                .candidates
+                .iter()
+                .map(|s| s.name.as_str())
+                .zip(probabilities.iter().copied())
+                .collect();
+            decide::capture::record(decide::capture::Input {
+                site: SITE,
+                features: decide::capture::rerank_features(
+                    &self.prompt,
+                    self.candidates
+                        .iter()
+                        .map(|s| (s.name.as_str(), s.description.as_str(), s.score)),
+                ),
+                norm_input: &self.prompt,
+                label: serde_json::json!({ "summary": names(&picks), "noul": noul }),
+                confidence: Some(certainty),
+                baseline: &baseline_names,
+                source_model,
+            });
+        }
+        match self.mode {
+            Mode::Apply => picks,
+            Mode::Shadow | Mode::Off => self.baseline.clone(),
+        }
+    }
+}
 
 fn question_for(skill: &RankedSkill) -> Question {
     let description: String = skill
@@ -111,6 +298,7 @@ fn pick_with(
     pick_with_baseline(prompt, ranked, baseline, keep, mode, ask, record)
 }
 
+#[allow(dead_code)]
 fn pick_with_baseline(
     prompt: &str,
     ranked: Vec<RankedSkill>,
@@ -120,100 +308,16 @@ fn pick_with_baseline(
     ask: &AskFn<'_>,
     record: &dyn Fn(&shadow::Row),
 ) -> Vec<RankedSkill> {
-    let prompt = prompt.trim();
-    if mode == Mode::Off || ranked.is_empty() || prompt.is_empty() || prompt.starts_with('/') {
-        return baseline;
-    }
-    let prompt: String = prompt.chars().take(MAX_PROMPT_CHARS).collect();
-    let candidates = &ranked[..ranked.len().min(TOP_N)];
-    let questions: BTreeMap<String, Question> = candidates
-        .iter()
-        .enumerate()
-        .map(|(i, s)| (format!("s{i}"), question_for(s)))
-        .collect();
-    let baseline_names = names(&baseline);
-    let outcome = match ask(&prompt, &questions) {
-        Ok(outcome) => outcome,
-        // Not configured: behave exactly as if reranking were off, silently.
-        Err(DecideError::Disabled | DecideError::NoCredentials) => return baseline,
-        Err(e) => {
-            record(&shadow::Row::failed(
-                SITE,
-                &prompt,
-                &baseline_names,
-                &e.to_string(),
-            ));
-            return baseline;
-        }
+    let pending = match prepare_with_mode(prompt, ranked, baseline, keep, mode) {
+        Ok(pending) => pending,
+        Err(baseline) => return baseline,
     };
-    let probabilities: Option<Vec<f64>> = (0..candidates.len())
-        .map(|i| match outcome.response.answers.get(&format!("s{i}")) {
-            Some(Answer::Noul { noul }) => Some(*noul),
-            _ => None,
-        })
-        .collect();
-    let Some(probabilities) = probabilities else {
-        record(&shadow::Row::failed(
-            SITE,
-            &prompt,
-            &baseline_names,
-            "incomplete answers",
-        ));
-        return baseline;
-    };
-    let in_baseline = |s: &RankedSkill| baseline.iter().any(|b| b.name == s.name);
-    let picks: Vec<RankedSkill> = candidates
-        .iter()
-        .zip(&probabilities)
-        .filter(|(s, p)| match **p {
-            p if p >= KEEP_AT => true,
-            p if p <= DROP_AT => false,
-            _ => in_baseline(s), // unsure: the existing ranking decides
-        })
-        .map(|(s, _)| s.clone())
-        .take(keep)
-        .collect();
-    // "Confidence" of the whole call = its least certain candidate.
-    let certainty = probabilities
-        .iter()
-        .map(|p| 2.0 * (p - 0.5).abs())
-        .fold(1.0, f64::min);
-    record(&shadow::Row::answered(
-        SITE,
-        &prompt,
-        &baseline_names,
-        &names(&picks),
-        Some(certainty),
-        outcome.elapsed_ms,
-        outcome.response.usage.cost,
-    ));
-    if decide::capture::enabled() {
-        let noul: BTreeMap<&str, f64> = candidates
-            .iter()
-            .map(|s| s.name.as_str())
-            .zip(probabilities.iter().copied())
-            .collect();
-        decide::capture::record(decide::capture::Input {
-            site: SITE,
-            features: decide::capture::rerank_features(
-                &prompt,
-                candidates
-                    .iter()
-                    .map(|s| (s.name.as_str(), s.description.as_str(), s.score)),
-            ),
-            norm_input: &prompt,
-            label: serde_json::json!({ "summary": names(&picks), "noul": noul }),
-            confidence: Some(certainty),
-            baseline: &baseline_names,
-            source_model: outcome.response.model.as_deref(),
-        });
-    }
-    match mode {
-        Mode::Apply => picks,
-        Mode::Shadow | Mode::Off => baseline,
+    let questions = pending.questions("");
+    match ask(pending.prompt(), &questions) {
+        Ok(outcome) => pending.finish_success(&outcome, "", record),
+        Err(err) => pending.finish_error(&err, record),
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,5 +503,46 @@ mod tests {
     fn fetch_limit_never_shrinks_below_the_injected_count() {
         assert!(fetch_limit(3) >= 3);
         assert_eq!(fetch_limit(20), 20); // larger than TOP_N: unchanged in every mode
+    }
+    #[test]
+    fn batched_rerank_uses_prefixed_question_ids_and_answers() {
+        let pending = match prepare_with_mode(
+            "fix the login bug",
+            ranked(3),
+            vec![skill("skill0"), skill("skill1"), skill("skill2")],
+            3,
+            Mode::Apply,
+        ) {
+            Ok(pending) => pending,
+            Err(_) => panic!("expected pending rerank"),
+        };
+        let mut batch = decide::Batch::new("fix the login bug");
+        pending.add_to_batch(&mut batch, "skill_rerank.");
+        assert!(batch.questions().contains_key("skill_rerank.s0"));
+        assert!(!batch.questions().contains_key("s0"));
+        let outcome = reply(&[0.1, 0.9, 0.95]).unwrap();
+        let answers = outcome
+            .response
+            .answers
+            .into_iter()
+            .map(|(k, v)| (format!("skill_rerank.{k}"), v))
+            .collect();
+        let outcome = Outcome {
+            response: Response {
+                answers,
+                model: None,
+                usage: Usage::default(),
+            },
+            elapsed_ms: 10,
+        };
+        let rows = RefCell::new(vec![]);
+        let picked = pending.finish_success(&outcome, "skill_rerank.", &|r| {
+            rows.borrow_mut().push(r.clone())
+        });
+        assert_eq!(
+            picked.into_iter().map(|s| s.name).collect::<Vec<_>>(),
+            ["skill1", "skill2"]
+        );
+        assert_eq!(rows.borrow()[0].site, "skill_rerank");
     }
 }
