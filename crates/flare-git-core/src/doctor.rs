@@ -519,6 +519,17 @@ fn list_worktrees(repo_root: &Path) -> String {
     run_git_in(repo_root, &["worktree", "list", "--porcelain"]).unwrap_or_default()
 }
 
+/// Path of the worktree (main checkout included) that has `branch` checked
+/// out, if any -- the one thing that makes `git worktree add <that branch>`
+/// fail with "already used by worktree".
+#[must_use]
+pub fn worktree_holding_branch(repo_root: &Path, branch: &str) -> Option<std::path::PathBuf> {
+    parse_worktree_list(&list_worktrees(repo_root))
+        .into_iter()
+        .find(|e| e.branch.as_deref() == Some(branch))
+        .map(|e| std::path::PathBuf::from(e.path))
+}
+
 pub(crate) fn parse_worktree_list(output: &str) -> Vec<WorktreeEntry> {
     let mut entries = Vec::new();
     let mut current_path: Option<String> = None;
@@ -1088,5 +1099,28 @@ mod tests {
             "a healthy lane must never be reclaimed just for being targeted"
         );
         assert!(healthy_path.exists(), "healthy worktree must survive");
+    }
+
+    #[test]
+    fn worktree_holding_branch_finds_the_checkout_that_owns_a_branch() {
+        let repo = crate::shell::test_support::init_repo_with_branch("main");
+        let linked = repo.path.join("linked");
+        crate::shell::run_in(
+            &repo.path,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "task/9-x",
+                linked.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        let holder = worktree_holding_branch(&repo.path, "task/9-x").unwrap();
+        assert_eq!(
+            std::fs::canonicalize(holder).unwrap(),
+            std::fs::canonicalize(&linked).unwrap()
+        );
+        assert!(worktree_holding_branch(&repo.path, "no-such-branch").is_none());
     }
 }

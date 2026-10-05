@@ -189,6 +189,94 @@ fn self_repair_or_gate_skips_when_needs_manual_dispatch_label_is_present() {
     });
 }
 
+/// Item #341: a green, approved PR whose item is gated used to be skipped in
+/// silence; the sweep now raises the operator notice once (and only for an
+/// approved PR -- an unapproved one already has its own approval card).
+#[test]
+fn handle_ci_green_notifies_once_for_a_gated_approved_pr() {
+    crate::paths::test_support::with_temp_home(|| {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        let auth_conn = test_auth_conn();
+        let auto_merge = AutoMergeRef::default();
+        let mut label_id_by_name = seed_gate_label(&mcp);
+        let manual_id = mcp
+            .with_backend_db(|conn| {
+                let project = mcp.resolve_project(conn).unwrap();
+                agentflare_backend::label::create(
+                    conn,
+                    agentflare_backend::label::CreateLabel {
+                        project_id: Some(project.id.clone()),
+                        workspace_id: project.workspace_id.clone(),
+                        name: NEEDS_MANUAL_LABEL.into(),
+                        color: None,
+                        parent_id: None,
+                        sort_order: None,
+                        external_source: None,
+                        external_id: None,
+                    },
+                )
+                .unwrap()
+                .id
+            })
+            .unwrap();
+        label_id_by_name.insert(NEEDS_MANUAL_LABEL.to_string(), manual_id.clone());
+
+        let sweep_once = |approved: bool| {
+            let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
+            mcp.with_backend_db(|conn| {
+                agentflare_backend::item::add_label(conn, &item_id, &manual_id).unwrap()
+            })
+            .unwrap();
+            let item = current_item(&mcp, &item_id);
+            let labels = if approved {
+                vec![PR_APPROVAL_LABEL.to_string()]
+            } else {
+                vec![]
+            };
+            let mut sweep = ReviewSweepResult {
+                promoted: 0,
+                self_repaired: 0,
+                review_repaired: 0,
+                skipped: 0,
+                waiting: 0,
+                updated: 0,
+                discovered: 0,
+                requeued: 0,
+            };
+            handle_ci_green(
+                &mcp,
+                &queue,
+                &auth_conn,
+                agentflare_resource_gate::Policy::Normal,
+                &item,
+                1,
+                &labels,
+                CiGreenMerge::Allowed {
+                    head_sha: None,
+                    auto_merge: &auto_merge,
+                },
+                &label_id_by_name,
+                "/repo",
+                Path::new("/repo"),
+                &mut sweep,
+            );
+            assert_eq!(sweep.skipped, 1, "a gated PR is skipped, not merged");
+            // `first_time_gated` is false once the notice key was consumed.
+            first_time_gated(&format!("pr-gated:{}", item.id))
+        };
+
+        assert!(
+            sweep_once(false),
+            "an unapproved PR must not consume the gated-PR notice"
+        );
+        assert!(
+            !sweep_once(true),
+            "an approved, gated PR must have raised its notice"
+        );
+    });
+}
+
 #[test]
 fn self_repair_or_gate_redispatches_silently_for_identical_failing_checks() {
     let mcp = test_mcp();

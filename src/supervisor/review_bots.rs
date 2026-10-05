@@ -853,6 +853,10 @@ pub(super) fn coderabbit_repair_or_gate(
         return SelfRepairOutcome::Skipped;
     }
 
+    if !findings.is_empty() && super::branch_held_by_foreign_worktree(item, folder_path) {
+        return SelfRepairOutcome::Deferred;
+    }
+
     if findings.is_empty() {
         let summary = maybe_post_repair_complete_summary(
             mcp,
