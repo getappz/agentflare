@@ -111,6 +111,17 @@ pub fn ask(state: &Value, questions: &BTreeMap<String, Question>) -> Result<Outc
     ask_with(&Config::from_lookup(&env_lookup())?, state, questions)
 }
 
+/// `ask`, with the timeout capped, for callers on a latency budget (hooks).
+pub fn ask_within(
+    state: &Value,
+    questions: &BTreeMap<String, Question>,
+    cap: std::time::Duration,
+) -> Result<Outcome, DecideError> {
+    let mut cfg = Config::from_lookup(&env_lookup())?;
+    cfg.timeout = cfg.timeout.min(cap);
+    ask_with(&cfg, state, questions)
+}
+
 pub fn ask_with(
     cfg: &Config,
     state: &Value,

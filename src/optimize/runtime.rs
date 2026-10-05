@@ -534,6 +534,7 @@ pub fn router_by_name(name: &str) -> Box<dyn Router> {
             cheap_model: "haiku".to_string(),
             big_model: "opus".to_string(),
         }),
+        "jev" => Box::new(super::jev_router::JevRouter),
         _ => Box::new(KeywordRouter),
     }
 }
