@@ -204,6 +204,13 @@ pub(super) fn handle_ci_green(
     // as the PR sits gated or in-flight.
     if already_gated_or_in_flight(mcp, queue, item, label_id_by_name) {
         result.skipped += 1;
+        // Item #339: green and approved, so the only thing stopping the merge
+        // is the gate -- say so once instead of leaving the PR to sit.
+        if matches!(merge, CiGreenMerge::Allowed { .. })
+            && let Some(label) = gate_label(mcp, item, label_id_by_name)
+        {
+            notify_gated_green_pr(item, number, label);
+        }
     } else {
         let head_sha = merge.head_sha();
         let review = fetch_review_bot_state(

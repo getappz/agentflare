@@ -1903,25 +1903,47 @@ fn already_gated_or_in_flight(
     item: &agentflare_backend::item::Item,
     label_id_by_name: &std::collections::HashMap<String, String>,
 ) -> bool {
+    gate_label(mcp, item, label_id_by_name).is_some() || job_in_flight(queue, &item.id)
+}
+
+/// Which lifecycle gate label `item` carries, if any. Split out of
+/// [`already_gated_or_in_flight`] so a caller can say *which* gate is holding
+/// an item (item #339: a green, approved PR held by one was silently counted
+/// as skipped).
+fn gate_label(
+    mcp: &AgentflareMcp,
+    item: &agentflare_backend::item::Item,
+    label_id_by_name: &std::collections::HashMap<String, String>,
+) -> Option<&'static str> {
     let item_label_ids = mcp
         .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item.id))
         .ok()
         .and_then(Result::ok);
-    // PR #818 review finding: `orphan_reconcile::restore_after_terminal_failure`
-    // adds NEEDS_MANUAL_LABEL once its own dispatch-failure cap trips, but
-    // this guard only checked NEEDS_HUMAN_GATE_LABEL -- a PR that just hit
-    // the cap could still enter self-repair on the very next sweep tick,
-    // defeating the cap. The stray-item recovery path already excludes both
-    // gates for the same reason (see `stray_candidates` above).
-    let already_gated = [NEEDS_HUMAN_GATE_LABEL, NEEDS_MANUAL_LABEL]
-        .iter()
-        .any(|name| {
+    gate_label_among(item_label_ids.as_deref(), label_id_by_name)
+}
+
+/// The pure half of [`gate_label`]: the first of `NEEDS_HUMAN_GATE_LABEL` /
+/// `NEEDS_MANUAL_LABEL` whose id (from the project's label set) is among the
+/// item's label ids.
+///
+/// PR #818 review finding: `orphan_reconcile::restore_after_terminal_failure`
+/// adds NEEDS_MANUAL_LABEL once its own dispatch-failure cap trips, but this
+/// guard only checked NEEDS_HUMAN_GATE_LABEL -- a PR that just hit the cap
+/// could still enter self-repair on the very next sweep tick, defeating the
+/// cap. The stray-item recovery path already excludes both gates for the same
+/// reason (see `stray_candidates` above).
+fn gate_label_among(
+    item_label_ids: Option<&[String]>,
+    label_id_by_name: &std::collections::HashMap<String, String>,
+) -> Option<&'static str> {
+    [NEEDS_HUMAN_GATE_LABEL, NEEDS_MANUAL_LABEL]
+        .into_iter()
+        .find(|name| {
             label_id_by_name
                 .get(*name)
-                .zip(item_label_ids.as_ref())
+                .zip(item_label_ids)
                 .is_some_and(|(gate_id, ids)| ids.contains(gate_id))
-        });
-    already_gated || job_in_flight(queue, &item.id)
+        })
 }
 
 /// Which in-progress PR stage label a self-repair dispatch should remove

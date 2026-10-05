@@ -119,6 +119,30 @@ pub(crate) fn notify_human_gate(item: &agentflare_backend::item::Item, reason: &
     }
 }
 
+/// Text of the one-time notice for a PR that is green and approved yet not
+/// merging because its item carries a gate label (item #339).
+pub(crate) fn gated_green_pr_notice(number: u64, label: &str) -> String {
+    format!(
+        "PR #{number} is green and approved but is not being merged: its item carries the \
+         `{label}` label, which stops the supervisor's merge and review-repair. Remove the \
+         label (or redispatch the item) once the cause is dealt with."
+    )
+}
+
+/// Fires [`notify_human_gate`] with [`gated_green_pr_notice`] the first time
+/// this process sees `item` holding a green, approved PR behind a gate label;
+/// later ticks stay quiet (`first_time_gated`, keyed apart from the item's
+/// other gate notices).
+pub(crate) fn notify_gated_green_pr(
+    item: &agentflare_backend::item::Item,
+    number: u64,
+    label: &str,
+) {
+    if first_time_gated(&format!("gated-green:{}", item.id)) {
+        notify_human_gate(item, &gated_green_pr_notice(number, label));
+    }
+}
+
 /// Shared card-send half of [`notify_pr_approval_gate`] and
 /// [`notify_plan_approval_gate`]: look up the configured notify chat and
 /// send a one-button Telegram card. Same fail-open contract as
@@ -424,5 +448,68 @@ mod summarize_reason_tests {
             NOTIFY_REASON_MAX_CHARS + 1 // + the "…" marker
         );
         assert!(summarized.ends_with('…'));
+    }
+}
+
+#[cfg(test)]
+mod gated_green_pr_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(name, id)| (name.to_string(), id.to_string()))
+            .collect()
+    }
+
+    // Item #339: a green, approved PR whose item carried a gate label was
+    // skipped and merely counted, so it sat unmerged with nobody told why.
+    #[test]
+    fn gate_label_names_the_gate_the_item_carries() {
+        let by_name = labels(&[
+            (crate::supervisor::NEEDS_MANUAL_LABEL, "L-manual"),
+            (crate::supervisor::NEEDS_HUMAN_GATE_LABEL, "L-human"),
+        ]);
+        let manual = vec!["L-manual".to_string()];
+        assert_eq!(
+            crate::supervisor::gate_label_among(Some(&manual), &by_name),
+            Some(crate::supervisor::NEEDS_MANUAL_LABEL)
+        );
+        let human = vec!["L-human".to_string(), "other".to_string()];
+        assert_eq!(
+            crate::supervisor::gate_label_among(Some(&human), &by_name),
+            Some(crate::supervisor::NEEDS_HUMAN_GATE_LABEL)
+        );
+    }
+
+    #[test]
+    fn gate_label_is_none_without_a_gate_or_without_label_data() {
+        let by_name = labels(&[(crate::supervisor::NEEDS_MANUAL_LABEL, "L-manual")]);
+        assert_eq!(
+            crate::supervisor::gate_label_among(Some(&["unrelated".to_string()]), &by_name),
+            None
+        );
+        assert_eq!(crate::supervisor::gate_label_among(None, &by_name), None);
+        // A project that never defined the label cannot have it applied.
+        assert_eq!(
+            crate::supervisor::gate_label_among(Some(&["L-manual".to_string()]), &HashMap::new()),
+            None
+        );
+    }
+
+    #[test]
+    fn notice_names_the_pr_the_gate_and_what_to_do() {
+        let text = gated_green_pr_notice(849, "needs-manual-dispatch");
+        assert!(text.contains("#849"), "{text}");
+        assert!(text.contains("needs-manual-dispatch"), "{text}");
+        assert!(
+            text.contains("green") && text.contains("approved"),
+            "{text}"
+        );
+        assert!(
+            text.contains("redispatch") || text.contains("remove"),
+            "{text}"
+        );
     }
 }
