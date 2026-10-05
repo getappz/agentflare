@@ -1097,8 +1097,18 @@ impl AgentflareMcp {
             let id = self.resolve_item_id(conn, &raw)?;
             let item = agentflare_backend::item::update_state(conn, &id, &state_id)
                 .map_err(map_backend_err)?;
-            Ok(serde_json::to_string_pretty(&item).unwrap_or_default())
+            let completed = agentflare_backend::state::get(conn, &state_id)
+                .is_ok_and(|s| s.group_name == "completed");
+            Ok((item, completed))
         })?
+        .map(|(item, completed)| {
+            // Same as `check_merge`'s promote: a finished item's clean
+            // worktree goes away (a dirty one is left alone).
+            if completed {
+                crate::worktree::cleanup_worktree(&item, &self.worktree_repo_root());
+            }
+            serde_json::to_string_pretty(&item).unwrap_or_default()
+        })
     }
 
     pub(super) fn item_delete(&self, req: ItemRequest) -> Result<String, ErrorData> {
