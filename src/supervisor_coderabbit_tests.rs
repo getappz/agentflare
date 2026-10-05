@@ -9,6 +9,73 @@ use super::tests::{
 use super::*;
 
 #[test]
+fn promoting_a_merged_item_cancels_its_queued_dispatch() {
+    let mut mcp = test_mcp();
+    let queue = test_queue();
+    mcp.job_queue_override = Some(queue.clone());
+    let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
+    let item = mcp
+        .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
+        .unwrap();
+    let job = queue
+        .enqueue(
+            &agentflare_jobs::AgentJob::new("agentflare-work")
+                .args([item_id.clone(), "claude-code".to_string()])
+                .in_process(),
+        )
+        .unwrap();
+    assert!(
+        mcp.promote_verified_merged_item(&item_id, &item, std::path::Path::new("/repo"))
+            .unwrap()
+    );
+    assert_eq!(
+        queue.get(&job.id).unwrap().state,
+        agentflare_jobs::JobState::Killed
+    );
+}
+
+#[test]
+fn coderabbit_never_repairs_a_merged_pr() {
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
+    mcp.with_backend_db(|conn| {
+        crate::mcp_server::merge_item_metadata(conn, &item_id, |m| {
+            m.insert(
+                "pr".into(),
+                serde_json::json!({"number": 1, "status": "merged"}),
+            );
+        })
+        .unwrap();
+    })
+    .unwrap();
+    let item = mcp
+        .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
+        .unwrap();
+    assert!(matches!(
+        coderabbit_repair_or_gate(
+            &mcp,
+            &queue,
+            &test_auth_conn(),
+            agentflare_resource_gate::Policy::Normal,
+            &item,
+            1,
+            &[coderabbit_finding(1, "coderabbitai[bot]")],
+            &[],
+            &seed_gate_label(&mcp),
+            "/repo",
+        ),
+        SelfRepairOutcome::Skipped
+    ));
+    assert!(
+        queue
+            .list(Some(agentflare_jobs::JobState::Queued))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn coderabbit_findings_fingerprint_ignores_order_but_not_content() {
     let a = coderabbit_finding(1, "coderabbitai[bot]");
     let mut b = coderabbit_finding(2, "coderabbitai[bot]");
@@ -30,7 +97,7 @@ fn coderabbit_findings_fingerprint_ignores_order_but_not_content() {
 }
 
 #[test]
-fn coderabbit_repair_or_gate_redispatches_silently_for_identical_findings() {
+fn coderabbit_repair_or_gate_skips_an_already_dispatched_round() {
     let mcp = test_mcp();
     let queue = test_queue();
     let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
@@ -80,17 +147,16 @@ fn coderabbit_repair_or_gate_redispatches_silently_for_identical_findings() {
     );
 
     assert!(
-        matches!(outcome, SelfRepairOutcome::Dispatched),
-        "the retry must still dispatch, just quietly"
+        matches!(outcome, SelfRepairOutcome::Skipped),
+        "an unresolved thread must not restart the same repair round"
     );
     assert_eq!(
         queue
             .list(Some(agentflare_jobs::JobState::Queued))
             .unwrap()
             .len(),
-        1,
-        "exactly the retry job must be queued (the cancelled prior attempt \
-         no longer counts as queued)"
+        0,
+        "the cancelled prior attempt must not be queued again"
     );
     let comments = mcp
         .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &item_id).unwrap())

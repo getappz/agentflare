@@ -360,6 +360,7 @@ pub(crate) fn sweep_review_threads(
     let findings = classify_threads(&threads, cfg, &meta);
     let in_flight = job_in_flight(queue, &item.id);
     let mut commits: Option<Vec<String>> = None;
+    let mut head_commit_date: Option<Option<String>> = None;
 
     // A restart between a fix's reply and its resolve leaves the thread
     // open with our marker as its last word: finish the resolve, never
@@ -478,8 +479,36 @@ pub(crate) fn sweep_review_threads(
             continue;
         }
         if record.round >= next && in_flight {
-            // Dispatched for this round and the agent is still on it.
+            // Dispatched for this round and the agent is still on it. Once
+            // that job is over, a thread the head commit has not answered goes
+            // back out (the head-date check below skips one that was fixed).
             continue;
+        }
+        if let Some(head) = input.head_sha
+            && let Some(reviewed_at) = thread
+                .comments
+                .iter()
+                .rev()
+                .find(|c| cfg.is_bot(&c.login))
+                .map(|c| c.created_at.as_str())
+            && !reviewed_at.is_empty()
+        {
+            let committed_at = head_commit_date.get_or_insert_with(|| {
+                review_threads::commit_date(client, repo, head).unwrap_or_else(|e| {
+                    eprintln!(
+                        "agentflare-supervisor: could not check head commit date of PR #{}: {}",
+                        input.number,
+                        e.log_safe()
+                    );
+                    None
+                })
+            });
+            if committed_at
+                .as_deref()
+                .is_some_and(|date| date > reviewed_at)
+            {
+                continue;
+            }
         }
         state.to_dispatch.push(f.clone());
     }
@@ -849,6 +878,22 @@ pub(super) fn coderabbit_repair_or_gate(
     label_id_by_name: &std::collections::HashMap<String, String>,
     folder_path: &str,
 ) -> SelfRepairOutcome {
+    if serde_json::from_str::<serde_json::Value>(&item.metadata)
+        .ok()
+        .and_then(|m| m["pr"]["status"].as_str().map(str::to_string))
+        .is_some_and(|s| s == "merged")
+    {
+        return SelfRepairOutcome::Skipped;
+    }
+    // Only a merged PR ends repair. Armed auto-merge does not: a CI-green PR
+    // with real unresolved findings must still be repaired, never merged
+    // untouched (see `supervisor::merge`).
+    if matches!(
+        crate::worktree::pr_ci_status(item, std::path::Path::new(folder_path)),
+        crate::worktree::PrCiStatus::Merged
+    ) {
+        return SelfRepairOutcome::Skipped;
+    }
     if already_gated_or_in_flight(mcp, queue, item, label_id_by_name) {
         return SelfRepairOutcome::Skipped;
     }
@@ -866,6 +911,14 @@ pub(super) fn coderabbit_repair_or_gate(
         );
         clear_stale_coderabbit_repair_label(folder_path, pr_number, labels, summary.as_deref());
         clear_coderabbit_repair_cap(mcp, item);
+        return SelfRepairOutcome::Skipped;
+    }
+
+    let meta = current_metadata(mcp, item);
+    if findings
+        .iter()
+        .all(|f| thread_record(&meta, &f.thread_id).round >= f.round())
+    {
         return SelfRepairOutcome::Skipped;
     }
 
