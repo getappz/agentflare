@@ -1095,10 +1095,11 @@ impl AgentflareMcp {
                 req.state_group.as_deref().and_then(non_empty),
             )?;
             let id = self.resolve_item_id(conn, &raw)?;
+            let completed = agentflare_backend::state::get(conn, &state_id)
+                .map(|s| s.group_name == "completed")
+                .map_err(map_backend_err)?;
             let item = agentflare_backend::item::update_state(conn, &id, &state_id)
                 .map_err(map_backend_err)?;
-            let completed = agentflare_backend::state::get(conn, &state_id)
-                .is_ok_and(|s| s.group_name == "completed");
             Ok((item, completed))
         })?
         .map(|(item, completed)| {
