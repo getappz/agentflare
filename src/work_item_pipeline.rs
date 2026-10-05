@@ -719,6 +719,18 @@ pub(crate) fn build_sdd_loop_step(
                     }
                 };
 
+                // Shadow-only (item #705): log what Jev would have decided next to
+                // this decision. Never alters the decision applied below.
+                spawn_judge_shadow(
+                    &ctx.data.tasks,
+                    ctx.data.current_task_index,
+                    &ctx.data.ledger,
+                    &role_reply,
+                    ctx.data.review_only,
+                    ctx.data.design_spec,
+                    decision.action,
+                );
+
                 // 3. Apply the decision.
                 ctx.data.ledger.push(decision.ledger_line.clone());
                 match decision.action {
@@ -1650,6 +1662,7 @@ include!("work_item_pipeline/task_sourcing.rs");
 
 include!("work_item_pipeline/prompt_builders.rs");
 include!("work_item_pipeline/roles.rs");
+include!("work_item_pipeline/judge_shadow.rs");
 
 #[cfg(test)]
 mod adopt_dispatch_tests;
@@ -1659,6 +1672,8 @@ mod cancel_tests;
 mod cap_tests;
 #[cfg(test)]
 mod judge_decision_tests;
+#[cfg(test)]
+mod judge_shadow_tests;
 #[cfg(test)]
 mod pause_tests;
 #[cfg(test)]
