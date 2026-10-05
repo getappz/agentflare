@@ -119,9 +119,36 @@ fn clear_removes_files() {
     for _ in 0..5 {
         append(&p, &row, 100).unwrap();
     }
-    assert_eq!(clear(&p), 2);
+    assert_eq!(clear(&p).unwrap(), 2);
     assert!(load(&p).is_empty());
-    assert_eq!(clear(&p), 0);
+    assert_eq!(clear(&p).unwrap(), 0);
+}
+
+#[test]
+fn clear_missing_dir_is_ok() {
+    let p = tmp("missing");
+    assert_eq!(clear(&p).unwrap(), 0);
+}
+
+#[test]
+fn clear_reports_real_errors() {
+    // A directory where the file should be: remove_file fails, not NotFound.
+    let p = tmp("clr-err");
+    std::fs::create_dir_all(&p).unwrap();
+    assert!(clear(&p).is_err());
+}
+
+#[test]
+fn label_and_baseline_redacted() {
+    let secret = "ghp_abcdefghijklmnopqrstuvwxyz012345";
+    let mut i = input("router", json!({}), "x", "easy");
+    i.label = json!({ "summary": secret, secret: [secret] });
+    let base = format!("skill-{secret}");
+    i.baseline = &base;
+    let row = build_row(i);
+    let out = format!("{}{}", row.label, row.baseline);
+    assert!(!out.contains("ghp_"));
+    assert!(out.contains("[REDACTED]"));
 }
 
 #[test]

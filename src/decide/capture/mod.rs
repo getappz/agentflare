@@ -75,9 +75,9 @@ pub fn build_row(i: Input<'_>) -> Row {
         site: i.site.to_string(),
         features: norm::sanitize_features(i.features),
         norm_key: norm::norm_key(&crate::mcp_server::secret_scan::redact(i.norm_input)),
-        label: i.label,
+        label: norm::redact_value(i.label),
         confidence: i.confidence,
-        baseline: i.baseline.to_string(),
+        baseline: crate::mcp_server::secret_scan::redact(i.baseline),
         source_model: i.source_model.map(str::to_string),
     }
 }
@@ -96,6 +96,7 @@ pub(crate) fn append(path: &Path, row: &Row, max_bytes: u64) -> std::io::Result<
         #[cfg(unix)]
         std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
         b.create(parent)?;
+        restrict(parent, path)?;
     }
     if std::fs::metadata(path).is_ok_and(|m| m.len() > max_bytes) {
         // rename replaces the target; a lost race or locked file must not drop the row.
@@ -108,6 +109,26 @@ pub(crate) fn append(path: &Path, row: &Row, max_bytes: u64) -> std::io::Result<
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
     opts.open(path)?.write_all(line.as_bytes())
+}
+
+/// Unix: dir 0o700, any pre-existing dataset/rotated file 0o600. Errors
+/// propagate so nothing is appended into a dir we could not lock down.
+#[cfg(unix)]
+fn restrict(dir: &Path, path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    for p in [path.to_path_buf(), rotated(path)] {
+        match std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            r => r?,
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict(_dir: &Path, _path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Rotated file first (older rows), then the live one; damaged lines skipped.
@@ -125,11 +146,21 @@ pub fn load(path: &Path) -> Vec<Row> {
 }
 
 /// Delete the dataset (and its rotated half); returns how many files went.
-pub fn clear(path: &Path) -> usize {
-    [path.to_path_buf(), rotated(path)]
-        .iter()
-        .filter(|p| std::fs::remove_file(p).is_ok())
-        .count()
+/// A missing file counts as already clear; any other error is returned
+/// (after attempting both files).
+pub fn clear(path: &Path) -> std::io::Result<usize> {
+    let mut removed = 0;
+    let mut first_err = None;
+    for p in [path.to_path_buf(), rotated(path)] {
+        match std::fs::remove_file(&p) {
+            Ok(()) => removed += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    first_err.map_or(Ok(removed), Err)
 }
 
 /// Jev's answer as a label: `summary` plus any probabilities.

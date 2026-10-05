@@ -41,7 +41,7 @@ pub fn norm_key(text: &str) -> String {
 /// Redact secrets, then clip, every string in `v`; replace the whole value
 /// with a marker if it is still over the size ceiling.
 pub fn sanitize_features(v: Value) -> Value {
-    let v = walk(v);
+    let v = redact_value(v);
     let len = v.to_string().len();
     if len > MAX_FEATURES_BYTES {
         serde_json::json!({ "truncated": true, "bytes": len })
@@ -50,14 +50,20 @@ pub fn sanitize_features(v: Value) -> Value {
     }
 }
 
-fn walk(v: Value) -> Value {
+/// Redact then clip every string value AND object key in `v`.
+pub fn redact_value(v: Value) -> Value {
+    let clean = |s: &str| -> String {
+        let red = crate::mcp_server::secret_scan::redact(s);
+        red.chars().take(MAX_STR_CHARS).collect()
+    };
     match v {
-        Value::String(s) => {
-            let red = crate::mcp_server::secret_scan::redact(&s);
-            Value::String(red.chars().take(MAX_STR_CHARS).collect())
-        }
-        Value::Array(a) => Value::Array(a.into_iter().map(walk).collect()),
-        Value::Object(o) => Value::Object(o.into_iter().map(|(k, v)| (k, walk(v))).collect()),
+        Value::String(s) => Value::String(clean(&s)),
+        Value::Array(a) => Value::Array(a.into_iter().map(redact_value).collect()),
+        Value::Object(o) => Value::Object(
+            o.into_iter()
+                .map(|(k, v)| (clean(&k), redact_value(v)))
+                .collect(),
+        ),
         other => other,
     }
 }

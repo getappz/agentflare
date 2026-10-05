@@ -64,10 +64,13 @@ impl DecideArgs {
                             decide::capture::render(&decide::capture::summarize(&rows))
                         );
                     }
-                    DatasetCmd::Clear => {
-                        let n = decide::capture::clear(&path);
-                        println!("removed {n} dataset file(s)");
-                    }
+                    DatasetCmd::Clear => match decide::capture::clear(&path) {
+                        Ok(n) => println!("removed {n} dataset file(s)"),
+                        Err(e) => {
+                            eprintln!("failed to clear dataset: {e}");
+                            std::process::exit(1);
+                        }
+                    },
                 }
             }
         }
