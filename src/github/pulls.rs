@@ -142,7 +142,7 @@ pub fn item_id_tag(item_id: &str) -> String {
 /// with no tag at all (a PR opened before `item_id_tag` existed, or by hand)
 /// still passes -- there's nothing to contradict, so callers fall back to the
 /// sequence-number marker alone.
-fn tag_allows(body: Option<&str>, item_id: &str) -> bool {
+pub(crate) fn tag_allows(body: Option<&str>, item_id: &str) -> bool {
     let Some(mut rest) = body else {
         return true;
     };

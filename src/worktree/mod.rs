@@ -995,6 +995,16 @@ fn persist_pr_identity(item: &agentflare_backend::item::Item, number: u64, branc
     }
 }
 
+pub(crate) fn item_owns_branch(item: &agentflare_backend::item::Item, branch: &str) -> bool {
+    let task_seq = branch
+        .strip_prefix("task/")
+        .map(|rest| rest.split('-').next().unwrap_or(rest))
+        .and_then(|digits| digits.parse::<i64>().ok());
+    task_seq == Some(item.sequence_id)
+        || serde_json::from_str::<serde_json::Value>(&item.metadata)
+            .ok()
+            .is_some_and(|m| m["pr"]["branch"] == branch)
+}
 /// True if `existing` should be trusted as *this item's own* PR on its
 /// branch rather than an unrelated closed/merged PR that happens to reuse
 /// the same branch name -- shared by `push_and_open_pr`'s pre-create lookup
@@ -1008,7 +1018,14 @@ fn is_own_pr(
     existing: &crate::github::models::PullRequest,
     item: &agentflare_backend::item::Item,
 ) -> bool {
-    crate::github::pulls::marks_this_item(existing.body.as_deref(), item.sequence_id, &item.id)
+    if crate::github::pulls::marks_this_item(existing.body.as_deref(), item.sequence_id, &item.id) {
+        return true;
+    }
+    crate::github::pulls::tag_allows(existing.body.as_deref(), &item.id)
+        && existing
+            .head
+            .as_ref()
+            .is_some_and(|head| item_owns_branch(item, &head.git_ref))
 }
 
 /// Rechecks `find_existing` once after `pulls::create` fails on `branch` --
@@ -1175,6 +1192,39 @@ pub fn push_and_open_pr(
     )
 }
 
+fn should_reuse_existing_pr(
+    client: &crate::github::Client,
+    repo: &RepoId,
+    existing: &crate::github::models::PullRequest,
+    branch: &str,
+) -> Result<bool, String> {
+    if existing.merged_at.is_none() {
+        return Ok(true);
+    }
+    let Some(head_sha) = existing
+        .head
+        .as_ref()
+        .map(|head| head.sha.as_str())
+        .filter(|sha| !sha.is_empty())
+    else {
+        return Err(format!(
+            "merged PR #{} has no head SHA; not opening a duplicate PR",
+            existing.number
+        ));
+    };
+    match crate::github::repos::compare_head_to_branch(client, repo, head_sha, branch) {
+        Ok(crate::github::repos::BranchCompare::Identical) => Ok(true),
+        Ok(crate::github::repos::BranchCompare::Ahead) => Ok(false),
+        Ok(crate::github::repos::BranchCompare::DivergedOrBehind) => Err(format!(
+            "branch {branch} diverged from merged PR #{}; needs human review before opening a new PR",
+            existing.number
+        )),
+        Err(e) => Err(format!(
+            "could not compare branch {branch} with merged PR #{}: {e}",
+            existing.number
+        )),
+    }
+}
 /// Whether an existing PR on this item's branch should be returned instead
 /// of opening a new one: it must be this item's own PR, and not one that was
 /// closed without merging -- a closed attempt is dead (the review sweep
@@ -1220,7 +1270,11 @@ fn open_pr_for_pushed_branch(
                 if reusable_own_pr(&existing, item)
                     && existing.head.as_ref().is_none_or(|h| h.git_ref == branch) =>
             {
-                return found_existing(existing);
+                match should_reuse_existing_pr(client, repo, &existing, branch) {
+                    Ok(true) => return found_existing(existing),
+                    Ok(false) => {}
+                    Err(reason) => return PrOutcome::Failed(reason),
+                }
             }
             Ok(_) => {}
             Err(e) => {
@@ -1244,7 +1298,11 @@ fn open_pr_for_pushed_branch(
     // share this branch's name (item #63).
     match crate::github::pulls::find_existing(client, repo, branch) {
         Ok(Some(existing)) if reusable_own_pr(&existing, item) => {
-            return found_existing(existing);
+            match should_reuse_existing_pr(client, repo, &existing, branch) {
+                Ok(true) => return found_existing(existing),
+                Ok(false) => {}
+                Err(reason) => return PrOutcome::Failed(reason),
+            }
         }
         Ok(Some(existing)) => {
             eprintln!(
