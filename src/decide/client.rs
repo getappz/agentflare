@@ -26,24 +26,59 @@ fn layered_lookup(
     vault: impl Fn(&str) -> Option<String>,
     dotenv: Vec<(String, String)>,
 ) -> impl Fn(&str) -> Option<String> {
+    let find = layered_source(env, vault, dotenv);
+    move |k| find(k).map(|(value, _)| value)
+}
+
+/// Which layer a setting came from. Shown by `decide ping` so a user can see
+/// where credentials are resolved without ever printing a value.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Source {
+    Env,
+    Vault,
+    Dotenv,
+}
+
+impl Source {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Env => "environment",
+            Self::Vault => "vault",
+            Self::Dotenv => "~/.env",
+        }
+    }
+}
+
+fn layered_source(
+    env: impl Fn(&str) -> Option<String>,
+    vault: impl Fn(&str) -> Option<String>,
+    dotenv: Vec<(String, String)>,
+) -> impl Fn(&str) -> Option<(String, Source)> {
     move |k| {
         env(k)
-            .or_else(|| VAULT_KEYS.contains(&k).then(|| vault(k)).flatten())
+            .map(|v| (v, Source::Env))
+            .or_else(|| {
+                VAULT_KEYS
+                    .contains(&k)
+                    .then(|| vault(k))
+                    .flatten()
+                    .map(|v| (v, Source::Vault))
+            })
             .or_else(|| {
                 dotenv
                     .iter()
                     .find(|(name, _)| name == k)
-                    .map(|(_, v)| v.clone())
+                    .map(|(_, v)| (v.clone(), Source::Dotenv))
             })
     }
 }
 
-fn env_lookup() -> impl Fn(&str) -> Option<String> {
+fn real_source_lookup() -> impl Fn(&str) -> Option<(String, Source)> {
     let dotenv = dirs::home_dir()
         .and_then(|h| std::fs::read_to_string(h.join(".env")).ok())
         .map(|c| crate::dev_vars::parse(&c))
         .unwrap_or_default();
-    layered_lookup(
+    layered_source(
         |k| std::env::var(k).ok(),
         |k| {
             crate::vault::get_secret(k)
@@ -53,6 +88,21 @@ fn env_lookup() -> impl Fn(&str) -> Option<String> {
         },
         dotenv,
     )
+}
+
+fn env_lookup() -> impl Fn(&str) -> Option<String> {
+    let find = real_source_lookup();
+    move |k| find(k).map(|(value, _)| value)
+}
+
+/// For each credential setting that resolves, the layer it resolved from
+/// (names and layers only, never values).
+pub fn credential_sources() -> Vec<(&'static str, Source)> {
+    let find = real_source_lookup();
+    VAULT_KEYS
+        .iter()
+        .filter_map(|k| find(k).map(|(_, source)| (*k, source)))
+        .collect()
 }
 
 /// Ask the configured backend. Errors are meant to be swallowed by callers
@@ -204,6 +254,19 @@ mod tests {
         assert_eq!(get("CLOUDFLARE_API_TOKEN").as_deref(), Some("cf-vault"));
         assert_eq!(get("CLOUDFLARE_ACCOUNT_ID").as_deref(), Some("acct-dotenv"));
         assert_eq!(get("NOT_SET"), None);
+    }
+
+    #[test]
+    fn source_reports_the_winning_layer() {
+        let find = layered_source(
+            |k| (k == "OPENROUTER_API_KEY").then(|| "e".to_string()),
+            |k| (k == "CLOUDFLARE_API_TOKEN").then(|| "v".to_string()),
+            dotenv(&[("CLOUDFLARE_ACCOUNT_ID", "d")]),
+        );
+        assert_eq!(find("OPENROUTER_API_KEY").unwrap().1, Source::Env);
+        assert_eq!(find("CLOUDFLARE_API_TOKEN").unwrap().1, Source::Vault);
+        assert_eq!(find("CLOUDFLARE_ACCOUNT_ID").unwrap().1, Source::Dotenv);
+        assert!(find("CLOUDFLARE_AI_GATEWAY_ID").is_none());
     }
 
     #[test]

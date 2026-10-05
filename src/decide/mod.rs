@@ -15,8 +15,9 @@
 
 mod client;
 mod provider;
+pub mod shadow;
 mod types;
 
-pub use client::{Outcome, ask, ask_with};
+pub use client::{Outcome, Source, ask, ask_with, credential_sources};
 pub use provider::{Config, DecideError};
 pub use types::{Answer, Question, Response, Usage};
