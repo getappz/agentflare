@@ -2005,6 +2005,17 @@ fn make_label(conn: &Connection, pid: &str, name: &str) -> crate::label::Label {
 }
 
 #[test]
+fn redispatch_without_ready_label_creates_and_attaches_it() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let item = make_item(&conn, &pid, &sid);
+    let outcome = redispatch(&conn, &item.id, Some("claude-code")).unwrap();
+    assert!(matches!(outcome, RedispatchOutcome::Ready { .. }));
+    let ready = crate::label::get_by_name(&conn, &pid, "ready-for-work").unwrap();
+    assert!(list_labels(&conn, &item.id).unwrap().contains(&ready.id));
+}
+
+#[test]
 fn redispatch_resets_state_clears_stale_labels_reattaches_ready_and_normalizes_assignee() {
     let conn = db::open_in_memory().unwrap();
     let (pid, sid) = seed_project(&conn, "");
@@ -2042,6 +2053,7 @@ fn redispatch_resets_state_clears_stale_labels_reattaches_ready_and_normalizes_a
 fn redispatch_explicit_assignee_overrides_the_items_existing_one() {
     let conn = db::open_in_memory().unwrap();
     let (pid, sid) = seed_project(&conn, "");
+    make_label(&conn, &pid, "ready-for-work");
     let item = make_item(&conn, &pid, &sid);
     claim(&conn, &item.id, "opencode:1", 1000, TTL).unwrap();
 
@@ -2062,6 +2074,7 @@ fn redispatch_explicit_assignee_overrides_the_items_existing_one() {
 fn redispatch_to_a_different_agent_clears_a_model_scoped_to_the_old_one() {
     let conn = db::open_in_memory().unwrap();
     let (pid, sid) = seed_project(&conn, "");
+    make_label(&conn, &pid, "ready-for-work");
     let item = make_item(&conn, &pid, &sid);
     claim(&conn, &item.id, "opencode:1", 1000, TTL).unwrap();
     update(
@@ -2095,6 +2108,7 @@ fn redispatch_to_a_different_agent_clears_a_model_scoped_to_the_old_one() {
 fn redispatch_to_the_same_agent_keeps_the_model_override() {
     let conn = db::open_in_memory().unwrap();
     let (pid, sid) = seed_project(&conn, "");
+    make_label(&conn, &pid, "ready-for-work");
     let item = make_item(&conn, &pid, &sid);
     claim(&conn, &item.id, "claude-code:1", 1000, TTL).unwrap();
     update(
@@ -2127,6 +2141,7 @@ fn redispatch_to_the_same_agent_keeps_the_model_override() {
 fn redispatch_clears_a_stale_pr_reference_from_a_prior_attempt() {
     let conn = db::open_in_memory().unwrap();
     let (pid, sid) = seed_project(&conn, "");
+    make_label(&conn, &pid, "ready-for-work");
     let item = make_item(&conn, &pid, &sid);
     claim(&conn, &item.id, "claude-code:1", 1000, TTL).unwrap();
     update(
