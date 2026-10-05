@@ -1912,15 +1912,14 @@ fn item_gated(
     // the cap could still enter self-repair on the very next sweep tick,
     // defeating the cap. The stray-item recovery path already excludes both
     // gates for the same reason (see `stray_candidates` above).
-    let already_gated = [NEEDS_HUMAN_GATE_LABEL, NEEDS_MANUAL_LABEL]
+    [NEEDS_HUMAN_GATE_LABEL, NEEDS_MANUAL_LABEL]
         .iter()
         .any(|name| {
             label_id_by_name
                 .get(*name)
                 .zip(item_label_ids.as_ref())
                 .is_some_and(|(gate_id, ids)| ids.contains(gate_id))
-        });
-    already_gated
+        })
 }
 
 fn already_gated_or_in_flight(
