@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Delete local branches + worktrees already merged (or remote-deleted after
-# squash-merge) into origin/<default>. --remote also prunes matching remote
-# branches. Default: apply locally; remote deletion always needs --remote.
+# Delete local branches checked out nowhere and already merged (or
+# remote-deleted after squash-merge) into origin/<default>. --remote also
+# prunes matching remote branches.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -67,6 +67,10 @@ for b in "${!candidates[@]}"; do
   is_protected "$b" && continue
 
   wt="${worktree_of[$b]:-}"
+  if [[ -n "$wt" ]]; then
+    echo "skip $b: checked out in worktree $wt (use agentflare clean --worktrees)" >&2
+    continue
+  fi
 
   # -D force-deletes without a merge check, so verify the branch's own
   # changes are actually present in origin/$DEFAULT_BRANCH BEFORE touching
@@ -88,44 +92,8 @@ for b in "${!candidates[@]}"; do
   fi
 
   if ((DRY_RUN)); then
-    if [[ -n "$wt" ]]; then
-      echo "would remove worktree $wt + branch $b"
-    else
-      echo "would delete branch $b"
-    fi
+    echo "would delete branch $b"
     continue
-  fi
-
-  if [[ -n "$wt" ]]; then
-    # Retry worktree removal on Windows where file locks (rust-analyzer,
-    # proc-macro-srv) can transiently block deletion. Exponential backoff
-    # up to 15s total before leaving the branch and worktree alone.
-    wt_removed=0
-    delay=1
-    for attempt in 1 2 3 4 5; do
-      if err=$(git worktree remove "$wt" 2>&1 1>/dev/null); then
-        echo "removed worktree $wt"
-        wt_removed=1
-        break
-      fi
-      # Git says "contains modified or untracked files" for a dirty worktree.
-      if [[ "$err" == *"modified or untracked"* || "$err" == *"has untracked"* || "$err" == *"has uncommitted"* || "$err" == *"dirty"* ]]; then
-        echo "skip $b: worktree $wt has uncommitted changes" >&2
-        break
-      fi
-      if [[ "$err" != *"Permission denied"* && "$err" != *"Access is denied"* && "$err" != *"being used by another process"* ]]; then
-        echo "skip $b: could not remove worktree $wt: $err" >&2
-        break
-      fi
-      if ((attempt < 5)); then
-        sleep "$delay"
-        delay=$((delay * 2))
-      fi
-    done
-    if ((wt_removed == 0)); then
-      echo "skip $b: worktree $wt remains registered" >&2
-      continue
-    fi
   fi
 
   if git branch -D "$b" >/dev/null 2>&1; then
@@ -134,8 +102,7 @@ for b in "${!candidates[@]}"; do
   fi
 done
 
-# `git worktree remove` drops its own admin entry. A repo-wide prune can
-# unregister unrelated live worktrees on Windows, so it is unnecessary here.
+# Leave worktree registration cleanup to `agentflare clean --worktrees`.
 
 if ((DO_REMOTE)); then
   echo "== remote branches merged into origin/$DEFAULT_BRANCH =="
