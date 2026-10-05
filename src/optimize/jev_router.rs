@@ -136,7 +136,9 @@ fn route_with(
     let outcome = match ask(&prompt) {
         Ok(outcome) => outcome,
         // Not configured: behave exactly like the keyword router, silently.
-        Err(DecideError::Disabled | DecideError::NoCredentials) => return baseline,
+        Err(DecideError::Disabled | DecideError::NoCredentials | DecideError::Unavailable) => {
+            return baseline;
+        }
         Err(e) => {
             record(&shadow::Row::failed(
                 SITE,
@@ -297,6 +299,15 @@ mod tests {
             assert!(nudge.is_some());
             assert!(rows.is_empty());
         }
+    }
+
+    #[test]
+    fn open_breaker_keeps_baseline_without_logging() {
+        let (nudge, rows) = run(&ctx("find the config file", None), |_| {
+            Err(DecideError::Unavailable)
+        });
+        assert!(nudge.is_some());
+        assert!(rows.is_empty());
     }
 
     fn err_clone(e: &DecideError) -> DecideError {

@@ -135,7 +135,9 @@ fn pick_with_baseline(
     let outcome = match ask(&prompt, &questions) {
         Ok(outcome) => outcome,
         // Not configured: behave exactly as if reranking were off, silently.
-        Err(DecideError::Disabled | DecideError::NoCredentials) => return baseline,
+        Err(DecideError::Disabled | DecideError::NoCredentials | DecideError::Unavailable) => {
+            return baseline;
+        }
         Err(e) => {
             record(&shadow::Row::failed(
                 SITE,
@@ -393,6 +395,13 @@ mod tests {
             assert_eq!(picked.len(), 3);
             assert!(rows.is_empty());
         }
+    }
+
+    #[test]
+    fn open_breaker_keeps_baseline_without_logging() {
+        let (picked, rows) = run(Mode::Apply, ranked(5), |_, _| Err(DecideError::Unavailable));
+        assert_eq!(picked.len(), 3);
+        assert!(rows.is_empty());
     }
 
     #[test]

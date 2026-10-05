@@ -1,3 +1,4 @@
+use super::breaker;
 use super::provider::{Config, DecideError, parse_response};
 use super::types::{Question, Response};
 use serde_json::Value;
@@ -124,6 +125,36 @@ pub fn ask_within(
 }
 
 pub fn ask_with(
+    cfg: &Config,
+    state: &Value,
+    questions: &BTreeMap<String, Question>,
+) -> Result<Outcome, DecideError> {
+    let path = breaker_path();
+    if !breaker::allow(&path, breaker::current_time(), cfg.timeout) {
+        return Err(DecideError::Unavailable);
+    }
+    let result = send(cfg, state, questions);
+    breaker::observe(&path, breaker::current_time(), result.is_ok());
+    result
+}
+
+fn breaker_path() -> std::path::PathBuf {
+    #[cfg(test)]
+    {
+        return std::env::temp_dir().join(format!(
+            "agentflare-breaker-test-{}-{}.json",
+            std::process::id(),
+            std::thread::current()
+                .name()
+                .unwrap_or("unnamed")
+                .replace(':', "_")
+        ));
+    }
+    #[cfg(not(test))]
+    breaker::path()
+}
+
+fn send(
     cfg: &Config,
     state: &Value,
     questions: &BTreeMap<String, Question>,
