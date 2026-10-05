@@ -338,6 +338,25 @@ fn no_alternative_is_agent_wide(metadata: &str) -> bool {
     failover_enabled_for(metadata) && item_allowed_agents(metadata).is_none()
 }
 
+/// Short quota state for a status column: `None` when the agent is fine.
+fn format_availability(cooldown: Option<(i64, String)>, usage: Option<String>) -> Option<String> {
+    match (cooldown, usage) {
+        (Some((until, why)), _) => Some(format!("{why} until {}", format_unix(until))),
+        (None, Some(breach)) => Some(format!("over threshold ({breach})")),
+        (None, None) => None,
+    }
+}
+
+/// What keeps `agent_name` from taking work right now, for `agents list` and
+/// `auth status`; `None` for an unknown name or an agent that is available.
+pub(crate) fn availability_state(agent_name: &str) -> Option<String> {
+    let agent = agent_registry::agent_by_name(&agentflare_backend::item::agent_part(agent_name))?;
+    format_availability(
+        unavailable_until(agent.as_str()),
+        usage_threshold_reason(agent),
+    )
+}
+
 /// Pure wording for [`unavailability_warning`]: a recorded cooldown wins
 /// over a live usage reading (it is the harder fact).
 fn format_unavailability(
@@ -405,6 +424,19 @@ mod tests {
         )
         .unwrap();
         assert!(cooldown.starts_with("cursor is out of credit -- unavailable until 1970-01-01"));
+    }
+
+    #[test]
+    fn availability_text_is_none_for_a_healthy_agent() {
+        assert_eq!(format_availability(None, None), None);
+        assert_eq!(
+            format_availability(None, Some("seven_day usage 74% >= threshold 70%".into())),
+            Some("over threshold (seven_day usage 74% >= threshold 70%)".into())
+        );
+        assert_eq!(
+            format_availability(Some((0, "out of credit".into())), None),
+            Some("out of credit until 1970-01-01 00:00 UTC".into())
+        );
     }
 
     #[test]
