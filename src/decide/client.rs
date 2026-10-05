@@ -9,6 +9,36 @@ pub struct Outcome {
     pub elapsed_ms: u64,
 }
 
+pub struct Batch {
+    state: Value,
+    questions: BTreeMap<String, Question>,
+}
+
+impl Batch {
+    pub fn new(state: impl Into<Value>) -> Self {
+        Self {
+            state: state.into(),
+            questions: BTreeMap::new(),
+        }
+    }
+
+    pub fn add(&mut self, id: impl Into<String>, question: Question) {
+        self.questions.insert(id.into(), question);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.questions.is_empty()
+    }
+
+    pub fn questions(&self) -> &BTreeMap<String, Question> {
+        &self.questions
+    }
+
+    pub fn ask_within(&self, cap: std::time::Duration) -> Result<Outcome, DecideError> {
+        ask_within(&self.state, &self.questions, cap)
+    }
+}
+
 /// Settings that are credentials: the only names looked up in the vault.
 const VAULT_KEYS: &[&str] = &[
     "OPENROUTER_API_KEY",

@@ -800,7 +800,9 @@ pub fn prompt_submit(agent: &str) {
         Err(_) => eprintln!("[agentflare] vent: consolidate panicked — skipping this turn"),
     }
 
-    let router = crate::optimize::active_router();
+    let jev_router = crate::optimize::jev_router::enabled();
+    let router = (!jev_router).then(crate::optimize::active_router);
+    let mut jev_route_ctx = None;
     let mut session_bits = vec![];
     // No session_id to track turn count against (rare) — always remind, same
     // as a first turn.
@@ -813,9 +815,6 @@ pub fn prompt_submit(agent: &str) {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         crate::optimize::prune_stale_sessions(&mut runtime, now);
-        // Same agent-scoped key as pre_tool_use/post_tool_use (item #220) --
-        // must resolve to the same record for the completion gate to see
-        // this session's turn/tool-call history.
         let session_key = crate::optimize::scoped_session_key(agent, sid);
         let record =
             runtime
@@ -840,7 +839,11 @@ pub fn prompt_submit(agent: &str) {
             recent_tool_calls: record.recent_tool_calls.clone(),
             current_model: crate::agent_model::detect(agent, &input),
         };
-        if let Some(nudge) = router.route(&ctx) {
+        if jev_router {
+            jev_route_ctx = Some(ctx);
+        } else if let Some(router) = &router
+            && let Some(nudge) = router.route(&ctx)
+        {
             session_bits.push(nudge);
         }
 
@@ -856,11 +859,14 @@ pub fn prompt_submit(agent: &str) {
             recent_tool_calls: vec![],
             current_model: crate::agent_model::detect(agent, &input),
         };
-        if let Some(nudge) = router.route(&ctx) {
+        if jev_router {
+            jev_route_ctx = Some(ctx);
+        } else if let Some(router) = &router
+            && let Some(nudge) = router.route(&ctx)
+        {
             session_bits.push(nudge);
         }
     }
-
     let components = get_components(agent);
     let mut bits = if first_turn {
         identity_bits(&components)
@@ -894,12 +900,13 @@ pub fn prompt_submit(agent: &str) {
             bits.push(nudge);
         }
     }
-    bits.extend(session_bits);
     bits.extend(crate::coaching::rule_bodies_for_prompt(prompt));
 
     let intent = crate::skill_detect::classify(prompt);
     bits.push(crate::skill_detect::format_briefing_header(&intent));
 
+    let mut skill_pick = None;
+    let mut pending_rerank = None;
     if intent.confidence >= 0.5 {
         let db_path = crate::paths::skills_db_path();
         if db_path.exists()
@@ -914,8 +921,6 @@ pub fn prompt_submit(agent: &str) {
                 crate::memory::engine::embed_query,
                 crate::memory::engine::embed_doc,
             ) {
-                // Re-ranking a wider pool can reorder the top picks, so the
-                // default 3-result set is fetched on its own as the baseline.
                 let baseline = if limit == 3 {
                     skills.clone()
                 } else {
@@ -928,15 +933,29 @@ pub fn prompt_submit(agent: &str) {
                     )
                     .unwrap_or_else(|_| skills.iter().take(3).cloned().collect())
                 };
-                if let Some(injection) = crate::skill_detect::build_injection(
-                    &crate::skill_rerank::pick(prompt, skills, baseline, 3),
-                ) {
-                    bits.push(injection);
+                match crate::skill_rerank::prepare(prompt, skills, baseline, 3) {
+                    Ok(pending) => {
+                        pending_rerank = Some(pending);
+                    }
+                    Err(baseline) => skill_pick = Some(baseline),
                 }
             }
         }
     }
-
+    let decisions =
+        crate::hook_decide_batch::run(prompt, jev_route_ctx.as_ref(), pending_rerank.as_ref());
+    if let Some(nudge) = decisions.route_nudge {
+        session_bits.push(nudge);
+    }
+    if decisions.skill_pick.is_some() {
+        skill_pick = decisions.skill_pick;
+    }
+    bits.extend(session_bits);
+    if let Some(skills) = skill_pick
+        && let Some(injection) = crate::skill_detect::build_injection(&skills)
+    {
+        bits.push(injection);
+    }
     // Detect "install <something> skill" patterns → suggest CLI command.
     let q = prompt.to_lowercase();
     if q.contains("install") && (q.contains("skill") || q.contains("skills")) {
