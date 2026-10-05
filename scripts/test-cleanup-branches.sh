@@ -11,7 +11,7 @@ git -C "$tmp/repo" config user.name Test
 git -C "$tmp/repo" config user.email test@example.invalid
 git -C "$tmp/repo" commit --quiet --allow-empty -m initial
 git -C "$tmp/repo" push --quiet -u origin HEAD:master
-git -C "$tmp/repo" worktree add --quiet -b merged "$tmp/wt" master
+git -C "$tmp/repo" worktree add --quiet -b merged "$tmp/wt" HEAD
 mkdir "$tmp/repo/scripts"
 cp scripts/cleanup-branches.sh "$tmp/repo/scripts/cleanup-branches.sh"
 
