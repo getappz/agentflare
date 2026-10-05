@@ -247,74 +247,70 @@ fn already_isolated_for_false_in_regular_repo() {
 }
 
 #[test]
-fn isolate_worktree_target_dir_writes_relative_target_dir() {
+fn retire_legacy_cargo_config_creates_no_config_for_fresh_worktree() {
     let tmp = TempDir::new().unwrap();
     let wt = tmp.path().join(".worktrees").join("task").join("1");
     std::fs::create_dir_all(&wt).unwrap();
-    isolate_worktree_target_dir(&wt);
+    retire_legacy_cargo_config(&wt);
+    assert!(!wt.join(".cargo").join("config.toml").exists());
+}
+
+#[test]
+fn retire_legacy_cargo_config_removes_generated_sccache_config() {
+    let tmp = TempDir::new().unwrap();
+    let wt = tmp.path().join("1");
     let config = wt.join(".cargo").join("config.toml");
-    assert!(config.exists(), "expected .cargo/config.toml in worktree");
-    let content = std::fs::read_to_string(&config).unwrap();
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(
+        &config,
+        format!(
+            "[build]\n# {LEGACY_CARGO_CONFIG_MARKER}.\ntarget-dir = \"target\"\n\
+             rustc-wrapper = \"sccache\"\n\n[env]\nSCCACHE_BASEDIRS = \"/x\"\n"
+        ),
+    )
+    .unwrap();
+    retire_legacy_cargo_config(&wt);
+    assert!(!config.exists(), "legacy sccache config must be retired");
+}
+
+#[test]
+fn retire_legacy_cargo_config_keeps_user_edits_under_the_marker() {
+    let tmp = TempDir::new().unwrap();
+    let wt = tmp.path().join("1");
+    let config = wt.join(".cargo").join("config.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(
+        &config,
+        format!(
+            "[build]\n# {LEGACY_CARGO_CONFIG_MARKER}.\ntarget-dir = \"target\"\n\
+             jobs = 2\n"
+        ),
+    )
+    .unwrap();
+    retire_legacy_cargo_config(&wt);
     assert!(
-        content.contains("target-dir = \"target\""),
-        "must set a relative, per-checkout target dir, got: {content}"
-    );
-    assert!(
-        !content.contains("target-dir = \"/")
-            && !content.contains("target-dir = \"~")
-            && !content.contains("CARGO_TARGET_DIR ="),
-        "must not set an absolute/shared target dir"
+        config.exists(),
+        "a marked config with local edits must stay"
     );
 }
 
 #[test]
-fn isolate_worktree_target_dir_does_not_clobber_existing_config() {
+fn retire_legacy_cargo_config_keeps_intentional_override() {
     let tmp = TempDir::new().unwrap();
-    let wt = tmp.path().join(".worktrees").join("task").join("1");
-    let cargo_dir = wt.join(".cargo");
-    std::fs::create_dir_all(&cargo_dir).unwrap();
-    let config = cargo_dir.join("config.toml");
+    let wt = tmp.path().join("1");
+    let config = wt.join(".cargo").join("config.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
     std::fs::write(
         &config,
         "[build]\ntarget-dir = \"/some/intentional/path\"\n",
     )
     .unwrap();
-    isolate_worktree_target_dir(&wt);
-    let content = std::fs::read_to_string(&config).unwrap();
+    retire_legacy_cargo_config(&wt);
     assert!(
-        content.contains("/some/intentional/path"),
-        "existing worktree-local config must be preserved"
+        std::fs::read_to_string(&config)
+            .unwrap()
+            .contains("/some/intentional/path")
     );
-}
-
-#[test]
-fn isolate_worktree_target_dir_wires_sccache_when_available() {
-    let tmp = TempDir::new().unwrap();
-    let wt = tmp.path().join(".worktrees").join("task").join("1");
-    std::fs::create_dir_all(&wt).unwrap();
-    isolate_worktree_target_dir(&wt);
-    let config = wt.join(".cargo").join("config.toml");
-    let content = std::fs::read_to_string(&config).unwrap();
-    if sccache_available() {
-        assert!(
-            content.contains("rustc-wrapper = \"sccache\""),
-            "expected sccache wired up as rustc-wrapper, got: {content}"
-        );
-        let escaped = wt
-            .to_string_lossy()
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"");
-        let basedir_line = format!("SCCACHE_BASEDIRS = \"{escaped}\"");
-        assert!(
-            content.contains(&basedir_line),
-            "expected SCCACHE_BASEDIRS to strip this worktree's own path, got: {content}"
-        );
-    } else {
-        assert!(
-            !content.contains("rustc-wrapper") && !content.contains("SCCACHE_BASEDIRS"),
-            "must not reference sccache when it isn't on PATH, got: {content}"
-        );
-    }
 }
 
 #[test]

@@ -26,6 +26,33 @@ use std::sync::OnceLock;
 /// defeating the containment this sandbox exists to provide.
 const HOME_CACHE_DIRS: &[&str] = &[".cargo", ".rustup", ".cache", ".npm"];
 
+/// mbx's shared build cache (item #330). The one `~/.cache` subdirectory bound
+/// read-write, overlaying the read-only `.cache` bind: `mbx build` stores
+/// compiled work and managed `target/` directories here, and fails with
+/// `Read-only file system` otherwise. Created on the host if missing so the
+/// first sandboxed build can populate it.
+pub const MBX_CACHE_DIR: &str = ".cache/mbx";
+
+/// `$HOME`-relative path of mbx's effective cache dir: `MBX_CACHE_DIR`, else
+/// `$XDG_CACHE_HOME/mbx`, when that lies under `home`; otherwise the default.
+/// A path outside `home` can't be bound (doctor reports it as not writable).
+fn mbx_cache_rel(
+    home: &Path,
+    mbx_cache_dir: Option<std::ffi::OsString>,
+    xdg_cache_home: Option<std::ffi::OsString>,
+) -> String {
+    mbx_cache_dir
+        .map(PathBuf::from)
+        .or_else(|| xdg_cache_home.map(|x| PathBuf::from(x).join("mbx")))
+        .and_then(|p| {
+            p.strip_prefix(home)
+                .ok()
+                .map(|r| r.to_string_lossy().into_owned())
+        })
+        .filter(|r| !r.is_empty())
+        .unwrap_or_else(|| MBX_CACHE_DIR.to_string())
+}
+
 /// `git_writable` controls whether `cwd/.git` is re-protected read-only
 /// (the default, `false` -- appropriate for an arbitrary job command that
 /// has no business rewriting git history) or left writable under the same
@@ -184,6 +211,21 @@ fn build_bwrap_args_with_home(
                 }
                 None => {}
             }
+        }
+
+        let mbx_cache = mbx_cache_rel(
+            home_path,
+            std::env::var_os("MBX_CACHE_DIR"),
+            std::env::var_os("XDG_CACHE_HOME"),
+        );
+        if let Some(dir) = paths::join_validated_home_dir(home_path, &mbx_cache) {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Some(resolved) = paths::resolve_existing_home_dir(home_path, &mbx_cache) {
+            let path_str = path_to_string(&resolved);
+            bwrap_args.push("--bind-try".to_string());
+            bwrap_args.push(path_str.clone());
+            bwrap_args.push(path_str);
         }
 
         for relative in &config.writable_home_dirs {
@@ -811,6 +853,42 @@ mod tests {
             .position(|a| a == &cargo_path)
             .expect(".cargo cache dir bound");
         assert_eq!(args[idx - 1], "--ro-bind-try");
+    }
+
+    #[test]
+    fn mbx_cache_rel_follows_effective_cache_dir_under_home() {
+        let home = Path::new("/home/u");
+        let os = |s: &str| Some(std::ffi::OsString::from(s));
+        assert_eq!(mbx_cache_rel(home, None, None), MBX_CACHE_DIR);
+        assert_eq!(mbx_cache_rel(home, os("/home/u/x/mbx"), None), "x/mbx");
+        assert_eq!(mbx_cache_rel(home, None, os("/home/u/xdg")), "xdg/mbx");
+        // MBX_CACHE_DIR outranks XDG_CACHE_HOME.
+        assert_eq!(mbx_cache_rel(home, os("/home/u/a"), os("/home/u/b")), "a");
+        // Outside home (or relative): can't bind, fall back to the default.
+        assert_eq!(mbx_cache_rel(home, os("/var/mbx"), None), MBX_CACHE_DIR);
+        assert_eq!(mbx_cache_rel(home, os("rel"), None), MBX_CACHE_DIR);
+    }
+
+    #[test]
+    fn mbx_cache_dir_is_created_and_bound_read_write_over_ro_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".cache")).unwrap();
+        let home = std::ffi::OsString::from(dir.path());
+        let args = build_bwrap_args_with_home(
+            None,
+            "true",
+            &[],
+            Some(&home),
+            false,
+            &SandboxConfig::default(),
+        );
+        let cache = path_to_string(&std::fs::canonicalize(dir.path().join(".cache")).unwrap());
+        let mbx = path_to_string(&std::fs::canonicalize(dir.path().join(MBX_CACHE_DIR)).unwrap());
+        let ro = args.iter().position(|a| a == &cache).unwrap();
+        let rw = args.iter().position(|a| a == &mbx).unwrap();
+        assert_eq!(args[ro - 1], "--ro-bind-try");
+        assert_eq!(args[rw - 1], "--bind-try");
+        assert!(rw > ro, "rw bind must come after the ro .cache bind");
     }
 
     #[test]
