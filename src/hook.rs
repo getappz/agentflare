@@ -719,6 +719,18 @@ fn identity_bits(components: &[crate::components::Component]) -> Vec<String> {
     bits
 }
 
+fn append_prompt_context(
+    bits: &mut Vec<String>,
+    session_bits: Vec<String>,
+    prompt: &str,
+) -> crate::skill_detect::IntentClassification {
+    bits.extend(session_bits);
+    bits.extend(crate::coaching::rule_bodies_for_prompt(prompt));
+    let intent = crate::skill_detect::classify(prompt);
+    bits.push(crate::skill_detect::format_briefing_header(&intent));
+    intent
+}
+
 pub fn prompt_submit(agent: &str) {
     let Some(input) = read_stdin_or_skip("UserPromptSubmit") else {
         return;
@@ -800,7 +812,9 @@ pub fn prompt_submit(agent: &str) {
         Err(_) => eprintln!("[agentflare] vent: consolidate panicked — skipping this turn"),
     }
 
-    let router = crate::optimize::active_router();
+    let jev_router = crate::optimize::jev_router::enabled();
+    let router = (!jev_router).then(crate::optimize::active_router);
+    let mut jev_route_ctx = None;
     let mut session_bits = vec![];
     // No session_id to track turn count against (rare) — always remind, same
     // as a first turn.
@@ -840,7 +854,11 @@ pub fn prompt_submit(agent: &str) {
             recent_tool_calls: record.recent_tool_calls.clone(),
             current_model: crate::agent_model::detect(agent, &input),
         };
-        if let Some(nudge) = router.route(&ctx) {
+        if jev_router {
+            jev_route_ctx = Some(ctx);
+        } else if let Some(router) = &router
+            && let Some(nudge) = router.route(&ctx)
+        {
             session_bits.push(nudge);
         }
 
@@ -856,11 +874,14 @@ pub fn prompt_submit(agent: &str) {
             recent_tool_calls: vec![],
             current_model: crate::agent_model::detect(agent, &input),
         };
-        if let Some(nudge) = router.route(&ctx) {
+        if jev_router {
+            jev_route_ctx = Some(ctx);
+        } else if let Some(router) = &router
+            && let Some(nudge) = router.route(&ctx)
+        {
             session_bits.push(nudge);
         }
     }
-
     let components = get_components(agent);
     let mut bits = if first_turn {
         identity_bits(&components)
@@ -894,12 +915,10 @@ pub fn prompt_submit(agent: &str) {
             bits.push(nudge);
         }
     }
-    bits.extend(session_bits);
-    bits.extend(crate::coaching::rule_bodies_for_prompt(prompt));
+    let intent = append_prompt_context(&mut bits, session_bits, prompt);
 
-    let intent = crate::skill_detect::classify(prompt);
-    bits.push(crate::skill_detect::format_briefing_header(&intent));
-
+    let mut skill_pick = None;
+    let mut pending_rerank = None;
     if intent.confidence >= 0.5 {
         let db_path = crate::paths::skills_db_path();
         if db_path.exists()
@@ -928,15 +947,28 @@ pub fn prompt_submit(agent: &str) {
                     )
                     .unwrap_or_else(|_| skills.iter().take(3).cloned().collect())
                 };
-                if let Some(injection) = crate::skill_detect::build_injection(
-                    &crate::skill_rerank::pick(prompt, skills, baseline, 3),
-                ) {
-                    bits.push(injection);
+                match crate::skill_rerank::prepare(prompt, skills, baseline, 3) {
+                    Ok(pending) => {
+                        pending_rerank = Some(pending);
+                    }
+                    Err(baseline) => skill_pick = Some(baseline),
                 }
             }
         }
     }
-
+    let decisions =
+        crate::hook_decide_batch::run(prompt, jev_route_ctx.as_ref(), pending_rerank.as_ref());
+    if let Some(nudge) = decisions.route_nudge {
+        bits.push(nudge);
+    }
+    if decisions.skill_pick.is_some() {
+        skill_pick = decisions.skill_pick;
+    }
+    if let Some(skills) = skill_pick
+        && let Some(injection) = crate::skill_detect::build_injection(&skills)
+    {
+        bits.push(injection);
+    }
     // Detect "install <something> skill" patterns → suggest CLI command.
     let q = prompt.to_lowercase();
     if q.contains("install") && (q.contains("skill") || q.contains("skills")) {
@@ -1290,6 +1322,36 @@ second line
                 vec!["Every review finding needs a diff.".to_string()]
             );
             assert!(crate::coaching::rule_bodies_for_prompt("what's for lunch").is_empty());
+        });
+    }
+
+    #[test]
+    fn prompt_context_keeps_keyword_nudge_before_rules_and_briefing_with_jev_off() {
+        use crate::coaching::rule::RuleTier;
+        use crate::paths::test_support::with_temp_home;
+        with_temp_home(|| {
+            crate::coaching::apply_rule(
+                "revorder",
+                "Review order",
+                "Review rule body.",
+                Some(crate::coaching::test_support::trigger(vec![], true)),
+                RuleTier::Override,
+                vec![],
+            )
+            .unwrap();
+
+            let prompt = "please review this PR";
+            let mut bits = vec![];
+            let intent =
+                append_prompt_context(&mut bits, vec!["keyword routing nudge".to_string()], prompt);
+            assert_eq!(
+                bits,
+                vec![
+                    "keyword routing nudge".to_string(),
+                    "Review rule body.".to_string(),
+                    crate::skill_detect::format_briefing_header(&intent),
+                ]
+            );
         });
     }
 
