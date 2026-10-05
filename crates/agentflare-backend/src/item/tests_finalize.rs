@@ -58,6 +58,7 @@ fn late_finalize_does_not_undo_a_redispatch() {
     // freshly re-armed backlog item back out.
     let conn = db::open_in_memory().unwrap();
     let (pid, sid) = seed_project(&conn, "");
+    make_label(&conn, &pid, "ready-for-work");
     let item = make_item(&conn, &pid, &sid);
     claim(&conn, &item.id, "claude-code:1", 1000, TTL).unwrap();
     redispatch(&conn, &item.id, None).unwrap();

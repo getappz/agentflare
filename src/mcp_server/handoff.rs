@@ -1,18 +1,5 @@
 use super::*;
 
-/// The project's `ready-for-work` label id, if the project has that label at
-/// all — skipped (returns `None`) rather than creating it out of nowhere.
-/// Shared by both branches of `handoff_impl` below: a brand-new handed-off
-/// item, and an existing item that's safe to queue (see the `Some(id)`
-/// branch's own comment for what "safe" means there).
-fn ready_label_id(conn: &rusqlite::Connection, project_id: &str) -> Option<String> {
-    agentflare_backend::label::list_by_project(conn, project_id)
-        .ok()?
-        .into_iter()
-        .find(|l| l.name == crate::supervisor::READY_LABEL)
-        .map(|l| l.id)
-}
-
 /// Merges `"task_type"` into an existing metadata JSON string, same
 /// defensive-coercion pattern as `work_item_pipeline::persist_run_id` (a
 /// non-object existing value, e.g. a double-encoded string, must not panic
@@ -223,6 +210,13 @@ impl AgentflareMcp {
         self.with_backend_db(|conn| {
             let project = self.resolve_project(conn)?;
             let ws_id = Self::resolve_workspace_id(conn)?;
+            let ready_id = agentflare_backend::label::ensure_project_label(
+                conn,
+                &project.id,
+                crate::supervisor::READY_LABEL,
+            )
+            .map_err(map_backend_err)?
+            .id;
 
             let item = match &item_id {
                 Some(id) => {
@@ -373,9 +367,9 @@ impl AgentflareMcp {
                             state.group_name.as_str(),
                             "backlog" | "unstarted" | "triage"
                         )
-                        && let Some(ready_id) = ready_label_id(conn, &project.id)
                     {
-                        let _ = agentflare_backend::item::add_label(conn, id, &ready_id);
+                        agentflare_backend::item::add_label(conn, id, &ready_id)
+                            .map_err(map_backend_err)?;
                     }
                     item
                 }
@@ -466,9 +460,7 @@ impl AgentflareMcp {
                         metadata =
                             Some(merge_handoff_depth(metadata.as_deref().unwrap_or("{}"), 1));
                         // A brand-new handed-off item is real, undone work —
-                        // labeling it `ready-for-work` (when the project has
-                        // that label at all; skipped otherwise rather than
-                        // creating it out of nowhere) lets the supervisor's
+                        // labeling it `ready-for-work` lets the supervisor's
                         // discovery loop pick it up without a human doing
                         // that by hand. Its own `resolve_confirmed_agent`
                         // gate already handles a non-autonomous recipient
@@ -479,7 +471,6 @@ impl AgentflareMcp {
                         // may already be claimed, in progress, or done, and
                         // silently re-queuing those for dispatch would be
                         // wrong.
-                        let ready_label_id = ready_label_id(conn, &project.id);
                         let input = agentflare_backend::item::CreateItem {
                             project_id: project.id.clone(),
                             state_id,
@@ -492,7 +483,7 @@ impl AgentflareMcp {
                             external_source: None,
                             external_id: None,
                             metadata,
-                            label_ids: ready_label_id.into_iter().collect(),
+                            label_ids: vec![ready_id.clone()],
                             assignee_ids: vec![],
                             dependency_ids: vec![],
                             start_date: None,
@@ -828,11 +819,13 @@ mod tests {
 
     fn init_test_repo(root: &std::path::Path) {
         let run = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(root)
-                .status()
-                .unwrap();
+            std::process::Command::new(
+                std::env::var_os("AGENTFLARE_TEST_GIT").unwrap_or_else(|| "git".into()),
+            )
+            .args(args)
+            .current_dir(root)
+            .status()
+            .unwrap();
         };
         run(&["init", "-b", "master"]);
         run(&["config", "user.email", "test@test.com"]);
@@ -974,18 +967,73 @@ mod tests {
     }
 
     #[test]
-    fn new_item_is_not_labeled_when_the_project_has_no_ready_for_work_label() {
+    fn new_handoff_without_ready_for_work_label_creates_and_attaches_it() {
         let (_tmp, mcp) = test_mcp();
-        // Deliberately not seeding the label — this project hasn't opted
-        // into autonomous dispatch, so nothing should be created out of
-        // nowhere and the handoff must still succeed.
-        let resp = mcp.handoff_impl(base_request()).unwrap();
-        let item_id = serde_json::from_str::<serde_json::Value>(&resp).unwrap()["item_id"]
+        let response = mcp.handoff_impl(base_request()).unwrap();
+        let item_id = serde_json::from_str::<serde_json::Value>(&response).unwrap()["item_id"]
             .as_str()
             .unwrap()
             .to_string();
+        mcp.with_backend_db(|conn| {
+            let project = mcp.resolve_project(conn).unwrap();
+            let ready = agentflare_backend::label::get_by_name(
+                conn,
+                &project.id,
+                crate::supervisor::READY_LABEL,
+            )
+            .unwrap();
+            assert!(
+                agentflare_backend::item::list_labels(conn, &item_id)
+                    .unwrap()
+                    .contains(&ready.id)
+            );
+        })
+        .unwrap();
+    }
 
-        assert!(item_label_names(&mcp, &item_id).is_empty());
+    #[test]
+    fn existing_item_handoff_without_ready_for_work_label_creates_and_attaches_it() {
+        let (_tmp, mcp) = test_mcp();
+        seed_ready_for_work_label(&mcp);
+        let first = mcp.handoff_impl(base_request()).unwrap();
+        let item_id = serde_json::from_str::<serde_json::Value>(&first).unwrap()["item_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        mcp.with_backend_db(|conn| {
+            let project = mcp.resolve_project(conn).unwrap();
+            let label = agentflare_backend::label::get_by_name(
+                conn,
+                &project.id,
+                crate::supervisor::READY_LABEL,
+            )
+            .unwrap();
+            agentflare_backend::label::delete(conn, &label.id).unwrap();
+        })
+        .unwrap();
+
+        mcp.handoff_impl(HandoffRequest {
+            item_id: Some(item_id.clone()),
+            recipient: "opencode".into(),
+            ..base_request()
+        })
+        .unwrap();
+        mcp.with_backend_db(|conn| {
+            let item = agentflare_backend::item::get(conn, &item_id).unwrap();
+            assert_eq!(item.assignee_agent.as_deref(), Some("opencode"));
+            let ready = agentflare_backend::label::get_by_name(
+                conn,
+                &item.project_id,
+                crate::supervisor::READY_LABEL,
+            )
+            .unwrap();
+            assert!(
+                agentflare_backend::item::list_labels(conn, &item_id)
+                    .unwrap()
+                    .contains(&ready.id)
+            );
+        })
+        .unwrap();
     }
 
     #[test]
@@ -1049,6 +1097,7 @@ mod tests {
     #[test]
     fn a_handoff_to_an_alias_of_the_claim_holder_keeps_its_claim() {
         let (_tmp, mcp) = test_mcp();
+        seed_ready_for_work_label(&mcp);
         let first = mcp.handoff_impl(base_request()).unwrap();
         let item_id = serde_json::from_str::<serde_json::Value>(&first).unwrap()["item_id"]
             .as_str()
@@ -1201,6 +1250,7 @@ mod tests {
             ..base_request()
         };
         let (_tmp, mcp) = test_mcp();
+        seed_ready_for_work_label(&mcp);
         let reply = mcp.handoff_impl(req).unwrap();
         let item_id = serde_json::from_str::<serde_json::Value>(&reply).unwrap()["item_id"]
             .as_str()
@@ -1228,6 +1278,7 @@ mod tests {
         // instead of relying on prose. Also asserts the merge is real (an
         // unrelated pre-existing key, e.g. `size`, survives).
         let (_tmp, mcp) = test_mcp();
+        seed_ready_for_work_label(&mcp);
         let first = mcp.handoff_impl(base_request()).unwrap();
         let item_id = serde_json::from_str::<serde_json::Value>(&first).unwrap()["item_id"]
             .as_str()
@@ -1358,6 +1409,7 @@ mod tests {
         // Item #219: first 10 hops on the same thread succeed with
         // incrementing depth; the 11th is rejected before any new asset.
         let (_tmp, mcp) = test_mcp();
+        seed_ready_for_work_label(&mcp);
         let thread = "thread-ping-pong".to_string();
         let mut req = base_request();
         req.thread_id = Some(thread.clone());
@@ -1408,6 +1460,7 @@ mod tests {
     fn handoff_thread_reuse_path_bumps_depth_and_rejects_past_cap() {
         // Depth must survive the thread-reuse path too (no item_id).
         let (_tmp, mcp) = test_mcp();
+        seed_ready_for_work_label(&mcp);
         let thread = "thread-reuse-depth".to_string();
         let mut req = base_request();
         req.thread_id = Some(thread.clone());
@@ -1595,6 +1648,7 @@ mod tests {
     #[test]
     fn allow_secrets_bypasses_the_scan() {
         let (_tmp, mcp) = test_mcp();
+        seed_ready_for_work_label(&mcp);
         let req = HandoffRequest {
             content: "ghp_abcdefghijklmnopqrstuvwxyz012345".to_string(),
             allow_secrets: Some(true),
@@ -1606,6 +1660,7 @@ mod tests {
     #[test]
     fn clean_handoff_passes_unchanged() {
         let (_tmp, mcp) = test_mcp();
+        seed_ready_for_work_label(&mcp);
         mcp.handoff_impl(base_request()).unwrap();
     }
 }

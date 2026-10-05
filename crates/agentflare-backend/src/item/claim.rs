@@ -441,6 +441,8 @@ pub fn redispatch(
         Some(agent) => agent,
         None => return Ok(RedispatchOutcome::NoAssignee),
     };
+    let ready = crate::label::ensure_project_label(&tx, &item.project_id, READY_LABEL)?;
+    let labels = crate::label::list_by_project(&tx, &item.project_id)?;
 
     // `metadata.model` (see `item_model_override` in `supervisor.rs`) is
     // scoped to whichever agent it was set alongside — forwarding it to a
@@ -478,15 +480,12 @@ pub fn redispatch(
         },
     )?;
 
-    let labels = crate::label::list_by_project(&tx, &item.project_id)?;
     for label in &labels {
         if REDISPATCH_CLEARED_LABELS.contains(&label.name.as_str()) {
             remove_label(&tx, item_id, &label.id)?;
         }
     }
-    if let Some(ready) = labels.iter().find(|l| l.name == READY_LABEL) {
-        add_label(&tx, item_id, &ready.id)?;
-    }
+    add_label(&tx, item_id, &ready.id)?;
 
     if let Ok(item) = get(&tx, item_id)
         && let Ok(wid) = workspace_id_for_project(&tx, &item.project_id)
