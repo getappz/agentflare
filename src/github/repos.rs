@@ -53,6 +53,50 @@ impl MergeMethod {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchCompare {
+    Identical,
+    Ahead,
+    DivergedOrBehind,
+}
+
+fn encode_path_component(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || "-._~".contains(ch) {
+            out.push(ch);
+        } else {
+            let mut buf = [0u8; 4];
+            for b in ch.encode_utf8(&mut buf).bytes() {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+    }
+    out
+}
+
+pub fn compare_head_to_branch(
+    client: &Client,
+    repo: &RepoId,
+    base_sha: &str,
+    branch: &str,
+) -> Result<BranchCompare, GitHubError> {
+    let path = format!(
+        "/repos/{}/{}/compare/{}...{}",
+        repo.owner,
+        repo.repo,
+        encode_path_component(base_sha),
+        encode_path_component(branch)
+    );
+    let json = client.request("GET", &path, None)?;
+    let status = json["status"].as_str().unwrap_or_default();
+    let ahead_by = json["ahead_by"].as_u64().unwrap_or(0);
+    Ok(match (status, ahead_by) {
+        ("identical", _) => BranchCompare::Identical,
+        ("ahead", n) if n > 0 => BranchCompare::Ahead,
+        _ => BranchCompare::DivergedOrBehind,
+    })
+}
 impl RepoSettings {
     /// What GitHub falls back to when it can't read a repo's settings: every
     /// merge method allowed (GitHub's defaults), auto-merge off. Used when
