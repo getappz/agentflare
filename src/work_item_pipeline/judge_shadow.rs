@@ -139,16 +139,18 @@ pub(crate) fn judge_shadow_compare(
                 outcome.elapsed_ms,
                 outcome.response.usage.cost,
             ));
-            let (features, norm_input) = crate::decide::capture::judge_features(state);
-            crate::decide::capture::record(crate::decide::capture::Input {
-                site: JUDGE_SHADOW_SITE,
-                features,
-                norm_input: &norm_input,
-                label: crate::decide::capture::label_of(answer),
-                confidence: *confidence,
-                baseline: claude_action,
-                source_model: outcome.response.model.as_deref(),
-            });
+            if crate::decide::capture::enabled() {
+                let (features, norm_input) = crate::decide::capture::judge_features(state);
+                crate::decide::capture::record(crate::decide::capture::Input {
+                    site: JUDGE_SHADOW_SITE,
+                    features,
+                    norm_input: &norm_input,
+                    label: crate::decide::capture::label_of(answer),
+                    confidence: *confidence,
+                    baseline: claude_action,
+                    source_model: outcome.response.model.as_deref(),
+                });
+            }
         }
         _ => record(&shadow::Row::failed(
             JUDGE_SHADOW_SITE,

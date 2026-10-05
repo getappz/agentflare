@@ -6,9 +6,14 @@ const ROUTER_PROMPT_CHARS: usize = 500;
 const RERANK_PROMPT_CHARS: usize = 500;
 const RERANK_DESC_CHARS: usize = 120;
 const JUDGE_REPLY_CHARS: usize = 500;
+const RERANK_MAX_CANDIDATES: usize = 10;
 
+/// Redact the FULL text, then clip, so a secret straddling the cut can't leak a prefix.
 fn clip(s: &str, max: usize) -> String {
-    s.chars().take(max).collect()
+    crate::mcp_server::secret_scan::redact(s)
+        .chars()
+        .take(max)
+        .collect()
 }
 
 /// Router: truncated prompt, length and simple counts.
@@ -33,6 +38,7 @@ pub fn rerank_features<'a>(
 ) -> Value {
     let cands: Vec<Value> = candidates
         .into_iter()
+        .take(RERANK_MAX_CANDIDATES)
         .enumerate()
         .map(|(rank, (name, desc, score))| {
             json!({
@@ -72,6 +78,10 @@ pub fn judge_features(state: &Value) -> (Value, String) {
         "markers": markers,
         "reply": clip(reply, JUDGE_REPLY_CHARS),
     });
-    let norm_input = format!("{mode}|{markers}|{}", clip(reply, 200));
+    let norm_input = format!(
+        "{mode}|{plan_len}|{}|{markers}|{}",
+        clip(current, 120),
+        clip(reply, 200)
+    );
     (features, norm_input)
 }

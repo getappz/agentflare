@@ -51,7 +51,11 @@ pub struct Input<'a> {
 }
 
 pub fn enabled() -> bool {
-    std::env::var("AGENTFLARE_DECIDE_CAPTURE").as_deref() == Ok("1")
+    enabled_for(std::env::var("AGENTFLARE_DECIDE_CAPTURE").ok().as_deref())
+}
+
+fn enabled_for(var: Option<&str>) -> bool {
+    var == Some("1")
 }
 
 pub fn dataset_path() -> PathBuf {
@@ -87,20 +91,23 @@ pub fn record(i: Input<'_>) {
 
 pub(crate) fn append(path: &Path, row: &Row, max_bytes: u64) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        let mut b = std::fs::DirBuilder::new();
+        b.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+        b.create(parent)?;
     }
     if std::fs::metadata(path).is_ok_and(|m| m.len() > max_bytes) {
-        let old = rotated(path);
-        let _ = std::fs::remove_file(&old); // rename won't overwrite on Windows
-        std::fs::rename(path, old)?;
+        // rename replaces the target; a lost race or locked file must not drop the row.
+        let _ = std::fs::rename(path, rotated(path));
     }
     let mut line = serde_json::to_string(row).map_err(std::io::Error::other)?;
     line.push('\n');
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?
-        .write_all(line.as_bytes())
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    opts.open(path)?.write_all(line.as_bytes())
 }
 
 /// Rotated file first (older rows), then the live one; damaged lines skipped.
@@ -108,9 +115,9 @@ pub fn load(path: &Path) -> Vec<Row> {
     [rotated(path), path.to_path_buf()]
         .iter()
         .flat_map(|p| {
-            std::fs::read_to_string(p)
-                .unwrap_or_default()
-                .lines()
+            let bytes = std::fs::read(p).unwrap_or_default();
+            let text = String::from_utf8_lossy(&bytes);
+            text.lines()
                 .filter_map(|l| serde_json::from_str(l).ok())
                 .collect::<Vec<Row>>()
         })

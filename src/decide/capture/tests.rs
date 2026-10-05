@@ -21,12 +21,42 @@ fn tmp(name: &str) -> PathBuf {
 
 #[test]
 fn off_by_default() {
-    // Safe: the var is only ever set to "1" by users, never by tests.
-    assert!(std::env::var("AGENTFLARE_DECIDE_CAPTURE").is_err() || enabled());
-    if !enabled() {
-        // record() must not even build a path-touching side effect.
-        record(input("router", json!({}), "x", "easy"));
-    }
+    assert!(!enabled_for(None));
+    assert!(!enabled_for(Some("0")));
+    assert!(!enabled_for(Some("true")));
+    assert!(enabled_for(Some("1")));
+}
+
+#[test]
+fn secret_straddling_clip_boundary_is_redacted() {
+    let secret = "ghp_abcdefghijklmnopqrstuvwxyz012345";
+    let prompt = format!("{}{secret} tail", "a ".repeat(248)); // cut lands inside the token
+    let f = router_features(&prompt);
+    assert!(!f["prompt"].as_str().unwrap().contains("ghp_"));
+    let state = json!({"mode": "m", "latest_role_reply": format!("{}{secret}", "b".repeat(195))});
+    let (jf, norm) = judge_features(&state);
+    assert!(!jf["reply"].as_str().unwrap().contains("ghp_"));
+    assert!(!norm.contains("ghp_"));
+}
+
+#[test]
+fn judge_norm_key_separates_plan_len_and_task() {
+    let mk = |plan: usize, task: &str| {
+        judge_features(&json!({
+            "mode": "m", "plan": vec!["x"; plan],
+            "current_task": {"title": task}, "latest_role_reply": "r",
+        }))
+        .1
+    };
+    assert_ne!(mk(1, "t"), mk(2, "t"));
+    assert_ne!(mk(1, "a"), mk(1, "b"));
+}
+
+#[test]
+fn rerank_candidates_capped() {
+    let c: Vec<(&str, &str, f64)> = (0..50).map(|_| ("s", "d", 1.0)).collect();
+    let f = rerank_features("p", c);
+    assert_eq!(f["candidates"].as_array().unwrap().len(), 10);
 }
 
 #[test]

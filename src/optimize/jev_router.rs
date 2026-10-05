@@ -165,7 +165,12 @@ fn route_with(
         outcome.elapsed_ms,
         outcome.response.usage.cost,
     ));
-    if let Some(answer) = outcome.response.answers.get(QUESTION_ID) {
+    if let Some(answer) = outcome
+        .response
+        .answers
+        .get(QUESTION_ID)
+        .filter(|_| decide::capture::enabled())
+    {
         decide::capture::record(decide::capture::Input {
             site: SITE,
             features: decide::capture::router_features(&prompt),
