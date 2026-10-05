@@ -32,6 +32,7 @@ mod daemon_autostart;
 mod daemon_client;
 mod dashboard;
 mod db;
+mod decide;
 mod dev_install;
 mod dev_vars;
 use agentflare_bin_lib::{dispatch_failure_ceiling, errors, mise_install, paths, state, store};
