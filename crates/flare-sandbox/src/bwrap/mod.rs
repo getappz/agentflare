@@ -115,6 +115,38 @@ fn build_bwrap_args(
     bwrap_args
 }
 
+/// `node_modules` dirs under `cwd` (itself and two levels down, like
+/// `flare-git-core::deps`) that agentflare hard-linked from the shared
+/// dependency store (item #329). Hard links share inodes with the store and
+/// other worktrees, so the job gets a private tmp overlay: reads pass
+/// through, writes never reach the shared bytes.
+fn shared_deps_dirs(cwd: &Path) -> Vec<PathBuf> {
+    const MARKER: &str = "node_modules/.agentflare-deps";
+    let mut found = Vec::new();
+    let mut level = vec![cwd.to_path_buf()];
+    for _ in 0..3 {
+        let mut next = Vec::new();
+        for dir in level {
+            if dir.join(MARKER).is_file() {
+                found.push(dir.join("node_modules"));
+            }
+            for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                if e.file_type().is_ok_and(|t| t.is_dir())
+                    && !name.starts_with('.')
+                    && name != "node_modules"
+                    && name != "target"
+                {
+                    next.push(e.path());
+                }
+            }
+        }
+        level = next;
+    }
+    found
+}
+
 fn build_bwrap_args_with_home(
     cwd: Option<&Path>,
     command: &str,
@@ -178,6 +210,14 @@ fn build_bwrap_args_with_home(
                 bwrap_args.push(git_str);
             }
             _ => {}
+        }
+
+        for nm in shared_deps_dirs(cwd) {
+            let nm = path_to_string(&nm);
+            bwrap_args.push("--overlay-src".to_string());
+            bwrap_args.push(nm.clone());
+            bwrap_args.push("--tmp-overlay".to_string());
+            bwrap_args.push(nm);
         }
 
         bwrap_args.push("--chdir".to_string());
@@ -610,6 +650,18 @@ pub(super) fn is_executable(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn provisioned_node_modules_gets_a_private_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(dir.path()).unwrap();
+        for nm in [cwd.join("node_modules"), cwd.join("web/node_modules")] {
+            std::fs::create_dir_all(&nm).unwrap();
+        }
+        std::fs::write(cwd.join("node_modules/.agentflare-deps"), "k").unwrap();
+        // web/node_modules is a plain install: no overlay.
+        assert_eq!(shared_deps_dirs(&cwd), [cwd.join("node_modules")]);
+    }
+
     use super::*;
     use crate::AgentProfile;
 

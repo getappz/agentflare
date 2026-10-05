@@ -250,6 +250,11 @@ pub(super) fn scan(input: &ScanInput, kinds: &[String]) -> (Vec<Item>, Vec<Skipp
         {
             continue;
         }
+        // Hard-linked from the shared dependency store: deleting it frees
+        // nothing, so it is never offered (item #329).
+        if crate::deps::is_provisioned(&path) {
+            continue;
+        }
         let age = newest_mtime(&path)
             .and_then(|t| t.elapsed().ok())
             .unwrap_or_default();
@@ -285,6 +290,41 @@ pub(super) fn scan(input: &ScanInput, kinds: &[String]) -> (Vec<Item>, Vec<Skipp
         })
         .collect();
     (items, skipped)
+}
+
+/// Shared dependency store entries (`~/.agentflare/deps`) that no checkout
+/// of `repo_root` (or the scan root) references any more.
+pub(super) fn scan_deps_store(input: &ScanInput) -> Vec<Item> {
+    let mut checkouts = vec![input.scan_root.to_path_buf()];
+    if let Some(repo) = input.repo_root {
+        checkouts.push(repo.to_path_buf());
+        let listing = run_in(repo, &["worktree", "list", "--porcelain"]).unwrap_or_default();
+        checkouts.extend(
+            listing
+                .lines()
+                .filter_map(|l| l.strip_prefix("worktree "))
+                .map(PathBuf::from),
+        );
+    }
+    let used = crate::deps::referenced_keys(&checkouts);
+    crate::deps::unreferenced(&crate::deps::store_root(), &used)
+        .into_iter()
+        .map(|(path, size_bytes)| {
+            let name = path
+                .file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+            Item {
+                id: format!("deps_store:{name}"),
+                kind: Kind::DepsStore,
+                label: format!("deps/{name}"),
+                path: Some(path),
+                branch: None,
+                sha: None,
+                size_bytes,
+                reason: "shared dependency store · no checkout uses this lockfile".into(),
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

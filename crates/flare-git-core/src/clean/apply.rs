@@ -189,6 +189,16 @@ fn remove_artifact(
     Ok("removed".into())
 }
 
+/// A shared dependency store entry: a re-seedable cache, so it is deleted
+/// outright, but only a direct child of the store.
+fn remove_deps_store(path: &Path) -> Result<String, String> {
+    if path.parent() != Some(crate::deps::store_root().as_path()) {
+        return Err("not a dependency store entry".into());
+    }
+    std::fs::remove_dir_all(path).map_err(|e| e.to_string())?;
+    Ok("removed".into())
+}
+
 fn apply_one(ctx: &Ctx, item: &Item, report: &mut Report) -> Result<String, String> {
     let path = || item.path.as_deref().ok_or("item has no path");
     match item.kind {
@@ -232,6 +242,7 @@ fn apply_one(ctx: &Ctx, item: &Item, report: &mut Report) -> Result<String, Stri
             }
         }
         Kind::Artifact => remove_artifact(ctx, item, path()?, report),
+        Kind::DepsStore => remove_deps_store(path()?),
         Kind::Remote => Err("remote branches are deleted by the caller".into()),
     }
 }

@@ -21,6 +21,7 @@ pub enum Kind {
     Worktree,
     Orphan,
     Artifact,
+    DepsStore,
     Remote,
 }
 
@@ -28,7 +29,7 @@ pub enum Kind {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Item {
     /// Stable across runs: `branch:<name>`, `worktree:<label>`,
-    /// `orphan:<name>`, `artifact:<label>`, `remote:<name>`.
+    /// `orphan:<name>`, `artifact:<label>`, `deps_store:<key>`, `remote:<name>`.
     pub id: String,
     pub kind: Kind,
     /// Branch name, or path relative to the scan root.
@@ -168,6 +169,9 @@ pub fn scan(input: &ScanInput) -> Plan {
         let (items, skipped) = artifacts::scan(input, kinds);
         plan.items.extend(items);
         plan.skipped.extend(skipped);
+        if kinds.is_empty() || kinds.iter().any(|k| k == "node") {
+            plan.items.extend(artifacts::scan_deps_store(input));
+        }
     }
     plan.items
         .retain(|i| wanted(opts, &i.label, i.branch.as_deref()));

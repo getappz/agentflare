@@ -140,6 +140,34 @@ worktrees never see each other's stale artifacts.
   never offers a managed `target` symlink — use `mbx gc` / `mbx clean` for those.
 - CI keeps its own sccache setup (no remote mbx cache yet).
 
+## Node dependencies — shared store (item #329)
+
+Claiming a worktree no longer means a second `npm ci`. `create_worktree_for`
+(`flare-git-core::deps`) materialises each project's `node_modules`
+(`package.json` + lockfile within two levels of the root) from
+`~/.agentflare/deps/<lockfile-sha256>-<os>-<arch>/`, seeding that entry from
+the main checkout's install when its lockfile is byte-identical. Files are
+hard-linked (zero extra bytes on ext4), falling back per file to
+`std::fs::copy` (reflink on btrfs/XFS, and the cross-device case).
+
+- **Share only on an identical lockfile.** Otherwise nothing is linked and the
+  worktree log says `deps: <dir>: no shared install for this lockfile …`; run a
+  normal install. Recognised: `package-lock.json`, `npm-shrinkwrap.json`,
+  `pnpm-lock.yaml`, `yarn.lock`, `bun.lock(b)`. A store entry is built beside
+  its final name and renamed in, so concurrent claims never see a partial tree.
+- **Writes.** Hard links share inodes, so in-place writes would leak. Provisioned
+  dirs carry a `node_modules/.agentflare-deps` marker and the bwrap sandbox
+  overlays them (`--overlay-src`/`--tmp-overlay`): jobs read the shared bytes,
+  their writes are private and discarded. `npm ci` recreates files and is safe.
+  Unsandboxed sessions get no overlay.
+- **pnpm projects:** also set `virtualStoreType: global` in `pnpm-workspace.yaml`
+  (`enableGlobalVirtualStore: true` before pnpm 11.23) so the store holds only
+  symlinks. Not automated.
+- **Clean.** `agentflare clean --artifacts` never offers a marked
+  (hard-link-provisioned) or symlinked `node_modules`, and lists store entries
+  no checkout's lockfile hashes to as `deps store` items.
+- Cargo `target/` is out of scope (see mbx above).
+
 ## Git
 
 Never add "Generated with Claude Code" or "Co-Authored-By: Claude" signatures.
