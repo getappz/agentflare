@@ -189,6 +189,191 @@ fn self_repair_or_gate_skips_when_needs_manual_dispatch_label_is_present() {
     });
 }
 
+/// Item #341: a branch held by another item's worktree defers repair -- but
+/// only below the cap. An item that already exhausted its attempts must still
+/// reach the cap handling (comment + human gate) while the branch stays
+/// occupied, not defer forever.
+#[test]
+fn self_repair_or_gate_defers_a_branch_collision_only_below_the_cap() {
+    crate::paths::test_support::with_temp_home(|| {
+        let git = |dir: &Path, args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        git(
+            repo.path(),
+            &["commit", "-q", "--allow-empty", "-m", "init"],
+        );
+        let foreign = repo.path().join("foreign");
+        git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feat/held",
+                foreign.to_str().unwrap(),
+            ],
+        );
+        let folder = repo.path().to_str().unwrap();
+
+        let mcp = test_mcp();
+        let queue = test_queue();
+        let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
+        mcp.with_backend_db(|conn| {
+            crate::mcp_server::merge_item_metadata(conn, &item_id, |m| {
+                m.insert(
+                    "pr".into(),
+                    serde_json::json!({"number": 1, "branch": "feat/held"}),
+                );
+            })
+        })
+        .unwrap()
+        .unwrap();
+        let label_id_by_name = seed_gate_label(&mcp);
+        let auth_conn = test_auth_conn();
+        let checks = vec!["clippy".to_string()];
+        let run = || {
+            let item = current_item(&mcp, &item_id);
+            self_repair_or_gate(
+                &mcp,
+                &queue,
+                &auth_conn,
+                agentflare_resource_gate::Policy::Normal,
+                &item,
+                1,
+                RepairTrigger::FailingChecks(&checks),
+                &[],
+                &label_id_by_name,
+                folder,
+            )
+        };
+
+        assert!(
+            matches!(run(), SelfRepairOutcome::Deferred),
+            "below the cap, a collision defers without enqueueing a doomed job"
+        );
+
+        for _ in 0..crate::quota::decide::SELF_REPAIR_CAP {
+            mcp.comment_impl(CommentRequest {
+                action: "create".into(),
+                item_id: Some(item_id.clone()),
+                body: Some(format!("{CI_SELF_REPAIR_MARKER}\n\njob: prior")),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        assert!(
+            matches!(run(), SelfRepairOutcome::Skipped),
+            "at the cap, the item must reach cap handling, not defer on the collision"
+        );
+        let labels = mcp
+            .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id).unwrap())
+            .unwrap();
+        assert!(
+            labels.contains(&label_id_by_name[NEEDS_HUMAN_GATE_LABEL]),
+            "the capped item must still be gated for a human"
+        );
+    });
+}
+
+/// Item #341: a green, approved PR whose item is gated used to be skipped in
+/// silence; the sweep now raises the operator notice once (and only for an
+/// approved PR -- an unapproved one already has its own approval card).
+#[test]
+fn handle_ci_green_notifies_once_for_a_gated_approved_pr() {
+    crate::paths::test_support::with_temp_home(|| {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        let auth_conn = test_auth_conn();
+        let auto_merge = AutoMergeRef::default();
+        let mut label_id_by_name = seed_gate_label(&mcp);
+        let manual_id = mcp
+            .with_backend_db(|conn| {
+                let project = mcp.resolve_project(conn).unwrap();
+                agentflare_backend::label::create(
+                    conn,
+                    agentflare_backend::label::CreateLabel {
+                        project_id: Some(project.id.clone()),
+                        workspace_id: project.workspace_id.clone(),
+                        name: NEEDS_MANUAL_LABEL.into(),
+                        color: None,
+                        parent_id: None,
+                        sort_order: None,
+                        external_source: None,
+                        external_id: None,
+                    },
+                )
+                .unwrap()
+                .id
+            })
+            .unwrap();
+        label_id_by_name.insert(NEEDS_MANUAL_LABEL.to_string(), manual_id.clone());
+
+        let sweep_once = |approved: bool| {
+            let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
+            mcp.with_backend_db(|conn| {
+                agentflare_backend::item::add_label(conn, &item_id, &manual_id).unwrap()
+            })
+            .unwrap();
+            let item = current_item(&mcp, &item_id);
+            let labels = if approved {
+                vec![PR_APPROVAL_LABEL.to_string()]
+            } else {
+                vec![]
+            };
+            let mut sweep = ReviewSweepResult {
+                promoted: 0,
+                self_repaired: 0,
+                review_repaired: 0,
+                skipped: 0,
+                waiting: 0,
+                updated: 0,
+                discovered: 0,
+                requeued: 0,
+            };
+            handle_ci_green(
+                &mcp,
+                &queue,
+                &auth_conn,
+                agentflare_resource_gate::Policy::Normal,
+                &item,
+                1,
+                &labels,
+                CiGreenMerge::Allowed {
+                    head_sha: None,
+                    auto_merge: &auto_merge,
+                },
+                &label_id_by_name,
+                "/repo",
+                Path::new("/repo"),
+                &mut sweep,
+            );
+            assert_eq!(sweep.skipped, 1, "a gated PR is skipped, not merged");
+            // `first_time_gated` is false once the notice key was consumed.
+            first_time_gated(&format!("pr-gated:{}", item.id))
+        };
+
+        assert!(
+            sweep_once(false),
+            "an unapproved PR must not consume the gated-PR notice"
+        );
+        assert!(
+            !sweep_once(true),
+            "an approved, gated PR must have raised its notice"
+        );
+    });
+}
+
 #[test]
 fn self_repair_or_gate_redispatches_silently_for_identical_failing_checks() {
     let mcp = test_mcp();

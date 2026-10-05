@@ -1897,9 +1897,8 @@ use review_bots::*;
 /// CodeRabbit-findings fetch it would otherwise throw away immediately (item
 /// #273 follow-up: that fetch used to run unconditionally on every tick for
 /// as long as a PR sat gated or in-flight).
-fn already_gated_or_in_flight(
+fn item_gated(
     mcp: &AgentflareMcp,
-    queue: &agentflare_jobs::Queue,
     item: &agentflare_backend::item::Item,
     label_id_by_name: &std::collections::HashMap<String, String>,
 ) -> bool {
@@ -1913,15 +1912,51 @@ fn already_gated_or_in_flight(
     // the cap could still enter self-repair on the very next sweep tick,
     // defeating the cap. The stray-item recovery path already excludes both
     // gates for the same reason (see `stray_candidates` above).
-    let already_gated = [NEEDS_HUMAN_GATE_LABEL, NEEDS_MANUAL_LABEL]
+    [NEEDS_HUMAN_GATE_LABEL, NEEDS_MANUAL_LABEL]
         .iter()
         .any(|name| {
             label_id_by_name
                 .get(*name)
                 .zip(item_label_ids.as_ref())
                 .is_some_and(|(gate_id, ids)| ids.contains(gate_id))
-        });
-    already_gated || job_in_flight(queue, &item.id)
+        })
+}
+
+fn already_gated_or_in_flight(
+    mcp: &AgentflareMcp,
+    queue: &agentflare_jobs::Queue,
+    item: &agentflare_backend::item::Item,
+    label_id_by_name: &std::collections::HashMap<String, String>,
+) -> bool {
+    item_gated(mcp, item, label_id_by_name) || job_in_flight(queue, &item.id)
+}
+
+/// True when `holder` (the worktree that has the PR's branch checked out) is
+/// not `own`, the item's own worktree path: a repair claim would then die at
+/// `git worktree add` ("already used by worktree"), burning a failure-cap
+/// strike and eventually gating the item on `needs-manual-dispatch`.
+fn is_foreign_worktree(holder: Option<&std::path::Path>, own: &std::path::Path) -> bool {
+    let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    holder.is_some_and(|h| canon(h) != canon(own))
+}
+
+/// Defer-worthy collision: another item's worktree holds this PR's branch
+/// (item #341 -- PR #849's `#334` beside `#330`). Same reasoning as the
+/// live-claim deferral in `self_repair_or_gate`: nothing can run yet, so
+/// don't spend an attempt on it.
+pub(super) fn branch_held_by_foreign_worktree(
+    item: &agentflare_backend::item::Item,
+    folder_path: &str,
+) -> bool {
+    let repo = std::path::Path::new(folder_path);
+    // The branch worktree creation would use, so legacy items without
+    // `metadata.pr.branch` are covered too.
+    let branch = flare_git_core::worktree::resolve_item_task_branch(item, repo);
+    let own = flare_git_core::worktree::item_worktree_path(repo, item.sequence_id);
+    is_foreign_worktree(
+        flare_git_core::doctor::worktree_holding_branch(repo, &branch).as_deref(),
+        &own,
+    )
 }
 
 /// Which in-progress PR stage label a self-repair dispatch should remove
@@ -2057,6 +2092,12 @@ fn self_repair_or_gate(
             ),
         );
         return SelfRepairOutcome::Skipped;
+    }
+
+    // Item #341: after the cap handling above, so an exhausted item still
+    // reaches its human gate while the branch stays occupied.
+    if branch_held_by_foreign_worktree(item, folder_path) {
+        return SelfRepairOutcome::Deferred;
     }
 
     // Item #114: while the item's claim is still live (within its
