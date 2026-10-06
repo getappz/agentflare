@@ -29,9 +29,63 @@ impl AgentflareMcp {
                 "session": session,
                 "backend_present": backend,
                 "backend_path": path,
-                "actions": flare_browser::ACTIONS.iter().map(|a| a.name).collect::<Vec<_>>(),
+                "actions": flare_browser::ACTIONS.iter().map(|a| a.name).chain(["plan", "act"]).collect::<Vec<_>>(),
             });
             return Ok(serde_json::to_string_pretty(&result).unwrap_or_default());
+        }
+
+        if action == "plan" || action == "act" {
+            if (action == "act"
+                && (req.target.is_some() || req.text.is_some() || req.operation.is_some()))
+                || (action == "plan" && req.decision.is_some())
+            {
+                return Err(ErrorData::invalid_params(
+                    "act accepts a decision id; plan accepts an operation and observed target",
+                    None,
+                ));
+            }
+            if req.url.is_some() || req.args.as_ref().is_some_and(|a| !a.is_empty()) {
+                return Err(ErrorData::invalid_params(
+                    "plan/act do not accept URL or extra args",
+                    None,
+                ));
+            }
+            let mut args = req.target.clone().into_iter().collect::<Vec<_>>();
+            args.extend(req.text.clone());
+            let operation = req.operation.unwrap_or_default();
+            if action == "plan" {
+                crate::browser_decision::validate(&operation, &args)
+                    .map_err(|e| ErrorData::invalid_params(e, None))?;
+            }
+            let token = req.decision.unwrap_or_default();
+            let planning = action == "plan";
+            let session_for_task = session.clone();
+            let output = tokio::task::spawn_blocking(move || {
+                let dir = crate::paths::agentflare_dir().join("browser-decisions");
+                let runner = |operation: &str, args: &[String]| {
+                    let argv = flare_browser::build_argv(&session_for_task, operation, args, &[])?;
+                    let (backend, path_env) = crate::browser_install::ensure_agent_browser(
+                        flare_browser::auto_install_enabled(),
+                    )?;
+                    // Fingerprint raw state: redaction must not hide a page change.
+                    flare_browser::run_blocking(&backend, &argv, &[], path_env.as_deref())
+                };
+                if planning {
+                    crate::browser_decision::plan_with(
+                        &dir,
+                        &session_for_task,
+                        &operation,
+                        &args,
+                        runner,
+                    )
+                } else {
+                    crate::browser_decision::act_with(&dir, &session_for_task, &token, runner)
+                }
+            })
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+            .map_err(|e| ErrorData::internal_error(flare_browser::redact(&e, &secrets), None))?;
+            return Ok(serde_json::json!({"action":action,"session":session,"read_only":planning,"output":flare_browser::compact_output(&flare_browser::redact(&output, &secrets), flare_browser::MAX_OUTPUT_CHARS)}).to_string());
         }
 
         // `observe` uses `text` directly as the local filter query and never
@@ -130,5 +184,23 @@ mod tests {
         };
         let err = mcp.browser_impl(req).await.unwrap_err();
         assert!(err.to_string().contains("action is required"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn research_patterns_browser_mcp_rejects_invalid_plan_before_backend() {
+        let mcp = AgentflareMcp::default();
+        let req = BrowserRequest {
+            action: "plan".into(),
+            operation: Some("eval".into()),
+            target: Some("@e1".into()),
+            ..Default::default()
+        };
+        assert!(
+            mcp.browser_impl(req)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("plan requires")
+        );
     }
 }

@@ -7,6 +7,8 @@
 use rusqlite::{Connection, params};
 use std::collections::{HashMap, HashSet};
 
+pub mod triage;
+
 /// Lines within this many rows of each other (same file) are treated as the
 /// same finding — different agents rarely cite the exact same line for one
 /// issue.

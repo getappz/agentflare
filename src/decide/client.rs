@@ -159,29 +159,90 @@ pub fn ask_with(
     questions: &BTreeMap<String, Question>,
 ) -> Result<Outcome, DecideError> {
     let req = cfg.request(state, questions);
-    let agent = ureq::AgentBuilder::new().timeout(cfg.timeout).build();
+    let agent = ureq::AgentBuilder::new()
+        .timeout(cfg.timeout)
+        .redirects(0)
+        .build();
     let mut call = agent.post(&req.url);
     for (name, value) in &req.headers {
         call = call.set(name, value);
     }
     let start = Instant::now();
-    // ureq returns non-2xx as `Err(Status(..))`; keep the body for the message.
-    let (status, body) = match call.send_json(&req.body) {
-        Ok(resp) => (resp.status(), resp.into_string().unwrap_or_default()),
-        Err(ureq::Error::Status(code, resp)) => (code, resp.into_string().unwrap_or_default()),
+    let resp = match call.send_json(&req.body) {
+        Ok(resp) | Err(ureq::Error::Status(_, resp)) => resp,
         Err(e) => return Err(DecideError::Transport(describe_transport(&e))),
     };
+    let status = resp.status();
+    let body = read_response(resp)?;
     let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     if !(200..300).contains(&status) {
-        return Err(DecideError::Status(
-            status,
-            body.chars().take(200).collect(),
-        ));
+        // A backend can echo credentials or private state in its error body.
+        return Err(DecideError::Status(status, "request rejected".to_string()));
     }
+    let response = parse_response(&body)?;
+    response
+        .validate(questions)
+        .map_err(DecideError::Malformed)?;
     Ok(Outcome {
-        response: parse_response(&body)?,
+        response,
         elapsed_ms,
     })
+}
+
+const MAX_RESPONSE_BYTES: usize = 512_000;
+
+fn read_response(resp: ureq::Response) -> Result<String, DecideError> {
+    use std::io::Read;
+
+    let mut bytes = Vec::new();
+    resp.into_reader()
+        .take((MAX_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            DecideError::Transport(format!("response body read failed: {:?}", error.kind()))
+        })?;
+    if bytes.len() > MAX_RESPONSE_BYTES {
+        return Err(DecideError::Malformed(
+            "response exceeds byte limit".to_string(),
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| DecideError::Malformed("response is not UTF-8".to_string()))
+}
+
+impl super::Budget {
+    pub fn ask(
+        &mut self,
+        state: &Value,
+        questions: &BTreeMap<String, Question>,
+    ) -> Result<Outcome, DecideError> {
+        self.ask_with(state, questions, ask)
+    }
+
+    pub fn ask_with(
+        &mut self,
+        state: &Value,
+        questions: &BTreeMap<String, Question>,
+        ask: impl FnOnce(&Value, &BTreeMap<String, Question>) -> Result<Outcome, DecideError>,
+    ) -> Result<Outcome, DecideError> {
+        let bytes =
+            serde_json::to_vec(&serde_json::json!({"state": state, "questions": questions}))
+                .map_err(|_| DecideError::Malformed("input cannot be serialized".to_string()))?
+                .len();
+        self.reserve(bytes).map_err(DecideError::Budget)?;
+        let outcome = ask(state, questions)?;
+        outcome
+            .response
+            .validate(questions)
+            .map_err(DecideError::Malformed)?;
+        self.reported_input_tokens = self
+            .reported_input_tokens
+            .saturating_add(outcome.response.usage.input_tokens);
+        self.reported_output_tokens = self
+            .reported_output_tokens
+            .saturating_add(outcome.response.usage.output_tokens);
+        Ok(outcome)
+    }
 }
 
 /// URL-free description of a transport failure: `ureq::Error`'s `Display`
@@ -356,6 +417,57 @@ mod tests {
     }
 
     #[test]
+    fn oversized_response_is_rejected() {
+        let url = serve_once(
+            http("200 OK", &" ".repeat(MAX_RESPONSE_BYTES + 1)),
+            Duration::ZERO,
+        );
+        let result = ask_with(&cfg(url, "3000"), &Value::from("x"), &questions());
+        assert!(
+            matches!(result, Err(DecideError::Malformed(message)) if message.contains("byte limit"))
+        );
+    }
+
+    #[test]
+    fn truncated_response_is_a_transport_error() {
+        let reply = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{}";
+        let url = serve_once(reply.to_string(), Duration::ZERO);
+        let result = ask_with(&cfg(url, "3000"), &Value::from("x"), &questions());
+        assert!(matches!(result, Err(DecideError::Transport(_))));
+    }
+
+    #[test]
+    fn http_error_does_not_display_echoed_secrets_or_state() {
+        let state = "private request contents";
+        let url = serve_once(
+            http("401 Unauthorized", &format!("{KEY} {state}")),
+            Duration::ZERO,
+        );
+        let err = ask_with(&cfg(url, "3000"), &Value::from(state), &questions())
+            .err()
+            .unwrap();
+        assert!(matches!(err, DecideError::Status(401, _)));
+        assert!(!err.to_string().contains(KEY));
+        assert!(!err.to_string().contains(state));
+    }
+
+    #[test]
+    fn redirect_is_not_followed() {
+        let destination = TcpListener::bind("127.0.0.1:0").unwrap();
+        destination.set_nonblocking(true).unwrap();
+        let reply = format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{}/decisions\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            destination.local_addr().unwrap()
+        );
+        let url = serve_once(reply, Duration::ZERO);
+        let result = ask_with(&cfg(url, "200"), &Value::from("x"), &questions());
+        assert!(matches!(result, Err(DecideError::Status(307, _))));
+        assert!(
+            matches!(destination.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
+
+    #[test]
     fn stalled_server_times_out_as_transport_error_without_url_or_key() {
         let url = serve_once(http("200 OK", "{}"), Duration::from_secs(3));
         let err = ask_with(&cfg(url.clone(), "200"), &Value::from("x"), &questions())
@@ -387,5 +499,25 @@ mod tests {
             .err()
             .unwrap();
         assert!(matches!(err, DecideError::Malformed(_)));
+    }
+
+    #[test]
+    fn missing_requested_answer_is_malformed() {
+        let url = serve_once(http("200 OK", r#"{"answers":{}}"#), Duration::ZERO);
+        let result = ask_with(&cfg(url, "3000"), &Value::from("x"), &questions());
+        assert!(matches!(result, Err(DecideError::Malformed(_))));
+    }
+
+    #[test]
+    fn out_of_range_probability_is_malformed() {
+        let url = serve_once(
+            http(
+                "200 OK",
+                r#"{"answers":{"urgent":{"type":"noul","noul":1.5}}}"#,
+            ),
+            Duration::ZERO,
+        );
+        let result = ask_with(&cfg(url, "3000"), &Value::from("x"), &questions());
+        assert!(matches!(result, Err(DecideError::Malformed(_))));
     }
 }

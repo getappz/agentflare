@@ -7,6 +7,10 @@ use super::*;
 pub(crate) struct GetRoutingSuggestionRequest {
     #[schemars(description = "The user's prompt to analyze")]
     pub(crate) prompt: String,
+    #[schemars(
+        description = "Optional host for a configured native model choice: claude-code, codex, cursor, opencode. Omit for the existing advisory nudge."
+    )]
+    pub(crate) agent: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -177,7 +181,9 @@ pub(crate) struct ChannelSendRequest {
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ReviewRequest {
-    #[schemars(description = "Action: clear|consensus|list|record|scores|submit")]
+    #[schemars(
+        description = "Action: clear|consensus|list|record|scores|submit|scan (advisory Jev diff screening)"
+    )]
     pub(crate) action: String,
     #[schemars(
         description = "Findings, each {file, line, message, severity?, category?} (submit)"
@@ -190,10 +196,12 @@ pub(crate) struct ReviewRequest {
     #[schemars(description = "Finder name (default: detected agent) (submit)")]
     #[serde(default)]
     pub(crate) agent: Option<String>,
-    #[schemars(description = "Diff base ref (default: master) (consensus, record)")]
+    #[schemars(description = "Diff base ref: master for consensus/record; HEAD for scan")]
     #[serde(default)]
     pub(crate) base: Option<String>,
-    #[schemars(description = "Diff head ref (default: HEAD) (consensus, record)")]
+    #[schemars(
+        description = "Head ref: HEAD for consensus/record; omitted for scan includes tracked working changes"
+    )]
     #[serde(default)]
     pub(crate) head: Option<String>,
     #[schemars(description = "Repo key owner/name (default: origin remote)")]
@@ -202,6 +210,10 @@ pub(crate) struct ReviewRequest {
     #[schemars(description = "Aggregate across every repo (default false) (scores)")]
     #[serde(default)]
     pub(crate) all_repos: bool,
+    #[schemars(description = "Lower the scan request budget (default and maximum 48)")]
+    pub(crate) max_requests: Option<usize>,
+    #[schemars(description = "Lower the scan input byte budget (default and maximum 512000)")]
+    pub(crate) max_input_bytes: Option<usize>,
 }
 
 /// A handoff assigns an item to another agent and attaches the work product
@@ -1496,6 +1508,14 @@ pub(crate) struct WorkflowRequest {
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct BrowserRequest {
+    #[schemars(
+        description = "Operation for action=plan: click|hover|check|uncheck|fill|type|select; target must be an observed @e ref"
+    )]
+    pub(crate) operation: Option<String>,
+    #[schemars(
+        description = "Single-use id returned by plan; required for action=act, expires after five minutes"
+    )]
+    pub(crate) decision: Option<String>,
     #[schemars(
         description = "Action: open|snapshot|observe|extract|click|fill|type|press|hover|select|check|uncheck|back|forward|reload|get|read|screenshot|pdf|eval|wait|cookies|storage|network|tabs|dialog|console|errors|batch|state|close|doctor|status. Subcommands allowed: \"get text\", \"tab new\", \"cookies set\", \"network requests\", \"dialog accept\", \"state save\". observe filters the snapshot to matching lines; extract runs JS via eval."
     )]
