@@ -118,3 +118,57 @@ pub struct Response {
     #[serde(default)]
     pub usage: Usage,
 }
+
+impl Response {
+    /// Validate against the request before any caller branches on an answer.
+    pub fn validate(&self, questions: &BTreeMap<String, Question>) -> Result<(), String> {
+        let probability = |p: f64| p.is_finite() && (0.0..=1.0).contains(&p);
+        if self.answers.len() != questions.len() {
+            return Err("answer ids do not match the request".to_string());
+        }
+        for (id, question) in questions {
+            let Some(answer) = self.answers.get(id) else {
+                return Err("a requested answer is missing".to_string());
+            };
+            let valid = match (question, answer) {
+                (Question::Noul { .. }, Answer::Noul { noul }) => probability(*noul),
+                (
+                    Question::Choice { criteria, .. },
+                    Answer::Choice {
+                        choice,
+                        confidence,
+                        probabilities,
+                    },
+                ) => {
+                    criteria.contains_key(choice)
+                        && confidence.is_none_or(probability)
+                        && probabilities.values().all(|p| probability(*p))
+                        && (probabilities.is_empty()
+                            || (probabilities.len() == criteria.len()
+                                && probabilities.keys().all(|k| criteria.contains_key(k))
+                                && (probabilities.values().sum::<f64>() - 1.0).abs() <= 0.02))
+                }
+                (
+                    Question::Score { criteria, .. },
+                    Answer::Score {
+                        score,
+                        confidence,
+                        probabilities,
+                    },
+                ) => {
+                    score.is_finite()
+                        && *score >= 0.0
+                        && !criteria.is_empty()
+                        && *score <= (criteria.len() - 1) as f64
+                        && confidence.is_none_or(probability)
+                        && probabilities.values().all(|p| probability(*p))
+                }
+                _ => false,
+            };
+            if !valid {
+                return Err("answer type or value is outside the requested rubric".to_string());
+            }
+        }
+        Ok(())
+    }
+}

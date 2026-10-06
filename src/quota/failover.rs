@@ -210,45 +210,59 @@ pub(crate) fn record_failover(
     reason: &str,
 ) -> Result<(), String> {
     let author = crate::claims::owner_id();
-    mcp.with_backend_db(|conn| -> agentflare_backend::error::Result<()> {
-        let tx = conn.unchecked_transaction()?;
-        // A `metadata.model` pin names a model of the agent being left
-        // (e.g. a Claude model); handing it to the new agent would just fail
-        // its launch, so it is dropped (and said so) on the move.
-        let item = agentflare_backend::item::get(&tx, item_id)?;
-        let mut meta: serde_json::Value =
-            serde_json::from_str(&item.metadata).unwrap_or_else(|_| serde_json::json!({}));
-        let dropped_model = meta
-            .as_object_mut()
-            .and_then(|m| m.remove("model"))
-            .and_then(|m| m.as_str().map(str::to_string));
-        let mut body = format!(
-            "{}\n\nmoved from {} to {}: {reason}",
-            crate::dispatch_failure_ceiling::AGENT_FAILOVER_MARKER,
-            from.as_str(),
-            to.as_str()
-        );
-        if let Some(model) = &dropped_model {
-            body.push_str(&format!(
-                "\n\nDropped the item's model pin `{model}` (it was for {}).",
-                from.as_str()
-            ));
-        }
-        agentflare_backend::item::update(
-            &tx,
-            item_id,
-            agentflare_backend::item::UpdateItem {
-                assignee_agent: Some(to.as_str().to_string()),
-                metadata: dropped_model.is_some().then(|| meta.to_string()),
-                ..Default::default()
-            },
-        )?;
-        agentflare_backend::comment::create(&tx, item_id, &author, &body)?;
-        tx.commit()?;
-        Ok(())
-    })
-    .map_err(|e| e.to_string())?
-    .map_err(|e| e.to_string())
+    let line = format!("moved from {} to {}: {reason}", from.as_str(), to.as_str());
+    let notified = mcp
+        .with_backend_db(|conn| -> agentflare_backend::error::Result<_> {
+            let tx = conn.unchecked_transaction()?;
+            // A `metadata.model` pin names a model of the agent being left
+            // (e.g. a Claude model); handing it to the new agent would just fail
+            // its launch, so it is dropped (and said so) on the move.
+            let item = agentflare_backend::item::get(&tx, item_id)?;
+            let mut meta: serde_json::Value =
+                serde_json::from_str(&item.metadata).unwrap_or_else(|_| serde_json::json!({}));
+            let dropped_model = meta
+                .as_object_mut()
+                .and_then(|m| m.remove("model"))
+                .and_then(|m| m.as_str().map(str::to_string));
+            // One comment per distinct move: the same line as the latest failover
+            // comment (a retry within one dispatch) is not posted again.
+            let repeated = agentflare_backend::comment::list_by_item(&tx, item_id)?
+                .iter()
+                .rev()
+                .find(|c| {
+                    c.body
+                        .contains(crate::dispatch_failure_ceiling::AGENT_FAILOVER_MARKER)
+                })
+                .is_some_and(|c| c.body.contains(&line));
+            let mut body = format!(
+                "{}\n\n{line}",
+                crate::dispatch_failure_ceiling::AGENT_FAILOVER_MARKER
+            );
+            if let Some(model) = &dropped_model {
+                body.push_str(&format!(
+                    "\n\nDropped the item's model pin `{model}` (it was for {}).",
+                    from.as_str()
+                ));
+            }
+            agentflare_backend::item::update(
+                &tx,
+                item_id,
+                agentflare_backend::item::UpdateItem {
+                    assignee_agent: Some(to.as_str().to_string()),
+                    metadata: dropped_model.is_some().then(|| meta.to_string()),
+                    ..Default::default()
+                },
+            )?;
+            if !repeated {
+                agentflare_backend::comment::create(&tx, item_id, &author, &body)?;
+            }
+            tx.commit()?;
+            Ok(item)
+        })
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+    crate::supervisor::notify_quota_event(&notified, &format!("#{} {line}", notified.sequence_id));
+    Ok(())
 }
 
 /// Label names on `item_id`, for routing (empty on any lookup failure).
@@ -324,6 +338,63 @@ fn no_alternative_is_agent_wide(metadata: &str) -> bool {
     failover_enabled_for(metadata) && item_allowed_agents(metadata).is_none()
 }
 
+/// Short quota state for a status column: `None` when the agent is fine.
+fn format_availability(cooldown: Option<(i64, String)>, usage: Option<String>) -> Option<String> {
+    match (cooldown, usage) {
+        (Some((until, why)), _) => Some(format!("{why} until {}", format_unix(until))),
+        (None, Some(breach)) => Some(format!("over threshold ({breach})")),
+        (None, None) => None,
+    }
+}
+
+/// What keeps `agent_name` from taking work right now, for `agents list` and
+/// `auth status`; `None` for an unknown name or an agent that is available.
+pub(crate) fn availability_state(agent_name: &str) -> Option<String> {
+    let agent = agent_registry::agent_by_name(&agentflare_backend::item::agent_part(agent_name))?;
+    format_availability(
+        unavailable_until(agent.as_str()),
+        usage_threshold_reason(agent),
+    )
+}
+
+/// Pure wording for [`unavailability_warning`]: a recorded cooldown wins
+/// over a live usage reading (it is the harder fact).
+fn format_unavailability(
+    agent: &str,
+    cooldown: Option<(i64, String)>,
+    usage: Option<String>,
+) -> Option<String> {
+    let state = match (cooldown, usage) {
+        (Some((until, why)), _) => format!("is {why} -- unavailable until {}", format_unix(until)),
+        (None, Some(breach)) => breach,
+        (None, None) => return None,
+    };
+    Some(format!(
+        "{agent} {state}. Dispatch may fail over to another agent; pin the item with metadata \
+         \"{FAILOVER_KEY}\": false, or restrict it with \"{ALLOWED_AGENTS_KEY}\"."
+    ))
+}
+
+/// Heads-up for an MCP caller that is about to hand work to an agent that is
+/// `known_unavailable` (cooling down, out of credit, over its usage
+/// threshold). Informational only -- the call still goes through. `None`
+/// for an unknown name or an agent that is fine.
+pub(crate) fn unavailability_warning(agent_name: &str) -> Option<String> {
+    let agent = agent_registry::agent_by_name(&agentflare_backend::item::agent_part(agent_name))?;
+    format_unavailability(
+        agent.as_str(),
+        unavailable_until(agent.as_str()),
+        usage_threshold_reason(agent),
+    )
+}
+
+/// Adds a `warnings` array to a JSON object response when there is one.
+pub(crate) fn attach_warning(resp: &mut serde_json::Value, warning: Option<String>) {
+    if let (Some(w), Some(obj)) = (warning, resp.as_object_mut()) {
+        obj.insert("warnings".into(), serde_json::json!([w]));
+    }
+}
+
 /// `2026-09-24 15:00 UTC` for a unix timestamp.
 pub(crate) fn format_unix(ts: i64) -> String {
     chrono::DateTime::from_timestamp(ts, 0)
@@ -334,6 +405,48 @@ pub(crate) fn format_unix(ts: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unavailability_wording_names_the_reason_and_the_escape_hatch() {
+        assert_eq!(format_unavailability("cursor", None, None), None);
+        let usage = format_unavailability(
+            "claude-code",
+            None,
+            Some("seven_day usage 74% >= threshold 70%".into()),
+        )
+        .unwrap();
+        assert!(usage.starts_with("claude-code seven_day usage 74% >= threshold 70%."));
+        assert!(usage.contains("\"failover\": false") && usage.contains("allowed_agents"));
+        let cooldown = format_unavailability(
+            "cursor",
+            Some((0, "out of credit".into())),
+            Some("seven_day usage 74% >= threshold 70%".into()),
+        )
+        .unwrap();
+        assert!(cooldown.starts_with("cursor is out of credit -- unavailable until 1970-01-01"));
+    }
+
+    #[test]
+    fn availability_text_is_none_for_a_healthy_agent() {
+        assert_eq!(format_availability(None, None), None);
+        assert_eq!(
+            format_availability(None, Some("seven_day usage 74% >= threshold 70%".into())),
+            Some("over threshold (seven_day usage 74% >= threshold 70%)".into())
+        );
+        assert_eq!(
+            format_availability(Some((0, "out of credit".into())), None),
+            Some("out of credit until 1970-01-01 00:00 UTC".into())
+        );
+    }
+
+    #[test]
+    fn attach_warning_adds_the_array_only_when_there_is_one() {
+        let mut v = serde_json::json!({"ok": true});
+        attach_warning(&mut v, None);
+        assert!(v.get("warnings").is_none());
+        attach_warning(&mut v, Some("w".into()));
+        assert_eq!(v["warnings"], serde_json::json!(["w"]));
+    }
 
     #[test]
     fn choose_alternative_skips_unavailable_and_disallowed_agents() {

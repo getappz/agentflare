@@ -238,6 +238,15 @@ fn warn_if_ambient_target_dir() {
     }
 }
 
+/// Shares the main checkout's `node_modules` with a claimed worktree on a
+/// byte-identical lockfile (item #329); a differing lockfile is logged and
+/// left for a fresh install. Idempotent and best effort.
+fn provision_shared_deps(repo_root: &Path, worktree_path: &Path) {
+    for line in crate::deps::provision(repo_root, worktree_path) {
+        eprintln!("worktree: {line}");
+    }
+}
+
 /// Marker comment of the `.cargo/config.toml` that items #133/#139 used to
 /// write into every claimed worktree.
 const LEGACY_CARGO_CONFIG_MARKER: &str = "Isolated per worktree (see item #133)";
@@ -508,6 +517,7 @@ pub fn create_worktree_for(
         }
         warn_if_ambient_target_dir();
         retire_legacy_cargo_config(&worktree_path);
+        provision_shared_deps(repo_root, &worktree_path);
         lock_item_worktree(repo_root, &worktree_path);
         return Ok(worktree_path);
     }
@@ -547,6 +557,7 @@ pub fn create_worktree_for(
             })?;
             warn_if_ambient_target_dir();
             retire_legacy_cargo_config(&worktree_path);
+            provision_shared_deps(repo_root, &worktree_path);
             lock_item_worktree(repo_root, &worktree_path);
             return Ok(worktree_path);
         }
@@ -731,6 +742,7 @@ pub fn create_worktree_for(
                     p.send(1.0, Some(1.0), Some("Worktree created".into()));
                 }
                 retire_legacy_cargo_config(&worktree_path);
+                provision_shared_deps(repo_root, &worktree_path);
                 lock_item_worktree(repo_root, &worktree_path);
                 return Ok(worktree_path);
             }

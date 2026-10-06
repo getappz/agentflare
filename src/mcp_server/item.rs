@@ -1076,7 +1076,14 @@ impl AgentflareMcp {
                 )
                 .map_err(internal_err)?;
             }
-            Ok(serde_json::to_string_pretty(&item).unwrap_or_default())
+            let mut resp = serde_json::to_value(&item).unwrap_or_default();
+            crate::quota::failover::attach_warning(
+                &mut resp,
+                req.assignee_agent
+                    .as_deref()
+                    .and_then(crate::quota::failover::unavailability_warning),
+            );
+            Ok(serde_json::to_string_pretty(&resp).unwrap_or_default())
         }
     }
 
@@ -2644,6 +2651,10 @@ impl AgentflareMcp {
                             "reason": "another agent already holds a live claim on this item",
                         });
                     }
+                    crate::quota::failover::attach_warning(
+                        &mut resp,
+                        crate::quota::failover::unavailability_warning(&assignee_agent),
+                    );
                     Ok(resp.to_string())
                 },
                 agentflare_backend::item::RedispatchOutcome::NoAssignee => {

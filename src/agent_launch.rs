@@ -1073,7 +1073,11 @@ fn run_headless_impl(
             spec.binary_names.join(" / ")
         ));
     };
-    let full_args = headless_full_args(spec.id, request_json, extra_args);
+    let mut routed_args = extra_args.to_vec();
+    if let Some(model) = crate::decide::model_routing::launch_model(agent, prompt, extra_args) {
+        routed_args.extend(model.args(agent));
+    }
+    let full_args = headless_full_args(spec.id, request_json, &routed_args);
     let Some(argv) = headless_argv(spec.id, &binary, &full_args) else {
         return HeadlessOutcome::NotHeadless(format!(
             "{} has no headless print mode",

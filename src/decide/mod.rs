@@ -13,12 +13,15 @@
 //! - never use it for security/guard decisions (Jev doesn't treat state as hostile).
 #![allow(dead_code, unused_imports)] // consumers land in items #702-#705
 
+mod budget;
 pub mod capture;
 mod client;
+pub mod model_routing;
 mod provider;
 pub mod shadow;
 mod types;
 
+pub use budget::{Budget, Limits};
 pub use client::{Batch, Outcome, Source, ask, ask_with, ask_within, credential_sources};
 pub use provider::{Config, DecideError};
 pub use types::{Answer, Question, Response, Usage};
