@@ -314,6 +314,64 @@ pub fn write_machine_name(name: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// Default friendly name: `<hostname>-<6 chars of the instance id>`, e.g.
+/// `host-51bb8d`. The hostname alone is not unique across machines (two
+/// workstations can both be `host`), which would give both the same
+/// `beacon:<name>` label; the id suffix keeps the name readable and distinct.
+/// The hostname is lowercased and reduced to `[a-z0-9._-]`; with none left
+/// the stem is `machine`.
+pub fn default_machine_name(hostname: Option<&str>, instance_id: &str) -> String {
+    let clean = |s: &str| {
+        s.to_ascii_lowercase()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_') {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>()
+            .trim_matches('-')
+            .to_string()
+    };
+    let stem: String = clean(hostname.unwrap_or_default())
+        .chars()
+        .take(32)
+        .collect();
+    let stem = if stem.is_empty() {
+        "machine".to_string()
+    } else {
+        stem
+    };
+    let suffix: String = instance_id
+        .rsplit(':')
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(6)
+        .collect();
+    if suffix.is_empty() {
+        stem
+    } else {
+        format!("{stem}-{suffix}")
+    }
+}
+
+/// Sets `[bridge].machine_name` to [`default_machine_name`] when none is set.
+/// Never overwrites an existing name. `Some(name)` only when it wrote one.
+pub fn ensure_machine_name() -> Option<String> {
+    if read_machine_name().is_some() {
+        return None;
+    }
+    let name = default_machine_name(
+        crate::sessions::os_hostname().as_deref(),
+        &stable_instance_id(),
+    );
+    write_machine_name(&name).ok().map(|_| name)
+}
+
 /// Removes `[bridge].machine_name`, falling `machine_label()` back to the
 /// hashed instance id. A noop (not an error) if it was never set — same
 /// contract as `clear_project_bridge_settings`.
@@ -1136,6 +1194,36 @@ mod tests {
     fn machine_label_falls_back_to_stable_instance_id_when_unset() {
         crate::paths::test_support::with_temp_home(|| {
             assert_eq!(machine_label(), stable_instance_id());
+        });
+    }
+
+    #[test]
+    fn default_machine_name_is_hostname_plus_instance_suffix() {
+        let id = "flared:51bb8de6c33b";
+        assert_eq!(default_machine_name(Some("host"), id), "host-51bb8d");
+        assert_eq!(
+            default_machine_name(Some("My Laptop!"), id),
+            "my-laptop-51bb8d"
+        );
+        assert_eq!(default_machine_name(None, id), "machine-51bb8d");
+        assert_eq!(default_machine_name(Some("///"), id), "machine-51bb8d");
+        // Two machines sharing a hostname still get different names.
+        assert_ne!(
+            default_machine_name(Some("host"), id),
+            default_machine_name(Some("host"), "flared:c997d745ae66")
+        );
+        validate_instance_id(&default_machine_name(Some("My Laptop!"), id)).unwrap();
+    }
+
+    #[test]
+    fn ensure_machine_name_writes_once_and_never_overwrites() {
+        crate::paths::test_support::with_temp_home(|| {
+            let first = ensure_machine_name().expect("unset, so it writes a default");
+            assert_eq!(read_machine_name().as_deref(), Some(first.as_str()));
+            assert!(ensure_machine_name().is_none(), "second call is a no-op");
+            write_machine_name("kumar-laptop").unwrap();
+            assert!(ensure_machine_name().is_none());
+            assert_eq!(read_machine_name().as_deref(), Some("kumar-laptop"));
         });
     }
 
