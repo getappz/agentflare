@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.8.0](https://github.com/getappz/agentflare/compare/v1.7.0...v1.8.0) - 2026-10-05
+## [1.8.1](https://github.com/getappz/agentflare/compare/v1.7.0...v1.8.1) - 2026-10-06
+
+Covers everything since 1.7.0. The v1.8.0 tag was never released (its macOS build failed, fixed in #871), so 1.8.1 is the first release of this line.
 
 ### Added
 
@@ -18,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Sandboxing and safety**: bubblewrap job sandbox (#420), reusable `flare-sandbox` crate (#541), pre-handoff secret scan (#669), encrypted SQLite with bundled or external SQLCipher (#824), host resource gate and capacity governor (#417, #459)
 - **Multi-workstation coordination**: GitHub as coordination substrate (#379), claim markers across workstations (#632), observation sync over a shared git branch (#400), machine-name config (#434, #467), agent continuity and team chat (#674, #829)
 - **Search and skills**: local-first hybrid search with vectors, RRF and rerank, `sqlite-vec` scale lane, semantic skill search, category taxonomy (#617, #618)
-- **Decision layer** (`decide`): Jev-backed decisions with shadow router, skill rerank and SDD judge comparison (#851), one batched call per prompt shared by router and rerank (#862), opt-in local training-data capture (#709, #853)
+- **Decision layer** (`decide`): bounded Jev workflows and agent-aware model routing (#877), Jev-backed decisions with shadow router, skill rerank and SDD judge comparison (#851), one batched call per prompt shared by router and rerank (#862), opt-in local training-data capture (#709, #853)
 - **CLI and tooling**: `agentflare clean` (#844), `git ship` (#391), `code impact` (#397), `apps run` (#612), browser automation via agent-browser (#680), `/flare:pm` prompt and `pm` MCP tool (#676, #782), `/flare:resume`, SDD session resume (#563), mbx shared Rust build cache (#849), work-item status aggregator (#801)
 - Typed item relations (blocks/duplicate/relates_to), SQL-level paginated item listing, structural item filters and annotations (#797)
 
@@ -30,6 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Windows**: console-window flashing across spawns (#407, #473, #477), git shim staging (#575), tree-kill hardening (#443), cursor-agent headless hang (#544)
 - **Updates and installs**: `update` and `dev-install` now verify the installed binary after a swap (#791, #795)
 - **Review sweep and CI**: CodeRabbit finding checks and caps (#760, #793, #833), `--resume` falls back to a fresh session when stale (#850), supervisor self-repair deferral and gated-green notifications (#488, #856)
+- **macOS release builds**: enable notify's `macos_kqueue` backend, which broke the v1.8.0 macOS build (#871)
+- **Failover and supervisor**: configurable per-window usage thresholds, measured-window logging and argv-error cooldown (#870, #308); stop re-dispatching items whose PR already merged (#875); `update_state` to completed removes the item's clean worktree (#868)
+- **Windows and shims**: Windows mbx discovery and mise tool paths (#873); shim real-binary lookup ignores the cached cargo target (#876)
 - `agentflare clean` keeps artifacts inside skipped worktrees out of the plan (#865)
 - Item id and relation scoping to the caller's project, auto-pick scoped to the current project (#859), plus many smaller dispatch, hook and workflow fixes
 
@@ -38,6 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Extracted `agentflare-core` (#816) and `flare-sandbox` (#541); dispatch now runs work items in-process
 - Vault consolidated into `agentflare vault` (#378); `flare_git` renamed to `git` (#542)
 - Toolchain pinned to Rust 1.98.0 (#589); tests run with nextest and cargo-hakari (#399, #779)
+- Cached mise bin-paths on disk so commands skip a mise spawn (#874)
 - Completion gate now requires fresh code-review evidence (#654, #581)
 - README, docs site and marketing site refreshed (#373)
 
