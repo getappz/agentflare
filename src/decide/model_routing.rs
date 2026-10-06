@@ -59,10 +59,16 @@ pub fn pinned_or_resuming(agent: &str, args: &[String]) -> bool {
             || arg.starts_with("--session=")
             || arg.starts_with("--effort=")
             || arg.starts_with("--variant=")
-            || (agent == "codex" && arg.contains("model_reasoning_effort="))
-            || (agent == "codex" && (arg == "resume" || arg.starts_with("model=")))
+            || (agent == "codex" && arg == "resume")
             || (agent == "codex"
-                && (arg.starts_with("--config=model=") || arg.starts_with("-cmodel=")))
+                && matches!(
+                    arg.strip_prefix("--config=")
+                        .or_else(|| arg.strip_prefix("-c"))
+                        .unwrap_or(arg)
+                        .split_once('=')
+                        .map(|(key, _)| key.trim()),
+                    Some("model" | "model_reasoning_effort")
+                ))
             || (agent == "opencode" && matches!(arg.as_str(), "-s" | "-c"))
             || (agent == "claude-code" && matches!(arg.as_str(), "-r" | "-c"))
     })
@@ -115,10 +121,13 @@ pub fn select_with(
         criteria: options,
     })]);
     let input_bytes = prompt.len();
-    let prompt: String = prompt.chars().take(2000).collect();
+    // Redact the full token before clipping; a clipped prefix may evade detection.
+    let redacted = crate::mcp_server::secret_scan::redact(prompt);
+    let truncated = redacted.chars().count() > 2000;
+    let prompt: String = redacted.chars().take(2000).collect();
     let state = json!({"agent": agent, "role": role,
-        "input_bytes": input_bytes, "task_excerpt_truncated": prompt.len() < input_bytes,
-        "task": crate::mcp_server::secret_scan::redact(&prompt)});
+        "input_bytes": input_bytes, "task_excerpt_truncated": truncated,
+        "task": prompt});
     let response = Budget::new(Limits {
         max_requests: 1,
         max_input_bytes: 40_000,
@@ -310,4 +319,37 @@ mod tests {
             .is_none()
         );
     }
+    #[test]
+    fn research_patterns_routing_redacts_secrets_across_excerpt_boundary() {
+        let candidates = [candidate("codex", "configured", &[], false)];
+        let prompt = format!("{}ghp_{}", "x".repeat(1988), "a".repeat(40));
+        assert!(
+            select_with(&candidates, "codex", "task", &prompt, |state, _| {
+                let task = state["task"].as_str().unwrap();
+                assert!(!task.contains("ghp_"));
+                assert!(task.contains("[REDACTED]"));
+                assert_eq!(state["input_bytes"], prompt.len());
+                assert_eq!(state["task_excerpt_truncated"], false);
+                Err(DecideError::Budget("test"))
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn research_patterns_routing_preserves_spaced_codex_config_pins() {
+        for value in [
+            "model = \"chosen\"",
+            "model_reasoning_effort = \"high\"",
+            "--config=model = \"chosen\"",
+            "-cmodel_reasoning_effort = \"high\"",
+        ] {
+            assert!(pinned_or_resuming("codex", &[value.into()]));
+        }
+        assert!(!pinned_or_resuming(
+            "codex",
+            &["-c".into(), "sandbox_mode = \"workspace-write\"".into()]
+        ));
+    }
+
 }
