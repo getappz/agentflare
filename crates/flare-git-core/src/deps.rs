@@ -69,6 +69,36 @@ pub fn lockfile_key(dir: &Path) -> Option<String> {
     ))
 }
 
+/// Files a package manager writes inside `node_modules` once an install
+/// finishes, per lockfile. Bun leaves none we can rely on, so a bun install
+/// can never be verified and is never seeded from.
+fn install_state_files(lockfile: &str) -> &'static [&'static str] {
+    match lockfile {
+        "package-lock.json" | "npm-shrinkwrap.json" => &[".package-lock.json"],
+        "pnpm-lock.yaml" => &[".modules.yaml"],
+        "yarn.lock" => &[".yarn-integrity", ".yarn-state.yml"],
+        _ => &[],
+    }
+}
+
+/// Whether `dir`'s `node_modules` was installed at or after its lockfile's
+/// last change. Seeding the shared store from a stale install would hand
+/// every later worktree the wrong dependencies under the new lockfile's key.
+/// `false` when it cannot be verified.
+fn install_is_current(dir: &Path) -> bool {
+    let mtime = |p: PathBuf| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let Some(lock) = LOCKFILES.iter().find(|l| dir.join(l).is_file()) else {
+        return false;
+    };
+    let Some(lock_time) = mtime(dir.join(lock)) else {
+        return false;
+    };
+    install_state_files(lock)
+        .iter()
+        .filter_map(|f| mtime(dir.join(DIR).join(f)))
+        .any(|t| t >= lock_time)
+}
+
 /// Directories under `root` (relative, `""` for root itself) holding a
 /// `package.json` and a lockfile.
 #[must_use]
@@ -170,6 +200,13 @@ pub fn provision_in(store: &Path, main: &Path, worktree: &Path) -> Vec<String> {
                 && lockfile_key(&main_dir).as_deref() == Some(&key)
                 && is_real_dir(&main_nm)
             {
+                if !install_is_current(&main_dir) {
+                    log.push(format!(
+                        "deps: {shown}: the main checkout's install is out of date (or cannot \
+                         be verified); run an install in main, then retry"
+                    ));
+                    continue;
+                }
                 let _ = std::fs::create_dir_all(store);
                 if let Err(e) = seed(&entry, &main_nm) {
                     log.push(format!("deps: {shown}: could not seed store: {e}"));
@@ -255,7 +292,7 @@ pub fn unreferenced(
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;
@@ -269,6 +306,8 @@ mod tests {
             std::fs::create_dir_all(&pkg).unwrap();
             std::fs::write(pkg.join("index.js"), "x").unwrap();
             std::os::unix::fs::symlink("a/index.js", dir.join("node_modules/link")).unwrap();
+            // What `npm install` leaves behind, written after the lockfile.
+            std::fs::write(dir.join("node_modules/.package-lock.json"), "{}").unwrap();
         }
     }
 
@@ -298,6 +337,27 @@ mod tests {
                 .unwrap()
                 .is_symlink()
         );
+    }
+
+    #[test]
+    fn a_stale_or_unverifiable_main_install_is_not_seeded_from() {
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        let t = tempfile::tempdir().unwrap();
+        let (main, wt, store) = (t.path().join("m"), t.path().join("w"), t.path().join("s"));
+        project(&main, "L", true);
+        project(&wt, "L", false);
+        // The install predates the lockfile: stale.
+        std::fs::File::open(main.join("node_modules/.package-lock.json"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let log = provision_in(&store, &main, &wt);
+        assert!(log[0].contains("out of date"), "{log:?}");
+        assert!(!wt.join("node_modules").exists() && !store.exists());
+        // No state file at all (e.g. bun): cannot be verified either.
+        std::fs::remove_file(main.join("node_modules/.package-lock.json")).unwrap();
+        let log = provision_in(&store, &main, &wt);
+        assert!(log[0].contains("out of date"), "{log:?}");
     }
 
     #[test]

@@ -296,9 +296,11 @@ pub(super) fn scan(input: &ScanInput, kinds: &[String]) -> (Vec<Item>, Vec<Skipp
 /// of `repo_root` (or the scan root) references and that no provisioning has
 /// used for [`crate::deps::STALE_AFTER`]. The store is shared by every project
 /// on the machine, so the age gate protects entries only other projects use.
-pub(super) fn scan_deps_store(input: &ScanInput) -> Vec<Item> {
-    let mut checkouts = vec![input.scan_root.to_path_buf()];
-    if let Some(repo) = input.repo_root {
+/// Every checkout whose lockfiles count as a reference to the store: the scan
+/// root, the repo root, and each of the repo's worktrees.
+fn store_checkouts(scan_root: &Path, repo_root: Option<&Path>) -> Vec<PathBuf> {
+    let mut checkouts = vec![scan_root.to_path_buf()];
+    if let Some(repo) = repo_root {
         checkouts.push(repo.to_path_buf());
         let listing = run_in(repo, &["worktree", "list", "--porcelain"]).unwrap_or_default();
         checkouts.extend(
@@ -308,6 +310,28 @@ pub(super) fn scan_deps_store(input: &ScanInput) -> Vec<Item> {
                 .map(PathBuf::from),
         );
     }
+    checkouts
+}
+
+/// Whether `entry` is *still* an unreferenced, stale store entry. The apply
+/// step asks again right before deleting: a worktree may have adopted the
+/// entry, or provisioning refreshed it, since the plan was drawn.
+pub(super) fn deps_store_still_removable(
+    entry: &Path,
+    scan_root: &Path,
+    repo_root: Option<&Path>,
+) -> bool {
+    let (Some(store), Some(name)) = (entry.parent(), entry.file_name()) else {
+        return false;
+    };
+    let used = crate::deps::referenced_keys(&store_checkouts(scan_root, repo_root));
+    crate::deps::unreferenced(store, &used, crate::deps::STALE_AFTER)
+        .iter()
+        .any(|(p, _)| p.file_name() == Some(name))
+}
+
+pub(super) fn scan_deps_store(input: &ScanInput) -> Vec<Item> {
+    let checkouts = store_checkouts(input.scan_root, input.repo_root);
     let used = crate::deps::referenced_keys(&checkouts);
     crate::deps::unreferenced(&crate::deps::store_root(), &used, crate::deps::STALE_AFTER)
         .into_iter()
@@ -550,5 +574,40 @@ mod tests {
         run_in(r, &["commit", "-m", "vendored deps"]).unwrap();
         let (l, _) = labels(r, Some(r), &all(), &[]);
         assert!(l.is_empty(), "{l:?}");
+    }
+
+    // The plan can go stale between scan and apply (a worktree adopts the
+    // entry, provisioning refreshes it): the delete-time check must notice.
+    #[cfg(unix)]
+    #[test]
+    fn deps_store_entry_is_rechecked_before_removal() {
+        let t = tempfile::tempdir().unwrap();
+        let proj = t.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("package.json"), "{}").unwrap();
+        std::fs::write(proj.join("package-lock.json"), "L").unwrap();
+        let key = crate::deps::lockfile_key(&proj).unwrap();
+        let store = t.path().join("store");
+        let entry = store.join(&key);
+        std::fs::create_dir_all(&entry).unwrap();
+        let old = std::time::SystemTime::now()
+            - crate::deps::STALE_AFTER
+            - std::time::Duration::from_secs(60);
+        std::fs::File::open(&entry)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let elsewhere = t.path().join("empty");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+
+        assert!(deps_store_still_removable(&entry, &elsewhere, None));
+        // A checkout now references the key.
+        assert!(!deps_store_still_removable(&entry, &proj, None));
+        // Unreferenced again, but provisioning just touched it.
+        std::fs::File::open(&entry)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now())
+            .unwrap();
+        assert!(!deps_store_still_removable(&entry, &elsewhere, None));
     }
 }
