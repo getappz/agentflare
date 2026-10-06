@@ -11,6 +11,18 @@ pub struct ReviewArgs {
 
 #[derive(Subcommand)]
 pub enum ReviewAction {
+    /// Advisory Jev screening; returns cited evidence and explicit unjudged files as JSON.
+    Scan {
+        /// Base ref (default HEAD); without --head includes tracked working changes.
+        #[arg(long)]
+        base: Option<String>,
+        #[arg(long)]
+        head: Option<String>,
+        #[arg(long)]
+        max_requests: Option<usize>,
+        #[arg(long)]
+        max_input_bytes: Option<usize>,
+    },
     /// Submit a finder's findings (JSON array of {file,line,message,severity?,category?})
     /// from --file or stdin. Replaces this agent's prior findings for the round.
     Submit {
@@ -105,11 +117,32 @@ pub enum ReviewAction {
 
 impl ReviewArgs {
     pub fn run(self) {
+        if let ReviewAction::Scan {
+            base,
+            head,
+            max_requests,
+            max_input_bytes,
+        } = &self.action
+        {
+            let report = crate::review::triage::scan(
+                base.as_deref(),
+                head.as_deref(),
+                *max_requests,
+                *max_input_bytes,
+            )
+            .unwrap_or_else(|e| fail(e));
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).unwrap_or_default()
+            );
+            return;
+        }
         let conn = match crate::db::open() {
             Ok(c) => c,
             Err(e) => fail(format!("cannot open ledger: {e}")),
         };
         match self.action {
+            ReviewAction::Scan { .. } => unreachable!(),
             ReviewAction::Submit {
                 pr,
                 agent,

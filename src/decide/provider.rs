@@ -27,6 +27,8 @@ pub enum DecideError {
     Malformed(String),
     #[error("AGENTFLARE_JEV_BASE_URL must be https, or http to a loopback IP address")]
     InvalidBaseUrl,
+    #[error("decision budget exhausted: {0}")]
+    Budget(&'static str),
 }
 
 pub enum Provider {
@@ -180,7 +182,8 @@ pub fn parse_response(body: &str) -> Result<Response, DecideError> {
     {
         v = result;
     }
-    serde_json::from_value(v).map_err(|e| DecideError::Malformed(e.to_string()))
+    serde_json::from_value(v)
+        .map_err(|_| DecideError::Malformed("body does not match the decision schema".to_string()))
 }
 
 #[cfg(test)]
@@ -395,5 +398,17 @@ mod tests {
             parse_response(r#"{"answers":{"x":{"type":"haiku"}}}"#).err(),
             Some(DecideError::Malformed(_))
         ));
+    }
+    #[test]
+    fn research_patterns_malformed_response_errors_do_not_echo_server_values() {
+        let secret = "sk-or-private-credential-value";
+        for body in [
+            format!(r#"{{"answers":{{"x":{{"type":"{secret}"}}}}}}"#),
+            format!(r#"{{"answers":{{"x":{{"type":"noul","noul":"{secret}"}}}}}}"#),
+        ] {
+            let error = parse_response(&body).err().unwrap();
+            assert!(matches!(error, DecideError::Malformed(_)));
+            assert!(!error.to_string().contains(secret));
+        }
     }
 }

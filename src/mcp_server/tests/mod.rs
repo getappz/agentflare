@@ -52,21 +52,27 @@ fn get_info_reports_agentflare_identity() {
     assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
 }
 
-#[test]
-fn routing_suggestion_returns_null_for_non_locate() {
+#[tokio::test]
+async fn routing_suggestion_returns_null_for_non_locate() {
     let s = AgentflareMcp::default();
-    let result = s.get_routing_suggestion(Parameters(GetRoutingSuggestionRequest {
-        prompt: "refactor the payment module".to_string(),
-    }));
+    let result = s
+        .get_routing_suggestion(Parameters(GetRoutingSuggestionRequest {
+            prompt: "refactor the payment module".to_string(),
+            agent: None,
+        }))
+        .await;
     assert!(result.contains("null"));
 }
 
-#[test]
-fn routing_suggestion_returns_nudge_for_find() {
+#[tokio::test]
+async fn routing_suggestion_returns_nudge_for_find() {
     let s = AgentflareMcp::default();
-    let result = s.get_routing_suggestion(Parameters(GetRoutingSuggestionRequest {
-        prompt: "find the auth handler".to_string(),
-    }));
+    let result = s
+        .get_routing_suggestion(Parameters(GetRoutingSuggestionRequest {
+            prompt: "find the auth handler".to_string(),
+            agent: None,
+        }))
+        .await;
     assert!(result.contains("cheap-model"));
 }
 
