@@ -37,6 +37,15 @@ fn pad(s: &str, width: usize) -> String {
     }
 }
 
+/// `ready` only for an installed agent that can take work: an agent that is
+/// cooling down or over its usage threshold shows that instead.
+fn display_status(a: &DetectedAgent) -> String {
+    match (a.status, crate::quota::failover::availability_state(a.id)) {
+        ("ready", Some(state)) => state,
+        (status, _) => status.to_string(),
+    }
+}
+
 fn render_table(agents: &[DetectedAgent]) {
     if agents.is_empty() {
         println!("No agents detected.");
@@ -62,7 +71,7 @@ fn render_table(agents: &[DetectedAgent]) {
             "  {}  {}  {}",
             pad(a.display_name, max_agent),
             pad(a.version.as_deref().unwrap_or("-"), max_version),
-            a.status
+            display_status(a)
         );
     }
 }
@@ -73,7 +82,7 @@ fn to_rows(agents: &[DetectedAgent]) -> Vec<AgentRow> {
         .map(|a| AgentRow {
             agent: a.display_name.to_string(),
             version: a.version.clone(),
-            status: a.status.to_string(),
+            status: display_status(a),
             binary_path: Some(a.binary_path.clone()),
             error: a.error.clone(),
         })

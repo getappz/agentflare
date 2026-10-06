@@ -1248,6 +1248,9 @@ pub(crate) struct ItemStatusResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) job: Option<agentflare_jobs::JobInfo>,
     pub(crate) pr: PrStatusSummary,
+    /// Why dispatch is not progressing, derived from the same checks the
+    /// supervisor makes (`{"kind": ...}` objects; empty when nothing blocks).
+    pub(crate) blocked_by: Vec<serde_json::Value>,
     /// Recent lines from the daemon's own log (`crate::daemon::daemon_log_path`)
     /// that mention this item's id or `#<sequence_id>`, oldest first.
     pub(crate) log_lines: Vec<String>,

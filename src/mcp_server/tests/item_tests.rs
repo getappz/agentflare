@@ -2705,3 +2705,27 @@ fn item_update_state_to_completed_removes_the_clean_worktree() {
     .unwrap();
     assert!(!wt.exists(), "completed item left {}", wt.display());
 }
+
+#[test]
+fn record_failover_posts_one_comment_per_distinct_move() {
+    use agent_registry::Agent;
+    let (tmp, s) = harness();
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let id = created["id"].as_str().unwrap();
+    let marker = crate::dispatch_failure_ceiling::AGENT_FAILOVER_MARKER;
+    let moves = |tmp: &tempfile::TempDir| {
+        agentflare_backend::comment::list_by_item(&backend_conn(tmp), id)
+            .unwrap()
+            .into_iter()
+            .filter(|c| c.body.contains(marker))
+            .count()
+    };
+    let (cc, cur) = (Agent::ClaudeCode, Agent::Cursor);
+    let why = "seven_day usage 74% >= threshold 70%";
+    crate::quota::failover::record_failover(&s, id, cc, cur, why).unwrap();
+    crate::quota::failover::record_failover(&s, id, cc, cur, why).unwrap();
+    assert_eq!(moves(&tmp), 1, "an identical retry must not repost");
+    crate::quota::failover::record_failover(&s, id, cc, cur, "cursor is out of credit").unwrap();
+    assert_eq!(moves(&tmp), 2, "a changed reason is a new move");
+}
