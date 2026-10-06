@@ -178,6 +178,36 @@ agentflare work issue#7 --agent claude-code --max-turns 40 --max-cost-usd 2.5 --
 | `--max-cost-usd` | Max cost in USD before forced stop (Claude Code only). |
 | `--notify` | Recipient for a handoff artifact describing the outcome. |
 
+#### Automatic failover
+
+If the assigned agent is rate limited, out of credit, over its subscription's usage
+threshold, or its CLI invocation is broken (unrecognized argument, bad subcommand), the
+item moves to another installed, available agent instead of waiting or repeatedly
+retrying a broken launch. The move is sticky: `assignee_agent` changes on the item and a
+comment records why.
+
+Two item-metadata keys scope this per item (`agentflare item update --metadata`, not a
+`work` flag):
+
+| Key | Effect |
+|---|---|
+| `"failover": false` | Pins the item to its current `assignee_agent`; it waits instead of moving. |
+| `"allowed_agents": ["codex", "opencode"]` | Restricts any failover move to this list. |
+
+Operator-wide behavior lives in `~/.agentflare/config.toml`'s `[failover]` table:
+
+```toml
+[failover]
+enabled = true                  # default true
+agents = ["codex", "opencode"]  # allow-list + preference order; empty = any installed agent
+usage_threshold_percent = 70.0  # default 70.0; blanket usage-window gate
+five_hour_percent = 90.0        # optional override for Claude's 5h window
+seven_day_percent = 85.0        # optional override for Claude's 7d window
+```
+
+`AGENTFLARE_FAILOVER=0` (or `false`/`off`/`no`) disables failover entirely; exhausted
+agents still cool down and the item waits for them.
+
 ## Optimization
 
 ### `agentflare cost`

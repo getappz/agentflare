@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Delete local branches + worktrees already merged (or remote-deleted after
-# squash-merge) into origin/<default>. --remote also prunes matching remote
-# branches. Default: apply locally; remote deletion always needs --remote.
+# Delete local branches checked out nowhere and already merged (or
+# remote-deleted after squash-merge) into origin/<default>. --remote also
+# prunes matching remote branches.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -67,6 +67,10 @@ for b in "${!candidates[@]}"; do
   is_protected "$b" && continue
 
   wt="${worktree_of[$b]:-}"
+  if [[ -n "$wt" ]]; then
+    echo "skip $b: checked out in worktree $wt (use agentflare clean --worktrees)" >&2
+    continue
+  fi
 
   # -D force-deletes without a merge check, so verify the branch's own
   # changes are actually present in origin/$DEFAULT_BRANCH BEFORE touching
@@ -88,45 +92,8 @@ for b in "${!candidates[@]}"; do
   fi
 
   if ((DRY_RUN)); then
-    if [[ -n "$wt" ]]; then
-      echo "would remove worktree $wt + branch $b"
-    else
-      echo "would delete branch $b"
-    fi
+    echo "would delete branch $b"
     continue
-  fi
-
-  if [[ -n "$wt" ]]; then
-    # Retry worktree removal on Windows where file locks (rust-analyzer,
-    # proc-macro-srv) can transiently block deletion. Exponential backoff
-    # up to ~16s total before falling through.
-    wt_removed=0
-    delay=1
-    for attempt in 1 2 3 4 5; do
-      if git worktree remove "$wt" 2>/dev/null; then
-        echo "removed worktree $wt"
-        wt_removed=1
-        break
-      fi
-      # Distinguish "Permission denied" (file lock) from "dirty" (unsafe)
-      err=$(git worktree remove "$wt" 2>&1 1>/dev/null) || true
-      if [[ "$err" == *"dirty"* || "$err" == *"has untracked"* || "$err" == *"has uncommitted"* ]]; then
-        echo "skip $b: worktree $wt has uncommitted changes" >&2
-        break
-      fi
-      if ((attempt < 5)); then
-        sleep "$delay"
-        delay=$((delay * 2))
-      fi
-    done
-    if ((wt_removed == 0)); then
-      # Permission denied after retries — likely rust-analyzer locking
-      # files on Windows. Still prune the git metadata so the branch
-      # itself can be cleaned up. The leftover directory will be caught
-      # by gc_orphans (which has retry+rmdir fallback) on next audit.
-      echo "warn: worktree $wt could not be removed (likely file lock)" >&2
-      echo "warn: pruning git admin entry, dir will be cleaned later" >&2
-    fi
   fi
 
   if git branch -D "$b" >/dev/null 2>&1; then
@@ -135,12 +102,7 @@ for b in "${!candidates[@]}"; do
   fi
 done
 
-# `git worktree remove` above already drops the admin entry for anything it
-# actually removes. `prune` is a real mutation (not a preview), and on at
-# least one Windows/Git-Bash setup it has misjudged untouched, still-present
-# worktrees as stale and wiped their registration — so it must never run
-# under --dry-run, which promises to "change nothing".
-((DRY_RUN)) || git worktree prune
+# Leave worktree registration cleanup to `agentflare clean --worktrees`.
 
 if ((DO_REMOTE)); then
   echo "== remote branches merged into origin/$DEFAULT_BRANCH =="
