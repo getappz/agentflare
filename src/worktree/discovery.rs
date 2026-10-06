@@ -177,6 +177,7 @@ pub(crate) fn claim_pr_for_discovery(
 /// (CI check, self-repair, branch update, merge) treats it identically to a
 /// normal item. Returns the number of items created; soft-fails to 0 on any
 /// GitHub error, same as this file's other PR-lookup functions.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn discover_untracked_prs(
     conn: &rusqlite::Connection,
     client: &crate::github::Client,
