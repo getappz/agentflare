@@ -16,16 +16,18 @@ pub(crate) fn tracked_pr_numbers(
         .collect()
 }
 
-/// The item whose own branch `branch` is: `task/<sequence_id>` or
-/// `task/<sequence_id>-<slug>` for an item in `items`, or the branch a
-/// previous PR was recorded against in `metadata.pr.branch`.
+/// The item whose own branch `branch` is: `task/<sequence_id>[-<slug>]` for
+/// an item in `items` *with a local branch of that name* (sequence numbers
+/// are per instance, so the name alone could be another workstation's), or
+/// the branch a previous PR was recorded against in `metadata.pr.branch`.
 fn item_owning_branch<'a>(
     items: &'a [agentflare_backend::item::Item],
     branch: &str,
+    local_branch: &dyn Fn(&str) -> bool,
 ) -> Option<&'a agentflare_backend::item::Item> {
     items
         .iter()
-        .find(|item| super::item_owns_branch(item, branch))
+        .find(|item| super::item_owns_branch_here(item, branch, local_branch))
 }
 
 /// Records `number`/`branch` as `item`'s PR when it has none yet, so the next
@@ -183,6 +185,7 @@ pub(crate) fn discover_untracked_prs(
     in_review_state_id: &str,
     known_pr_numbers: &std::collections::HashSet<u64>,
     owner: &str,
+    local_branch: &dyn Fn(&str) -> bool,
 ) -> usize {
     let prs = match crate::github::pulls::list(client, repo, "open") {
         Ok(prs) => prs,
@@ -211,7 +214,7 @@ pub(crate) fn discover_untracked_prs(
         // attach the PR there instead of minting a second item that the
         // supervisor would then dispatch repairs against, colliding with the
         // owner's worktree (#334 beside #330).
-        if let Some(owning) = item_owning_branch(&items, &branch) {
+        if let Some(owning) = item_owning_branch(&items, &branch, local_branch) {
             attach_pr_to_item(conn, owning, pr.number, &branch);
             continue;
         }
@@ -506,6 +509,7 @@ mod tests {
             &in_review_state_id,
             &known,
             "flared:box-a",
+            &|_| true,
         );
 
         assert_eq!(created, 1);
@@ -544,6 +548,7 @@ mod tests {
             &in_review_state_id,
             &known,
             "flared:box-a",
+            &|_| true,
         );
 
         assert_eq!(created, 0);
@@ -595,6 +600,7 @@ mod tests {
             &in_review_state_id,
             &known,
             "flared:c997d745ae66",
+            &|_| true,
         );
 
         assert_eq!(created, 0);
@@ -632,6 +638,7 @@ mod tests {
             &in_review_state_id,
             &known,
             "flared:box-a",
+            &|_| true,
         );
 
         assert_eq!(created, 0);
@@ -667,6 +674,7 @@ mod tests {
             &in_review_state_id,
             &known,
             "flared:box-a",
+            &|_| true,
         );
 
         assert_eq!(created, 0);
@@ -711,6 +719,7 @@ mod tests {
             &in_review_state_id,
             &known,
             "flared:box-a",
+            &|_| true,
         );
 
         assert_eq!(created, 0);
@@ -787,6 +796,7 @@ mod tests {
             &in_review_state_id,
             &std::collections::HashSet::new(),
             "flared:box-a",
+            &|_| true,
         );
 
         assert_eq!(
@@ -843,11 +853,92 @@ mod tests {
             &in_review_state_id,
             &std::collections::HashSet::new(),
             "flared:box-a",
+            &|_| true,
         );
 
         assert_eq!(
             created, 1,
             "another workstation's task branch is not ours to attach"
         );
+    }
+
+    // Sequence numbers are per instance: a `task/<N>-…` branch another
+    // workstation pushed (no local branch of that name here) must not attach to
+    // this instance's unrelated item #N. It falls through to the normal claim
+    // path and is tracked as its own item.
+    #[test]
+    fn a_foreign_branch_matching_a_local_sequence_number_is_not_attached() {
+        let conn = agentflare_backend::db::open_in_memory().unwrap();
+        let (project_id, in_review_state_id) = test_project_with_in_review_state(&conn);
+        let unrelated = create_owner_item(&conn, &project_id, &in_review_state_id);
+        let branch = format!("task/{}-from-another-workstation", unrelated.sequence_id);
+        let ours = crate::github::bridge::marker::Marker {
+            action: crate::github::bridge::marker::Action::Claim,
+            owner: "flared:box-a".into(),
+            item: "pr-discovery".into(),
+            ts: 1,
+            hash: String::new(),
+        };
+        let server = crate::github::test_support::MockServer::start(vec![
+            crate::github::test_support::MockResponse::json(
+                200,
+                &format!(
+                    r#"[{{"number":321,"html_url":"u","state":"open","title":"Other box","body":"x","head":{{"ref":"{branch}","sha":"abc"}},"author_association":"OWNER"}}]"#
+                ),
+            ),
+            crate::github::test_support::MockResponse::json(200, "[]"),
+            crate::github::test_support::MockResponse::json(201, r#"{"id":100}"#),
+            crate::github::test_support::MockResponse::json(
+                200,
+                &format!(
+                    r#"[{{"id":100,"user":{{"login":"bot"}},"body":"{}"}}]"#,
+                    ours.render()
+                ),
+            ),
+        ]);
+        let client = server.client(Some("tok"));
+        let repo = crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+
+        let created = discover_untracked_prs(
+            &conn,
+            &client,
+            &repo,
+            &project_id,
+            &in_review_state_id,
+            &std::collections::HashSet::new(),
+            "flared:box-a",
+            &|_| false,
+        );
+
+        assert_eq!(created, 1, "tracked as its own item, not attached");
+        let items = agentflare_backend::item::list_by_project(&conn, &project_id).unwrap();
+        let unrelated_now = items.iter().find(|i| i.id == unrelated.id).unwrap();
+        assert!(
+            !unrelated_now.metadata.contains("321"),
+            "the unrelated local item must not receive the foreign PR: {}",
+            unrelated_now.metadata
+        );
+    }
+
+    // A branch the item itself recorded stays attached without local evidence
+    // (e.g. its worktree was cleaned but the PR is still open).
+    #[test]
+    fn a_recorded_pr_branch_attaches_without_a_local_branch() {
+        let conn = agentflare_backend::db::open_in_memory().unwrap();
+        let (project_id, in_review_state_id) = test_project_with_in_review_state(&conn);
+        let item = create_owner_item(&conn, &project_id, &in_review_state_id);
+        crate::mcp_server::merge_item_metadata(&conn, &item.id, |m| {
+            m.insert(
+                "pr".into(),
+                serde_json::json!({"number": 1, "branch": "feature/recorded"}),
+            );
+        })
+        .unwrap();
+        let items = agentflare_backend::item::list_by_project(&conn, &project_id).unwrap();
+        assert!(item_owning_branch(&items, "feature/recorded", &|_| false).is_some());
+        assert!(item_owning_branch(&items, "feature/other", &|_| false).is_none());
     }
 }

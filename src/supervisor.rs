@@ -1492,6 +1492,7 @@ pub(crate) fn run_review_sweep(
             }
         }
         if let (Some(repo), Ok(client)) = &resolved {
+            let repo_root = mcp.worktree_repo_root();
             let discovered = mcp
                 .with_backend_db(|conn| {
                     crate::worktree::discover_untracked_prs(
@@ -1502,6 +1503,17 @@ pub(crate) fn run_review_sweep(
                         &in_review_state_id,
                         &known_pr_numbers,
                         &discovery_owner,
+                        &|branch| {
+                            flare_git_core::shell::run_in_ok(
+                                &repo_root,
+                                &[
+                                    "rev-parse",
+                                    "--verify",
+                                    "--quiet",
+                                    &format!("refs/heads/{branch}"),
+                                ],
+                            )
+                        },
                     )
                 })
                 .unwrap_or(0);
