@@ -223,6 +223,9 @@ pub fn run(agent: Option<&str>, json: bool) {
     }
 
     let mbx = crate::mbx::MbxStatus::collect();
+    // Advisory only: never part of `healthy`, so an unset name cannot make
+    // `doctor` exit non-zero.
+    let machine_name = crate::github::bridge::config::read_machine_name();
     let healthy = checks.iter().all(|r| r.ok) && stale.is_empty() && mbx.ok();
 
     if json {
@@ -231,6 +234,7 @@ pub fn run(agent: Option<&str>, json: bool) {
             checks: &'a [CheckResult],
             stale_rules: &'a [StaleRule],
             mbx: &'a crate::mbx::MbxStatus,
+            machine_name: Option<&'a str>,
             healthy: bool,
         }
         println!(
@@ -239,6 +243,7 @@ pub fn run(agent: Option<&str>, json: bool) {
                 checks: &checks,
                 stale_rules: &stale,
                 mbx: &mbx,
+                machine_name: machine_name.as_deref(),
                 healthy,
             })
             .unwrap()
@@ -267,6 +272,13 @@ pub fn run(agent: Option<&str>, json: bool) {
         }
 
         println!("{}", mbx.format_text());
+        match &machine_name {
+            Some(name) => println!("machine-name: {name}"),
+            None => println!(
+                "machine-name: not set -- PR labels show the raw instance id; run \
+                 `agentflare init` or `agentflare config set machine-name <name>`"
+            ),
+        }
         println!();
         if healthy {
             println!("{passed}/{total} checks passed — all good.");

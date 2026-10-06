@@ -123,7 +123,7 @@ pub fn this_host() -> String {
 /// The kernel's hostname -- the same for every process on the machine,
 /// unlike `$HOSTNAME`, which is a shell variable a launchd/systemd daemon
 /// usually doesn't have (every such Mac would otherwise be "localhost").
-fn os_hostname() -> Option<String> {
+pub(crate) fn os_hostname() -> Option<String> {
     #[cfg(unix)]
     {
         let mut buf = [0u8; 256];
