@@ -9,6 +9,7 @@ pub mod branch;
 pub mod classify;
 pub mod clean;
 pub mod config_loader;
+pub mod deps;
 pub mod doctor;
 pub mod policy_config;
 pub mod provenance;
