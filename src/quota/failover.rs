@@ -120,6 +120,20 @@ pub(crate) fn over_usage_threshold(agent: Agent) -> bool {
     }
 }
 
+/// What was actually measured when `agent` tripped [`over_usage_threshold`]
+/// -- e.g. `"seven_day usage 74% >= threshold 70%"` -- so a failover log or
+/// comment states the real reading instead of the opaque "over its usage
+/// threshold". `None` when `agent` isn't currently over threshold.
+pub(crate) fn usage_threshold_reason(agent: Agent) -> Option<String> {
+    match agent {
+        Agent::ClaudeCode => crate::claude_usage::claude_usage_breach().map(|b| b.to_string()),
+        Agent::Opencode => {
+            crate::opencode_go_usage::opencode_go_usage_breach().map(|b| b.to_string())
+        }
+        _ => None,
+    }
+}
+
 /// Whether `agent` is known to be unable to take work right now.
 pub(crate) fn known_unavailable(agent: Agent) -> bool {
     unavailable_until(agent.as_str()).is_some() || over_usage_threshold(agent)

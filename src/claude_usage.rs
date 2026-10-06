@@ -16,8 +16,27 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
-const FALLBACK_THRESHOLD_PERCENT: f32 = 70.0;
 const CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// Which usage window breached its configured threshold, and by how much --
+/// carried through so the failover log/comment can say what was actually
+/// measured instead of an opaque "over its usage threshold".
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct UsageBreach {
+    pub window: &'static str,
+    pub percent: f32,
+    pub threshold: f32,
+}
+
+impl std::fmt::Display for UsageBreach {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} usage {:.0}% >= threshold {:.0}%",
+            self.window, self.percent, self.threshold
+        )
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 struct ClaudeCredentials {
@@ -64,10 +83,29 @@ fn read_credentials_file() -> Result<ClaudeCredentials, String> {
     parse_credentials(&text)
 }
 
-/// True when either usage window is at/over the fallback threshold.
-fn is_over_threshold(five_hour_percent: f32, seven_day_percent: f32) -> bool {
-    five_hour_percent >= FALLBACK_THRESHOLD_PERCENT
-        || seven_day_percent >= FALLBACK_THRESHOLD_PERCENT
+/// The first usage window (5-hour checked before 7-day) at/over its
+/// threshold, or `None` when both have headroom.
+fn detect_breach(
+    five_hour_percent: f32,
+    seven_day_percent: f32,
+    five_hour_threshold: f32,
+    seven_day_threshold: f32,
+) -> Option<UsageBreach> {
+    if five_hour_percent >= five_hour_threshold {
+        Some(UsageBreach {
+            window: "five_hour",
+            percent: five_hour_percent,
+            threshold: five_hour_threshold,
+        })
+    } else if seven_day_percent >= seven_day_threshold {
+        Some(UsageBreach {
+            window: "seven_day",
+            percent: seven_day_percent,
+            threshold: seven_day_threshold,
+        })
+    } else {
+        None
+    }
 }
 
 /// Same `anthropic-beta`/`User-Agent` headers Claude Code itself sends —
@@ -103,43 +141,58 @@ fn fetch_usage_percentages(access_token: &str) -> Result<(f32, f32), String> {
 }
 
 struct CacheEntry {
-    over_threshold: bool,
+    breach: Option<UsageBreach>,
     fetched_at: Instant,
 }
 
 static CACHE: OnceLock<Mutex<Option<CacheEntry>>> = OnceLock::new();
 
-/// True when the active Claude account's 5-hour or 7-day usage is at/over
-/// the fallback threshold. Fails open (`false`) on any credential-read,
-/// expired-token, network, or parse error. Cached 5 minutes so this never
-/// adds a network call per SDD-loop turn.
-pub fn claude_over_threshold() -> bool {
+/// The usage-window breach (if any) for the active Claude account's 5-hour
+/// or 7-day windows, against `~/.agentflare/config.toml`'s `[failover]`
+/// thresholds (const default when unset -- see
+/// `agent_registry::FailoverConfig`). Fails open (`None`) on any
+/// credential-read, expired-token, network, or parse error. Cached 5
+/// minutes so this never adds a network call per SDD-loop turn.
+pub(crate) fn claude_usage_breach() -> Option<UsageBreach> {
     let cache = CACHE.get_or_init(|| Mutex::new(None));
     {
         let guard = cache.lock().unwrap();
         if let Some(entry) = guard.as_ref()
             && entry.fetched_at.elapsed() < CACHE_TTL
         {
-            return entry.over_threshold;
+            return entry.breach;
         }
     }
 
-    let over_threshold = (|| -> Result<bool, String> {
+    let breach = (|| -> Result<Option<UsageBreach>, String> {
         let creds = read_credentials_file()?;
         let now_ms = chrono::Utc::now().timestamp_millis();
         if creds.expires_at_ms <= now_ms {
             return Err("access token expired".to_string());
         }
         let (five_hour, seven_day) = fetch_usage_percentages(&creds.access_token)?;
-        Ok(is_over_threshold(five_hour, seven_day))
+        let config = crate::quota::failover::load_failover_config();
+        Ok(detect_breach(
+            five_hour,
+            seven_day,
+            config.five_hour_threshold(),
+            config.seven_day_threshold(),
+        ))
     })()
-    .unwrap_or(false);
+    .unwrap_or(None);
 
     *cache.lock().unwrap() = Some(CacheEntry {
-        over_threshold,
+        breach,
         fetched_at: Instant::now(),
     });
-    over_threshold
+    breach
+}
+
+/// True when the active Claude account's 5-hour or 7-day usage is at/over
+/// the configured fallback threshold. See [`claude_usage_breach`] for the
+/// measured-window detail this collapses.
+pub fn claude_over_threshold() -> bool {
+    claude_usage_breach().is_some()
 }
 
 #[cfg(test)]
@@ -147,18 +200,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn is_over_threshold_true_when_five_hour_at_seventy() {
-        assert!(is_over_threshold(70.0, 10.0));
+    fn detect_breach_true_when_five_hour_at_seventy() {
+        let breach = detect_breach(70.0, 10.0, 70.0, 70.0).unwrap();
+        assert_eq!(breach.window, "five_hour");
+        assert_eq!(breach.percent, 70.0);
     }
 
     #[test]
-    fn is_over_threshold_true_when_seven_day_at_seventy() {
-        assert!(is_over_threshold(10.0, 70.0));
+    fn detect_breach_true_when_seven_day_at_seventy() {
+        let breach = detect_breach(10.0, 70.0, 70.0, 70.0).unwrap();
+        assert_eq!(breach.window, "seven_day");
+        assert_eq!(breach.percent, 70.0);
     }
 
     #[test]
-    fn is_over_threshold_false_when_both_under_seventy() {
-        assert!(!is_over_threshold(69.9, 69.9));
+    fn detect_breach_none_when_both_under_seventy() {
+        assert_eq!(detect_breach(69.9, 69.9, 70.0, 70.0), None);
+    }
+
+    #[test]
+    fn detect_breach_honors_per_window_thresholds() {
+        // 74% seven-day trips a 70% threshold but not a 90% one; 10%
+        // five-hour never trips either -- this is the item #308 scenario.
+        assert_eq!(
+            detect_breach(10.0, 74.0, 90.0, 70.0).unwrap().window,
+            "seven_day"
+        );
+        assert_eq!(detect_breach(10.0, 74.0, 90.0, 85.0), None);
+    }
+
+    #[test]
+    fn breach_display_states_the_measured_window_and_percentage() {
+        let breach = UsageBreach {
+            window: "seven_day",
+            percent: 74.0,
+            threshold: 70.0,
+        };
+        assert_eq!(breach.to_string(), "seven_day usage 74% >= threshold 70%");
     }
 
     #[test]
