@@ -351,5 +351,4 @@ mod tests {
             &["-c".into(), "sandbox_mode = \"workspace-write\"".into()]
         ));
     }
-
 }
