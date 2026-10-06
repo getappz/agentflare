@@ -995,16 +995,40 @@ fn persist_pr_identity(item: &agentflare_backend::item::Item, number: u64, branc
     }
 }
 
-pub(crate) fn item_owns_branch(item: &agentflare_backend::item::Item, branch: &str) -> bool {
-    let task_seq = branch
+/// `branch` is `task/<N>` or `task/<N>-<slug>`: its sequence number, if so.
+fn branch_sequence(branch: &str) -> Option<i64> {
+    branch
         .strip_prefix("task/")
         .map(|rest| rest.split('-').next().unwrap_or(rest))
-        .and_then(|digits| digits.parse::<i64>().ok());
-    task_seq == Some(item.sequence_id)
-        || serde_json::from_str::<serde_json::Value>(&item.metadata)
-            .ok()
-            .is_some_and(|m| m["pr"]["branch"] == branch)
+        .and_then(|digits| digits.parse().ok())
 }
+
+/// The branch a previous PR was recorded against in `metadata.pr.branch`.
+fn recorded_pr_branch_is(item: &agentflare_backend::item::Item, branch: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(&item.metadata)
+        .ok()
+        .is_some_and(|m| m["pr"]["branch"] == branch)
+}
+
+pub(crate) fn item_owns_branch(item: &agentflare_backend::item::Item, branch: &str) -> bool {
+    branch_sequence(branch) == Some(item.sequence_id) || recorded_pr_branch_is(item, branch)
+}
+
+/// [`item_owns_branch`] for a branch some *other* actor pushed (PR discovery).
+/// Sequence numbers are per instance, so a bare `task/<N>-…` match proves
+/// nothing about a branch another workstation created: it would attach that
+/// PR to this instance's unrelated item #N. The name must therefore be
+/// backed by local evidence (`local_branch`: this clone has a branch of that
+/// name), unless the item already recorded the branch itself.
+pub(crate) fn item_owns_branch_here(
+    item: &agentflare_backend::item::Item,
+    branch: &str,
+    local_branch: &dyn Fn(&str) -> bool,
+) -> bool {
+    recorded_pr_branch_is(item, branch)
+        || (branch_sequence(branch) == Some(item.sequence_id) && local_branch(branch))
+}
+
 /// True if `existing` should be trusted as *this item's own* PR on its
 /// branch rather than an unrelated closed/merged PR that happens to reuse
 /// the same branch name -- shared by `push_and_open_pr`'s pre-create lookup
