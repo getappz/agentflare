@@ -361,7 +361,8 @@ fn promote_in_review(
     let tx = immediate_tx(conn)?;
     let item = get(&tx, item_id)?;
     let state = crate::state::get(&tx, &item.state_id)?;
-    if state.group_name != "in_review" {
+    if state.group_name != "in_review" && !(expected_pr.is_some() && state.group_name == "started")
+    {
         return Ok(false);
     }
     if let Some(expected) = expected_pr

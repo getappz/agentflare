@@ -364,7 +364,7 @@ pub(super) fn stray_pr_is_still_relevant(
     }
 }
 
-pub(super) fn promote_merged_item(
+pub(crate) fn promote_merged_item(
     mcp: &AgentflareMcp,
     item: &agentflare_backend::item::Item,
     repo_root: &std::path::Path,

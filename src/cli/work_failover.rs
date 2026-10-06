@@ -127,9 +127,11 @@ fn exhaustion_comment_detail(
 }
 
 /// Handles a run that failed because its agent is out (rate limited, out
-/// of credit, usage window used up -- see `auth_runner::AgentFailure`).
-/// `None` when `msg` isn't exhaustion-shaped, so the caller falls through
-/// to the generic failure path.
+/// of credit, usage window used up) or because its own launch arguments
+/// were rejected (clap exit code 2 -- see `AgentFailure::LaunchArgvError`,
+/// item #308) -- see `auth_runner::AgentFailure`. `None` when `msg` isn't
+/// shaped like either, so the caller falls through to the generic failure
+/// path.
 ///
 /// - Short rate limit (known wait <= `SHORT_RATE_LIMIT_SECS`): cool the
 ///   agent down for that wait and retry the same agent after it.
@@ -164,6 +166,7 @@ fn handle_agent_exhaustion(
         AgentFailure::RateLimited { .. }
             | AgentFailure::CreditExhausted
             | AgentFailure::QuotaWindowExhausted { .. }
+            | AgentFailure::LaunchArgvError
     ) {
         return None;
     }
@@ -295,13 +298,14 @@ fn prelaunch_failover(
     let from = agent_registry::agent_by_name(agent)?;
     let reason = match crate::quota::failover::unavailable_until(from.as_str()) {
         Some((until, why)) => format!(
-            "{why} -- unavailable until {}",
+            "{} is {why} -- unavailable until {}",
+            from.as_str(),
             crate::quota::failover::format_unix(until)
         ),
-        None if crate::quota::failover::over_usage_threshold(from) => {
-            "over its usage threshold".to_string()
+        None => {
+            let breach = crate::quota::failover::usage_threshold_reason(from)?;
+            format!("{} {breach}", from.as_str())
         }
-        None => return None,
     };
     let mcp = match repo_root {
         Some(root) => AgentflareMcp::for_project_dir(root.to_path_buf()),
@@ -317,11 +321,6 @@ fn prelaunch_failover(
     let labels = crate::quota::failover::item_label_names(&mcp, &item.id);
     let to = crate::quota::failover::find_alternative(&item, &labels, from)?;
     crate::quota::failover::record_failover(&mcp, &item.id, from, to, &reason).ok()?;
-    let _ = writeln!(
-        log,
-        "failover: {} is {reason}; running {} instead",
-        from.as_str(),
-        to.as_str()
-    );
+    let _ = writeln!(log, "failover: {reason}; running {} instead", to.as_str());
     Some(to.as_str().to_string())
 }

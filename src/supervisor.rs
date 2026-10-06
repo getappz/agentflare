@@ -1883,7 +1883,7 @@ fn job_in_flight(queue: &agentflare_jobs::Queue, item_id: &str) -> bool {
 pub(crate) mod notify;
 pub(crate) use notify::*;
 mod merge;
-use merge::*;
+pub(crate) use merge::*;
 mod auto_merge;
 use auto_merge::*;
 mod review_bots;

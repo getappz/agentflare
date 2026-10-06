@@ -156,6 +156,16 @@ pub enum Commands {
     /// Vent friction or feedback encountered during an agent session.
     Vent(vent::VentArgs),
     /// Manage work items in the agentflare project queue.
+    ///
+    /// Automatic failover moves an item to another installed agent when the
+    /// current one is rate limited, out of credit, over its subscription's
+    /// usage threshold, or its CLI invocation is broken. Two item-metadata
+    /// keys scope this per item (set via `agentflare item update --metadata`,
+    /// not a work flag): `"failover": false` pins the item to its current
+    /// assignee_agent, and `"allowed_agents": ["codex", "opencode"]`
+    /// restricts any failover move to that list. The usage threshold and the
+    /// operator-wide on/off/allow-list are `~/.agentflare/config.toml`'s
+    /// `[failover]` table.
     Work(work::WorkArgs),
     /// Search and fetch cached third-party API documentation.
     Docs(docs::DocsArgs),
