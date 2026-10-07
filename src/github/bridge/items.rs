@@ -9,7 +9,7 @@ use agentflare_backend::item::Item;
 
 pub const EXTERNAL_SOURCE: &str = "github";
 
-const LAST_HASH_KEY: &str = "github_last_hash";
+pub(crate) const LAST_HASH_KEY: &str = "github_last_hash";
 
 /// The item linked to `number`, if this instance tracks it.
 ///
@@ -36,31 +36,6 @@ pub fn last_hash(item: &Item) -> Option<String> {
         .get(LAST_HASH_KEY)?
         .as_str()
         .map(str::to_string)
-}
-
-/// This item's metadata with `github_last_hash` set, preserving every other
-/// key. Malformed existing metadata is replaced rather than propagated.
-pub fn with_last_hash(item: &Item, hash: &str) -> String {
-    let mut v = serde_json::from_str::<serde_json::Value>(&item.metadata)
-        .ok()
-        .filter(serde_json::Value::is_object)
-        .unwrap_or_else(|| serde_json::json!({}));
-    v[LAST_HASH_KEY] = serde_json::Value::String(hash.to_string());
-    v.to_string()
-}
-
-/// This item's metadata with `github_last_hash` REMOVED, preserving every
-/// other key. Used to roll the export latch back after a failed remote write
-/// without disturbing metadata anyone else owns.
-pub fn without_last_hash(item: &Item) -> String {
-    let mut v = serde_json::from_str::<serde_json::Value>(&item.metadata)
-        .ok()
-        .filter(serde_json::Value::is_object)
-        .unwrap_or_else(|| serde_json::json!({}));
-    if let Some(obj) = v.as_object_mut() {
-        obj.remove(LAST_HASH_KEY);
-    }
-    v.to_string()
 }
 
 /// First state in `group` (e.g. `backlog`, `started`, `completed`).
@@ -148,40 +123,6 @@ pub(crate) mod tests {
         assert!(last_hash(&item_with_metadata("{}")).is_none());
         assert!(last_hash(&item_with_metadata("not json")).is_none());
         assert!(last_hash(&item_with_metadata(r#"{"other":1}"#)).is_none());
-    }
-
-    #[test]
-    fn with_last_hash_sets_the_key_and_preserves_other_fields() {
-        let i = item_with_metadata(r#"{"size":"M"}"#);
-        let updated = with_last_hash(&i, "deadbeef");
-        let v: serde_json::Value = serde_json::from_str(&updated).unwrap();
-        assert_eq!(v["github_last_hash"], "deadbeef");
-        assert_eq!(v["size"], "M", "unrelated metadata must survive");
-    }
-
-    #[test]
-    fn with_last_hash_recovers_from_malformed_metadata() {
-        let i = item_with_metadata("not json");
-        let v: serde_json::Value = serde_json::from_str(&with_last_hash(&i, "x")).unwrap();
-        assert_eq!(v["github_last_hash"], "x");
-    }
-
-    #[test]
-    fn with_last_hash_recovers_from_valid_json_that_is_not_an_object() {
-        for non_object in ["[]", "42", r#""str""#, "null", "true"] {
-            let i = item_with_metadata(non_object);
-            let updated = with_last_hash(&i, "deadbeef");
-            let v: serde_json::Value = serde_json::from_str(&updated)
-                .unwrap_or_else(|e| panic!("{non_object} produced invalid JSON: {e}"));
-            assert!(
-                v.is_object(),
-                "{non_object} must be replaced with an object, got {v}"
-            );
-            assert_eq!(
-                v["github_last_hash"], "deadbeef",
-                "{non_object} must still carry the new hash"
-            );
-        }
     }
 
     #[test]

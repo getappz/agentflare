@@ -213,51 +213,59 @@ pub(crate) fn record_failover(
     let line = format!("moved from {} to {}: {reason}", from.as_str(), to.as_str());
     let notified = mcp
         .with_backend_db(|conn| -> agentflare_backend::error::Result<_> {
-            let tx = conn.unchecked_transaction()?;
-            // A `metadata.model` pin names a model of the agent being left
-            // (e.g. a Claude model); handing it to the new agent would just fail
-            // its launch, so it is dropped (and said so) on the move.
-            let item = agentflare_backend::item::get(&tx, item_id)?;
-            let mut meta: serde_json::Value =
-                serde_json::from_str(&item.metadata).unwrap_or_else(|_| serde_json::json!({}));
-            let dropped_model = meta
-                .as_object_mut()
-                .and_then(|m| m.remove("model"))
-                .and_then(|m| m.as_str().map(str::to_string));
-            // One comment per distinct move: the same line as the latest failover
-            // comment (a retry within one dispatch) is not posted again.
-            let repeated = agentflare_backend::comment::list_by_item(&tx, item_id)?
-                .iter()
-                .rev()
-                .find(|c| {
-                    c.body
-                        .contains(crate::dispatch_failure_ceiling::AGENT_FAILOVER_MARKER)
-                })
-                .is_some_and(|c| c.body.contains(&line));
-            let mut body = format!(
-                "{}\n\n{line}",
-                crate::dispatch_failure_ceiling::AGENT_FAILOVER_MARKER
-            );
-            if let Some(model) = &dropped_model {
-                body.push_str(&format!(
-                    "\n\nDropped the item's model pin `{model}` (it was for {}).",
-                    from.as_str()
-                ));
-            }
-            agentflare_backend::item::update(
-                &tx,
-                item_id,
-                agentflare_backend::item::UpdateItem {
-                    assignee_agent: Some(to.as_str().to_string()),
-                    metadata: dropped_model.is_some().then(|| meta.to_string()),
-                    ..Default::default()
-                },
-            )?;
-            if !repeated {
-                agentflare_backend::comment::create(&tx, item_id, &author, &body)?;
-            }
-            tx.commit()?;
-            Ok(item)
+            // IMMEDIATE, not DEFERRED (`unchecked_transaction`): the write
+            // lock is taken before the first read, so a concurrent
+            // `persist_run_id` (also IMMEDIATE via `merge_item_metadata`)
+            // serializes after this whole body instead of interleaving a
+            // stale-metadata commit between this read and write and silently
+            // reverting the fresh `workflow_run_id` (item #353). Joins the
+            // caller's transaction when one is already open, same as
+            // `merge_item_metadata`.
+            crate::mcp_server::in_immediate_tx(conn, agentflare_backend::error::Error::from, || {
+                let item = agentflare_backend::item::get(conn, item_id)?;
+                // A `metadata.model` pin names a model of the agent being left
+                // (e.g. a Claude model); handing it to the new agent would just fail
+                // its launch, so it is dropped (and said so) on the move.
+                let mut meta: serde_json::Value =
+                    serde_json::from_str(&item.metadata).unwrap_or_else(|_| serde_json::json!({}));
+                let dropped_model = meta
+                    .as_object_mut()
+                    .and_then(|m| m.remove("model"))
+                    .and_then(|m| m.as_str().map(str::to_string));
+                // One comment per distinct move: the same line as the latest failover
+                // comment (a retry within one dispatch) is not posted again.
+                let repeated = agentflare_backend::comment::list_by_item(conn, item_id)?
+                    .iter()
+                    .rev()
+                    .find(|c| {
+                        c.body
+                            .contains(crate::dispatch_failure_ceiling::AGENT_FAILOVER_MARKER)
+                    })
+                    .is_some_and(|c| c.body.contains(&line));
+                let mut body = format!(
+                    "{}\n\n{line}",
+                    crate::dispatch_failure_ceiling::AGENT_FAILOVER_MARKER
+                );
+                if let Some(model) = &dropped_model {
+                    body.push_str(&format!(
+                        "\n\nDropped the item's model pin `{model}` (it was for {}).",
+                        from.as_str()
+                    ));
+                }
+                agentflare_backend::item::update(
+                    conn,
+                    item_id,
+                    agentflare_backend::item::UpdateItem {
+                        assignee_agent: Some(to.as_str().to_string()),
+                        metadata: dropped_model.is_some().then(|| meta.to_string()),
+                        ..Default::default()
+                    },
+                )?;
+                if !repeated {
+                    agentflare_backend::comment::create(conn, item_id, &author, &body)?;
+                }
+                Ok(item)
+            })
         })
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?;
@@ -480,6 +488,65 @@ mod tests {
                 r#"{"allowed_agents":["codex"]}"#
             ));
         });
+    }
+
+    #[test]
+    fn record_failover_keeps_a_dispatch_written_workflow_run_id() {
+        // Item #353: the model-pin drop rewrote the whole metadata blob, so
+        // a dispatch's `persist_run_id` landing around the failover lost its
+        // `workflow_run_id`. The read and the write now run inside one
+        // IMMEDIATE transaction, serialized against `persist_run_id`.
+        let mcp = crate::mcp_server::AgentflareMcp::for_test_memory();
+        let id = mcp
+            .with_backend_db(|conn| {
+                let project = mcp.resolve_project(conn).unwrap();
+                let states = agentflare_backend::state::list_by_project(conn, &project.id).unwrap();
+                let state_id = states.iter().find(|s| s.is_default).unwrap().id.clone();
+                agentflare_backend::item::create(
+                    conn,
+                    agentflare_backend::item::CreateItem {
+                        project_id: project.id.clone(),
+                        state_id,
+                        name: "todo".into(),
+                        description: None,
+                        priority: None,
+                        parent_id: None,
+                        assignee_agent: Some("claude-code".into()),
+                        sort_order: None,
+                        external_source: None,
+                        external_id: None,
+                        metadata: Some(
+                            serde_json::json!({
+                                "model": "anthropic/claude-sonnet-5",
+                                "workflow_run_id": "run-live",
+                            })
+                            .to_string(),
+                        ),
+                        label_ids: vec![],
+                        assignee_ids: vec![],
+                        dependency_ids: vec![],
+                        start_date: None,
+                        due_date: None,
+                    },
+                )
+                .unwrap()
+                .id
+            })
+            .unwrap();
+        record_failover(&mcp, &id, Agent::ClaudeCode, Agent::Cursor, "out of credit").unwrap();
+        let meta: serde_json::Value = serde_json::from_str(
+            &mcp.with_backend_db(|conn| agentflare_backend::item::get(conn, &id).unwrap().metadata)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            meta.get("model").is_none(),
+            "the model pin is dropped: {meta}"
+        );
+        assert_eq!(
+            meta["workflow_run_id"], "run-live",
+            "the dispatch's run id must survive the failover: {meta}"
+        );
     }
 
     #[test]

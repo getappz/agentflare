@@ -240,18 +240,40 @@ impl AgentflareMcp {
                             None,
                         ));
                     }
-                    let mut metadata_str = merge_handoff_depth(&incumbent.metadata, next_depth);
-                    if let Some(t) = &task_type {
-                        metadata_str = merge_task_type(&metadata_str, t);
-                    }
-                    let metadata = Some(metadata_str);
-                    let input = agentflare_backend::item::UpdateItem {
-                        assignee_agent: Some(recipient.clone()),
-                        metadata,
-                        ..Default::default()
-                    };
-                    let item = agentflare_backend::item::update(conn, id, input)
-                        .map_err(map_backend_err)?;
+                    // Metadata goes through `merge_item_metadata` (read-current +
+                    // write inside one IMMEDIATE transaction), never a
+                    // wholesale rewrite of the snapshot above: a dispatch's
+                    // `persist_run_id` landing between that `get` and this
+                    // write would otherwise have its `workflow_run_id`
+                    // silently reverted (item #353). The assignee rides in a
+                    // separate field-only update that leaves `metadata`
+                    // untouched, so the two writes commute.
+                    crate::mcp_server::merge_item_metadata(conn, id, |meta| {
+                        let current = meta
+                            .get(HANDOFF_DEPTH_KEY)
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        meta.insert(
+                            HANDOFF_DEPTH_KEY.into(),
+                            serde_json::Value::from(next_depth.max(current + 1)),
+                        );
+                        if let Some(t) = &task_type {
+                            meta.insert(
+                                "task_type".into(),
+                                serde_json::Value::String(t.clone()),
+                            );
+                        }
+                    })
+                    .map_err(map_backend_err)?;
+                    let item = agentflare_backend::item::update(
+                        conn,
+                        id,
+                        agentflare_backend::item::UpdateItem {
+                            assignee_agent: Some(recipient.clone()),
+                            ..Default::default()
+                        },
+                    )
+                    .map_err(map_backend_err)?;
                     // Handing an item that another agent still holds to a
                     // different agent is a reassignment, same as
                     // `redispatch` with a new `assignee_agent`: cancel the
@@ -419,25 +441,23 @@ impl AgentflareMcp {
                                 None,
                             ));
                         }
-                        let mut metadata_str = merge_handoff_depth(&item.metadata, next_depth);
-                        if let Some(t) = &task_type {
-                            metadata_str = merge_task_type(&metadata_str, t);
-                        }
-                        if let Some(t) = &thread_id
-                            && !metadata_str.contains("\"thread\"")
-                        {
-                            let mut v = crate::mcp_server::metadata_object(&metadata_str);
-                            v.insert("thread".into(), serde_json::Value::String(t.clone()));
-                            metadata_str = serde_json::Value::Object(v).to_string();
-                        }
-                        agentflare_backend::item::update(
-                            conn,
-                            &item.id,
-                            agentflare_backend::item::UpdateItem {
-                                metadata: Some(metadata_str),
-                                ..Default::default()
-                            },
-                        )
+                        crate::mcp_server::merge_item_metadata(conn, &item.id, |meta| {
+                            let mut s = merge_handoff_depth(
+                                &serde_json::Value::Object(meta.clone()).to_string(),
+                                next_depth,
+                            );
+                            if let Some(t) = &task_type {
+                                s = merge_task_type(&s, t);
+                            }
+                            if let Some(t) = &thread_id
+                                && !s.contains("\"thread\"")
+                            {
+                                let mut v = crate::mcp_server::metadata_object(&s);
+                                v.insert("thread".into(), serde_json::Value::String(t.clone()));
+                                s = serde_json::Value::Object(v).to_string();
+                            }
+                            *meta = crate::mcp_server::metadata_object(&s);
+                        })
                         .map_err(map_backend_err)?
                     } else {
                         let state_id =
@@ -1320,6 +1340,55 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&metadata).unwrap();
         assert_eq!(parsed["task_type"], "implementation");
         assert_eq!(parsed["size"], "M");
+    }
+
+    #[test]
+    fn an_explicit_item_id_handoff_preserves_a_dispatch_written_workflow_run_id() {
+        // Item #353: the explicit-`item_id` branch used to rewrite the whole
+        // metadata blob from the snapshot it read at the top, so a dispatch's
+        // `persist_run_id` landing in between had its `workflow_run_id`
+        // silently reverted — the next tick/resume could no longer find the
+        // live run. Metadata must merge into the current row instead.
+        let (_tmp, mcp) = test_mcp();
+        seed_ready_for_work_label(&mcp);
+        let first = mcp.handoff_impl(base_request()).unwrap();
+        let item_id = serde_json::from_str::<serde_json::Value>(&first).unwrap()["item_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // A dispatch lands after the handoff created the item.
+        mcp.with_backend_db(|conn| {
+            crate::mcp_server::merge_item_metadata(conn, &item_id, |meta| {
+                meta.insert(
+                    "workflow_run_id".into(),
+                    serde_json::Value::String("run-live".to_string()),
+                );
+            })
+            .unwrap();
+        })
+        .unwrap();
+
+        let reply = HandoffRequest {
+            item_id: Some(item_id.clone()),
+            task_type: Some("bugfix".to_string()),
+            completed: "more".to_string(),
+            remaining: "less".to_string(),
+            ..base_request()
+        };
+        mcp.handoff_impl(reply).unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(
+            &mcp.with_backend_db(|conn| {
+                agentflare_backend::item::get(conn, &item_id)
+                    .unwrap()
+                    .metadata
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(parsed["workflow_run_id"], "run-live");
+        assert_eq!(parsed["task_type"], "bugfix");
+        assert_eq!(parsed["handoff_depth"], 2);
     }
 
     #[test]
