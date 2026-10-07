@@ -124,10 +124,11 @@ pub fn preserve_plan_approval(incoming: &str, current: &str) -> String {
         }
         _ => false,
     };
-    if was_approved && !explicit_transition {
-        if let Some(v) = cur.get("plan_status") {
-            obj.insert("plan_status".into(), v.clone());
-        }
+    if was_approved
+        && !explicit_transition
+        && let Some(v) = cur.get("plan_status")
+    {
+        obj.insert("plan_status".into(), v.clone());
     }
     let fresh_approval = !was_approved && new_status == Some("approved");
     if !fresh_approval {
@@ -139,7 +140,6 @@ pub fn preserve_plan_approval(incoming: &str, current: &str) -> String {
     }
     new.to_string()
 }
-
 
 /// Identity to store in `plan_approved_by`. MCP/CLI channel approve often has
 /// no agent identity (`None`); writing that as JSON null left the audit field
@@ -257,7 +257,6 @@ mod tests {
         assert_eq!(v["plan_approved_at"], 5);
         assert_eq!(v["plan_approved_by"], "h");
     }
-
 
     #[test]
     fn approved_by_identity_defaults_channel_to_human_when_unset() {

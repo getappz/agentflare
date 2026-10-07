@@ -1399,12 +1399,11 @@ impl AgentflareMcp {
             let mut patch = serde_json::json!({ "plan_status": new_status });
             if new_status == "approved" {
                 // Channel/CLI approve often has agent=None; never store JSON null (#300).
-                patch["plan_approved_by"] = serde_json::json!(
-                    agentflare_backend::item::plan_gate::approved_by_identity(
+                patch["plan_approved_by"] =
+                    serde_json::json!(agentflare_backend::item::plan_gate::approved_by_identity(
                         self.agent.as_deref(),
                         matches!(route, PlanStatusRoute::ChannelApprove),
-                    )
-                );
+                    ));
                 patch["plan_approved_at"] = serde_json::json!(crate::claims::now());
             }
             if let Some(reason) = &reason {

@@ -79,4 +79,3 @@ pub(crate) fn restore_plan_transition_fields(metadata_str: &str, current_metadat
     }
     value.to_string()
 }
-
