@@ -74,6 +74,59 @@ pub fn merge_metadata_patch(existing: &str, patch: serde_json::Value) -> String 
     base.to_string()
 }
 
+/// Backend-level immutability guard for a recorded human approval, applied by
+/// `crud::update` to every wholesale `metadata` write. Many writers
+/// (orphan reconcile, supervisor, handoff, failover) read-modify-write a
+/// stale snapshot; if that snapshot predates `approve-plan`, the write
+/// silently reverts `plan_status` to "pending" and drops
+/// `plan_approved_at`/`plan_approved_by` (live incident, item #281).
+///
+/// When the stored row is `"approved"`, the incoming metadata keeps the
+/// stored `plan_status`/`plan_approved_*` unless it is an explicit
+/// transition: `"rejected"` (reject) or `"pending"` with a different
+/// `plan_asset_id` (resubmit). A fresh approval after a non-approved status
+/// may replace `plan_approved_*`. Unparseable or non-object input is
+/// returned unchanged.
+pub fn preserve_plan_approval(incoming: &str, current: &str) -> String {
+    let Ok(mut new) = serde_json::from_str::<serde_json::Value>(incoming) else {
+        return incoming.to_string();
+    };
+    let Some(cur) = serde_json::from_str::<serde_json::Value>(current)
+        .ok()
+        .filter(|c| c.get("plan_approved_at").is_some() || c["plan_status"] == "approved")
+    else {
+        return incoming.to_string();
+    };
+    let Some(obj) = new.as_object_mut() else {
+        return incoming.to_string();
+    };
+    let was_approved = cur["plan_status"] == "approved";
+    let new_status = obj
+        .get("plan_status")
+        .and_then(|s| s.as_str())
+        .map(str::to_string);
+    let new_status = new_status.as_deref();
+    let explicit_transition = match new_status {
+        Some("rejected") => true,
+        Some("pending") => obj.get("plan_asset_id") != cur.get("plan_asset_id"),
+        _ => false,
+    };
+    if was_approved && !explicit_transition {
+        if let Some(v) = cur.get("plan_status") {
+            obj.insert("plan_status".into(), v.clone());
+        }
+    }
+    let fresh_approval = !was_approved && new_status == Some("approved");
+    if !fresh_approval {
+        for key in ["plan_approved_at", "plan_approved_by"] {
+            if let Some(v) = cur.get(key) {
+                obj.insert(key.into(), v.clone());
+            }
+        }
+    }
+    new.to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanGateStatus {
     Open,
@@ -118,6 +171,49 @@ pub fn default_policy(priority: &str, metadata: &str) -> Option<(bool, &'static 
 
 #[cfg(test)]
 mod tests {
+    const APPROVED: &str = r#"{"plan_status":"approved","plan_approved_at":5,"plan_approved_by":"h","plan_asset_id":"a"}"#;
+
+    #[test]
+    fn stale_write_cannot_revert_approval() {
+        let out = preserve_plan_approval(
+            r#"{"plan_status":"pending","plan_asset_id":"a","workflow_run_id":"x"}"#,
+            APPROVED,
+        );
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["plan_status"], "approved");
+        assert_eq!(v["plan_approved_at"], 5);
+        assert_eq!(v["plan_approved_by"], "h");
+        assert_eq!(v["workflow_run_id"], "x");
+    }
+
+    #[test]
+    fn reject_and_resubmit_still_transition() {
+        let v: serde_json::Value = serde_json::from_str(&preserve_plan_approval(
+            r#"{"plan_status":"rejected","plan_approved_at":5}"#,
+            APPROVED,
+        ))
+        .unwrap();
+        assert_eq!(v["plan_status"], "rejected");
+        let v: serde_json::Value = serde_json::from_str(&preserve_plan_approval(
+            r#"{"plan_status":"pending","plan_asset_id":"b"}"#,
+            APPROVED,
+        ))
+        .unwrap();
+        assert_eq!(v["plan_status"], "pending");
+        assert_eq!(v["plan_approved_at"], 5);
+    }
+
+    #[test]
+    fn fresh_approval_after_reject_replaces_approved_at() {
+        let cur = r#"{"plan_status":"rejected","plan_approved_at":5}"#;
+        let v: serde_json::Value = serde_json::from_str(&preserve_plan_approval(
+            r#"{"plan_status":"approved","plan_approved_at":9,"plan_approved_by":"h2"}"#,
+            cur,
+        ))
+        .unwrap();
+        assert_eq!(v["plan_approved_at"], 9);
+    }
+
     use super::*;
 
     #[test]
