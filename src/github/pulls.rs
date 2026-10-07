@@ -414,6 +414,40 @@ pub fn update_branch(
     Ok(())
 }
 
+/// Replaces PR `number`'s description.
+pub fn update_body(
+    client: &Client,
+    repo: &RepoId,
+    number: u64,
+    body: &str,
+) -> Result<(), GitHubError> {
+    let path = format!("/repos/{}/{}/pulls/{number}", repo.owner, repo.repo);
+    client.request("PATCH", &path, Some(serde_json::json!({ "body": body })))?;
+    Ok(())
+}
+
+/// Post-hoc stamp (item #347 phase 3): appends this instance's origin stamp
+/// to a PR that was opened without one (plain `gh pr create`), once local
+/// evidence shows this instance created its head branch. A body that already
+/// carries any parseable stamp is left alone -- never overwrite another
+/// instance's claim to a PR. Returns whether the body was changed.
+pub fn stamp_if_unstamped(
+    client: &Client,
+    repo: &RepoId,
+    pr: &PullRequest,
+    item_id: &str,
+    sequence_id: i64,
+    branch: &str,
+) -> Result<bool, GitHubError> {
+    if origin_of(pr.body.as_deref()).is_some() {
+        return Ok(false);
+    }
+    let tag = origin_tag(&self_instance(), item_id, sequence_id, branch);
+    let body = format!("{}\n\n{tag}", pr.body.as_deref().unwrap_or("").trim_end());
+    update_body(client, repo, pr.number, &body)?;
+    Ok(true)
+}
+
 pub fn comment(client: &Client, repo: &RepoId, number: u64, body: &str) -> Result<(), GitHubError> {
     let path = format!(
         "/repos/{}/{}/issues/{number}/comments",
@@ -488,6 +522,60 @@ pub fn resolved_review_comment_ids(
     number: u64,
 ) -> Result<std::collections::HashSet<u64>, GitHubError> {
     crate::github::review_threads::resolved_review_comment_ids(client, repo, number)
+}
+
+#[cfg(test)]
+mod stamp_tests {
+    use super::*;
+    use crate::github::test_support::{MockResponse, MockServer};
+
+    fn pr(body: Option<&str>) -> PullRequest {
+        serde_json::from_value(serde_json::json!({
+            "number": 7, "html_url": "u", "state": "open", "title": "t", "body": body
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn stamps_an_unstamped_pr_with_this_instance() {
+        let server = MockServer::start(vec![MockResponse::json(200, "{}")]);
+        let client = server.client(Some("t"));
+        let repo = RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+        assert!(
+            stamp_if_unstamped(
+                &client,
+                &repo,
+                &pr(Some("hand made")),
+                "uuid",
+                5,
+                "task/5-x"
+            )
+            .unwrap()
+        );
+        let reqs = server.requests();
+        assert_eq!(reqs[0].method, "PATCH");
+        assert_eq!(reqs[0].path, "/repos/o/r/pulls/7");
+        let sent: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
+        let body = sent["body"].as_str().unwrap();
+        assert!(body.starts_with("hand made"));
+        assert_eq!(origin_of(Some(body)).unwrap().instance, self_instance());
+    }
+
+    #[test]
+    fn leaves_an_already_stamped_pr_alone() {
+        let server = MockServer::start(vec![]);
+        let client = server.client(Some("t"));
+        let repo = RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+        let stamped = origin_tag("flared:other", "u", 1, "b");
+        assert!(!stamp_if_unstamped(&client, &repo, &pr(Some(&stamped)), "uuid", 5, "b").unwrap());
+        assert!(server.requests().is_empty());
+    }
 }
 
 #[cfg(test)]

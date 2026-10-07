@@ -279,6 +279,11 @@ pub fn run(agent: Option<&str>, json: bool) {
                  `agentflare init` or `agentflare config set machine-name <name>`"
             ),
         }
+        if let Some(line) = crate::github::pr_owner::doctor_line(
+            &crate::mcp_server::AgentflareMcp::default().worktree_repo_root(),
+        ) {
+            println!("{line}");
+        }
         println!();
         if healthy {
             println!("{passed}/{total} checks passed — all good.");
