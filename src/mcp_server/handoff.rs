@@ -247,30 +247,37 @@ impl AgentflareMcp {
                     // write would otherwise have its `workflow_run_id`
                     // silently reverted (item #353). The assignee rides in a
                     // separate field-only update that leaves `metadata`
-                    // untouched, so the two writes commute.
-                    crate::mcp_server::merge_item_metadata(conn, id, |meta| {
-                        let current = meta
-                            .get(HANDOFF_DEPTH_KEY)
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        meta.insert(
-                            HANDOFF_DEPTH_KEY.into(),
-                            serde_json::Value::from(next_depth.max(current + 1)),
-                        );
-                        if let Some(t) = &task_type {
-                            meta.insert(
-                                "task_type".into(),
-                                serde_json::Value::String(t.clone()),
-                            );
-                        }
-                    })
-                    .map_err(map_backend_err)?;
-                    let item = agentflare_backend::item::update(
+                    // untouched, so the two writes commute. Both run in one
+                    // IMMEDIATE transaction so either both commit or neither
+                    // does (`merge_item_metadata` joins the open tx).
+                    let item = crate::mcp_server::in_immediate_tx(
                         conn,
-                        id,
-                        agentflare_backend::item::UpdateItem {
-                            assignee_agent: Some(recipient.clone()),
-                            ..Default::default()
+                        agentflare_backend::error::Error::from,
+                        || {
+                            crate::mcp_server::merge_item_metadata(conn, id, |meta| {
+                                let current = meta
+                                    .get(HANDOFF_DEPTH_KEY)
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                meta.insert(
+                                    HANDOFF_DEPTH_KEY.into(),
+                                    serde_json::Value::from(next_depth.max(current + 1)),
+                                );
+                                if let Some(t) = &task_type {
+                                    meta.insert(
+                                        "task_type".into(),
+                                        serde_json::Value::String(t.clone()),
+                                    );
+                                }
+                            })?;
+                            agentflare_backend::item::update(
+                                conn,
+                                id,
+                                agentflare_backend::item::UpdateItem {
+                                    assignee_agent: Some(recipient.clone()),
+                                    ..Default::default()
+                                },
+                            )
                         },
                     )
                     .map_err(map_backend_err)?;
