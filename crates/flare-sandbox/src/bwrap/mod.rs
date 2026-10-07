@@ -12,6 +12,10 @@
 //! workspaces, so that machinery isn't needed here.
 mod bwrap_install;
 
+#[cfg(test)]
+#[path = "persist_mount_tests.rs"]
+mod persist_mount_tests;
+
 use crate::{AgentProfile, AgentStateMount, MountPolicy, SandboxConfig};
 use crate::{events, identity, paths};
 use std::path::{Path, PathBuf};
@@ -367,6 +371,9 @@ fn matching_profile<'a>(command: &str, config: &'a SandboxConfig) -> Option<&'a 
 /// needs somewhere to create its own state). `EphemeralEmpty` always mounts
 /// an empty tmpfs: nothing readable, nothing persisted -- the credential
 /// posture OpenShell enforces by never handing agents real credentials.
+/// `Persist` binds the host directory read-write (`--bind-try`): reads see
+/// it and writes persist -- only for state whose own protocol requires
+/// persistence across jobs (rotation-based OAuth, item #355).
 fn push_agent_state_mount(
     bwrap_args: &mut Vec<String>,
     command: &str,
@@ -408,6 +415,33 @@ fn push_agent_state_mount(
             return;
         }
         MountPolicy::OverlayEphemeral => {}
+        MountPolicy::Persist => {
+            // Writable bind, persisting to the host (item #355): same shape
+            // as `writable_home_dirs` above, scoped to this agent's profile.
+            // A missing dir gets no mount at all (`--bind-try` would skip it
+            // anyway); a present-but-unresolvable one (symlink, dangling
+            // symlink, escape above $HOME) is skipped with an event instead
+            // of binding the wrong directory.
+            match paths::resolve_existing_home_dir(home_path, mount.relative_path) {
+                Some(resolved) => {
+                    let dir_str = path_to_string(&resolved);
+                    bwrap_args.push("--bind-try".to_string());
+                    bwrap_args.push(dir_str.clone());
+                    bwrap_args.push(dir_str);
+                }
+                None if paths::join_validated_home_dir(home_path, mount.relative_path)
+                    .is_some_and(|p| std::fs::symlink_metadata(&p).is_ok()) =>
+                {
+                    events::emit(&events::SandboxEvent::skipped_mount(
+                        command,
+                        mount.relative_path,
+                        "symlink-or-escape",
+                    ));
+                }
+                None => {}
+            }
+            return;
+        }
     }
     if let Some(resolved) = paths::resolve_existing_home_dir(home_path, mount.relative_path) {
         let dir_str = path_to_string(&resolved);

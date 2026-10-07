@@ -30,9 +30,25 @@ use std::path::Path;
 pub enum MountPolicy {
     /// Reads see the real directory; writes land in a discarded tmpfs
     /// overlay and never persist back to the host. The default containment
-    /// policy for agent auth/session state -- a sandboxed job's oauth
-    /// refresh or per-project tracking file shouldn't outlive that one job.
+    /// policy for agent session/tracking state -- per-project tracking files
+    /// and diagnostic logs shouldn't outlive one job. NOT for rotation-based OAuth
+    /// credentials (see `Persist`): discarding a rotated token pair while the
+    /// server has already consumed the old refresh token poisons the shared
+    /// credential for every later job and the host login (item #355).
     OverlayEphemeral,
+    /// Real writable bind (`--bind-try`): reads see the host directory and
+    /// writes persist back to it, exactly like `SandboxConfig`'s
+    /// `writable_home_dirs` but scoped to one agent's profile instead of
+    /// every job. For rotation-based OAuth state (claude-code's
+    /// `~/.claude/.credentials.json`, item #355): the server consumes the
+    /// old refresh token the moment a refresh succeeds, so a refreshed pair
+    /// that isn't persisted leaves the host file holding dead credentials --
+    /// the next refresh attempt fails with "OAuth session expired and could
+    /// not be refreshed" and the CLI wipes the file. Persisting also keeps
+    /// the CLI's own cross-process refresh lock (`.oauth_refresh.lock`)
+    /// shared, so concurrent jobs serialize their refreshes the same way
+    /// concurrent unsandboxed processes already do.
+    Persist,
     /// No read-through at all: the sandbox sees an empty writable tmpfs,
     /// never the host directory's contents. For credential-dense state the
     /// agent must not be able to exfiltrate (OpenShell never hands agents
