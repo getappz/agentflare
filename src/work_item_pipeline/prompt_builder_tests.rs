@@ -11,28 +11,47 @@ fn sample_task() -> SddTask {
 
 #[test]
 fn implementer_prompt_includes_task_body() {
-    let prompt = build_implementer_prompt(&sample_task(), None, false);
+    let prompt = build_implementer_prompt(&sample_task(), None, false, false);
     assert!(prompt.contains("Add --verbose"));
 }
 
 #[test]
 fn implementer_prompt_includes_fix_context_when_present() {
-    let prompt =
-        build_implementer_prompt(&sample_task(), Some("Reviewer found: missing test"), false);
+    let prompt = build_implementer_prompt(
+        &sample_task(),
+        Some("Reviewer found: missing test"),
+        false,
+        false,
+    );
     assert!(prompt.contains("Reviewer found: missing test"));
 }
 
 #[test]
 fn implementer_prompt_includes_tdd_instructions_when_set() {
-    let prompt = build_implementer_prompt(&sample_task(), None, true);
+    let prompt = build_implementer_prompt(&sample_task(), None, true, false);
     assert!(prompt.contains("test-driven development"));
     assert!(prompt.contains("failing test"));
 }
 
 #[test]
 fn implementer_prompt_omits_tdd_instructions_by_default() {
-    let prompt = build_implementer_prompt(&sample_task(), None, false);
+    let prompt = build_implementer_prompt(&sample_task(), None, false, false);
     assert!(!prompt.contains("test-driven development"));
+}
+
+#[test]
+fn implementer_prompt_includes_ci_alignment_when_verify_against_ci_set() {
+    let prompt = build_implementer_prompt(&sample_task(), None, false, true);
+    assert!(prompt.contains("cargo fmt --check"));
+    assert!(prompt.contains("gh pr checks"));
+    assert!(prompt.contains("already done"));
+}
+
+#[test]
+fn task_reviewer_prompt_requires_ci_evidence_when_verify_against_ci_set() {
+    let prompt = build_task_reviewer_prompt(&sample_task(), "DONE", false, true);
+    assert!(prompt.contains("cargo fmt --check"));
+    assert!(prompt.contains("gh pr checks"));
 }
 
 #[test]
@@ -45,7 +64,7 @@ fn implementer_prompt_forbids_backgrounding_verification() {
     // the old one-shot dispatch), but each round is still a separate
     // process, so a backgrounded job is still lost -- the prompt must say
     // so explicitly.
-    let prompt = build_implementer_prompt(&sample_task(), None, false);
+    let prompt = build_implementer_prompt(&sample_task(), None, false, false);
     assert!(prompt.contains("separate process"));
     assert!(prompt.contains("Never run build, test, or lint commands as a background task"));
     assert!(prompt.contains("synchronously in the foreground"));
@@ -65,7 +84,7 @@ fn review_analyst_prompt_forbids_backgrounding_verification() {
 
 #[test]
 fn task_reviewer_prompt_forbids_backgrounding_verification() {
-    let prompt = build_task_reviewer_prompt(&sample_task(), "DONE: added the flag", false);
+    let prompt = build_task_reviewer_prompt(&sample_task(), "DONE: added the flag", false, false);
     assert!(prompt.contains("separate process"));
     assert!(prompt.contains("Never run build, test, or lint commands as a background task"));
     assert!(prompt.contains("synchronously in the foreground"));
@@ -89,7 +108,7 @@ fn re_reviewer_prompt_forbids_backgrounding_verification() {
 
 #[test]
 fn task_reviewer_prompt_includes_task_and_report() {
-    let prompt = build_task_reviewer_prompt(&sample_task(), "DONE: added the flag", false);
+    let prompt = build_task_reviewer_prompt(&sample_task(), "DONE: added the flag", false, false);
     assert!(prompt.contains("Add --verbose"));
     assert!(prompt.contains("DONE: added the flag"));
     assert!(prompt.contains("REVIEW_APPROVED"));
@@ -97,13 +116,13 @@ fn task_reviewer_prompt_includes_task_and_report() {
 
 #[test]
 fn task_reviewer_prompt_checks_test_first_evidence_when_tdd_set() {
-    let prompt = build_task_reviewer_prompt(&sample_task(), "DONE: added the flag", true);
+    let prompt = build_task_reviewer_prompt(&sample_task(), "DONE: added the flag", true, false);
     assert!(prompt.contains("test-first evidence"));
 }
 
 #[test]
 fn task_reviewer_prompt_omits_test_first_check_by_default() {
-    let prompt = build_task_reviewer_prompt(&sample_task(), "DONE: added the flag", false);
+    let prompt = build_task_reviewer_prompt(&sample_task(), "DONE: added the flag", false, false);
     assert!(!prompt.contains("test-first evidence"));
 }
 
