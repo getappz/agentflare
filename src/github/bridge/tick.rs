@@ -772,10 +772,11 @@ fn close_if_still_open(ctx: &Ctx, issue: &Issue) {
 ///
 /// `metadata` is one JSON column and `item::update` replaces it wholesale.
 /// The tick's snapshot is read at the top of `run_inner` and written after a
-/// GitHub round trip, so it is seconds stale — and an `item(update)` through
-/// the MCP server in that window would be silently reverted. Re-reading
-/// immediately before the write narrows that to the width of a single
-/// statement.
+/// GitHub round trip, so it is seconds stale — and a dispatch's
+/// `persist_run_id` in that window would have its `workflow_run_id`
+/// silently reverted. `merge_item_metadata` reads the current row and
+/// writes it back inside one IMMEDIATE transaction, so only this key is
+/// touched (item #353).
 ///
 /// `None` clears the key, which is what the rollback path wants.
 fn store_hash(
@@ -783,20 +784,91 @@ fn store_hash(
     item_id: &str,
     hash: Option<&str>,
 ) -> Result<(), agentflare_backend::Error> {
-    let current = agentflare_backend::item::get(conn, item_id)?;
-    let metadata = match hash {
-        Some(h) => items::with_last_hash(&current, h),
-        None => items::without_last_hash(&current),
-    };
-    agentflare_backend::item::update(
-        conn,
-        item_id,
-        agentflare_backend::item::UpdateItem {
-            metadata: Some(metadata),
-            ..Default::default()
-        },
-    )
+    crate::mcp_server::merge_item_metadata(conn, item_id, |meta| match hash {
+        Some(h) => {
+            meta.insert(
+                items::LAST_HASH_KEY.into(),
+                serde_json::Value::String(h.to_string()),
+            );
+        }
+        None => {
+            meta.remove(items::LAST_HASH_KEY);
+        }
+    })
     .map(|_| ())
+}
+
+#[cfg(test)]
+mod store_hash_tests {
+    use super::*;
+
+    fn hash_test_db() -> (rusqlite::Connection, String) {
+        crate::github::bridge::items::tests::tests_support_db()
+    }
+
+    fn hash_test_item(
+        conn: &rusqlite::Connection,
+        project_id: &str,
+    ) -> agentflare_backend::item::Item {
+        let state = items::state_id_for_group(conn, project_id, "started").unwrap();
+        agentflare_backend::item::create(
+            conn,
+            agentflare_backend::item::CreateItem {
+                project_id: project_id.to_string(),
+                state_id: state,
+                name: "t".into(),
+                description: None,
+                priority: None,
+                parent_id: None,
+                assignee_agent: None,
+                sort_order: None,
+                external_source: Some(items::EXTERNAL_SOURCE.into()),
+                external_id: Some("7".into()),
+                metadata: None,
+                label_ids: vec![],
+                assignee_ids: vec![],
+                dependency_ids: vec![],
+                start_date: None,
+                due_date: None,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn store_hash_sets_and_clears_only_its_own_key() {
+        // Item #353: only the hash key may change; a dispatch-written
+        // `workflow_run_id` must survive both the set and the clear.
+        let (conn, project_id) = hash_test_db();
+        let item = hash_test_item(&conn, &project_id);
+        crate::mcp_server::merge_item_metadata(&conn, &item.id, |meta| {
+            meta.insert(
+                "workflow_run_id".into(),
+                serde_json::Value::String("run-live".into()),
+            );
+        })
+        .unwrap();
+
+        store_hash(&conn, &item.id, Some("abc")).unwrap();
+        let meta: serde_json::Value = serde_json::from_str(
+            &agentflare_backend::item::get(&conn, &item.id)
+                .unwrap()
+                .metadata,
+        )
+        .unwrap();
+        assert_eq!(meta["github_last_hash"], "abc");
+        assert_eq!(meta["workflow_run_id"], "run-live");
+
+        store_hash(&conn, &item.id, None).unwrap();
+        let meta: serde_json::Value = serde_json::from_str(
+            &agentflare_backend::item::get(&conn, &item.id)
+                .unwrap()
+                .metadata,
+        )
+        .unwrap();
+        assert!(meta.get("github_last_hash").is_none());
+        assert_eq!(meta["workflow_run_id"], "run-live");
+    }
 }
 
 #[cfg(test)]
