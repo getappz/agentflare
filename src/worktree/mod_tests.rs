@@ -34,10 +34,14 @@ fn pr_body_falls_back_to_the_placeholder_when_summary_is_blank() {
 
 #[test]
 fn pr_footer_names_agent_machine_and_item() {
+    let instance = crate::github::bridge::config::stable_instance_id();
     assert_eq!(
-        pr_footer("claude-code", "kumar-laptop", 42, "item-uuid"),
-        "---\n_Opened by `claude-code` on **kumar-laptop** for item #42 via agentflare._\n\
-             <!-- agentflare-item-id: item-uuid -->"
+        pr_footer("claude-code", "kumar-laptop", 42, "item-uuid", "task/42-slug"),
+        format!(
+            "---\n_Opened by `claude-code` on **kumar-laptop** (`{instance}`) for item #42 via agentflare._\n\
+              <!-- agentflare-item-id: item-uuid -->\n\
+              <!-- agentflare-origin: v=1 instance={instance} item=item-uuid seq=42 branch=task/42-slug -->"
+        )
     );
 }
 
@@ -1128,6 +1132,26 @@ fn is_own_pr_true_for_an_unmarked_pr_on_this_items_branch() {
     .unwrap();
     assert!(is_own_pr(&pr, &item));
 }
+// Item #347 phase 2: a PR stamped by another instance is never this item's
+// own, even when the visible sequence-number marker matches -- sequence
+// numbers are per instance.
+#[test]
+fn is_own_pr_false_for_a_pr_stamped_by_a_foreign_instance() {
+    let me = crate::github::bridge::config::stable_instance_id();
+    let foreign = format!("{me}-other-instance");
+    let body = format!(
+        "_Opened by `a` on **m** for item #259 via agentflare._\n{}",
+        crate::github::pulls::origin_tag(&foreign, "my-uuid", 259, "task/259-x")
+    );
+    let pr: crate::github::models::PullRequest = serde_json::from_value(serde_json::json!({
+        "number": 688, "html_url": "u", "state": "open", "title": "t", "body": body,
+        "head": {"ref": "task/259-x", "sha": "abc"}
+    }))
+    .unwrap();
+    let item = item_with_metadata(259, "{}");
+    assert!(!is_own_pr(&pr, &item));
+}
+
 // Item #595: a closed/merged PR on the same branch name stamped with the
 // same sequence number but tagged for a different item's UUID must not be
 // trusted as this item's own PR.
