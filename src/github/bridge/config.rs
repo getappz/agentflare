@@ -314,49 +314,24 @@ pub fn write_machine_name(name: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// Default friendly name: `<hostname>-<6 chars of the instance id>`, e.g.
-/// `host-51bb8d`. The hostname alone is not unique across machines (two
-/// workstations can both be `host`), which would give both the same
-/// `beacon:<name>` label; the id suffix keeps the name readable and distinct.
-/// The hostname is lowercased and reduced to `[a-z0-9._-]`; with none left
-/// the stem is `machine`.
-pub fn default_machine_name(hostname: Option<&str>, instance_id: &str) -> String {
-    let clean = |s: &str| {
-        s.to_ascii_lowercase()
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_') {
-                    c
-                } else {
-                    '-'
-                }
-            })
-            .collect::<String>()
-            .trim_matches('-')
-            .to_string()
-    };
-    let stem: String = clean(hostname.unwrap_or_default())
-        .chars()
-        .take(32)
-        .collect();
-    let stem = if stem.is_empty() {
-        "machine".to_string()
-    } else {
-        stem
-    };
-    let suffix: String = instance_id
+/// Default friendly name, AWS-instance-id style: `i-flare-<instance hex>`,
+/// e.g. `i-flare-51bb8de6c33b` for `flared:51bb8de6c33b`. Derived only from
+/// the instance id, never the hostname: hostnames reach public `beacon:<name>`
+/// labels and PR footers (the id is hashed from the machine id so the raw
+/// identity is not exposed), collide across machines, and say nothing a
+/// claim marker can be matched against. The full hex maps 1:1 to the
+/// `owner=flared:<hex>` markers. A friendly name is still one
+/// `agentflare config set machine-name` away.
+pub fn default_machine_name(instance_id: &str) -> String {
+    let id: String = instance_id
         .rsplit(':')
         .next()
         .unwrap_or_default()
         .chars()
         .filter(char::is_ascii_alphanumeric)
-        .take(6)
+        .take(12)
         .collect();
-    if suffix.is_empty() {
-        stem
-    } else {
-        format!("{stem}-{suffix}")
-    }
+    format!("i-flare-{}", if id.is_empty() { "unknown" } else { &id })
 }
 
 /// Sets `[bridge].machine_name` to [`default_machine_name`] when none is set.
@@ -365,10 +340,7 @@ pub fn ensure_machine_name() -> Option<String> {
     if read_machine_name().is_some() {
         return None;
     }
-    let name = default_machine_name(
-        crate::sessions::os_hostname().as_deref(),
-        &stable_instance_id(),
-    );
+    let name = default_machine_name(&stable_instance_id());
     write_machine_name(&name).ok().map(|_| name)
 }
 
@@ -1198,21 +1170,19 @@ mod tests {
     }
 
     #[test]
-    fn default_machine_name_is_hostname_plus_instance_suffix() {
-        let id = "flared:51bb8de6c33b";
-        assert_eq!(default_machine_name(Some("host"), id), "host-51bb8d");
+    fn default_machine_name_is_i_flare_plus_the_instance_hex() {
         assert_eq!(
-            default_machine_name(Some("My Laptop!"), id),
-            "my-laptop-51bb8d"
+            default_machine_name("flared:51bb8de6c33b"),
+            "i-flare-51bb8de6c33b"
         );
-        assert_eq!(default_machine_name(None, id), "machine-51bb8d");
-        assert_eq!(default_machine_name(Some("///"), id), "machine-51bb8d");
-        // Two machines sharing a hostname still get different names.
+        // Distinct machines get distinct names; no hostname is involved.
         assert_ne!(
-            default_machine_name(Some("host"), id),
-            default_machine_name(Some("host"), "flared:c997d745ae66")
+            default_machine_name("flared:51bb8de6c33b"),
+            default_machine_name("flared:c997d745ae66")
         );
-        validate_instance_id(&default_machine_name(Some("My Laptop!"), id)).unwrap();
+        // A pid-scoped fallback id is sanitised, never empty.
+        assert_eq!(default_machine_name("flared:"), "i-flare-unknown");
+        validate_instance_id(&default_machine_name("claude-code:12-ab")).unwrap();
     }
 
     #[test]
