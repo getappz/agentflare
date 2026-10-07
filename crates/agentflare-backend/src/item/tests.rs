@@ -1698,6 +1698,62 @@ fn claim_succeeds_once_plan_approved() {
     assert_eq!(outcome, ClaimOutcome::Acquired);
 }
 
+/// Item #300 / live #281: a post-dispatch metadata write that carries a
+/// stale `plan_status: "pending"` (same `plan_asset_id`) must not erase the
+/// approval record when going through `item::update` directly — the path
+/// orphan reconcile / `merge_item_metadata` / handoff use, bypassing MCP
+/// `restore_plan_transition_fields`.
+#[test]
+fn update_preserves_approval_against_stale_pending_metadata() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "_planimm");
+    let item = create(
+        &conn,
+        CreateItem {
+            project_id: pid,
+            state_id: sid,
+            name: "approved item".into(),
+            description: None,
+            priority: None,
+            parent_id: None,
+            assignee_agent: None,
+            sort_order: None,
+            external_source: None,
+            external_id: None,
+            metadata: Some(
+                r#"{"plan_required":true,"plan_status":"approved","plan_approved_at":5,"plan_approved_by":"human","plan_asset_id":"a"}"#
+                    .into(),
+            ),
+            label_ids: vec![],
+            assignee_ids: vec![],
+            dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
+        },
+    )
+    .unwrap();
+
+    update(
+        &conn,
+        &item.id,
+        UpdateItem {
+            metadata: Some(
+                r#"{"plan_required":true,"plan_status":"pending","plan_asset_id":"a","workflow_run_id":"01a0d24a"}"#
+                    .into(),
+            ),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let got = get(&conn, &item.id).unwrap();
+    let meta: serde_json::Value = serde_json::from_str(&got.metadata).unwrap();
+    assert_eq!(meta["plan_status"], "approved");
+    assert_eq!(meta["plan_approved_at"], 5);
+    assert_eq!(meta["plan_approved_by"], "human");
+    assert_eq!(meta["workflow_run_id"], "01a0d24a");
+}
+
 #[test]
 fn resolve_id_passes_through_uuid_unchanged() {
     let conn = db::open_in_memory().unwrap();
