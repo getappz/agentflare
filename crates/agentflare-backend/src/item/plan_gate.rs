@@ -140,6 +140,23 @@ pub fn preserve_plan_approval(incoming: &str, current: &str) -> String {
     new.to_string()
 }
 
+
+/// Identity to store in `plan_approved_by`. MCP/CLI channel approve often has
+/// no agent identity (`None`); writing that as JSON null left the audit field
+/// looking unset after a successful human approval (item #300 / live #281).
+pub fn approved_by_identity(agent: Option<&str>, channel_route: bool) -> String {
+    agent
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if channel_route {
+                "human".to_string()
+            } else {
+                "agent".to_string()
+            }
+        })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanGateStatus {
     Open,
@@ -239,6 +256,15 @@ mod tests {
         assert_eq!(v["plan_status"], "approved");
         assert_eq!(v["plan_approved_at"], 5);
         assert_eq!(v["plan_approved_by"], "h");
+    }
+
+
+    #[test]
+    fn approved_by_identity_defaults_channel_to_human_when_unset() {
+        assert_eq!(approved_by_identity(None, true), "human");
+        assert_eq!(approved_by_identity(Some(""), true), "human");
+        assert_eq!(approved_by_identity(Some("cli:me"), true), "cli:me");
+        assert_eq!(approved_by_identity(None, false), "agent");
     }
 
     use super::*;
