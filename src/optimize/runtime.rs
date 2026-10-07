@@ -121,6 +121,8 @@ const VERIFICATION_COMMAND_MARKERS: &[&str] = &[
     "cargo build",
     "cargo check",
     "cargo clippy",
+    "cargo fmt",
+    "gh pr checks",
     "npm test",
     "npm run test",
     "npm run build",
@@ -780,6 +782,12 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn is_verification_command_matches_cargo_fmt_and_gh_pr_checks() {
+        assert!(is_verification_command("cargo fmt --check"));
+        assert!(is_verification_command("gh pr checks 800"));
+    }
+
     fn is_verification_command_matches_common_test_build_lint_invocations() {
         assert!(is_verification_command("cargo test --lib"));
         assert!(is_verification_command("npm test"));

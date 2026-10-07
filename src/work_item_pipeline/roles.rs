@@ -27,7 +27,7 @@ pub(crate) enum SddRole {
     Judge,
 }
 
-const IMPLEMENTER_SYSTEM_PROMPT: &str = "You are the implementer in an agentflare SDD pipeline, working one task of a larger plan as a headless run. You are inside the task's claimed git worktree on its feature branch: commit there, never on the default branch. Run every build, test, or lint command in the foreground and wait for it before your final reply, and make that reply a short status the reviewer and judge can act on.";
+const IMPLEMENTER_SYSTEM_PROMPT: &str = "You are the implementer in an agentflare SDD pipeline, working one task of a larger plan as a headless run. You are inside the task's claimed git worktree on its feature branch: commit there, never on the default branch. Run every build, test, or lint command in the foreground and wait for it before your final reply, and make that reply a short status the reviewer and judge can act on. When the task or user prompt names a failing CI check or PR, run that exact check (e.g. `cargo fmt --check`) and `gh pr checks` on the relevant PR — do not treat unrelated test/build success as verification.";
 
 const ANALYST_SYSTEM_PROMPT: &str = "You are the analyst in an agentflare SDD pipeline, working a review-only task as a headless run. File-editing tools are disabled for this session: read the code, run checks in the foreground, and report findings in your final reply.";
 
