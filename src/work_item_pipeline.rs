@@ -151,6 +151,11 @@ pub(crate) struct WorkItemData {
     /// started before this field existed must still deserialize.
     #[serde(default)]
     pub tdd: bool,
+    /// Set from `detect_verify_against_ci` at dispatch time (item #299) —
+    /// appends CI/PR check alignment instructions to the implementer prompt
+    /// and matching review criteria to the task reviewer.
+    #[serde(default)]
+    pub verify_against_ci: bool,
     /// Provider session id last observed for each agent name dispatched in
     /// this run (implementer and judge/reviewer are usually different
     /// agents and get independent entries). Used to pass `--resume <id>` on
@@ -505,7 +510,12 @@ pub(crate) fn build_sdd_loop_step(
                         let prompt = if ctx.data.review_only {
                             build_review_analyst_prompt(&task, fix_context, ctx.data.design_spec)
                         } else {
-                            build_implementer_prompt(&task, fix_context, ctx.data.tdd)
+                            build_implementer_prompt(
+                                &task,
+                                fix_context,
+                                ctx.data.tdd,
+                                ctx.data.verify_against_ci,
+                            )
                         };
                         (
                             agent_name.clone(),
@@ -520,7 +530,12 @@ pub(crate) fn build_sdd_loop_step(
                     let prompt = if ctx.data.review_only {
                         build_review_of_analysis_prompt(&task, &report)
                     } else {
-                        build_task_reviewer_prompt(&task, &report, ctx.data.tdd)
+                        build_task_reviewer_prompt(
+                            &task,
+                            &report,
+                            ctx.data.tdd,
+                            ctx.data.verify_against_ci,
+                        )
                     };
                     (judge_agent_name.clone(), prompt, false, SddRole::Reviewer)
                 } else {
@@ -528,7 +543,12 @@ pub(crate) fn build_sdd_loop_step(
                     let prompt = if ctx.data.review_only {
                         build_review_analyst_prompt(&task, None, ctx.data.design_spec)
                     } else {
-                        build_implementer_prompt(&task, None, ctx.data.tdd)
+                        build_implementer_prompt(
+                            &task,
+                            None,
+                            ctx.data.tdd,
+                            ctx.data.verify_against_ci,
+                        )
                     };
                     (
                         agent_name.clone(),
@@ -1191,6 +1211,7 @@ pub(crate) fn run_or_resume_with_sender(
     let design_spec = detect_design_spec(&item_description, &existing_metadata);
     // Seeds `WorkItemData::tdd` (item #179) the same way.
     let tdd = detect_tdd_mode(&existing_metadata);
+    let verify_against_ci = detect_verify_against_ci(&item_description, &existing_metadata);
 
     let agent_name = implementer_agent.as_str().to_string();
     let judge_agent_name = review_agent.as_str().to_string();
@@ -1228,6 +1249,7 @@ pub(crate) fn run_or_resume_with_sender(
             review_only,
             design_spec,
             tdd,
+            verify_against_ci,
             worktree_path: worktree_path.clone(),
             // A resumed run (the other arm below) keeps its own persisted
             // cursor instead of going through `fresh_data()`. A genuinely
@@ -1694,3 +1716,5 @@ mod task_sourcing_tests;
 mod tdd_mode_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod verify_against_ci_tests;
