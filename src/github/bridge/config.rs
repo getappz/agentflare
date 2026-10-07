@@ -366,6 +366,31 @@ pub fn clear_machine_name() -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// How long `worktree::discover_untracked_prs` waits before adopting an
+/// unstamped PR with no local branch evidence (item #347 phase 2): the
+/// window in which the workstation that actually opened the PR is expected
+/// to stamp or claim it first, so two instances sharing one repo don't race
+/// to adopt each other's fresh hand-opened PRs. `0` disables the wait
+/// (today's immediate first-claim-wins). Reads
+/// `AGENTFLARE_BRIDGE_DISCOVERY_GRACE_SECS`, else `[bridge]
+/// discovery_grace_secs` from the user-home config file, else the default.
+pub const DEFAULT_DISCOVERY_GRACE_SECS: u64 = 600;
+
+pub fn discovery_grace_secs() -> u64 {
+    std::env::var("AGENTFLARE_BRIDGE_DISCOVERY_GRACE_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .or_else(|| {
+            let content = std::fs::read_to_string(home_config_path()).ok()?;
+            let doc = content.parse::<toml::Value>().ok()?;
+            let n = bridge_table(&doc)?
+                .get("discovery_grace_secs")?
+                .as_integer()?;
+            u64::try_from(n).ok()
+        })
+        .unwrap_or(DEFAULT_DISCOVERY_GRACE_SECS)
+}
+
 #[derive(Debug, Clone)]
 pub struct BridgeConfig {
     pub enabled: bool,
@@ -704,6 +729,20 @@ mod tests {
         for v in ["0", "false", "no", "", "banana"] {
             let c = BridgeConfig::from_values(Some(v), None, None, None, None, "a".to_string());
             assert!(!c.enabled, "{v} should not enable");
+        }
+    }
+
+    #[test]
+    fn discovery_grace_secs_reads_the_env_override() {
+        let _guard = agent_registry::detect::PATH_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("AGENTFLARE_BRIDGE_DISCOVERY_GRACE_SECS", "42");
+        }
+        assert_eq!(discovery_grace_secs(), 42);
+        unsafe {
+            std::env::remove_var("AGENTFLARE_BRIDGE_DISCOVERY_GRACE_SECS");
         }
     }
 
