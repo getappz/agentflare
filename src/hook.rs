@@ -895,7 +895,7 @@ pub fn prompt_submit(agent: &str) {
         if let Some(nudge) = crate::nudge_pace::paced_submit_nudge(
             nudge_bypass,
             &pace_key,
-            "PM MODE ACTIVE — delegate & dispatch only, don't implement directly (see the `pm` skill, Part 2). /pm mode off to exit."
+            "PM MODE ACTIVE — delegate & dispatch; do small mechanical changes yourself (see the `pm` skill, Part 2). /pm mode off to exit."
                 .to_string(),
         ) {
             bits.push(nudge);
