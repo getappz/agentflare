@@ -849,14 +849,22 @@ fn closes_issue_line(
 
 /// Human-readable attribution appended to the PR body -- who opened it and
 /// on which machine, so a reviewer never has to guess whether a PR came
-/// from agentflare. Unlike `bridge::marker::Marker`, this is not a
-/// parseable format: nothing reads a PR footer back (the bridge doesn't
-/// poll PRs for claim state the way it polls issues), so there is no
-/// format to keep stable.
-fn pr_footer(agent: &str, machine: &str, sequence_id: i64, item_id: &str) -> String {
+/// from agentflare. The visible line names the friendly machine label *and*
+/// the stable instance id (`flared:<hex>`), since labels can be renamed but
+/// the instance id is what ownership decisions key on.
+///
+/// Next to it, two hidden machine-readable lines: the item-UUID identity
+/// tag (disambiguates same-numbered items across workstations' unsynced
+/// databases, item #595) and the origin stamp (names the opening instance,
+/// item #347 phase 2). `pulls::origin_of` reads the stamp back -- unlike the
+/// old comment here claimed, part of the footer IS a parseable format now --
+/// while the bridge still never polls PRs for issue-style claim state.
+fn pr_footer(agent: &str, machine: &str, sequence_id: i64, item_id: &str, branch: &str) -> String {
+    let instance = crate::github::bridge::config::stable_instance_id();
     format!(
-        "---\n_Opened by `{agent}` on **{machine}** for item #{sequence_id} via agentflare._\n{}",
-        crate::github::pulls::item_id_tag(item_id)
+        "---\n_Opened by `{agent}` on **{machine}** (`{instance}`) for item #{sequence_id} via agentflare._\n{}\n{}",
+        crate::github::pulls::item_id_tag(item_id),
+        crate::github::pulls::origin_tag(&instance, item_id, sequence_id, branch)
     )
 }
 
@@ -1042,6 +1050,15 @@ fn is_own_pr(
     existing: &crate::github::models::PullRequest,
     item: &agentflare_backend::item::Item,
 ) -> bool {
+    // A PR stamped by another instance is never this item's own, even when
+    // the sequence-number marker matches: sequence numbers are per
+    // instance (item #347 phase 2). Unstamped bodies keep today's behavior.
+    if !crate::github::pulls::origin_allows(
+        existing.body.as_deref(),
+        &crate::github::bridge::config::stable_instance_id(),
+    ) {
+        return false;
+    }
     if crate::github::pulls::marks_this_item(existing.body.as_deref(), item.sequence_id, &item.id) {
         return true;
     }
@@ -1202,7 +1219,7 @@ pub fn push_and_open_pr(
     }
     let body = format!(
         "{body}\n\n{}",
-        pr_footer(agent, &machine, item.sequence_id, &item.id)
+        pr_footer(agent, &machine, item.sequence_id, &item.id, &branch)
     );
     open_pr_for_pushed_branch(
         &client,
