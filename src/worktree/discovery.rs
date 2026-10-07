@@ -146,6 +146,27 @@ pub(crate) fn claim_pr_for_discovery(
     matches!(earliest_claim_owner(&after), Some((_, o)) if o == owner)
 }
 
+/// True when `created_at` (the PR's GitHub `created_at`) is less than
+/// `grace_secs` old as of `now` -- i.e. the PR is still inside the discovery
+/// grace window and must be left alone for its opener to claim. A missing or
+/// unparseable timestamp is `false`: it can't prove freshness, so the caller
+/// falls back to today's first-claim-wins instead of deferring on evidence
+/// that will never arrive. A future timestamp (clock skew) counts as fresh.
+fn within_discovery_grace(
+    created_at: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+    grace_secs: u64,
+) -> bool {
+    let Some(created) = created_at else {
+        return false;
+    };
+    let Ok(created) = chrono::DateTime::parse_from_rfc3339(created) else {
+        return false;
+    };
+    let age_secs = now.signed_duration_since(created.with_timezone(&chrono::Utc));
+    age_secs < chrono::Duration::seconds(i64::try_from(grace_secs).unwrap_or(i64::MAX))
+}
+
 /// Creates an `in_review` item for every open, non-draft PR in `repo` not
 /// already in `known_pr_numbers` -- PRs opened outside the `item done` flow
 /// (by hand, or by an agent working ad hoc) would otherwise sit invisible to
@@ -160,8 +181,9 @@ pub(crate) fn claim_pr_for_discovery(
 /// no shared item DB, so without a durable marker on the PR itself, two of
 /// them could both create their own duplicate tracking item for it.
 ///
-/// Also skips any PR whose body already carries agentflare's own
-/// `pulls::opened_by_agentflare` stamp, *before* the claim-comment check --
+/// Also skips any PR whose body already carries agentflare's own stamp --
+/// either the hidden origin stamp or the legacy `pulls::opened_by_agentflare`
+/// marker -- *before* the claim-comment check.
 /// `known_pr_numbers` only reflects items in *this* workstation's own local
 /// database, so a PR another workstation's `push_and_open_pr` just opened
 /// for its own item is invisible here even though it's already tracked
@@ -171,7 +193,21 @@ pub(crate) fn claim_pr_for_discovery(
 /// still see the PR as unclaimed and win the (uncontested) claim, adopting a
 /// second, duplicate local item and stacking a second `beacon:` label on top
 /// of the real opener's (item #261, live: PR #688 ended up carrying two
-/// different workstations' `beacon:` labels 23 seconds apart).
+/// different workstations' `beacon:` labels 23 seconds later).
+///
+/// A PR stamped by a *foreign* instance is never adopted here, full stop:
+/// sequence numbers are per instance, so its `seq` says nothing about local
+/// items (item #347 phase 2). An *unstamped* PR with no local branch evidence
+/// (no `refs/heads/<branch>` here) may be another instance's fresh work that
+/// simply hasn't been stamped or claimed yet, so it waits out the discovery
+/// grace window (`[bridge] discovery_grace_secs`, default 600 s, measured
+/// from the PR's `created_at`) before falling back to first-claim-wins.
+/// Local branch evidence adopts at once -- via the owning-item attach path
+/// for `task/<seq>` branches, via the claim path otherwise. A missing or
+/// unparseable `created_at` can't prove freshness, so it falls back to
+/// today's behavior instead of waiting on a timestamp that will never come.
+/// The claim protocol itself (`claim_pr_for_discovery`, #632) is unchanged.
+///
 /// The synthesized item's `metadata.pr` shape matches
 /// `merge_and_persist_pr_identity` exactly, so every downstream sweep step
 /// (CI check, self-repair, branch update, merge) treats it identically to a
@@ -187,6 +223,36 @@ pub(crate) fn discover_untracked_prs(
     known_pr_numbers: &std::collections::HashSet<u64>,
     owner: &str,
     local_branch: &dyn Fn(&str) -> bool,
+) -> usize {
+    discover_untracked_prs_with_clock(
+        conn,
+        client,
+        repo,
+        project_id,
+        in_review_state_id,
+        known_pr_numbers,
+        owner,
+        local_branch,
+        chrono::Utc::now(),
+        crate::github::bridge::config::discovery_grace_secs(),
+    )
+}
+
+/// [`discover_untracked_prs`] with the clock and grace window injected, so
+/// the freshness boundary is unit-testable without sleeping. Production
+/// callers use [`discover_untracked_prs`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn discover_untracked_prs_with_clock(
+    conn: &rusqlite::Connection,
+    client: &crate::github::Client,
+    repo: &crate::github::RepoId,
+    project_id: &str,
+    in_review_state_id: &str,
+    known_pr_numbers: &std::collections::HashSet<u64>,
+    owner: &str,
+    local_branch: &dyn Fn(&str) -> bool,
+    now: chrono::DateTime<chrono::Utc>,
+    grace_secs: u64,
 ) -> usize {
     let prs = match crate::github::pulls::list(client, repo, "open") {
         Ok(prs) => prs,
@@ -217,6 +283,17 @@ pub(crate) fn discover_untracked_prs(
         // owner's worktree (#334 beside #330).
         if let Some(owning) = item_owning_branch(&items, &branch, local_branch) {
             attach_pr_to_item(conn, owning, pr.number, &branch);
+            continue;
+        }
+        // Item #347 phase 2: an unstamped PR with no local branch evidence
+        // may be another instance's fresh work. Give its opener the grace
+        // window to stamp or claim it first; only then fall back to
+        // first-claim-wins. (Stamped PRs never reach here -- the
+        // `opened_by_agentflare` guard above already skipped them -- and the
+        // claim protocol itself is unchanged.)
+        if !local_branch(&branch)
+            && within_discovery_grace(pr.created_at.as_deref(), now, grace_secs)
+        {
             continue;
         }
         if !claim_pr_for_discovery(client, repo, pr.number, owner) {
@@ -941,5 +1018,253 @@ mod tests {
         let items = agentflare_backend::item::list_by_project(&conn, &project_id).unwrap();
         assert!(item_owning_branch(&items, "feature/recorded", &|_| false).is_some());
         assert!(item_owning_branch(&items, "feature/other", &|_| false).is_none());
+    }
+
+    // Item #347 phase 2 (discovery eligibility): the grace-window predicate.
+    #[test]
+    fn within_discovery_grace_holds_fresh_prs_and_releases_old_ones() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-07T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        // 60 s old with a 600 s window: still inside.
+        assert!(within_discovery_grace(
+            Some("2026-10-07T11:59:00Z"),
+            now,
+            600
+        ));
+        // 3600 s old: outside.
+        assert!(!within_discovery_grace(
+            Some("2026-10-07T11:00:00Z"),
+            now,
+            600
+        ));
+        // No timestamp proves nothing: fall back to first-claim-wins.
+        assert!(!within_discovery_grace(None, now, 600));
+        assert!(!within_discovery_grace(Some("not-a-timestamp"), now, 600));
+        // Clock skew (PR "from the future") waits rather than rushing.
+        assert!(within_discovery_grace(
+            Some("2026-10-07T12:05:00Z"),
+            now,
+            600
+        ));
+        // A zero window never holds anything.
+        assert!(!within_discovery_grace(
+            Some("2026-10-07T11:59:59Z"),
+            now,
+            0
+        ));
+    }
+
+    fn clock_at(rfc3339: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(rfc3339)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    fn unstamped_pr_json(number: u64, branch: &str, created_at: &str) -> String {
+        format!(
+            r#"[{{"number":{number},"html_url":"u","state":"open","title":"Hand opened","body":"hand opened, no stamp","head":{{"ref":"{branch}","sha":"abc"}},"author_association":"OWNER","created_at":"{created_at}"}}]"#
+        )
+    }
+
+    fn claim_win_responses(owner: &str) -> Vec<crate::github::test_support::MockResponse> {
+        let marker = crate::github::bridge::marker::Marker {
+            action: crate::github::bridge::marker::Action::Claim,
+            owner: owner.to_string(),
+            item: "pr-discovery".to_string(),
+            ts: 1,
+            hash: String::new(),
+        };
+        vec![
+            crate::github::test_support::MockResponse::json(200, "[]"),
+            crate::github::test_support::MockResponse::json(201, r#"{"id":100}"#),
+            crate::github::test_support::MockResponse::json(
+                200,
+                &format!(
+                    r#"[{{"id":100,"user":{{"login":"bot"}},"body":"{}"}}]"#,
+                    marker.render()
+                ),
+            ),
+        ]
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn discover_with_clock(
+        conn: &rusqlite::Connection,
+        client: &crate::github::Client,
+        repo: &crate::github::RepoId,
+        project_id: &str,
+        in_review_state_id: &str,
+        local_branch: &dyn Fn(&str) -> bool,
+        now: chrono::DateTime<chrono::Utc>,
+        grace_secs: u64,
+    ) -> usize {
+        discover_untracked_prs_with_clock(
+            conn,
+            client,
+            repo,
+            project_id,
+            in_review_state_id,
+            &std::collections::HashSet::new(),
+            "flared:box-a",
+            local_branch,
+            now,
+            grace_secs,
+        )
+    }
+
+    // Item #347 phase 2: an unstamped PR with no local branch evidence that is
+    // still inside the grace window is left alone -- no claim comment is even
+    // attempted (only the PR-list response is queued; anything more would
+    // panic on an empty mock queue).
+    #[test]
+    fn discover_skips_a_fresh_unstamped_pr_without_local_evidence() {
+        let conn = agentflare_backend::db::open_in_memory().unwrap();
+        let (project_id, in_review_state_id) = test_project_with_in_review_state(&conn);
+        let server = crate::github::test_support::MockServer::start(vec![
+            crate::github::test_support::MockResponse::json(
+                200,
+                &unstamped_pr_json(42, "fix/fresh-hand-opened", "2026-10-07T11:59:00Z"),
+            ),
+        ]);
+        let client = server.client(Some("tok"));
+        let repo = crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+
+        let created = discover_with_clock(
+            &conn,
+            &client,
+            &repo,
+            &project_id,
+            &in_review_state_id,
+            &|_| false,
+            clock_at("2026-10-07T12:00:00Z"),
+            600,
+        );
+
+        assert_eq!(created, 0);
+        assert!(
+            agentflare_backend::item::list_by_project(&conn, &project_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(server.requests().len(), 1, "list only, never a claim");
+    }
+
+    // The same PR once the grace window has passed falls back to today's
+    // first-claim-wins path and is adopted.
+    #[test]
+    fn discover_adopts_a_stale_unstamped_pr_without_local_evidence() {
+        let conn = agentflare_backend::db::open_in_memory().unwrap();
+        let (project_id, in_review_state_id) = test_project_with_in_review_state(&conn);
+        let mut responses = vec![crate::github::test_support::MockResponse::json(
+            200,
+            &unstamped_pr_json(42, "fix/stale-hand-opened", "2026-10-07T11:00:00Z"),
+        )];
+        responses.extend(claim_win_responses("flared:box-a"));
+        let server = crate::github::test_support::MockServer::start(responses);
+        let client = server.client(Some("tok"));
+        let repo = crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+
+        let created = discover_with_clock(
+            &conn,
+            &client,
+            &repo,
+            &project_id,
+            &in_review_state_id,
+            &|_| false,
+            clock_at("2026-10-07T12:00:00Z"),
+            600,
+        );
+
+        assert_eq!(created, 1);
+    }
+
+    // Local branch evidence adopts at once even inside the grace window --
+    // this workstation can see the branch, so the PR is (also) its own work
+    // to track, not a stranger's to wait on.
+    #[test]
+    fn discover_adopts_at_once_with_local_branch_evidence_inside_grace() {
+        let conn = agentflare_backend::db::open_in_memory().unwrap();
+        let (project_id, in_review_state_id) = test_project_with_in_review_state(&conn);
+        let mut responses = vec![crate::github::test_support::MockResponse::json(
+            200,
+            &unstamped_pr_json(42, "fix/fresh-but-local", "2026-10-07T11:59:00Z"),
+        )];
+        responses.extend(claim_win_responses("flared:box-a"));
+        let server = crate::github::test_support::MockServer::start(responses);
+        let client = server.client(Some("tok"));
+        let repo = crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+
+        let created = discover_with_clock(
+            &conn,
+            &client,
+            &repo,
+            &project_id,
+            &in_review_state_id,
+            &|_| true,
+            clock_at("2026-10-07T12:00:00Z"),
+            600,
+        );
+
+        assert_eq!(created, 1);
+    }
+
+    // Item #347 phase 2: a PR stamped by a foreign instance is never adopted
+    // -- no matter how stale -- and never even reaches the claim step.
+    #[test]
+    fn discover_never_adopts_a_foreign_stamped_pr() {
+        let conn = agentflare_backend::db::open_in_memory().unwrap();
+        let (project_id, in_review_state_id) = test_project_with_in_review_state(&conn);
+        let body = format!(
+            "---\n_Opened by `a` on **m** for item #259 via agentflare._\n{}",
+            crate::github::pulls::origin_tag(
+                "flared:other-workstation",
+                "other-uuid",
+                259,
+                "task/259-x"
+            ),
+        );
+        let pr_json = serde_json::json!([{
+            "number": 688, "html_url": "u", "state": "open", "title": "Other box",
+            "body": body, "head": {"ref": "task/259-x", "sha": "abc"},
+            "author_association": "OWNER", "created_at": "2026-10-07T11:00:00Z",
+        }])
+        .to_string();
+        let server = crate::github::test_support::MockServer::start(vec![
+            crate::github::test_support::MockResponse::json(200, &pr_json),
+        ]);
+        let client = server.client(Some("tok"));
+        let repo = crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+
+        let created = discover_with_clock(
+            &conn,
+            &client,
+            &repo,
+            &project_id,
+            &in_review_state_id,
+            &|_| false,
+            clock_at("2026-10-07T12:00:00Z"),
+            600,
+        );
+
+        assert_eq!(created, 0);
+        assert!(
+            agentflare_backend::item::list_by_project(&conn, &project_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(server.requests().len(), 1, "list only, never a claim");
     }
 }

@@ -111,6 +111,95 @@ fn item_marker(sequence_id: i64) -> String {
     format!("for item #{sequence_id} ")
 }
 
+/// Hidden machine-readable origin stamp `pr_footer` writes next to the
+/// legacy item tag. The visible `for item #N` marker and the item-UUID tag
+/// identify the *item*; neither says *which workstation* opened the PR, and
+/// sequence numbers plus item UUIDs alone can't tell a second workstation
+/// whether a stamped PR is its own to adopt or another instance's to leave
+/// alone (item #347 phase 2). The stamp names the opener's
+/// `bridge::config::stable_instance_id()` outright, so ownership is decided
+/// where tracking starts (discovery eligibility, marker matching) instead of
+/// at every supervisor action site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Origin {
+    pub instance: String,
+    pub item: String,
+    pub seq: i64,
+    pub branch: String,
+}
+
+const ORIGIN_TAG_PREFIX: &str = "<!-- agentflare-origin:";
+
+/// Renders one origin stamp line, e.g.
+/// `<!-- agentflare-origin: v=1 instance=flared:51bb8de6c33b item=<uuid> seq=259 branch=task/259-slug -->`.
+pub fn origin_tag(instance: &str, item_id: &str, sequence_id: i64, branch: &str) -> String {
+    format!(
+        "{ORIGIN_TAG_PREFIX} v=1 instance={instance} item={item_id} seq={sequence_id} branch={branch} -->"
+    )
+}
+
+/// Parses the first well-formed origin stamp in `body`. Malformed stamps
+/// (no closing ` -->`, wrong version, missing field, non-numeric `seq`)
+/// are skipped, not trusted: a body with only malformed stamps -- or none
+/// at all (a PR opened before the stamp existed, or by hand) -- yields
+/// `None`, and callers fall back to the legacy marker behavior.
+pub fn origin_of(body: Option<&str>) -> Option<Origin> {
+    let mut rest = body?;
+    while let Some((_, after_prefix)) = rest.split_once(ORIGIN_TAG_PREFIX) {
+        let (fields, after_tag) = after_prefix.split_once("-->")?;
+        if let Some(origin) = parse_origin_fields(fields) {
+            return Some(origin);
+        }
+        rest = after_tag;
+    }
+    None
+}
+
+fn parse_origin_fields(fields: &str) -> Option<Origin> {
+    let mut version = None;
+    let mut instance = None;
+    let mut item = None;
+    let mut seq = None;
+    let mut branch = None;
+    for token in fields.split_whitespace() {
+        let (key, value) = token.split_once('=')?;
+        match key {
+            "v" => version = Some(value),
+            "instance" => instance = Some(value),
+            "item" => item = Some(value),
+            "seq" => seq = Some(value),
+            "branch" => branch = Some(value),
+            _ => {}
+        }
+    }
+    if version? != "1" {
+        return None;
+    }
+    Some(Origin {
+        instance: instance?.to_string(),
+        item: item?.to_string(),
+        seq: seq?.parse().ok()?,
+        branch: branch?.to_string(),
+    })
+}
+
+/// True when no parseable origin stamp names a *different* instance than
+/// `instance` -- i.e. this PR is either unstamped (legacy/hand-opened, keep
+/// today's behavior) or stamped by `instance` itself. A foreign stamp means
+/// another workstation owns this PR; sequence numbers are per instance, so
+/// its `seq` says nothing about our items.
+pub(crate) fn origin_allows(body: Option<&str>, instance: &str) -> bool {
+    origin_of(body).is_none_or(|o| o.instance == instance)
+}
+
+/// This workstation's own instance id, the `instance == self` half of the
+/// marker tightening below. Read here (rather than threaded through every
+/// body-check signature) because these checks are pure predicates over a PR
+/// body used from a dozen call sites with no instance in scope.
+fn self_instance() -> String {
+    crate::github::bridge::config::stable_instance_id()
+}
+
 /// True if `body` carries `item_marker(sequence_id)` -- i.e. this PR really
 /// is `sequence_id`'s own, as opposed to an unrelated PR that only happens
 /// to share the same branch name. Branch names get reused across items over
@@ -119,8 +208,16 @@ fn item_marker(sequence_id: i64) -> String {
 /// a stale, unrelated, already-merged PR from a prior item was returned as
 /// the current item's `pr_url`, which made `in_review` true and skipped the
 /// `nothing_was_ever_committed` safety net for real, uncommitted work).
+///
+/// With an origin stamp the marker alone is not enough: the PR must also be
+/// stamped by *this* instance (`instance == self`). Sequence numbers are per
+/// instance, so a foreign workstation's same-numbered marker must never
+/// count as evidence for a local item (item #347 phase 2). With no stamp at
+/// all the behavior is unchanged (a PR opened before the stamp existed, or
+/// by hand, still matches on the marker alone).
 pub fn marks_item(body: Option<&str>, sequence_id: i64) -> bool {
     body.is_some_and(|b| b.contains(&item_marker(sequence_id)))
+        && origin_allows(body, &self_instance())
 }
 
 const ITEM_ID_TAG_PREFIX: &str = "<!-- agentflare-item-id: ";
@@ -160,13 +257,20 @@ pub(crate) fn tag_allows(body: Option<&str>, item_id: &str) -> bool {
 
 /// [`marks_item`] plus the identity-tag check: the PR must carry this
 /// sequence number's marker *and* not be tagged for some other item.
+/// A foreign origin stamp additionally disqualifies the PR even when the
+/// marker and tag both match: sequence numbers are per instance, so a
+/// same-numbered marker from another workstation says nothing about this
+/// item (item #347 phase 2).
 pub fn marks_this_item(body: Option<&str>, sequence_id: i64, item_id: &str) -> bool {
     marks_item(body, sequence_id) && tag_allows(body, item_id)
 }
 
-/// True if `body` carries agentflare's own `for item #<N> via agentflare.`
-/// stamp `pr_footer` puts on every PR it opens -- for *any* item, unlike
-/// `marks_item` which checks one specific `sequence_id`. `discover_untracked_prs`
+/// True if `body` carries agentflare's own stamp -- for *any* item, unlike
+/// `marks_item` which checks one specific `sequence_id`. Either the hidden
+/// origin stamp (item #347 phase 2) or the legacy `for item #<N> via
+/// agentflare.` footer counts, so PRs opened by older instances keep working
+/// while old and new instances coexist during rollout.
+/// `discover_untracked_prs`
 /// uses this: each workstation keeps its own local, unsynced item database
 /// (see that function's doc comment), so a PR another workstation's
 /// `push_and_open_pr` just opened for its own item is invisible to this
@@ -180,7 +284,8 @@ pub fn marks_this_item(body: Option<&str>, sequence_id: i64, item_id: &str) -> b
 /// PR's actual opener, and `beacon:flared:c997d745ae66`, from a second
 /// workstation's discovery sweep 23 seconds later).
 pub fn opened_by_agentflare(body: Option<&str>) -> bool {
-    body.is_some_and(|b| b.contains("for item #") && b.contains(" via agentflare."))
+    origin_of(body).is_some()
+        || body.is_some_and(|b| b.contains("for item #") && b.contains(" via agentflare."))
 }
 
 /// Finds every PR (open, merged, or closed) whose body carries the
@@ -203,6 +308,11 @@ pub fn opened_by_agentflare(body: Option<&str>) -> bool {
 /// locally afterward for the literal fixed suffix `pr_footer` always
 /// stamps -- `for item #N via agentflare.` -- before it counts as a real
 /// duplicate.
+///
+/// A candidate carrying a *foreign* origin stamp is dropped even when the
+/// marker and tag both match: sequence numbers are per instance, so another
+/// workstation's same-numbered PR is never this item's duplicate (item #347
+/// phase 2). Unstamped candidates keep today's behavior.
 pub fn find_by_item_marker(
     client: &Client,
     repo: &RepoId,
@@ -224,6 +334,7 @@ pub fn find_by_item_marker(
         .filter_map(|item| item["number"].as_u64())
         .collect();
     let marker = format!("for item #{sequence_id} via agentflare.");
+    let self_instance = self_instance();
     let prs: Vec<PullRequest> = numbers
         .into_iter()
         .map(|n| get(client, repo, n))
@@ -233,6 +344,7 @@ pub fn find_by_item_marker(
         .filter(|pr| {
             pr.body.as_deref().is_some_and(|b| b.contains(&marker))
                 && tag_allows(pr.body.as_deref(), item_id)
+                && origin_allows(pr.body.as_deref(), &self_instance)
         })
         .collect())
 }
@@ -574,6 +686,38 @@ mod tests {
         assert_eq!(prs.iter().map(|p| p.number).collect::<Vec<_>>(), vec![637]);
     }
 
+    /// Item #347 phase 2: two instances share sequence numbers, so a foreign
+    /// workstation's same-numbered PR (marker and all) must not come back as
+    /// this item's duplicate even when its item-UUID tag doesn't contradict
+    /// (e.g. an untagged legacy-shaped body with only a foreign origin
+    /// stamp).
+    #[test]
+    fn find_by_item_marker_drops_a_pr_stamped_by_a_foreign_instance() {
+        let me = self_instance();
+        let foreign = format!("{me}-other-instance");
+        let footer = |instance: &str| {
+            format!(
+                "_Opened by `a` on **m** for item #198 via agentflare._\n{}",
+                origin_tag(instance, "gateway-item-uuid", 198, "task/198-x")
+            )
+        };
+        let pr_json = |number: u64, body: &str| {
+            serde_json::json!({
+                "number": number, "html_url": "u", "state": "open", "title": "t",
+                "body": body
+            })
+            .to_string()
+        };
+        let server = MockServer::start(vec![
+            MockResponse::json(200, r#"{"items":[{"number":636},{"number":637}]}"#),
+            MockResponse::json(200, &pr_json(636, &footer(&foreign))),
+            MockResponse::json(200, &pr_json(637, &footer(&me))),
+        ]);
+        let client = server.client(None);
+        let prs = find_by_item_marker(&client, &repo(), 198, "gateway-item-uuid").unwrap();
+        assert_eq!(prs.iter().map(|p| p.number).collect::<Vec<_>>(), vec![637]);
+    }
+
     /// Every tag occurrence counts: a matching tag followed by a conflicting or
     /// malformed one is an ambiguous identity, not a match.
     #[test]
@@ -610,6 +754,109 @@ mod tests {
     #[test]
     fn opened_by_agentflare_false_for_a_hand_opened_pr() {
         assert!(!opened_by_agentflare(Some("just a regular PR description")));
+    }
+
+    #[test]
+    fn origin_tag_round_trips_through_origin_of() {
+        let tag = origin_tag("flared:51bb8de6c33b", "item-uuid-1", 259, "task/259-slug");
+        let origin = origin_of(Some(&tag)).unwrap();
+        assert_eq!(
+            origin,
+            Origin {
+                instance: "flared:51bb8de6c33b".into(),
+                item: "item-uuid-1".into(),
+                seq: 259,
+                branch: "task/259-slug".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn origin_of_finds_the_stamp_inside_a_full_pr_body() {
+        let body = format!(
+            "Did the thing.\n\n---\n_Opened by `a` on **m** for item #259 via agentflare._\n{}\n{}",
+            item_id_tag("item-uuid-1"),
+            origin_tag("flared:abc", "item-uuid-1", 259, "task/259-x"),
+        );
+        let origin = origin_of(Some(&body)).unwrap();
+        assert_eq!(origin.instance, "flared:abc");
+        assert_eq!(origin.seq, 259);
+        assert_eq!(origin.branch, "task/259-x");
+    }
+
+    #[test]
+    fn origin_of_returns_none_for_legacy_only_and_hand_opened_bodies() {
+        assert!(
+            origin_of(Some(
+                "---\n_Opened by `a` on **m** for item #259 via agentflare._"
+            ))
+            .is_none()
+        );
+        assert!(origin_of(Some("just a regular PR description")).is_none());
+        assert!(origin_of(None).is_none());
+    }
+
+    #[test]
+    fn origin_of_returns_none_for_malformed_stamps() {
+        // No closing delimiter.
+        assert!(
+            origin_of(Some(
+                "<!-- agentflare-origin: v=1 instance=a item=b seq=1 branch=c"
+            ))
+            .is_none()
+        );
+        // Wrong version.
+        assert!(
+            origin_of(Some(
+                "<!-- agentflare-origin: v=2 instance=a item=b seq=1 branch=c -->"
+            ))
+            .is_none()
+        );
+        // Missing field.
+        assert!(
+            origin_of(Some(
+                "<!-- agentflare-origin: v=1 instance=a item=b seq=1 -->"
+            ))
+            .is_none()
+        );
+        // Non-numeric seq.
+        assert!(
+            origin_of(Some(
+                "<!-- agentflare-origin: v=1 instance=a item=b seq=abc branch=c -->"
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn opened_by_agentflare_true_for_an_origin_stamp_without_any_legacy_marker() {
+        let body = origin_tag("flared:abc", "item-uuid-1", 259, "task/259-x");
+        assert!(opened_by_agentflare(Some(&body)));
+    }
+
+    #[test]
+    fn marks_item_false_for_a_foreign_stamped_body_with_a_matching_marker() {
+        let me = self_instance();
+        let foreign = format!("{me}-other-instance");
+        let body = format!(
+            "---\n_Opened by `a` on **m** for item #259 via agentflare._\n{}",
+            origin_tag(&foreign, "some-other-uuid", 259, "task/259-x"),
+        );
+        assert_ne!(foreign, me);
+        assert!(opened_by_agentflare(Some(&body)));
+        assert!(!marks_item(Some(&body), 259));
+        assert!(!marks_this_item(Some(&body), 259, "some-other-uuid"));
+    }
+
+    #[test]
+    fn marks_item_true_for_an_own_stamped_body() {
+        let me = self_instance();
+        let body = format!(
+            "---\n_Opened by `a` on **m** for item #259 via agentflare._\n{}",
+            origin_tag(&me, "my-uuid", 259, "task/259-x"),
+        );
+        assert!(marks_item(Some(&body), 259));
+        assert!(!marks_item(Some(&body), 260));
     }
 
     #[test]
