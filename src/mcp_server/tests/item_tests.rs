@@ -623,6 +623,12 @@ fn submit_plan_cannot_downgrade_a_stored_human_approver() {
 /// The other half of Fix 1: the channel-only route (a human's Telegram tap,
 /// routed by `supervisor::handle_telegram_callback`) is the ONE way the same
 /// item does get approved.
+///
+/// Item #300 / live #281 follow-up: CLI `approve-plan` and the daemon's
+/// Telegram tap both build an `AgentflareMcp` with `agent: None` (no
+/// `AGENTFLARE_AGENT` for a human). Writing `serde_json::json!(None)`
+/// stored `plan_approved_by: null`, so the audit field looked unset even
+/// though `plan_status`/`plan_approved_at` were set.
 #[test]
 fn channel_approve_plan_succeeds_for_a_human_approver_item() {
     let (tmp, s) = harness();
@@ -643,6 +649,15 @@ fn channel_approve_plan_succeeds_for_a_human_approver_item() {
     let item = agentflare_backend::item::get(&conn, &item_id).unwrap();
     let metadata: serde_json::Value = serde_json::from_str(&item.metadata).unwrap();
     assert_eq!(metadata["plan_status"], "approved");
+    assert!(
+        metadata["plan_approved_at"].as_i64().is_some(),
+        "channel approve must record plan_approved_at: {metadata}"
+    );
+    assert_eq!(
+        metadata["plan_approved_by"].as_str(),
+        Some("human"),
+        "channel approve with no MCP agent identity must still record a non-null plan_approved_by (item #300): {metadata}"
+    );
 }
 
 /// Live incident, item #281: a human approved a plan, the supervisor
@@ -690,12 +705,13 @@ fn update_with_unrelated_metadata_does_not_erase_an_existing_approval() {
         metadata["plan_status"], "approved",
         "an unrelated metadata write must not revert the approval: {metadata}"
     );
-    assert!(
-        metadata.get("plan_approved_by").is_some(),
-        "plan_approved_by must survive an unrelated metadata write: {metadata}"
+    assert_eq!(
+        metadata["plan_approved_by"].as_str(),
+        Some("human"),
+        "plan_approved_by must survive an unrelated metadata write as a non-null string: {metadata}"
     );
     assert!(
-        metadata.get("plan_approved_at").is_some(),
+        metadata["plan_approved_at"].as_i64().is_some(),
         "plan_approved_at must survive an unrelated metadata write: {metadata}"
     );
     assert_eq!(metadata["workflow_run_id"], "01a0b3ad-test-run");
