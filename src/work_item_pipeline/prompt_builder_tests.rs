@@ -40,7 +40,6 @@ fn implementer_prompt_omits_tdd_instructions_by_default() {
 }
 
 #[test]
-#[test]
 fn implementer_prompt_includes_ci_alignment_when_verify_against_ci_set() {
     let prompt = build_implementer_prompt(&sample_task(), None, false, true);
     assert!(prompt.contains("cargo fmt --check"));
@@ -55,6 +54,7 @@ fn task_reviewer_prompt_requires_ci_evidence_when_verify_against_ci_set() {
     assert!(prompt.contains("gh pr checks"));
 }
 
+#[test]
 fn implementer_prompt_forbids_backgrounding_verification() {
     // Item #71/#438: a headless-dispatched agent ran `cargo build` as a
     // background task and ended its turn saying it would report back once

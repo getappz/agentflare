@@ -782,12 +782,12 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn is_verification_command_matches_cargo_fmt_and_gh_pr_checks() {
         assert!(is_verification_command("cargo fmt --check"));
         assert!(is_verification_command("gh pr checks 800"));
     }
 
+    #[test]
     fn is_verification_command_matches_common_test_build_lint_invocations() {
         assert!(is_verification_command("cargo test --lib"));
         assert!(is_verification_command("npm test"));
