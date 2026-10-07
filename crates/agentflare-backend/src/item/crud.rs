@@ -363,7 +363,11 @@ pub fn update(conn: &Connection, id: &str, input: UpdateItem) -> Result<Item> {
         param_values.push(Box::new(so));
     }
     if let Some(ref metadata) = input.metadata {
-        param_values.push(Box::new(metadata.clone()));
+        let current = get(conn, id)?;
+        param_values.push(Box::new(super::plan_gate::preserve_plan_approval(
+            metadata,
+            &current.metadata,
+        )));
     }
     if let Some(ref parent_id) = input.parent_id {
         param_values.push(Box::new(parent_id.clone()));
