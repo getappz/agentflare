@@ -787,7 +787,10 @@ mod tests {
     #[test]
     fn origin_of_returns_none_for_legacy_only_and_hand_opened_bodies() {
         assert!(
-            origin_of(Some("---\n_Opened by `a` on **m** for item #259 via agentflare._")).is_none()
+            origin_of(Some(
+                "---\n_Opened by `a` on **m** for item #259 via agentflare._"
+            ))
+            .is_none()
         );
         assert!(origin_of(Some("just a regular PR description")).is_none());
         assert!(origin_of(None).is_none());
@@ -796,20 +799,32 @@ mod tests {
     #[test]
     fn origin_of_returns_none_for_malformed_stamps() {
         // No closing delimiter.
-        assert!(origin_of(Some("<!-- agentflare-origin: v=1 instance=a item=b seq=1 branch=c")).is_none());
+        assert!(
+            origin_of(Some(
+                "<!-- agentflare-origin: v=1 instance=a item=b seq=1 branch=c"
+            ))
+            .is_none()
+        );
         // Wrong version.
         assert!(
-            origin_of(Some("<!-- agentflare-origin: v=2 instance=a item=b seq=1 branch=c -->"))
-                .is_none()
+            origin_of(Some(
+                "<!-- agentflare-origin: v=2 instance=a item=b seq=1 branch=c -->"
+            ))
+            .is_none()
         );
         // Missing field.
         assert!(
-            origin_of(Some("<!-- agentflare-origin: v=1 instance=a item=b seq=1 -->")).is_none()
+            origin_of(Some(
+                "<!-- agentflare-origin: v=1 instance=a item=b seq=1 -->"
+            ))
+            .is_none()
         );
         // Non-numeric seq.
         assert!(
-            origin_of(Some("<!-- agentflare-origin: v=1 instance=a item=b seq=abc branch=c -->"))
-                .is_none()
+            origin_of(Some(
+                "<!-- agentflare-origin: v=1 instance=a item=b seq=abc branch=c -->"
+            ))
+            .is_none()
         );
     }
 
