@@ -1107,39 +1107,24 @@ fn persist_repair_track(
     silent_bump: bool,
     completed: Option<&str>,
 ) {
-    let Ok(raw) = mcp.item_get(ItemRequest {
-        action: "get".into(),
-        id: Some(item_id.to_string()),
-        ..Default::default()
-    }) else {
-        return;
-    };
-    let Ok(item) = serde_json::from_str::<agentflare_backend::item::Item>(&raw) else {
-        return;
-    };
-    let mut merged = serde_json::from_str::<serde_json::Value>(&item.metadata)
-        .ok()
-        .and_then(|v| v.as_object().cloned())
-        .map(serde_json::Value::Object)
-        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
-    if let Some(fp) = announced {
-        merged[announced_key] = serde_json::Value::String(fp.to_string());
-    }
-    if silent_bump {
-        let current = merged
-            .get(silent_key)
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        merged[silent_key] = serde_json::Value::from(current + 1);
-    }
-    if let Some(fp) = completed {
-        merged[completed_key] = serde_json::Value::String(fp.to_string());
-    }
-    let _ = mcp.item_update(ItemRequest {
-        action: "update".into(),
-        id: Some(item_id.to_string()),
-        metadata: Some(merged),
-        ..Default::default()
+    let _ = mcp.with_backend_db(|conn| {
+        let id = mcp.resolve_item_id(conn, item_id)?;
+        crate::mcp_server::merge_item_metadata(conn, &id, |merged| {
+            if let Some(fp) = announced {
+                merged.insert(announced_key.into(), serde_json::Value::String(fp.into()));
+            }
+            if silent_bump {
+                let current = merged
+                    .get(silent_key)
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                merged.insert(silent_key.into(), serde_json::Value::from(current + 1));
+            }
+            if let Some(fp) = completed {
+                merged.insert(completed_key.into(), serde_json::Value::String(fp.into()));
+            }
+        })
+        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))
     });
 }
 

@@ -47,22 +47,11 @@ pub fn save_goal_metadata(
     goal_item_id: &str,
     goal: &GoalMetadata,
 ) -> Result<(), String> {
-    let item = agentflare_backend::item::get(conn, goal_item_id)
-        .map_err(|e| format!("cannot load goal item {goal_item_id}: {e}"))?;
-    let mut value: serde_json::Value =
-        serde_json::from_str(&item.metadata).unwrap_or_else(|_| serde_json::json!({}));
-    value["goal"] =
+    let goal =
         serde_json::to_value(goal).map_err(|e| format!("goal metadata does not serialize: {e}"))?;
-    let updated =
-        serde_json::to_string(&value).map_err(|e| format!("metadata does not serialize: {e}"))?;
-    agentflare_backend::item::update(
-        conn,
-        goal_item_id,
-        agentflare_backend::item::UpdateItem {
-            metadata: Some(updated),
-            ..Default::default()
-        },
-    )
+    crate::mcp_server::merge_item_metadata(conn, goal_item_id, |metadata| {
+        metadata.insert("goal".into(), goal);
+    })
     .map_err(|e| format!("cannot save goal metadata on {goal_item_id}: {e}"))?;
     Ok(())
 }

@@ -1101,26 +1101,15 @@ include!("work_item_pipeline/adopt_dispatch.rs");
 /// `poll_pending_corrections`: a failure here just means the next fresh
 /// dispatch reseeds from "now" again, same as before this fix.
 fn persist_comment_cursor(mcp: &AgentflareMcp, item_id: &str, cursor: i64) {
-    let Ok(raw) = mcp.item_get(ItemRequest {
-        action: "get".into(),
-        id: Some(item_id.to_string()),
-        ..Default::default()
-    }) else {
-        return;
-    };
-    let Ok(item) = serde_json::from_str::<agentflare_backend::item::Item>(&raw) else {
-        return;
-    };
-    let mut merged = crate::mcp_server::metadata_object(&item.metadata);
-    merged.insert(
-        "last_seen_comment_at".into(),
-        serde_json::Value::from(cursor),
-    );
-    let _ = mcp.item_update(ItemRequest {
-        action: "update".into(),
-        id: Some(item_id.to_string()),
-        metadata: Some(serde_json::Value::Object(merged)),
-        ..Default::default()
+    let _ = mcp.with_backend_db(|conn| {
+        let id = mcp.resolve_item_id(conn, item_id)?;
+        crate::mcp_server::merge_item_metadata(conn, &id, |metadata| {
+            metadata.insert(
+                "last_seen_comment_at".into(),
+                serde_json::Value::from(cursor),
+            );
+        })
+        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))
     });
 }
 
