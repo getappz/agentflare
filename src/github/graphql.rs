@@ -123,6 +123,19 @@ pub(crate) fn graphql_error(client: &Client, errors: &serde_json::Value) -> GitH
 /// Callers with more than `GRAPHQL_PR_BATCH_SIZE` numbers must chunk first --
 /// this function does not, so its own cost stays predictable and testable
 /// per call.
+/// Merge-queue flags for a single PR -- used by the REST `pr_ci_status_impl`
+/// fallback so merge-queue bases are not misread as missing CI.
+pub(crate) fn merge_queue_flags_for_pr(
+    client: &Client,
+    repo: &RepoId,
+    number: u64,
+) -> (bool, bool) {
+    batch_pr_status_chunked(client, repo, &[number])
+        .get(&number)
+        .map(|data| (data.merge_queue_enabled, data.in_merge_queue))
+        .unwrap_or((false, false))
+}
+
 pub fn batch_pr_status(
     client: &Client,
     repo: &RepoId,

@@ -5,7 +5,10 @@
 //! branch is pushed (depends on `src/github`, a GitHub-REST concern kept
 //! out of flare-git-core on purpose).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::github::identity::RepoId;
 use crate::progress::ProgressSender;
@@ -342,6 +345,12 @@ pub enum PrCiStatus {
         number: u64,
         head_sha: Option<String>,
     },
+    /// GitHub still requires checks, but none of their contexts exist yet.
+    /// The sweep checks Actions by head SHA before deciding whether to retry.
+    MissingCi {
+        number: u64,
+        head_sha: Option<String>,
+    },
     /// CI is green. Carries the PR number and its GitHub label names so
     /// `run_review_sweep` can decide whether to auto-merge without a second
     /// API round-trip just to re-fetch labels, plus the head commit the
@@ -436,7 +445,35 @@ pub fn pr_ci_status(item: &agentflare_backend::item::Item, repo_root: &Path) -> 
         Ok(c) => c,
         Err(_) => return PrCiStatus::Unknown,
     };
-    pr_ci_status_impl(item, repo_root, &client, &repo)
+    pending_if_ci_running(
+        pr_ci_status_impl(item, repo_root, &client, &repo),
+        &client,
+        &repo,
+    )
+}
+
+/// A missing check context can mean that Actions has queued the run but has
+/// not created its check runs yet. Keep that head pending until the run ends.
+/// A lookup error is also pending: it is not evidence that CI is absent.
+pub(crate) fn pending_if_ci_running(
+    status: PrCiStatus,
+    client: &crate::github::Client,
+    repo: &RepoId,
+) -> PrCiStatus {
+    let PrCiStatus::MissingCi {
+        number,
+        head_sha: Some(ref sha),
+    } = status
+    else {
+        return status;
+    };
+    match crate::github::actions::ci_runs_for_head(client, repo, sha) {
+        Ok(runs) if runs.iter().all(|run| run.status == "completed") => status,
+        _ => PrCiStatus::Pending {
+            number,
+            head_sha: Some(sha.clone()),
+        },
+    }
 }
 
 fn pr_ci_status_impl(
@@ -529,6 +566,8 @@ fn pr_ci_status_impl(
             return PrCiStatus::Unknown;
         }
     };
+    let (merge_queue_enabled, in_merge_queue) =
+        crate::github::graphql::merge_queue_flags_for_pr(client, repo, pr.number);
     decide_from_checks(
         pr.number,
         &checks,
@@ -545,12 +584,10 @@ fn pr_ci_status_impl(
                 node_id: pr.node_id.clone(),
                 enabled: pr.auto_merge.is_some(),
                 base_ref: pr.base.as_ref().map(|b| b.git_ref.clone()),
-                merge_queue: false,
+                merge_queue: merge_queue_enabled,
             },
-            // REST doesn't say; a merge-queue repo's PR stays `Pending`
-            // on this path, as it did before.
-            merge_queue_enabled: false,
-            in_merge_queue: false,
+            merge_queue_enabled,
+            in_merge_queue,
         },
     )
 }
@@ -608,6 +645,10 @@ fn decide_from_checks(
         number,
         head_sha: signals.head_sha.map(str::to_string),
     };
+    let missing_ci = || PrCiStatus::MissingCi {
+        number,
+        head_sha: signals.head_sha.map(str::to_string),
+    };
     let awaiting_review = signals.mergeable_state == Some("blocked")
         && matches!(
             signals.review_decision,
@@ -640,6 +681,12 @@ fn decide_from_checks(
                     labels,
                 };
             }
+            Some("PENDING") | Some("EXPECTED")
+                if matches!(signals.mergeable_state, Some("blocked") | Some("unknown"))
+                    && !signals.in_merge_queue =>
+            {
+                return missing_ci();
+            }
             Some("PENDING") | Some("EXPECTED") => return pending(),
             _ => {}
         }
@@ -650,6 +697,15 @@ fn decide_from_checks(
             if awaiting_review {
                 return awaiting(labels);
             }
+            if signals.merge_queue_enabled && signals.mergeable_state == Some("blocked") {
+                return passing(labels);
+            }
+        }
+        if !awaiting_review
+            && matches!(signals.mergeable_state, Some("blocked") | Some("unknown"))
+            && !signals.in_merge_queue
+        {
+            return missing_ci();
         }
         return pending();
     }
@@ -678,19 +734,16 @@ fn decide_from_checks(
     if awaiting_review {
         return awaiting(labels);
     }
-    // The check-run list above only reflects what GitHub has created so far --
-    // gated jobs (e.g. a `build` matrix behind a `changes` job) may not exist
-    // yet even though every check-run seen so far is green, which would
-    // otherwise read as "0 pending, 0 failed" and report Passing well before
-    // the PR is actually mergeable. GitHub's own `mergeable_state` already
-    // accounts for the full required-checks list, so "blocked" here means
-    // more is still outstanding -- treat it as still-pending rather than
-    // trusting the incomplete snapshot. Item #587: the original fix only
-    // special-cased "blocked" and the ping still fired early, because right
-    // after a push GitHub reports "unknown" (it hasn't finished computing
-    // mergeability at all yet) before it ever settles into "blocked" --
-    // that's the exact same incomplete-snapshot window, just caught one tick
-    // earlier, so it gets the same treatment.
+    // The check-run list above only reflects what GitHub has created so far.
+    // When branch protection marks contexts required, only those contexts are
+    // in `relevant`; if every one of them is green but GitHub still says
+    // "blocked", a gated job may not have created its check run yet --
+    // retry missing CI only when no optional context is present (every listed
+    // context is required), which means the block is likely absent required
+    // checks rather than conversation resolution or other non-CI gates.
+    // Item #721 round 2: when any optional context is on the head commit,
+    // "blocked" with green checks is not missing CI -- an empty commit cannot
+    // fix it, so stay Pending.
     if matches!(signals.mergeable_state, Some("blocked") | Some("unknown")) {
         // A base branch with a merge queue never reports "clean": a direct
         // merge is refused there by design, and the PR reads "blocked"
@@ -702,7 +755,10 @@ fn decide_from_checks(
         if signals.merge_queue_enabled && signals.mergeable_state == Some("blocked") {
             return passing(labels);
         }
-        return pending();
+        if checks.iter().any(|c| !c.required) {
+            return pending();
+        }
+        return missing_ci();
     }
     passing(labels)
 }
@@ -760,6 +816,156 @@ pub(crate) fn pr_ci_status_from_batch(
             in_merge_queue: data.in_merge_queue,
         },
     )
+}
+
+/// Push an empty commit when CI never produced the required contexts for this
+/// exact head. GitHub rejects the non-forced ref update if another push won.
+/// Whether this item may drive a missing-CI recovery push for `number` -- the
+/// same `is_own_pr` gate `push_and_open_pr` uses, and metadata mismatch guard
+/// for legacy items that recorded the wrong PR number.
+pub(crate) fn item_may_retry_missing_ci(
+    item: &agentflare_backend::item::Item,
+    repo_root: &Path,
+    number: u64,
+) -> bool {
+    if pr_number_from_metadata(item).is_some_and(|n| n != number) {
+        return false;
+    }
+    let Some(repo) = RepoId::resolve_from_remote(repo_root) else {
+        return false;
+    };
+    let Ok(client) = crate::github::Client::new() else {
+        return false;
+    };
+    match crate::github::pulls::get(&client, &repo, number) {
+        Ok(pr) => is_own_pr(&pr, item),
+        Err(_) => false,
+    }
+}
+
+pub(crate) fn retry_missing_ci(repo_root: &Path, number: u64, head_sha: &str) -> bool {
+    let Some(repo) = RepoId::resolve_from_remote(repo_root) else {
+        return false;
+    };
+    let Ok(client) = crate::github::Client::new() else {
+        return false;
+    };
+    static FIRST_MISSING: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    static MISSING_CI_RETRIES: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
+    let result = retry_missing_ci_with_client(
+        &client,
+        &repo,
+        number,
+        head_sha,
+        FIRST_MISSING.get_or_init(|| Mutex::new(HashMap::new())),
+        MISSING_CI_RETRIES.get_or_init(|| Mutex::new(HashMap::new())),
+    );
+    match result {
+        Ok(pushed) => pushed,
+        Err(e) => {
+            eprintln!(
+                "worktree: could not retry missing CI for PR #{number}: {}",
+                e.log_safe()
+            );
+            false
+        }
+    }
+}
+
+pub(crate) const MISSING_CI_RETRY_BUDGET: u32 = 1;
+
+pub(crate) fn retry_missing_ci_with_client(
+    client: &crate::github::Client,
+    repo: &RepoId,
+    number: u64,
+    head_sha: &str,
+    first_missing: &Mutex<HashMap<String, Instant>>,
+    retries: &Mutex<HashMap<String, u32>>,
+) -> Result<bool, crate::github::GitHubError> {
+    let pr_key = format!("{repo}#{number}");
+    {
+        let budget = retries.lock().unwrap_or_else(|e| e.into_inner());
+        if budget.get(&pr_key).copied().unwrap_or(0) >= MISSING_CI_RETRY_BUDGET {
+            return Ok(false);
+        }
+    }
+    let runs = crate::github::actions::ci_runs_for_head(client, repo, head_sha)?;
+    let due = {
+        let mut seen = first_missing.lock().unwrap_or_else(|e| e.into_inner());
+        if runs.iter().any(|run| run.status != "completed") {
+            seen.remove(&pr_key);
+            false
+        } else {
+            let now = Instant::now();
+            let first = seen.entry(pr_key.clone()).or_insert(now);
+            now.duration_since(*first) >= Duration::from_secs(120)
+        }
+    };
+    if !due {
+        return Ok(false);
+    }
+    let result = (|| -> Result<bool, crate::github::GitHubError> {
+        let commit_path = format!("/repos/{}/{}/git/commits/{head_sha}", repo.owner, repo.repo);
+        let old = client.request("GET", &commit_path, None)?;
+        let pr = crate::github::pulls::get(client, repo, number)?;
+        let Some(head) = pr.head else {
+            return Ok(false);
+        };
+        if head.sha != head_sha
+            || head
+                .repo
+                .as_ref()
+                .is_none_or(|r| r.full_name != repo.to_string())
+        {
+            return Ok(false);
+        }
+        let ref_path = format!(
+            "/repos/{}/{}/git/ref/heads/{}",
+            repo.owner,
+            repo.repo,
+            crate::github::encode_query(&head.git_ref)
+        );
+        let reference = client.request("GET", &ref_path, None)?;
+        if reference["object"]["sha"].as_str() != Some(head_sha) {
+            return Ok(false);
+        }
+        let Some(tree) = old["tree"]["sha"].as_str() else {
+            return Ok(false);
+        };
+        let created = client.request(
+            "POST",
+            &format!("/repos/{}/{}/git/commits", repo.owner, repo.repo),
+            Some(serde_json::json!({
+                "message": "chore: retrigger missing CI checks",
+                "tree": tree,
+                "parents": [head_sha],
+            })),
+        )?;
+        let Some(new_sha) = created["sha"].as_str() else {
+            return Ok(false);
+        };
+        client.request(
+            "PATCH",
+            &format!(
+                "/repos/{}/{}/git/refs/heads/{}",
+                repo.owner,
+                repo.repo,
+                crate::github::encode_query(&head.git_ref)
+            ),
+            Some(serde_json::json!({"sha": new_sha, "force": false})),
+        )?;
+        Ok(true)
+    })();
+    if matches!(result, Ok(true)) {
+        first_missing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&pr_key);
+        let mut budget = retries.lock().unwrap_or_else(|e| e.into_inner());
+        let count = budget.get(&pr_key).copied().unwrap_or(0);
+        budget.insert(pr_key, count + 1);
+    }
+    result
 }
 
 /// Brings a cleanly-behind PR's branch up to date with the base branch via
