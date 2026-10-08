@@ -133,6 +133,20 @@ pub(crate) fn merge_queue_flags_for_pr(
         .map(|data| (data.merge_queue_enabled, data.in_merge_queue))
 }
 
+/// True when every error is a `NOT_FOUND` for a `repository.pr<N>` alias --
+/// the partial-failure shape for a PR number that doesn't exist, with the rest
+/// of `data` still valid. Any other error (rate limit, bad query) is not.
+fn only_missing_pr_errors(errors: &serde_json::Value) -> bool {
+    errors.as_array().is_some_and(|errs| {
+        !errs.is_empty()
+            && errs.iter().all(|e| {
+                e["type"] == "NOT_FOUND"
+                    && e["path"][0] == "repository"
+                    && e["path"][1].as_str().is_some_and(|a| a.starts_with("pr"))
+            })
+    })
+}
+
 /// Fetches `BatchPrData` for every PR in `numbers` in one GraphQL request.
 /// Callers with more than `GRAPHQL_PR_BATCH_SIZE` numbers must chunk first --
 /// this function does not, so its own cost stays predictable and testable
@@ -155,7 +169,9 @@ pub fn batch_pr_status(
         "variables": { "owner": repo.owner, "repo": repo.repo }
     });
     let json = client.graphql(body)?;
-    if let Some(errors) = json.get("errors") {
+    if let Some(errors) = json.get("errors")
+        && !only_missing_pr_errors(errors)
+    {
         return Err(graphql_error(client, errors));
     }
     let Some(repository) = json.get("data").and_then(|d| d.get("repository")) else {
@@ -167,7 +183,10 @@ pub fn batch_pr_status(
         // A null/missing alias means GitHub couldn't resolve that PR number
         // (deleted, or a repo mismatch) -- left out of the map so the caller
         // treats it the same as any other "couldn't determine status" case
-        // rather than as a parse error for the whole batch.
+        // rather than as a parse error for the whole batch. GitHub reports
+        // such a number as a null alias *plus* a NOT_FOUND error, which
+        // `only_missing_pr_errors` lets through so one stale number can't
+        // blind the sweep to every other PR in the chunk.
         match repository.get(pr_alias(*number)) {
             Some(node) if !node.is_null() => {
                 out.insert(*number, parse_batch_pr(node));
@@ -361,6 +380,33 @@ mod tests {
         let client = server.client(Some("tok"));
         let out = batch_pr_status(&client, &repo(), &[]).unwrap();
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn batch_pr_status_survives_not_found_for_one_number() {
+        let server = MockServer::start(vec![MockResponse::json(
+            200,
+            r#"{"data":{"repository":{
+                "pr1":null,
+                "pr422":{"merged":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","labels":{"nodes":[]},"commits":{"nodes":[]}}
+            }},"errors":[{"type":"NOT_FOUND","path":["repository","pr1"],"message":"Could not resolve to a PullRequest with the number of 1."}]}"#,
+        )]);
+        let client = server.client(Some("tok"));
+        let out = batch_pr_status(&client, &repo(), &[1, 422]).unwrap();
+        assert!(!out.contains_key(&1));
+        assert_eq!(out[&422].mergeable_state.as_deref(), Some("clean"));
+    }
+
+    #[test]
+    fn batch_pr_status_still_fails_on_other_graphql_errors() {
+        let server = MockServer::start(vec![MockResponse::json(
+            200,
+            r#"{"data":{"repository":{"pr1":null}},"errors":[
+                {"type":"NOT_FOUND","path":["repository","pr1"],"message":"x"},
+                {"type":"FORBIDDEN","path":["repository","pr2"],"message":"y"}]}"#,
+        )]);
+        let client = server.client(Some("tok"));
+        assert!(batch_pr_status(&client, &repo(), &[1, 2]).is_err());
     }
 
     #[test]
