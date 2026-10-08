@@ -106,8 +106,13 @@ pub fn doctor_line(repo_root: &std::path::Path) -> Option<String> {
     if foreign.is_empty() {
         return None;
     }
-    let list: Vec<String> = foreign.iter().map(|(n, i)| format!("#{n} ({i})")).collect();
-    Some(format!("other-instance PRs: {}", list.join(", ")))
+    // PR numbers only: the instance ids come from the same client-fetched data
+    // as the token-bearing request, and `pr owner <n>` shows who owns each.
+    let list: Vec<String> = foreign.iter().map(|(n, _)| format!("#{n}")).collect();
+    Some(format!(
+        "other-instance PRs: {} (see `agentflare pr owner <n>`)",
+        list.join(", ")
+    ))
 }
 
 pub fn takeover_comment(me: &str, pr_number: u64) -> String {
