@@ -5,6 +5,7 @@ use crate::error::Result;
 
 mod claim;
 mod crud;
+mod decompose;
 pub mod plan_format;
 pub mod plan_gate;
 mod relations;
@@ -14,6 +15,7 @@ mod tests;
 
 pub use claim::*;
 pub use crud::*;
+pub use decompose::*;
 pub use plan_gate::{PlanGateMeta, PlanGateStatus, default_policy as plan_default_policy};
 pub use relations::*;
 pub use search::*;
