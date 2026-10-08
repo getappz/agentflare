@@ -106,12 +106,12 @@ pub fn doctor_line(repo_root: &std::path::Path) -> Option<String> {
     if foreign.is_empty() {
         return None;
     }
-    // PR numbers only: the instance ids come from the same client-fetched data
-    // as the token-bearing request, and `pr owner <n>` shows who owns each.
-    let list: Vec<String> = foreign.iter().map(|(n, _)| format!("#{n}")).collect();
+    // Count only: the listed ids derive from the token-bearing client's data,
+    // which CodeQL flags as a cleartext secret when printed. `pr owner <n>`
+    // names the owner of a specific PR.
     Some(format!(
-        "other-instance PRs: {} (see `agentflare pr owner <n>`)",
-        list.join(", ")
+        "other-instance PRs: {} open (inspect with `agentflare pr owner <n>`)",
+        foreign.len()
     ))
 }
 
