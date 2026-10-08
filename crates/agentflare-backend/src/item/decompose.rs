@@ -46,6 +46,7 @@ pub fn decompose_plan(
 
     let mut ids: BTreeMap<usize, String> = BTreeMap::new();
     let (mut created, mut existing) = (0, 0);
+    let mut warnings = Vec::new();
     let mut pending: Vec<&PlanTask> = plan.tasks.iter().collect();
     while !pending.is_empty() {
         let (now, later): (Vec<&PlanTask>, Vec<&PlanTask>) = pending
@@ -61,6 +62,17 @@ pub fn decompose_plan(
                 existing += 1;
                 continue;
             }
+            // Existing dependents keep pointing at a deleted child's old id and
+            // are never rewritten, so they would wait on it forever. Say so.
+            if let Some(old) = find_deleted_child(conn, &source, &external_id)? {
+                let stranded = super::dependents_of(conn, &old)?.len();
+                if stranded > 0 {
+                    warnings.push(format!(
+                        "task {} was deleted and recreated; {stranded} existing child(ren) still depend on the deleted item {old} and will never unblock",
+                        task.no
+                    ));
+                }
+            }
             let item = create(
                 conn,
                 CreateItem {
@@ -75,7 +87,13 @@ pub fn decompose_plan(
                     external_source: Some(source.clone()),
                     external_id: Some(external_id),
                     metadata: Some(metadata_json(task)),
-                    label_ids: if task.depends_on.is_empty() {
+                    // Label now if every blocker is already completed (true for
+                    // roots too): the dependency cascade only fires when a
+                    // blocker completes, so it would never label this child.
+                    label_ids: if deps_completed(
+                        conn,
+                        task.depends_on.iter().map(|d| ids[d].as_str()),
+                    )? {
                         vec![ready.id.clone()]
                     } else {
                         vec![]
@@ -99,7 +117,6 @@ pub fn decompose_plan(
         )));
     }
 
-    let mut warnings = Vec::new();
     if epic.assignee_agent.is_none() {
         warnings.push(
             "epic has no assignee_agent: root children will not auto-dispatch until one is set"
@@ -130,13 +147,44 @@ pub fn close_epic_if_children_done(conn: &Connection, epic_id: &str) -> Result<b
         return Ok(false);
     }
     let epic = get(conn, epic_id)?;
-    let done = crate::state::first_in_group(conn, &epic.project_id, "completed")?;
-    if epic.state_id == done.id {
+    // Already finished (completed in any completed-group state, or cancelled):
+    // moving it to the first completed state would overwrite `completed_at`
+    // or turn a cancellation into a completion.
+    let group = crate::state::get(conn, &epic.state_id)?.group_name;
+    if matches!(group.as_str(), "completed" | "cancelled") {
         return Ok(false);
     }
+    let done = crate::state::first_in_group(conn, &epic.project_id, "completed")?;
     Ok(update_state(conn, epic_id, &done.id)?
         .completed_at
         .is_some())
+}
+
+/// True when every dependency is in the `completed` group (vacuously true for none).
+fn deps_completed<'a>(conn: &Connection, deps: impl Iterator<Item = &'a str>) -> Result<bool> {
+    for id in deps {
+        let item = get(conn, id)?;
+        if crate::state::get(conn, &item.state_id)?.group_name != "completed" {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn find_deleted_child(
+    conn: &Connection,
+    source: &str,
+    external_id: &str,
+) -> Result<Option<String>> {
+    match conn.query_row(
+        "SELECT id FROM items WHERE external_source = ?1 AND external_id = ?2 AND deleted_at IS NOT NULL ORDER BY deleted_at DESC LIMIT 1",
+        rusqlite::params![source, external_id],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(id) => Ok(Some(id)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 fn find_child(conn: &Connection, source: &str, external_id: &str) -> Result<Option<String>> {

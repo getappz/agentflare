@@ -208,3 +208,88 @@ fn an_epic_without_plan_children_is_never_closed() {
     let epic = make_epic(&conn, &pid, &sid, None);
     assert!(!close_epic_if_children_done(&conn, &epic.id).unwrap());
 }
+
+#[test]
+fn child_created_after_its_blockers_completed_is_labeled_ready() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let epic = make_epic(&conn, &pid, &sid, Some("claude-code"));
+    // An interrupted earlier run created task 1, and it has since completed,
+    // so the dependency cascade has already fired and will not fire again.
+    let done = crate::state::first_in_group(&conn, &pid, "completed").unwrap();
+    create(
+        &conn,
+        CreateItem {
+            project_id: pid.clone(),
+            state_id: done.id,
+            name: "Task 1: Schema".into(),
+            description: None,
+            priority: None,
+            parent_id: Some(epic.id.clone()),
+            assignee_agent: None,
+            sort_order: None,
+            external_source: Some(plan_source(&epic.id)),
+            external_id: Some("task-1".into()),
+            metadata: None,
+            label_ids: vec![],
+            assignee_ids: vec![],
+            dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
+        },
+    )
+    .unwrap();
+
+    decompose_plan(&conn, &epic.id, PLAN).unwrap();
+
+    let ready = crate::label::get_by_name(&conn, &pid, READY_LABEL).unwrap();
+    let names: Vec<String> = list_by_label(&conn, &pid, &ready.id)
+        .unwrap()
+        .into_iter()
+        .map(|i| i.name)
+        .collect();
+    // Task 2 depends only on the completed task 1; task 3 also waits on task 2.
+    assert_eq!(names, vec!["Task 2: Parser".to_string()]);
+}
+
+#[test]
+fn recreating_a_deleted_child_warns_about_stranded_dependents() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let epic = make_epic(&conn, &pid, &sid, Some("claude-code"));
+    decompose_plan(&conn, &epic.id, PLAN).unwrap();
+    let kids = children(&conn, &epic.id);
+    conn.execute(
+        "UPDATE items SET deleted_at = 1 WHERE id = ?1",
+        [&kids[0].id],
+    )
+    .unwrap();
+
+    let out = decompose_plan(&conn, &epic.id, PLAN).unwrap();
+    assert_eq!((out.created, out.existing), (1, 2));
+    assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+    assert!(
+        out.warnings[0].contains("deleted and recreated"),
+        "{:?}",
+        out.warnings
+    );
+}
+
+#[test]
+fn a_cancelled_epic_is_not_turned_into_a_completed_one() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let epic = make_epic(&conn, &pid, &sid, Some("claude-code"));
+    decompose_plan(&conn, &epic.id, PLAN).unwrap();
+    for kid in children(&conn, &epic.id) {
+        finish(&conn, &pid, &kid.id, "completed");
+    }
+    finish(&conn, &pid, &epic.id, "cancelled");
+
+    assert!(!close_epic_if_children_done(&conn, &epic.id).unwrap());
+    let after = get(&conn, &epic.id).unwrap();
+    let group = crate::state::get(&conn, &after.state_id)
+        .unwrap()
+        .group_name;
+    assert_eq!(group, "cancelled");
+}
