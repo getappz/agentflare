@@ -1542,6 +1542,11 @@ pub(crate) fn run_review_sweep(
                 Some(data) => crate::worktree::pr_ci_status_from_batch(number, data),
                 None => crate::worktree::PrCiStatus::Unknown,
             };
+            let status = if let (Some(repo), Ok(client)) = &resolved {
+                crate::worktree::pending_if_ci_running(status, client, repo)
+            } else {
+                status
+            };
             handle_pr_status(
                 mcp,
                 queue,
@@ -1754,6 +1759,23 @@ fn handle_pr_status(
         crate::worktree::PrCiStatus::Pending { number, head_sha } => {
             if let Some(head) = head_sha.as_deref() {
                 nudge_paused_review_for_pending(mcp, item, repo_root, number, head);
+            }
+            result.skipped += 1;
+        }
+        crate::worktree::PrCiStatus::MissingCi { number, head_sha } => {
+            if !crate::worktree::item_may_retry_missing_ci(item, repo_root, number) {
+                result.skipped += 1;
+                return;
+            }
+            if let Some(head) = head_sha.as_deref() {
+                nudge_paused_review_for_pending(mcp, item, repo_root, number, head);
+                if crate::worktree::retry_missing_ci(repo_root, number, head) {
+                    // A recovery push changes the judged head; an armed merge
+                    // must wait for the sweep to judge that new head again.
+                    disarm_our_auto_merge(mcp, item, repo_root, number, "required CI is missing");
+                    result.updated += 1;
+                    return;
+                }
             }
             result.skipped += 1;
         }

@@ -110,6 +110,10 @@ ALLOWLIST=(
   # Already 1660 lines before this branch; keep the full-repo LOC gate green
   # until workflow tests are split into a separate module.
   src/workflow.rs
+  # Both files were near LIMIT before item #698's missing-CI recovery.
+  # Keep this scoped fix separate from a worktree module/test split.
+  src/worktree/mod.rs
+  src/worktree/mod_tests.rs
 )
 
 cd "$(dirname "$0")/.."
