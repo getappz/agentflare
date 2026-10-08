@@ -279,10 +279,11 @@ pub fn run(agent: Option<&str>, json: bool) {
                  `agentflare init` or `agentflare config set machine-name <name>`"
             ),
         }
-        if let Some(line) = crate::github::pr_owner::doctor_line(
+        let foreign = crate::github::pr_owner::foreign_pr_count(
             &crate::mcp_server::AgentflareMcp::default().worktree_repo_root(),
-        ) {
-            println!("{line}");
+        );
+        if foreign > 0 {
+            println!("other-instance PRs: {foreign} open (inspect with `agentflare pr owner <n>`)");
         }
         println!();
         if healthy {

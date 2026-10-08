@@ -96,23 +96,20 @@ pub fn foreign_stamped(prs: &[crate::github::models::PullRequest], me: &str) -> 
         .collect()
 }
 
-/// Doctor line for PRs other instances own; `None` when GitHub isn't
-/// reachable (no remote or credentials) or nothing is foreign.
-pub fn doctor_line(repo_root: &std::path::Path) -> Option<String> {
-    let repo = crate::github::RepoId::resolve_from_remote(repo_root)?;
-    let client = crate::github::Client::new().ok()?;
-    let prs = crate::github::pulls::list(&client, &repo, "open").ok()?;
-    let foreign = foreign_stamped(&prs, &crate::github::bridge::config::stable_instance_id());
-    if foreign.is_empty() {
-        return None;
-    }
-    // Count only: the listed ids derive from the token-bearing client's data,
-    // which CodeQL flags as a cleartext secret when printed. `pr owner <n>`
-    // names the owner of a specific PR.
-    Some(format!(
-        "other-instance PRs: {} open (inspect with `agentflare pr owner <n>`)",
-        foreign.len()
-    ))
+/// Number of open PRs stamped by other instances; 0 when GitHub isn't
+/// reachable (no remote or credentials). Returns a count, not text, so no
+/// client-derived string reaches `doctor`'s output.
+pub fn foreign_pr_count(repo_root: &std::path::Path) -> usize {
+    let Some(repo) = crate::github::RepoId::resolve_from_remote(repo_root) else {
+        return 0;
+    };
+    let Ok(client) = crate::github::Client::new() else {
+        return 0;
+    };
+    let Ok(prs) = crate::github::pulls::list(&client, &repo, "open") else {
+        return 0;
+    };
+    foreign_stamped(&prs, &crate::github::bridge::config::stable_instance_id()).len()
 }
 
 pub fn takeover_comment(me: &str, pr_number: u64) -> String {
