@@ -1060,6 +1060,27 @@ fn pr_ci_status_rest_path_treats_merge_queue_blocked_as_passing_not_missing_ci()
 }
 
 #[test]
+fn pr_ci_status_rest_path_stays_pending_when_merge_queue_flags_are_unavailable() {
+    // Same checkless blocked PR, but GraphQL has no answer: unknown flags must
+    // not read as "no merge queue" (that would be MissingCi and a CI retry).
+    let server = crate::github::test_support::MockServer::start(vec![
+        crate::github::test_support::MockResponse::json(
+            200,
+            r#"{"number":702,"html_url":"u","state":"open","title":"t","mergeable":true,"mergeable_state":"blocked","head":{"ref":"b","sha":"abc123"}}"#,
+        ),
+        crate::github::test_support::MockResponse::json(200, r#"{"check_runs":[]}"#),
+        crate::github::test_support::MockResponse::json(200, r#"{"state":"pending","statuses":[]}"#),
+    ]);
+    let client = server.client(Some("tok"));
+    let repo = repo_id("o", "r");
+    let item = item_with_metadata(702, r#"{"pr":{"number":702,"branch":"b"}}"#);
+    assert!(matches!(
+        pr_ci_status_impl(&item, Path::new("/does/not/exist"), &client, &repo),
+        PrCiStatus::Pending { number: 702, .. }
+    ));
+}
+
+#[test]
 fn pr_ci_status_rest_path_also_reads_legacy_commit_statuses() {
     // Check runs are all green, but a Statuses-API context failed: the
     // REST fallback must see it too.

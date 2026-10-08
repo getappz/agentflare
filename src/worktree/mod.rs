@@ -566,30 +566,45 @@ fn pr_ci_status_impl(
             return PrCiStatus::Unknown;
         }
     };
-    let (merge_queue_enabled, in_merge_queue) =
-        crate::github::graphql::merge_queue_flags_for_pr(client, repo, pr.number);
-    decide_from_checks(
-        pr.number,
-        &checks,
-        pr.labels.into_iter().map(|l| l.name).collect(),
-        &MergeSignals {
-            mergeable: pr.mergeable,
-            mergeable_state: pr.mergeable_state.as_deref(),
-            // REST's PR object has no review decision; a review-blocked PR
-            // stays `Pending` on this path.
-            review_decision: None,
-            rollup_state: None,
-            head_sha: Some(&sha),
-            auto_merge: AutoMergeRef {
-                node_id: pr.node_id.clone(),
-                enabled: pr.auto_merge.is_some(),
-                base_ref: pr.base.as_ref().map(|b| b.git_ref.clone()),
-                merge_queue: merge_queue_enabled,
+    let labels: Vec<String> = pr.labels.iter().map(|l| l.name.clone()).collect();
+    let decide = |merge_queue_enabled: bool, in_merge_queue: bool| {
+        decide_from_checks(
+            pr.number,
+            &checks,
+            labels.clone(),
+            &MergeSignals {
+                mergeable: pr.mergeable,
+                mergeable_state: pr.mergeable_state.as_deref(),
+                // REST's PR object has no review decision; a review-blocked PR
+                // stays `Pending` on this path.
+                review_decision: None,
+                rollup_state: None,
+                head_sha: Some(&sha),
+                auto_merge: AutoMergeRef {
+                    node_id: pr.node_id.clone(),
+                    enabled: pr.auto_merge.is_some(),
+                    base_ref: pr.base.as_ref().map(|b| b.git_ref.clone()),
+                    merge_queue: merge_queue_enabled,
+                },
+                merge_queue_enabled,
+                in_merge_queue,
             },
-            merge_queue_enabled,
-            in_merge_queue,
+        )
+    };
+    let status = decide(false, false);
+    if !matches!(status, PrCiStatus::MissingCi { .. }) {
+        return status;
+    }
+    // Only a checkless-looking PR depends on the merge-queue flags, so they are
+    // fetched lazily. Unknown flags must not read as "no merge queue": that
+    // would retrigger CI on a checkless merge-queue PR.
+    match crate::github::graphql::merge_queue_flags_for_pr(client, repo, pr.number) {
+        Some((enabled, in_queue)) => decide(enabled, in_queue),
+        None => PrCiStatus::Pending {
+            number: pr.number,
+            head_sha: pr.head.as_ref().map(|h| h.sha.clone()),
         },
-    )
+    }
 }
 
 /// GitHub's own view of a PR's mergeability, alongside its checks -- what
