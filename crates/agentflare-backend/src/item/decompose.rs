@@ -42,9 +42,7 @@ pub fn decompose_plan(
     let state = crate::state::list_by_project(conn, &epic.project_id)?
         .into_iter()
         .find(|s| s.is_default)
-        .ok_or_else(|| {
-            Error::NotFound(format!("default state for project {}", epic.project_id))
-        })?;
+        .ok_or_else(|| Error::NotFound(format!("default state for project {}", epic.project_id)))?;
 
     let mut ids: BTreeMap<usize, String> = BTreeMap::new();
     let (mut created, mut existing) = (0, 0);
@@ -136,7 +134,9 @@ pub fn close_epic_if_children_done(conn: &Connection, epic_id: &str) -> Result<b
     if epic.state_id == done.id {
         return Ok(false);
     }
-    Ok(update_state(conn, epic_id, &done.id)?.completed_at.is_some())
+    Ok(update_state(conn, epic_id, &done.id)?
+        .completed_at
+        .is_some())
 }
 
 fn find_child(conn: &Connection, source: &str, external_id: &str) -> Result<Option<String>> {

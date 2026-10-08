@@ -35,7 +35,8 @@ fn parses_a_valid_plan_with_header_body_and_metadata() {
 fn missing_and_invalid_size_are_rejected_with_the_task_named() {
     let errs = parse_plan(&plan(&[task(1, "A", "parallel: true")])).unwrap_err();
     assert!(
-        errs.iter().any(|e| e.contains("task 1") && e.contains("size")),
+        errs.iter()
+            .any(|e| e.contains("task 1") && e.contains("size")),
         "{errs:?}"
     );
     let errs = parse_plan(&plan(&[task(1, "A", "size: m")])).unwrap_err();
@@ -118,5 +119,8 @@ fn empty_plan_unknown_key_and_duplicate_task_are_rejected() {
     let errs = parse_plan(&plan(&[task(1, "A", "size: S\nbogus: 1")])).unwrap_err();
     assert!(errs.iter().any(|e| e.contains("bogus")), "{errs:?}");
     let errs = parse_plan(&plan(&[task(1, "A", "size: S"), task(1, "B", "size: S")])).unwrap_err();
-    assert!(errs.iter().any(|e| e.contains("declared twice")), "{errs:?}");
+    assert!(
+        errs.iter().any(|e| e.contains("declared twice")),
+        "{errs:?}"
+    );
 }
