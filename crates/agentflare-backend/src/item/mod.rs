@@ -5,6 +5,7 @@ use crate::error::Result;
 
 mod claim;
 mod crud;
+pub mod plan_format;
 pub mod plan_gate;
 mod relations;
 mod search;
