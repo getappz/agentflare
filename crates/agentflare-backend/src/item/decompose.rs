@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use rusqlite::Connection;
 
 use super::plan_format::{ParsedPlan, PlanTask, parse_plan};
-use super::{CreateItem, create, get};
+use super::{CreateItem, create, get, update_state};
 use crate::error::{Error, Result};
 
 pub const READY_LABEL: &str = "ready-for-work";
@@ -113,6 +113,30 @@ pub fn decompose_plan(
         existing,
         warnings,
     })
+}
+
+/// Moves `epic_id` to its project's completed state once it has plan children
+/// and every one is completed or cancelled. Returns true only if the epic was
+/// actually closed (`completed_at` set): `item done` has silently no-opped
+/// before, so callers get an honest signal instead of assuming success.
+pub fn close_epic_if_children_done(conn: &Connection, epic_id: &str) -> Result<bool> {
+    let (total, open): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*),
+                COALESCE(SUM(CASE WHEN s.group_name NOT IN ('completed', 'cancelled') THEN 1 ELSE 0 END), 0)
+         FROM items i JOIN states s ON s.id = i.state_id
+         WHERE i.parent_id = ?1 AND i.external_source = ?2 AND i.deleted_at IS NULL",
+        rusqlite::params![epic_id, plan_source(epic_id)],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if total == 0 || open > 0 {
+        return Ok(false);
+    }
+    let epic = get(conn, epic_id)?;
+    let done = crate::state::first_in_group(conn, &epic.project_id, "completed")?;
+    if epic.state_id == done.id {
+        return Ok(false);
+    }
+    Ok(update_state(conn, epic_id, &done.id)?.completed_at.is_some())
 }
 
 fn find_child(conn: &Connection, source: &str, external_id: &str) -> Result<Option<String>> {

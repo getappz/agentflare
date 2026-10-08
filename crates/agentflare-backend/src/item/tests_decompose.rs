@@ -161,3 +161,50 @@ fn warns_when_the_epic_has_no_assignee() {
         out.warnings
     );
 }
+
+fn finish(conn: &Connection, pid: &str, id: &str, group: &str) {
+    let st = crate::state::first_in_group(conn, pid, group).unwrap();
+    update_state(conn, id, &st.id).unwrap();
+}
+
+#[test]
+fn epic_closes_only_when_every_child_is_finished() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let epic = make_epic(&conn, &pid, &sid, Some("claude-code"));
+    decompose_plan(&conn, &epic.id, PLAN).unwrap();
+    let kids = children(&conn, &epic.id);
+
+    assert!(!close_epic_if_children_done(&conn, &epic.id).unwrap());
+    finish(&conn, &pid, &kids[0].id, "completed");
+    finish(&conn, &pid, &kids[1].id, "completed");
+    assert!(!close_epic_if_children_done(&conn, &epic.id).unwrap());
+    finish(&conn, &pid, &kids[2].id, "completed");
+
+    assert!(close_epic_if_children_done(&conn, &epic.id).unwrap());
+    let closed = get(&conn, &epic.id).unwrap();
+    assert!(closed.completed_at.is_some());
+    // Already closed: a second call reports nothing to do.
+    assert!(!close_epic_if_children_done(&conn, &epic.id).unwrap());
+}
+
+#[test]
+fn a_cancelled_child_counts_as_finished() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let epic = make_epic(&conn, &pid, &sid, Some("claude-code"));
+    decompose_plan(&conn, &epic.id, PLAN).unwrap();
+    let kids = children(&conn, &epic.id);
+    finish(&conn, &pid, &kids[0].id, "completed");
+    finish(&conn, &pid, &kids[1].id, "cancelled");
+    finish(&conn, &pid, &kids[2].id, "completed");
+    assert!(close_epic_if_children_done(&conn, &epic.id).unwrap());
+}
+
+#[test]
+fn an_epic_without_plan_children_is_never_closed() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let epic = make_epic(&conn, &pid, &sid, None);
+    assert!(!close_epic_if_children_done(&conn, &epic.id).unwrap());
+}
