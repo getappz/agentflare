@@ -33,6 +33,24 @@ pub fn list_runs(
     serde_json::from_value(arr).map_err(|e| GitHubError::Parse(e.to_string()))
 }
 
+/// CI workflow runs for one PR head, including runs still queued before any
+/// check context appears on the PR.
+pub fn ci_runs_for_head(
+    client: &Client,
+    repo: &RepoId,
+    sha: &str,
+) -> Result<Vec<WorkflowRun>, GitHubError> {
+    let path = format!(
+        "/repos/{}/{}/actions/workflows/ci.yml/runs?head_sha={}&per_page=100",
+        repo.owner,
+        repo.repo,
+        crate::github::encode_query(sha)
+    );
+    let json = client.request("GET", &path, None)?;
+    serde_json::from_value(serde_json::Value::Array(workflow_runs(&json)))
+        .map_err(|e| GitHubError::Parse(e.to_string()))
+}
+
 pub fn get_run(client: &Client, repo: &RepoId, run_id: u64) -> Result<WorkflowRun, GitHubError> {
     let path = format!("/repos/{}/{}/actions/runs/{run_id}", repo.owner, repo.repo);
     let json = client.request("GET", &path, None)?;
@@ -207,6 +225,20 @@ mod tests {
         assert_eq!(
             server.requests()[0].path,
             "/repos/o/r/actions/runs?branch=feat/x&per_page=100&page=1"
+        );
+    }
+
+    #[test]
+    fn ci_runs_for_head_includes_queued_runs() {
+        let server = MockServer::start(vec![MockResponse::json(
+            200,
+            r#"{"workflow_runs":[{"id":2,"status":"queued","html_url":"u"}]}"#,
+        )]);
+        let runs = ci_runs_for_head(&server.client(None), &repo(), "abc123").unwrap();
+        assert_eq!(runs[0].status, "queued");
+        assert_eq!(
+            server.requests()[0].path,
+            "/repos/o/r/actions/workflows/ci.yml/runs?head_sha=abc123&per_page=100"
         );
     }
 

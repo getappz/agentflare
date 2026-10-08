@@ -119,6 +119,20 @@ pub(crate) fn graphql_error(client: &Client, errors: &serde_json::Value) -> GitH
     }
 }
 
+/// Merge-queue flags `(enabled, in_queue)` for a single PR -- used by the REST
+/// `pr_ci_status_impl` fallback so merge-queue bases are not misread as
+/// missing CI. `None` means GraphQL returned nothing for the PR: the flags are
+/// unknown, which is not the same as "no merge queue".
+pub(crate) fn merge_queue_flags_for_pr(
+    client: &Client,
+    repo: &RepoId,
+    number: u64,
+) -> Option<(bool, bool)> {
+    batch_pr_status_chunked(client, repo, &[number])
+        .get(&number)
+        .map(|data| (data.merge_queue_enabled, data.in_merge_queue))
+}
+
 /// Fetches `BatchPrData` for every PR in `numbers` in one GraphQL request.
 /// Callers with more than `GRAPHQL_PR_BATCH_SIZE` numbers must chunk first --
 /// this function does not, so its own cost stays predictable and testable
