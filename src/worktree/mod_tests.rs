@@ -847,6 +847,24 @@ fn pr_ci_status_from_batch_decides_on_required_contexts_only_when_any_are_marked
 }
 
 #[test]
+fn pr_ci_status_from_batch_blocked_with_optional_context_stays_pending_not_missing_ci() {
+    let data = batch_data(
+        false,
+        Some(true),
+        Some("blocked"),
+        vec![
+            required(check("build", "completed", Some("success"))),
+            check("optional-lint", "completed", Some("success")),
+        ],
+        vec![],
+    );
+    assert!(matches!(
+        pr_ci_status_from_batch(101, &data),
+        PrCiStatus::Pending { .. }
+    ));
+}
+
+#[test]
 fn pr_ci_status_from_batch_counts_a_pending_required_legacy_status() {
     let data = batch_data(
         false,
