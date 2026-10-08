@@ -116,11 +116,14 @@ pub fn parse_plan(markdown: &str) -> Result<ParsedPlan, Vec<String>> {
         });
     }
 
-    // Tasks that touch the same file conflict even if the planner forgot to say so.
+    // Tasks that touch the same file conflict even if the planner forgot to say
+    // so. Kept apart from declared conflicts: an implied one only has to
+    // serialize the pair, so it yields to any order the planner already gave.
+    let mut implied: Vec<(usize, usize)> = Vec::new();
     for (i, a) in tasks.iter().enumerate() {
         for b in &tasks[i + 1..] {
             if a.files.iter().any(|f| b.files.contains(f)) {
-                conflicts.entry(a.no).or_default().insert(b.no);
+                implied.push((a.no.min(b.no), a.no.max(b.no)));
             }
         }
     }
@@ -154,6 +157,12 @@ pub fn parse_plan(markdown: &str) -> Result<ParsedPlan, Vec<String>> {
             t.depends_on.insert(lo);
         }
     }
+    for (lo, hi) in implied {
+        let ordered = depends_transitively(&tasks, hi, lo) || depends_transitively(&tasks, lo, hi);
+        if !ordered && let Some(t) = tasks.iter_mut().find(|t| t.no == hi) {
+            t.depends_on.insert(lo);
+        }
+    }
 
     if errors.is_empty()
         && let Some(stuck) = find_cycle(&tasks)
@@ -165,6 +174,26 @@ pub fn parse_plan(markdown: &str) -> Result<ParsedPlan, Vec<String>> {
     } else {
         Err(errors)
     }
+}
+
+/// Whether task `from` waits on task `target`, directly or through other tasks.
+fn depends_transitively(tasks: &[PlanTask], from: usize, target: usize) -> bool {
+    let mut stack = vec![from];
+    let mut seen = BTreeSet::new();
+    while let Some(n) = stack.pop() {
+        if !seen.insert(n) {
+            continue;
+        }
+        if let Some(t) = tasks.iter().find(|t| t.no == n) {
+            for d in &t.depends_on {
+                if *d == target {
+                    return true;
+                }
+                stack.push(*d);
+            }
+        }
+    }
+    false
 }
 
 /// Kahn's algorithm; returns the task numbers that can never become ready.

@@ -100,6 +100,45 @@ fn overlapping_files_imply_a_conflict() {
 }
 
 #[test]
+fn implied_file_conflict_defers_to_an_existing_reverse_order() {
+    // The planner already ordered 2 before 1; the shared file must not turn
+    // that into a cycle (only an explicit contradiction is an error).
+    let md = plan(&[
+        task(1, "A", "size: S\ndepends_on: [2]\nfiles: [mod.rs]"),
+        task(2, "B", "size: S\nfiles: [mod.rs]"),
+    ]);
+    let parsed = parse_plan(&md).unwrap();
+    assert_eq!(
+        parsed.tasks[0]
+            .depends_on
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![2]
+    );
+    assert!(parsed.tasks[1].depends_on.is_empty());
+}
+
+#[test]
+fn implied_file_conflict_defers_to_a_transitive_order() {
+    let md = plan(&[
+        task(1, "A", "size: S\nfiles: [mod.rs]"),
+        task(2, "B", "size: S\ndepends_on: [1]"),
+        task(3, "C", "size: S\ndepends_on: [2]\nfiles: [mod.rs]"),
+    ]);
+    let parsed = parse_plan(&md).unwrap();
+    assert_eq!(
+        parsed.tasks[2]
+            .depends_on
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![2],
+        "3 already waits on 1 through 2, so no extra edge"
+    );
+}
+
+#[test]
 fn more_than_the_task_cap_is_rejected() {
     let tasks: Vec<String> = (1..=MAX_TASKS + 1)
         .map(|n| task(n, "T", "size: S"))

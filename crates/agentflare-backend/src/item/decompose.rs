@@ -134,6 +134,10 @@ pub fn decompose_plan(
 /// and every one is completed or cancelled. Returns true only if the epic was
 /// actually closed (`completed_at` set): `item done` has silently no-opped
 /// before, so callers get an honest signal instead of assuming success.
+///
+/// Only children created by `decompose_plan` count: they define the epic's
+/// completion. A child someone adds to the epic by hand is theirs to track and
+/// does not hold the epic open.
 pub fn close_epic_if_children_done(conn: &Connection, epic_id: &str) -> Result<bool> {
     let (total, open): (i64, i64) = conn.query_row(
         "SELECT COUNT(*),
