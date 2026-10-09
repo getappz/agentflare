@@ -17,6 +17,8 @@ pub enum Action {
     Progress,
     Done,
     Cede,
+    /// Explicit takeover of a PR another instance owns (item #347 phase 3).
+    Takeover,
 }
 
 impl Action {
@@ -26,6 +28,7 @@ impl Action {
             Action::Progress => "progress",
             Action::Done => "done",
             Action::Cede => "cede",
+            Action::Takeover => "takeover",
         }
     }
 
@@ -35,6 +38,7 @@ impl Action {
             "progress" => Some(Action::Progress),
             "done" => Some(Action::Done),
             "cede" => Some(Action::Cede),
+            "takeover" => Some(Action::Takeover),
             _ => None,
         }
     }

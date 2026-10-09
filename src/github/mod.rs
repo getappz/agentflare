@@ -15,6 +15,7 @@ pub mod init_auth;
 pub mod issues;
 pub mod mcp;
 pub mod models;
+pub mod pr_owner;
 pub mod pulls;
 pub mod releases;
 pub mod repos;
