@@ -426,6 +426,17 @@ pub fn update_body(
     Ok(())
 }
 
+/// `body` with its origin stamp re-pointed at `instance`, or `None` when the
+/// body has no stamp (or one not in `origin_tag`'s canonical form). `pr adopt`
+/// uses it so the stamp-reading gates (`origin_allows`, `marks_item`) follow
+/// a takeover instead of still honouring the previous owner.
+pub fn restamp_origin(body: &str, instance: &str) -> Option<String> {
+    let o = origin_of(Some(body))?;
+    let old = origin_tag(&o.instance, &o.item, o.seq, &o.branch);
+    body.contains(&old)
+        .then(|| body.replacen(&old, &origin_tag(instance, &o.item, o.seq, &o.branch), 1))
+}
+
 /// Post-hoc stamp (item #347 phase 3): appends this instance's origin stamp
 /// to a PR that was opened without one (plain `gh pr create`), once local
 /// evidence shows this instance created its head branch. A body that already
@@ -562,6 +573,16 @@ mod stamp_tests {
         let body = sent["body"].as_str().unwrap();
         assert!(body.starts_with("hand made"));
         assert_eq!(origin_of(Some(body)).unwrap().instance, self_instance());
+    }
+
+    #[test]
+    fn restamp_origin_moves_the_stamp_to_the_new_instance() {
+        let body = format!("text\n\n{}", origin_tag("old", "u", 3, "task/3-x"));
+        let out = restamp_origin(&body, "new").unwrap();
+        assert!(!origin_allows(Some(&out), "old"));
+        assert!(origin_allows(Some(&out), "new"));
+        assert!(out.starts_with("text"));
+        assert!(restamp_origin("hand made", "new").is_none());
     }
 
     #[test]

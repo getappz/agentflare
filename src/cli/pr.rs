@@ -161,6 +161,15 @@ fn adopt(number: u64, ttl_hours: i64, force: bool) {
         &crate::github::pr_owner::takeover_comment(&me, number),
     )
     .unwrap_or_else(|e| fail(&format!("could not post takeover marker: {e}")));
+    // The gates read the body stamp, not the takeover comment: re-point it.
+    if let Some(body) = pr
+        .body
+        .as_deref()
+        .and_then(|b| crate::github::pulls::restamp_origin(b, &me))
+        && let Err(e) = crate::github::pulls::update_body(&client, &repo, number, &body)
+    {
+        eprintln!("warning: could not re-stamp PR #{number}: {e}");
+    }
     // Swap the beacon so exactly one instance's label remains.
     for l in pr.labels.iter().filter(|l| l.name.starts_with("beacon:")) {
         let _ = crate::github::issues::remove_label(&client, &repo, number, &l.name);
