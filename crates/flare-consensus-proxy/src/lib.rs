@@ -101,6 +101,21 @@ impl FlareProxyModelCaller {
 #[async_trait]
 impl ModelCaller for FlareProxyModelCaller {
     async fn call(&self, request: ModelCallRequest) -> Result<ModelCallResponse, ModelCallError> {
+        let Some(token) = request.cancellation.clone() else {
+            return self.send(request).await;
+        };
+        // Dropping the losing future aborts the in-flight HTTP call.
+        let work = std::pin::pin!(self.send(request));
+        let cancelled = std::pin::pin!(token.cancelled());
+        match futures::future::select(work, cancelled).await {
+            futures::future::Either::Left((result, _)) => result,
+            futures::future::Either::Right(_) => Err(ModelCallError("cancelled".to_string())),
+        }
+    }
+}
+
+impl FlareProxyModelCaller {
+    async fn send(&self, request: ModelCallRequest) -> Result<ModelCallResponse, ModelCallError> {
         let body = request::build_request_body(&request);
         let body_bytes = serde_json::to_vec(&body)
             .map_err(|e| ModelCallError(format!("encode request: {e}")))?;
@@ -137,9 +152,10 @@ impl ModelCaller for FlareProxyModelCaller {
         let mut acc = sse::SseAccumulator::new();
         let on_token = request.on_token.clone();
 
+        let mut done = false;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| ModelCallError(format!("stream error: {e}")))?;
-            let done = acc.feed(&chunk, |token| {
+            done = acc.feed(&chunk, |token| {
                 if let Some(sink) = &on_token {
                     sink(token);
                 }
@@ -150,6 +166,14 @@ impl ModelCaller for FlareProxyModelCaller {
         }
 
         let turn = acc.finish();
+        if let Some(message) = turn.error {
+            return Err(ModelCallError(format!("upstream stream error: {message}")));
+        }
+        if !done {
+            return Err(ModelCallError(
+                "stream ended before message_stop".to_string(),
+            ));
+        }
         Ok(ModelCallResponse {
             content: turn.content,
             usage: turn.usage,

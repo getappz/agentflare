@@ -19,10 +19,13 @@ pub struct SseAccumulator {
     output_tokens: u32,
     got_usage: bool,
     done: bool,
+    error: Option<String>,
 }
 
 pub struct ParsedTurn {
     pub content: String,
+    /// Message of an in-stream `error` event, if one arrived.
+    pub error: Option<String>,
     pub usage: Option<TokenUsage>,
 }
 
@@ -33,7 +36,7 @@ impl SseAccumulator {
 
     /// Feed one chunk of raw bytes from the stream. Calls `on_token` with
     /// each `content_block_delta` text delta as it's found, in order.
-    /// Returns `true` once `message_stop` has been seen — the caller should
+    /// Returns `true` once `message_stop` or an `error` event has been seen — the caller should
     /// stop reading the stream at that point.
     pub fn feed(&mut self, chunk: &[u8], mut on_token: impl FnMut(&str)) -> bool {
         self.line_buf.extend_from_slice(chunk);
@@ -79,6 +82,14 @@ impl SseAccumulator {
                 Some("message_stop") => {
                     self.done = true;
                 }
+                Some("error") => {
+                    let message = val
+                        .pointer("/error/message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown error");
+                    self.error = Some(message.to_string());
+                    self.done = true;
+                }
                 _ => {}
             }
         }
@@ -94,6 +105,7 @@ impl SseAccumulator {
         });
         ParsedTurn {
             content: self.content,
+            error: self.error,
             usage,
         }
     }
@@ -175,6 +187,17 @@ mod tests {
         });
         assert!(!done);
         assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn error_event_is_surfaced_and_ends_the_stream() {
+        let mut acc = SseAccumulator::new();
+        let done = acc.feed(
+            b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+            |_| {},
+        );
+        assert!(done);
+        assert_eq!(acc.finish().error.as_deref(), Some("Overloaded"));
     }
 
     #[test]
