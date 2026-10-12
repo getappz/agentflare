@@ -2251,6 +2251,8 @@ fn redispatch_rejects_a_completed_item() {
     );
 }
 
+#[path = "tests_claim_planning.rs"]
+mod tests_claim_planning;
 #[path = "tests_decompose.rs"]
 mod tests_decompose;
 #[path = "tests_finalize.rs"]
