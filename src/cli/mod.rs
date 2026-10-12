@@ -29,6 +29,7 @@ mod mcp;
 mod memory;
 mod message;
 mod optimize;
+mod pr;
 mod project;
 mod review;
 mod run;
@@ -155,6 +156,8 @@ pub enum Commands {
     Serve(serve::ServeArgs),
     /// Vent friction or feedback encountered during an agent session.
     Vent(vent::VentArgs),
+    /// Open stamped PRs and manage cross-instance PR ownership.
+    Pr(pr::PrArgs),
     /// Manage work items in the agentflare project queue.
     ///
     /// Automatic failover moves an item to another installed agent when the
@@ -223,6 +226,7 @@ impl Commands {
             Self::Serve(cmd) => cmd.run(),
             Self::Daemon(cmd) => cmd.run(),
             Self::Vent(cmd) => vent::run(cmd),
+            Self::Pr(cmd) => cmd.run(),
             Self::Work(cmd) => cmd.run(),
             Self::Docs(cmd) => docs::run(cmd),
             Self::Workflow(cmd) => cmd.run(),
