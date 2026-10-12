@@ -1575,6 +1575,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "flare-consensus"
+version = "0.1.0"
+dependencies = [
+ "agentflare-workspace-hack",
+ "async-trait",
+ "chrono",
+ "futures",
+ "rand 0.8.6",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "flare-consensus-proxy"
+version = "0.1.0"
+dependencies = [
+ "agentflare-workspace-hack",
+ "async-trait",
+ "axum",
+ "flare-consensus",
+ "flare-proxy",
+ "futures",
+ "http",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tower",
+]
+
+[[package]]
 name = "flare-docs"
 version = "0.1.0"
 dependencies = [
