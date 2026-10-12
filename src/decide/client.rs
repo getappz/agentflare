@@ -182,14 +182,17 @@ pub fn ask_with(
 fn breaker_path() -> std::path::PathBuf {
     #[cfg(test)]
     {
-        return std::env::temp_dir().join(format!(
-            "agentflare-breaker-test-{}-{}.json",
-            std::process::id(),
-            std::thread::current()
-                .name()
-                .unwrap_or("unnamed")
-                .replace(':', "_")
-        ));
+        // Own subdirectory: with_state chmods the parent dir to 0700, which
+        // fails on a shared dir like /tmp.
+        return std::env::temp_dir()
+            .join(format!("agentflare-breaker-test-{}", std::process::id()))
+            .join(format!(
+                "{}.json",
+                std::thread::current()
+                    .name()
+                    .unwrap_or("unnamed")
+                    .replace(':', "_")
+            ));
     }
     #[cfg(not(test))]
     breaker::path()
