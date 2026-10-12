@@ -57,7 +57,7 @@ pub fn decompose_plan(
         }
         for task in now {
             let external_id = format!("task-{}", task.no);
-            if let Some(id) = find_child(conn, &source, &external_id)? {
+            if let Some(id) = find_child(conn, &epic.id, &source, &external_id)? {
                 ids.insert(task.no, id);
                 existing += 1;
                 continue;
@@ -191,10 +191,15 @@ fn find_deleted_child(
     }
 }
 
-fn find_child(conn: &Connection, source: &str, external_id: &str) -> Result<Option<String>> {
+fn find_child(
+    conn: &Connection,
+    epic_id: &str,
+    source: &str,
+    external_id: &str,
+) -> Result<Option<String>> {
     match conn.query_row(
-        "SELECT id FROM items WHERE external_source = ?1 AND external_id = ?2 AND deleted_at IS NULL",
-        rusqlite::params![source, external_id],
+        "SELECT id FROM items WHERE parent_id = ?1 AND external_source = ?2 AND external_id = ?3 AND deleted_at IS NULL",
+        rusqlite::params![epic_id, source, external_id],
         |row| row.get::<_, String>(0),
     ) {
         Ok(id) => Ok(Some(id)),

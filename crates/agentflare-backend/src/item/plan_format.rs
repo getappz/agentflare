@@ -128,7 +128,8 @@ pub fn parse_plan(markdown: &str) -> Result<ParsedPlan, Vec<String>> {
         }
     }
 
-    let known: BTreeSet<usize> = tasks.iter().map(|t| t.no).collect();
+    // Every declared number is a valid reference, even for a task rejected above.
+    let known: BTreeSet<usize> = seen;
     for t in &tasks {
         let declared_conflicts = conflicts.get(&t.no).into_iter().flatten();
         for d in t.depends_on.iter().chain(declared_conflicts) {
