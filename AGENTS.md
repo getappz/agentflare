@@ -174,6 +174,17 @@ a later in-place edit or postinstall in main never reaches it.
   `<key>.tmp-<pid>` dirs from a crashed seeder are reclaimed after an hour.
 - Cargo `target/` is out of scope (see mbx above).
 
+## Pull requests — use `agentflare pr`, not `gh pr create`
+
+`gh pr create` leaves the PR without agentflare's origin stamp, so other
+instances sharing the repo can't tell whose it is. Open PRs with
+`agentflare pr open [--item <seq>] [--summary ...]` (same body and stamp as
+`item done`). `agentflare pr owner <n>` shows the owning instance;
+`agentflare pr adopt <n> [--ttl-hours 24] [--force]` takes over a PR whose
+owner has shown no activity (GitHub `updated_at`) within the TTL.
+`agentflare doctor` lists open PRs stamped by other instances. A PR opened by
+hand on a branch this instance created gets stamped post hoc by the sweep.
+
 ## Git
 
 Never add "Generated with Claude Code" or "Co-Authored-By: Claude" signatures.

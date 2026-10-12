@@ -55,6 +55,28 @@ fn attach_pr_to_item(
     }
 }
 
+/// Post-hoc origin stamp (item #347 phase 3): local branch evidence says this
+/// instance created `pr`'s head branch, so record that in the PR body.
+/// Soft-fails -- the stamp is an optimisation over first-claim-wins.
+fn stamp_pr(
+    client: &crate::github::Client,
+    repo: &crate::github::RepoId,
+    pr: &crate::github::models::PullRequest,
+    item: &agentflare_backend::item::Item,
+    branch: &str,
+) {
+    if let Err(e) = crate::github::pulls::stamp_if_unstamped(
+        client,
+        repo,
+        pr,
+        &item.id,
+        item.sequence_id,
+        branch,
+    ) {
+        eprintln!("worktree: could not stamp PR #{}: {e}", pr.number);
+    }
+}
+
 /// The lowest-numbered (earliest) comment carrying a valid `Claim` marker,
 /// paired with its owner -- comment ids are monotonic, so this is the same
 /// tie-break `github::bridge`'s own issue-claim race resolves on.
@@ -165,6 +187,42 @@ fn within_discovery_grace(
     };
     let age_secs = now.signed_duration_since(created.with_timezone(&chrono::Utc));
     age_secs < chrono::Duration::seconds(i64::try_from(grace_secs).unwrap_or(i64::MAX))
+}
+
+/// The `in_review` item that tracks `pr` locally. Its `metadata.pr` shape
+/// matches `merge_and_persist_pr_identity`; shared by discovery and
+/// `agentflare pr adopt`.
+pub(crate) fn create_tracking_item(
+    conn: &rusqlite::Connection,
+    project_id: &str,
+    in_review_state_id: &str,
+    pr: &crate::github::models::PullRequest,
+    branch: &str,
+) -> agentflare_backend::Result<agentflare_backend::item::Item> {
+    let description = pr
+        .body
+        .clone()
+        .unwrap_or_else(|| format!("Auto-tracked PR: {}", pr.html_url));
+    let metadata = serde_json::json!({"pr": {"number": pr.number, "branch": branch}});
+    let input = agentflare_backend::item::CreateItem {
+        project_id: project_id.to_string(),
+        state_id: in_review_state_id.to_string(),
+        name: pr.title.clone(),
+        description: Some(description),
+        priority: None,
+        parent_id: None,
+        assignee_agent: None,
+        sort_order: None,
+        external_source: None,
+        external_id: None,
+        metadata: Some(metadata.to_string()),
+        label_ids: vec![],
+        assignee_ids: vec![],
+        dependency_ids: vec![],
+        start_date: None,
+        due_date: None,
+    };
+    agentflare_backend::item::create(conn, input)
 }
 
 /// Creates an `in_review` item for every open, non-draft PR in `repo` not
@@ -283,6 +341,7 @@ pub(crate) fn discover_untracked_prs_with_clock(
         // owner's worktree (#334 beside #330).
         if let Some(owning) = item_owning_branch(&items, &branch, local_branch) {
             attach_pr_to_item(conn, owning, pr.number, &branch);
+            stamp_pr(client, repo, &pr, owning, &branch);
             continue;
         }
         // Item #347 phase 2: an unstamped PR with no local branch evidence
@@ -299,47 +358,26 @@ pub(crate) fn discover_untracked_prs_with_clock(
         if !claim_pr_for_discovery(client, repo, pr.number, owner) {
             continue;
         }
-        let description = pr
-            .body
-            .clone()
-            .unwrap_or_else(|| format!("Auto-tracked PR: {}", pr.html_url));
-        let metadata = serde_json::json!({"pr": {"number": pr.number, "branch": branch}});
-        let input = agentflare_backend::item::CreateItem {
-            project_id: project_id.to_string(),
-            state_id: in_review_state_id.to_string(),
-            name: pr.title,
-            description: Some(description),
-            priority: None,
-            parent_id: None,
-            assignee_agent: None,
-            sort_order: None,
-            external_source: None,
-            external_id: None,
-            metadata: Some(metadata.to_string()),
-            label_ids: vec![],
-            assignee_ids: vec![],
-            dependency_ids: vec![],
-            start_date: None,
-            due_date: None,
-        };
-        match agentflare_backend::item::create(conn, input) {
-            Ok(_) => {
+        match create_tracking_item(conn, project_id, in_review_state_id, &pr, &branch) {
+            Ok(item) => {
                 created += 1;
+                if local_branch(&branch) {
+                    stamp_pr(client, repo, &pr, &item, &branch);
+                }
                 // Same starting stage label `push_and_open_pr` gives a PR
                 // opened through the item-done flow -- without this, a
                 // hand-opened PR discovery only ever tracks would carry no
                 // agentflare lifecycle label at all, leaving a human with no
                 // GitHub-visible signal that it's under the sweep's watch.
                 let machine = crate::github::bridge::config::machine_label();
-                if let Err(e) = crate::github::issues::add_labels(
-                    client,
-                    repo,
-                    pr.number,
-                    &[
-                        "agentflare:in-review".to_string(),
-                        format!("beacon:{machine}"),
-                    ],
-                ) {
+                let mut labels = vec!["agentflare:in-review".to_string()];
+                // Never stack a second `beacon:` on a PR another instance
+                // already labelled (item #347).
+                if !pr.labels.iter().any(|l| l.name.starts_with("beacon:")) {
+                    labels.push(format!("beacon:{machine}"));
+                }
+                if let Err(e) = crate::github::issues::add_labels(client, repo, pr.number, &labels)
+                {
                     eprintln!(
                         "worktree: could not label discovered PR #{}: {e}",
                         pr.number
