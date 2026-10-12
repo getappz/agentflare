@@ -74,6 +74,89 @@ pub fn merge_metadata_patch(existing: &str, patch: serde_json::Value) -> String 
     base.to_string()
 }
 
+/// Backend-level immutability guard for a recorded human approval, applied by
+/// `crud::update` to every wholesale `metadata` write. Many writers
+/// (orphan reconcile, supervisor, handoff, failover) read-modify-write a
+/// stale snapshot; if that snapshot predates `approve-plan`, the write
+/// silently reverts `plan_status` to "pending" and drops
+/// `plan_approved_at`/`plan_approved_by` (live incident, item #281).
+///
+/// When the stored row is `"approved"`, the incoming metadata keeps the
+/// stored `plan_status`/`plan_approved_*` unless it is an explicit
+/// transition: `"rejected"` (reject) or `"pending"` with a *present* and
+/// different `plan_asset_id` (resubmit). A pending write that omits
+/// `plan_asset_id` is not a resubmit. A fresh approval after a non-approved
+/// status may replace `plan_approved_*`. Unparseable or non-object input is
+/// returned unchanged.
+pub fn preserve_plan_approval(incoming: &str, current: &str) -> String {
+    let Ok(mut new) = serde_json::from_str::<serde_json::Value>(incoming) else {
+        return incoming.to_string();
+    };
+    let Some(cur) = serde_json::from_str::<serde_json::Value>(current)
+        .ok()
+        .filter(|c| c.get("plan_approved_at").is_some() || c["plan_status"] == "approved")
+    else {
+        return incoming.to_string();
+    };
+    let Some(obj) = new.as_object_mut() else {
+        return incoming.to_string();
+    };
+    let was_approved = cur["plan_status"] == "approved";
+    let new_status = obj
+        .get("plan_status")
+        .and_then(|s| s.as_str())
+        .map(str::to_string);
+    let new_status = new_status.as_deref();
+    // Resubmit only when incoming carries a non-empty plan_asset_id that
+    // differs from the stored one. A pending write that omits plan_asset_id
+    // (or leaves it unchanged) is treated as a stale partial replace — the
+    // live #281 shape — and must not clear the approval.
+    let explicit_transition = match new_status {
+        Some("rejected") => true,
+        Some("pending") => {
+            let new_asset = obj.get("plan_asset_id").and_then(|v| v.as_str());
+            let cur_asset = cur.get("plan_asset_id").and_then(|v| v.as_str());
+            match (new_asset, cur_asset) {
+                (Some(n), Some(c)) => n != c,
+                (Some(_), None) => true,
+                _ => false,
+            }
+        }
+        _ => false,
+    };
+    if was_approved
+        && !explicit_transition
+        && let Some(v) = cur.get("plan_status")
+    {
+        obj.insert("plan_status".into(), v.clone());
+    }
+    let fresh_approval = !was_approved && new_status == Some("approved");
+    if !fresh_approval {
+        for key in ["plan_approved_at", "plan_approved_by"] {
+            if let Some(v) = cur.get(key) {
+                obj.insert(key.into(), v.clone());
+            }
+        }
+    }
+    new.to_string()
+}
+
+/// Identity to store in `plan_approved_by`. MCP/CLI channel approve often has
+/// no agent identity (`None`); writing that as JSON null left the audit field
+/// looking unset after a successful human approval (item #300 / live #281).
+pub fn approved_by_identity(agent: Option<&str>, channel_route: bool) -> String {
+    agent
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if channel_route {
+                "human".to_string()
+            } else {
+                "agent".to_string()
+            }
+        })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanGateStatus {
     Open,
@@ -118,6 +201,71 @@ pub fn default_policy(priority: &str, metadata: &str) -> Option<(bool, &'static 
 
 #[cfg(test)]
 mod tests {
+    const APPROVED: &str = r#"{"plan_status":"approved","plan_approved_at":5,"plan_approved_by":"h","plan_asset_id":"a"}"#;
+
+    #[test]
+    fn stale_write_cannot_revert_approval() {
+        let out = preserve_plan_approval(
+            r#"{"plan_status":"pending","plan_asset_id":"a","workflow_run_id":"x"}"#,
+            APPROVED,
+        );
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["plan_status"], "approved");
+        assert_eq!(v["plan_approved_at"], 5);
+        assert_eq!(v["plan_approved_by"], "h");
+        assert_eq!(v["workflow_run_id"], "x");
+    }
+
+    #[test]
+    fn reject_and_resubmit_still_transition() {
+        let v: serde_json::Value = serde_json::from_str(&preserve_plan_approval(
+            r#"{"plan_status":"rejected","plan_approved_at":5}"#,
+            APPROVED,
+        ))
+        .unwrap();
+        assert_eq!(v["plan_status"], "rejected");
+        let v: serde_json::Value = serde_json::from_str(&preserve_plan_approval(
+            r#"{"plan_status":"pending","plan_asset_id":"b"}"#,
+            APPROVED,
+        ))
+        .unwrap();
+        assert_eq!(v["plan_status"], "pending");
+        assert_eq!(v["plan_approved_at"], 5);
+    }
+
+    #[test]
+    fn fresh_approval_after_reject_replaces_approved_at() {
+        let cur = r#"{"plan_status":"rejected","plan_approved_at":5}"#;
+        let v: serde_json::Value = serde_json::from_str(&preserve_plan_approval(
+            r#"{"plan_status":"approved","plan_approved_at":9,"plan_approved_by":"h2"}"#,
+            cur,
+        ))
+        .unwrap();
+        assert_eq!(v["plan_approved_at"], 9);
+    }
+
+    #[test]
+    fn pending_without_plan_asset_id_is_not_a_resubmit() {
+        // A partial/stale replace that drops plan_asset_id must not count as
+        // "new plan" just because None != Some(old_id).
+        let out = preserve_plan_approval(
+            r#"{"plan_status":"pending","workflow_run_id":"x"}"#,
+            APPROVED,
+        );
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["plan_status"], "approved");
+        assert_eq!(v["plan_approved_at"], 5);
+        assert_eq!(v["plan_approved_by"], "h");
+    }
+
+    #[test]
+    fn approved_by_identity_defaults_channel_to_human_when_unset() {
+        assert_eq!(approved_by_identity(None, true), "human");
+        assert_eq!(approved_by_identity(Some(""), true), "human");
+        assert_eq!(approved_by_identity(Some("cli:me"), true), "cli:me");
+        assert_eq!(approved_by_identity(None, false), "agent");
+    }
+
     use super::*;
 
     #[test]

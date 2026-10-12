@@ -172,6 +172,20 @@ pub fn pr_commit_shas(
         .collect())
 }
 
+/// Committer time of the PR head, for detecting a push after a bot review.
+/// ponytail: committer time approximates push time; use push events if old-dated rebases matter.
+pub fn commit_date(
+    client: &Client,
+    repo: &RepoId,
+    sha: &str,
+) -> Result<Option<String>, GitHubError> {
+    let path = format!("/repos/{}/{}/commits/{sha}", repo.owner, repo.repo);
+    let json = client.request("GET", &path, None)?;
+    Ok(json["commit"]["committer"]["date"]
+        .as_str()
+        .map(str::to_string))
+}
+
 /// A legacy commit status with its human-readable description kept --
 /// `actions::list_commit_statuses` folds these into `CheckRun`s and drops
 /// the description, but a review bot's pause state lives in exactly that

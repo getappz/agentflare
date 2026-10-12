@@ -109,6 +109,13 @@ pub fn run(agent: &str, yes: bool) {
         }
     }
 
+    if let Some(name) = crate::github::bridge::config::ensure_machine_name() {
+        ui::step(&format!(
+            "machine-name: set to {name} (PR labels read beacon:{name}; change it with \
+             `agentflare config set machine-name <name>`)"
+        ));
+    }
+
     match agent {
         "claude-code" => {
             wire_claude_code();

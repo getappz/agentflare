@@ -18,8 +18,27 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const USAGE_URL: &str = "https://opencode.ai/zen/go/v1/usage";
-const FALLBACK_THRESHOLD_PERCENT: f32 = 70.0;
 const CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// Which usage window breached the configured blanket threshold, and by how
+/// much -- carried through so the failover log/comment can say what was
+/// actually measured. Mirrors `claude_usage::UsageBreach`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct UsageBreach {
+    pub window: &'static str,
+    pub percent: f32,
+    pub threshold: f32,
+}
+
+impl std::fmt::Display for UsageBreach {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} usage {:.0}% >= threshold {:.0}%",
+            self.window, self.percent, self.threshold
+        )
+    }
+}
 
 /// Extracts the `opencode-go` API key from opencode's `auth.json` content —
 /// the shape is `{"opencode-go": {"type": "api", "key": "sk-..."}}`. Any
@@ -45,11 +64,27 @@ fn read_api_key() -> Result<String, String> {
     parse_auth_key(&text)
 }
 
-/// True when any of the three windows is at/over the fallback threshold.
-fn is_over_threshold(rolling_percent: f32, weekly_percent: f32, monthly_percent: f32) -> bool {
-    rolling_percent >= FALLBACK_THRESHOLD_PERCENT
-        || weekly_percent >= FALLBACK_THRESHOLD_PERCENT
-        || monthly_percent >= FALLBACK_THRESHOLD_PERCENT
+/// The first window (rolling, then weekly, then monthly) at/over
+/// `threshold`, or `None` when all three have headroom.
+fn detect_breach(
+    rolling_percent: f32,
+    weekly_percent: f32,
+    monthly_percent: f32,
+    threshold: f32,
+) -> Option<UsageBreach> {
+    let windows = [
+        ("rolling", rolling_percent),
+        ("weekly", weekly_percent),
+        ("monthly", monthly_percent),
+    ];
+    windows
+        .into_iter()
+        .find(|(_, percent)| *percent >= threshold)
+        .map(|(window, percent)| UsageBreach {
+            window,
+            percent,
+            threshold,
+        })
 }
 
 /// Fetches the three usage percentages. Not unit tested directly (no
@@ -87,39 +122,49 @@ fn fetch_usage_percentages(api_key: &str) -> Result<(f32, f32, f32), String> {
 }
 
 struct CacheEntry {
-    over_threshold: bool,
+    breach: Option<UsageBreach>,
     fetched_at: Instant,
 }
 
 static CACHE: OnceLock<Mutex<Option<CacheEntry>>> = OnceLock::new();
 
-/// True when the active OpenCode Go account's rolling/weekly/monthly usage
-/// is at/over the fallback threshold. Fails open (`false`) on any key-read,
-/// network, or parse error. Cached 5 minutes so this never adds a network
-/// call per SDD-loop turn.
-pub fn opencode_go_over_threshold() -> bool {
+/// The usage-window breach (if any) for the active OpenCode Go account's
+/// rolling/weekly/monthly windows, against `~/.agentflare/config.toml`'s
+/// `[failover] usage_threshold_percent` (const default when unset). Fails
+/// open (`None`) on any key-read, network, or parse error. Cached 5 minutes
+/// so this never adds a network call per SDD-loop turn.
+pub(crate) fn opencode_go_usage_breach() -> Option<UsageBreach> {
     let cache = CACHE.get_or_init(|| Mutex::new(None));
     {
         let guard = cache.lock().unwrap();
         if let Some(entry) = guard.as_ref()
             && entry.fetched_at.elapsed() < CACHE_TTL
         {
-            return entry.over_threshold;
+            return entry.breach;
         }
     }
 
-    let over_threshold = (|| -> Result<bool, String> {
+    let breach = (|| -> Result<Option<UsageBreach>, String> {
         let api_key = read_api_key()?;
         let (rolling, weekly, monthly) = fetch_usage_percentages(&api_key)?;
-        Ok(is_over_threshold(rolling, weekly, monthly))
+        let threshold = crate::quota::failover::load_failover_config().usage_threshold_percent;
+        Ok(detect_breach(rolling, weekly, monthly, threshold))
     })()
-    .unwrap_or(false);
+    .unwrap_or(None);
 
     *cache.lock().unwrap() = Some(CacheEntry {
-        over_threshold,
+        breach,
         fetched_at: Instant::now(),
     });
-    over_threshold
+    breach
+}
+
+/// True when the active OpenCode Go account's rolling/weekly/monthly usage
+/// is at/over the configured fallback threshold. See
+/// [`opencode_go_usage_breach`] for the measured-window detail this
+/// collapses.
+pub fn opencode_go_over_threshold() -> bool {
+    opencode_go_usage_breach().is_some()
 }
 
 #[cfg(test)]
@@ -127,23 +172,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn is_over_threshold_true_when_rolling_at_seventy() {
-        assert!(is_over_threshold(70.0, 10.0, 10.0));
+    fn detect_breach_true_when_rolling_at_seventy() {
+        assert_eq!(
+            detect_breach(70.0, 10.0, 10.0, 70.0).unwrap().window,
+            "rolling"
+        );
     }
 
     #[test]
-    fn is_over_threshold_true_when_weekly_at_seventy() {
-        assert!(is_over_threshold(10.0, 70.0, 10.0));
+    fn detect_breach_true_when_weekly_at_seventy() {
+        assert_eq!(
+            detect_breach(10.0, 70.0, 10.0, 70.0).unwrap().window,
+            "weekly"
+        );
     }
 
     #[test]
-    fn is_over_threshold_true_when_monthly_at_seventy() {
-        assert!(is_over_threshold(10.0, 10.0, 70.0));
+    fn detect_breach_true_when_monthly_at_seventy() {
+        assert_eq!(
+            detect_breach(10.0, 10.0, 70.0, 70.0).unwrap().window,
+            "monthly"
+        );
     }
 
     #[test]
-    fn is_over_threshold_false_when_all_under_seventy() {
-        assert!(!is_over_threshold(69.9, 69.9, 69.9));
+    fn detect_breach_none_when_all_under_seventy() {
+        assert_eq!(detect_breach(69.9, 69.9, 69.9, 70.0), None);
+    }
+
+    #[test]
+    fn detect_breach_honors_a_configured_threshold() {
+        assert_eq!(detect_breach(80.0, 10.0, 10.0, 90.0), None);
+        assert_eq!(detect_breach(95.0, 10.0, 10.0, 90.0).unwrap().percent, 95.0);
     }
 
     #[test]

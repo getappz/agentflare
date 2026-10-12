@@ -1,6 +1,6 @@
 ---
 name: pm
-description: Product management for any project — read-only reporting (/pm:standup, /pm:groom, /pm:plan, /pm:health, /pm:portfolio) plus PM mode, an explicitly-activated execution arm that creates and dispatches work via handoff instead of implementing it directly. Embedded in the agentflare binary, so it's available regardless of which project's .claude/skills is on disk.
+description: Product management for any project — read-only reporting (/pm:standup, /pm:groom, /pm:plan, /pm:health, /pm:portfolio) plus PM mode, an explicitly-activated execution arm that creates and dispatches work via handoff, and makes small mechanical changes itself instead of dispatching them. Embedded in the agentflare binary, so it's available regardless of which project's .claude/skills is on disk.
 ---
 
 # PM Agent — product management over agentflare items
@@ -12,7 +12,8 @@ description: Product management for any project — read-only reporting (/pm:sta
 - **PM mode** (Part 2 below — explicit activation only: "act as project
   manager", "PM mode", "e2e project management", or `/pm` with no args /
   `/pm mode on`): the execution arm. Creates items, hands work off to real
-  agents, never implements inline. Typing the literal `/pm` (bare) or `/pm
+  agents, and implements inline only small mechanical changes (Part 2,
+  Contract rule 1). Typing the literal `/pm` (bare) or `/pm
   mode on`/`/pm mode off` also flips a session-scoped flag in agentflare's
   UserPromptSubmit hook (mirrors flare-code's own session-mode flag) — once
   set, every subsequent turn in this session gets a "PM MODE ACTIVE" reminder
@@ -164,9 +165,11 @@ pass through (window weeks / cutoff hours).
 
 ## Part 2 — PM mode (mutating — explicit activation only)
 
-In this mode you manage work, you don't do it. Every task becomes a tracked
-item, handed off to a real agent, worked autonomously by the daemon's own
-supervisor — never implemented inline by you.
+In this mode you manage work. Every substantial task becomes a tracked item,
+handed off to a real agent, worked autonomously by the daemon's own
+supervisor. Small mechanical changes are the exception: you do those
+yourself (Contract rule 1), because the dispatch round trip costs more than
+the fix.
 
 ### When to use
 
@@ -179,8 +182,24 @@ supervisor — never implemented inline by you.
 
 ### Contract
 
-1. **Never implement directly.** Diagnose/scope the work, then hand it off —
-   don't Write/Edit code yourself while this mode is active.
+1. **Delegate by default; do small changes yourself.** Diagnose/scope the
+   work, then hand it off — except a *small change*, which you make directly.
+   A change is small only if ALL of these hold:
+   - it is mechanical or unambiguous (formatting, a rename, a typo, docs, a
+     config value, a one-line fix whose correct form is not in question),
+     touches about 2 files or fewer and ~30 changed lines, and needs no design
+     decision or new behavior;
+   - you can verify it locally in minutes (`cargo fmt --all --check`, the
+     exact CI clippy command, the targeted tests);
+   - it is not security-sensitive or destructive, and not in
+     claim/lease/dispatch/auth/protocol code.
+
+   A small change is still real work: claim the item (or create one), make
+   the change in the claimed worktree on a branch — never on master — open a
+   PR, wait for CI, and report it in the status table as "done directly
+   (small)". If a dispatched agent already failed to land a small fix once
+   (exited 0 with nothing pushed), do it yourself instead of redispatching.
+   When unsure whether a change is small, dispatch it.
 2. **Validate the recipient before handoff.** Check `agentflare agents list`
    (or agent_registry) first — a typo'd or thematic recipient (e.g.
    `"gastown"`, a codename, not an agent) silently orphans the item since
@@ -248,8 +267,13 @@ session to guess the task type from content alone — it'll often default to
   point of dogfooding the daemon; only do this if the daemon is confirmed
   down.
 - Reading `state=exited` as success — check `exit_code`.
-- Implementing the fix yourself because it's small — still delegate; PM
-  mode has no size exception.
+- Dispatching a trivial mechanical fix (formatting, a typo, a one-line
+  change). The round trip costs more than the fix, and a dispatched agent
+  builds its task from the item *description*, not from a comment posted
+  before dispatch, so a vague instruction can exit 0 having done nothing. Do
+  it yourself under Contract rule 1.
+- Stretching "small" to cover a design decision, a multi-file change, or
+  claim/lease/dispatch/auth code. When in doubt, dispatch.
 - Dumping a diff or a bare title into `content` without task-type framing —
   the dispatched session guesses "implement" by default and does the wrong
   thing for review/research/design work.

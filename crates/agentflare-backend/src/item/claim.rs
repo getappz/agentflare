@@ -98,6 +98,59 @@ pub fn claim(
     now: i64,
     ttl_secs: i64,
 ) -> Result<ClaimOutcome> {
+    claim_inner(conn, item_id, owner, now, ttl_secs, false)
+}
+
+/// Label that marks an item as waiting for the planning workflow to author its plan.
+pub const NEEDS_PLAN_LABEL: &str = "needs-plan";
+
+/// Claims a plan-gated item strictly to author its plan. Same lease, state and
+/// assignee effects as `claim`, but instead of the plan gate refusing it, the
+/// item must be `plan_required`, labeled `needs-plan`, with no plan status yet
+/// or a rejected one. The gate itself is never touched: an implementation
+/// `claim` on the item stays `BlockedByPlan` until a human approves. Refusals
+/// reuse `ClaimOutcome::BlockedByPlan` so no existing match changes.
+pub fn claim_for_planning(
+    conn: &Connection,
+    item_id: &str,
+    owner: &str,
+    now: i64,
+    ttl_secs: i64,
+) -> Result<ClaimOutcome> {
+    claim_inner(conn, item_id, owner, now, ttl_secs, true)
+}
+
+/// Why `item` may not be claimed for planning right now, or `None` if it may.
+fn planning_refusal(conn: &Connection, item: &super::Item) -> Result<Option<String>> {
+    let gate = super::plan_gate::read_plan_gate(&item.metadata);
+    if !gate.plan_required {
+        return Ok(Some("not_required".to_string()));
+    }
+    match gate.plan_status.as_deref() {
+        None | Some("rejected") => {}
+        Some(other) => return Ok(Some(other.to_string())),
+    }
+    let label = match crate::label::get_by_name(conn, &item.project_id, NEEDS_PLAN_LABEL) {
+        Ok(label) => label,
+        Err(crate::error::Error::NotFound(_)) => {
+            return Ok(Some("no_needs_plan_label".to_string()));
+        }
+        Err(e) => return Err(e),
+    };
+    if !super::list_labels(conn, &item.id)?.contains(&label.id) {
+        return Ok(Some("no_needs_plan_label".to_string()));
+    }
+    Ok(None)
+}
+
+fn claim_inner(
+    conn: &Connection,
+    item_id: &str,
+    owner: &str,
+    now: i64,
+    ttl_secs: i64,
+    planning: bool,
+) -> Result<ClaimOutcome> {
     // IMMEDIATE, not the default DEFERRED: this transaction always ends in a
     // write, and DEFERRED takes its read snapshot on the first SELECT below,
     // then only grabs the write lock later. Under concurrent writers that
@@ -111,7 +164,11 @@ pub fn claim(
     // busy_timeout-honoring path.
     let tx = immediate_tx(conn)?;
     let item = get(&tx, item_id)?;
-    if let super::plan_gate::PlanGateStatus::Blocked(status) =
+    if planning {
+        if let Some(status) = planning_refusal(&tx, &item)? {
+            return Ok(ClaimOutcome::BlockedByPlan { status });
+        }
+    } else if let super::plan_gate::PlanGateStatus::Blocked(status) =
         super::plan_gate::plan_gate_status(&item.metadata)
     {
         return Ok(ClaimOutcome::BlockedByPlan { status });
@@ -361,7 +418,8 @@ fn promote_in_review(
     let tx = immediate_tx(conn)?;
     let item = get(&tx, item_id)?;
     let state = crate::state::get(&tx, &item.state_id)?;
-    if state.group_name != "in_review" {
+    if state.group_name != "in_review" && !(expected_pr.is_some() && state.group_name == "started")
+    {
         return Ok(false);
     }
     if let Some(expected) = expected_pr
@@ -441,6 +499,8 @@ pub fn redispatch(
         Some(agent) => agent,
         None => return Ok(RedispatchOutcome::NoAssignee),
     };
+    let ready = crate::label::ensure_project_label(&tx, &item.project_id, READY_LABEL)?;
+    let labels = crate::label::list_by_project(&tx, &item.project_id)?;
 
     // `metadata.model` (see `item_model_override` in `supervisor.rs`) is
     // scoped to whichever agent it was set alongside — forwarding it to a
@@ -478,15 +538,12 @@ pub fn redispatch(
         },
     )?;
 
-    let labels = crate::label::list_by_project(&tx, &item.project_id)?;
     for label in &labels {
         if REDISPATCH_CLEARED_LABELS.contains(&label.name.as_str()) {
             remove_label(&tx, item_id, &label.id)?;
         }
     }
-    if let Some(ready) = labels.iter().find(|l| l.name == READY_LABEL) {
-        add_label(&tx, item_id, &ready.id)?;
-    }
+    add_label(&tx, item_id, &ready.id)?;
 
     if let Ok(item) = get(&tx, item_id)
         && let Ok(wid) = workspace_id_for_project(&tx, &item.project_id)

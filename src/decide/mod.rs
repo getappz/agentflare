@@ -14,12 +14,15 @@
 #![allow(dead_code, unused_imports)] // consumers land in items #702-#705
 
 pub mod breaker;
+mod budget;
 pub mod capture;
 mod client;
+pub mod model_routing;
 mod provider;
 pub mod shadow;
 mod types;
 
-pub use client::{Outcome, Source, ask, ask_with, ask_within, credential_sources};
+pub use budget::{Budget, Limits};
+pub use client::{Batch, Outcome, Source, ask, ask_with, ask_within, credential_sources};
 pub use provider::{Config, DecideError};
 pub use types::{Answer, Question, Response, Usage};

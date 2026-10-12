@@ -13,6 +13,7 @@ mod auth_db;
 mod auth_runner;
 mod banner;
 mod bashenv;
+mod browser_decision;
 mod browser_install;
 mod build_time;
 mod channels;
@@ -46,6 +47,7 @@ mod hook;
 mod hook_claim_guard;
 mod hook_completion_gate;
 mod hook_deadline;
+mod hook_decide_batch;
 mod hook_messages;
 mod hook_redirect;
 mod init;
@@ -90,6 +92,7 @@ use clap::Parser;
 
 fn main() {
     color_eyre::install().expect("color_eyre::install failed");
+    mise_install::init_mise_path();
     let cli = cli::Cli::parse();
     match cli.command {
         Some(command) => command.run(),

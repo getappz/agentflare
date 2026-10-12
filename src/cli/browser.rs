@@ -24,6 +24,15 @@ pub struct BrowserArgs {
 
 #[derive(Subcommand)]
 pub enum BrowserCommands {
+    /// Bind an observed @e operation to the current page for five minutes.
+    Plan {
+        action: String,
+        target: String,
+        #[arg(long)]
+        text: Option<String>,
+    },
+    /// Consume a planned decision once; reject if the page has changed.
+    Act { decision: String },
     /// Launch the browser and navigate to a URL.
     Open { url: String },
     /// Accessibility tree with @e refs — the primary page read.
@@ -123,9 +132,41 @@ impl BrowserArgs {
         if let BrowserCommands::Status = &self.command {
             return print_status(&session);
         }
+        let auto_install = !self.no_auto_install && flare_browser::auto_install_enabled();
+        let dir = crate::paths::agentflare_dir().join("browser-decisions");
+        let runner =
+            |action: &str, args: &[String]| exec_raw(&session, action, args, &[], auto_install);
+        let guarded = match &self.command {
+            BrowserCommands::Plan {
+                action,
+                target,
+                text,
+            } => {
+                let mut args = vec![target.clone()];
+                args.extend(text.clone());
+                Some(crate::browser_decision::plan_with(
+                    &dir, &session, action, &args, runner,
+                ))
+            }
+            BrowserCommands::Act { decision } => Some(crate::browser_decision::act_with(
+                &dir, &session, decision, runner,
+            )),
+            _ => None,
+        };
+        if let Some(result) = guarded {
+            match result {
+                Ok(out) => println!(
+                    "{}",
+                    flare_browser::compact_output(&out, flare_browser::MAX_OUTPUT_CHARS)
+                ),
+                Err(e) => crate::ui::error(&e),
+            }
+            return;
+        }
         // (action, positionals, extra)
         let (action, positionals, extra): (&str, Vec<String>, Vec<String>) = match &self.command {
             BrowserCommands::Status => unreachable!(),
+            BrowserCommands::Plan { .. } | BrowserCommands::Act { .. } => unreachable!(),
             BrowserCommands::Open { url } => ("open", vec![url.clone()], vec![]),
             BrowserCommands::Snapshot => ("snapshot", vec![], vec![]),
             BrowserCommands::Observe { .. } => ("snapshot", vec![], vec![]),

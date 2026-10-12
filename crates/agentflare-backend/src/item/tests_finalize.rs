@@ -58,6 +58,7 @@ fn late_finalize_does_not_undo_a_redispatch() {
     // freshly re-armed backlog item back out.
     let conn = db::open_in_memory().unwrap();
     let (pid, sid) = seed_project(&conn, "");
+    make_label(&conn, &pid, "ready-for-work");
     let item = make_item(&conn, &pid, &sid);
     claim(&conn, &item.id, "claude-code:1", 1000, TTL).unwrap();
     redispatch(&conn, &item.id, None).unwrap();
@@ -122,6 +123,38 @@ fn promote_if_pr_with_no_tracked_pr_matches_none() {
 
     assert!(!promote_in_review_to_completed_if_pr(&conn, &item.id, Some(7)).unwrap());
     assert!(promote_in_review_to_completed_if_pr(&conn, &item.id, None).unwrap());
+}
+
+/// A job still running when its PR merged leaves the item `started`. Only the
+/// verified-merged path (`_if_pr`) completes it, and only for the PR checked;
+/// the unconditional promote stays `in_review`-only, and a backlog item is
+/// never completed.
+#[test]
+fn promote_if_pr_completes_a_started_item_but_only_on_the_verified_pr() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let item = make_item(&conn, &pid, &sid);
+    set_metadata(&conn, &item.id, r#"{"pr":{"number":42,"branch":"b"}}"#);
+    assert!(!promote_in_review_to_completed_if_pr(&conn, &item.id, Some(42)).unwrap());
+    assert_eq!(
+        get(&conn, &item.id).unwrap().state_id,
+        state_in_group(&conn, &pid, "backlog")
+    );
+
+    claim(&conn, &item.id, "agent:1", 1000, TTL).unwrap();
+    assert!(!promote_in_review_to_completed(&conn, &item.id).unwrap());
+    assert!(!promote_in_review_to_completed_if_pr(&conn, &item.id, Some(41)).unwrap());
+    assert_eq!(
+        get(&conn, &item.id).unwrap().state_id,
+        state_in_group(&conn, &pid, "started")
+    );
+
+    assert!(promote_in_review_to_completed_if_pr(&conn, &item.id, Some(42)).unwrap());
+    assert_eq!(
+        get(&conn, &item.id).unwrap().state_id,
+        state_in_group(&conn, &pid, "completed")
+    );
+    assert!(crate::claim::current_owner(&conn, &item.id).is_none());
 }
 
 /// Every read-then-write here used to open a DEFERRED transaction: under WAL

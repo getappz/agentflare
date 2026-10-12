@@ -151,6 +151,11 @@ pub(crate) struct WorkItemData {
     /// started before this field existed must still deserialize.
     #[serde(default)]
     pub tdd: bool,
+    /// Set from `detect_verify_against_ci` at dispatch time (item #299) —
+    /// appends CI/PR check alignment instructions to the implementer prompt
+    /// and matching review criteria to the task reviewer.
+    #[serde(default)]
+    pub verify_against_ci: bool,
     /// Provider session id last observed for each agent name dispatched in
     /// this run (implementer and judge/reviewer are usually different
     /// agents and get independent entries). Used to pass `--resume <id>` on
@@ -505,7 +510,12 @@ pub(crate) fn build_sdd_loop_step(
                         let prompt = if ctx.data.review_only {
                             build_review_analyst_prompt(&task, fix_context, ctx.data.design_spec)
                         } else {
-                            build_implementer_prompt(&task, fix_context, ctx.data.tdd)
+                            build_implementer_prompt(
+                                &task,
+                                fix_context,
+                                ctx.data.tdd,
+                                ctx.data.verify_against_ci,
+                            )
                         };
                         (
                             agent_name.clone(),
@@ -520,7 +530,12 @@ pub(crate) fn build_sdd_loop_step(
                     let prompt = if ctx.data.review_only {
                         build_review_of_analysis_prompt(&task, &report)
                     } else {
-                        build_task_reviewer_prompt(&task, &report, ctx.data.tdd)
+                        build_task_reviewer_prompt(
+                            &task,
+                            &report,
+                            ctx.data.tdd,
+                            ctx.data.verify_against_ci,
+                        )
                     };
                     (judge_agent_name.clone(), prompt, false, SddRole::Reviewer)
                 } else {
@@ -528,7 +543,12 @@ pub(crate) fn build_sdd_loop_step(
                     let prompt = if ctx.data.review_only {
                         build_review_analyst_prompt(&task, None, ctx.data.design_spec)
                     } else {
-                        build_implementer_prompt(&task, None, ctx.data.tdd)
+                        build_implementer_prompt(
+                            &task,
+                            None,
+                            ctx.data.tdd,
+                            ctx.data.verify_against_ci,
+                        )
                     };
                     (
                         agent_name.clone(),
@@ -1081,26 +1101,15 @@ include!("work_item_pipeline/adopt_dispatch.rs");
 /// `poll_pending_corrections`: a failure here just means the next fresh
 /// dispatch reseeds from "now" again, same as before this fix.
 fn persist_comment_cursor(mcp: &AgentflareMcp, item_id: &str, cursor: i64) {
-    let Ok(raw) = mcp.item_get(ItemRequest {
-        action: "get".into(),
-        id: Some(item_id.to_string()),
-        ..Default::default()
-    }) else {
-        return;
-    };
-    let Ok(item) = serde_json::from_str::<agentflare_backend::item::Item>(&raw) else {
-        return;
-    };
-    let mut merged = crate::mcp_server::metadata_object(&item.metadata);
-    merged.insert(
-        "last_seen_comment_at".into(),
-        serde_json::Value::from(cursor),
-    );
-    let _ = mcp.item_update(ItemRequest {
-        action: "update".into(),
-        id: Some(item_id.to_string()),
-        metadata: Some(serde_json::Value::Object(merged)),
-        ..Default::default()
+    let _ = mcp.with_backend_db(|conn| {
+        let id = mcp.resolve_item_id(conn, item_id)?;
+        crate::mcp_server::merge_item_metadata(conn, &id, |metadata| {
+            metadata.insert(
+                "last_seen_comment_at".into(),
+                serde_json::Value::from(cursor),
+            );
+        })
+        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))
     });
 }
 
@@ -1191,6 +1200,7 @@ pub(crate) fn run_or_resume_with_sender(
     let design_spec = detect_design_spec(&item_description, &existing_metadata);
     // Seeds `WorkItemData::tdd` (item #179) the same way.
     let tdd = detect_tdd_mode(&existing_metadata);
+    let verify_against_ci = detect_verify_against_ci(&item_description, &existing_metadata);
 
     let agent_name = implementer_agent.as_str().to_string();
     let judge_agent_name = review_agent.as_str().to_string();
@@ -1228,6 +1238,7 @@ pub(crate) fn run_or_resume_with_sender(
             review_only,
             design_spec,
             tdd,
+            verify_against_ci,
             worktree_path: worktree_path.clone(),
             // A resumed run (the other arm below) keeps its own persisted
             // cursor instead of going through `fresh_data()`. A genuinely
@@ -1694,3 +1705,5 @@ mod task_sourcing_tests;
 mod tdd_mode_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod verify_against_ci_tests;

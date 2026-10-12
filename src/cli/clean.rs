@@ -200,6 +200,7 @@ fn kind_word(kind: Kind) -> &'static str {
         Kind::Worktree => "worktree",
         Kind::Orphan => "orphan",
         Kind::Artifact => "artifact",
+        Kind::DepsStore => "deps store",
         Kind::Remote => "remote",
     }
 }

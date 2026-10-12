@@ -124,17 +124,63 @@ pub(crate) struct Released {
     pub reason: String,
     /// Whether the item was re-armed (`ready-for-work`) for redispatch.
     pub redispatched: bool,
+    /// A merged PR was found; finish promotion after releasing the DB lock.
+    pub promote: bool,
+    /// Whether the dispatch-failure ceiling parked it on
+    /// `needs-manual-dispatch` instead -- an operator has to act.
+    pub parked_at_cap: bool,
 }
 
 /// One liveness sweep over every active item claim in `backend`. Releases a
 /// claim only when its owner was judged dead on this sweep AND the previous
 /// one, then restores the item for redispatch (see `restore_item`).
+#[cfg(test)]
 pub(crate) fn sweep(
     backend: &Connection,
     sessions: Option<&Connection>,
     queue: Option<&agentflare_jobs::Queue>,
     memory: &mut SweepMemory,
     now: i64,
+) -> Vec<Released> {
+    sweep_with(backend, sessions, queue, memory, now, |_| {
+        crate::worktree::PrCiStatus::Unknown
+    })
+}
+
+/// The items `sweep_with` will release this tick: owner dead now AND already
+/// suspected on the previous sweep. Lets `run_sweep` look up their PR state
+/// before taking the DB lock for the sweep itself.
+fn confirmed_dead_items(
+    backend: &Connection,
+    sessions: Option<&Connection>,
+    queue: Option<&agentflare_jobs::Queue>,
+    memory: &SweepMemory,
+    now: i64,
+) -> Vec<agentflare_backend::item::Item> {
+    let ttl = crate::mcp_server::types::backend_claim_ttl_secs();
+    let claims = agentflare_backend::claim::list_all(backend, now, ttl).unwrap_or_default();
+    claims
+        .into_iter()
+        .filter(|c| c.status == "claimed" && c.key.len() == 1)
+        .filter(|c| {
+            matches!(
+                judge_owner(&c.owner, c.heartbeat_at, now, sessions, queue),
+                OwnerLiveness::Dead(_)
+            ) && memory
+                .suspects
+                .contains(&(c.key[0].clone(), c.owner.clone()))
+        })
+        .filter_map(|c| agentflare_backend::item::get(backend, &c.key[0]).ok())
+        .collect()
+}
+
+fn sweep_with(
+    backend: &Connection,
+    sessions: Option<&Connection>,
+    queue: Option<&agentflare_jobs::Queue>,
+    memory: &mut SweepMemory,
+    now: i64,
+    pr_status: impl Fn(&agentflare_backend::item::Item) -> crate::worktree::PrCiStatus,
 ) -> Vec<Released> {
     let ttl = crate::mcp_server::types::backend_claim_ttl_secs();
     let claims = match agentflare_backend::claim::list_all(backend, now, ttl) {
@@ -175,12 +221,15 @@ pub(crate) fn sweep(
                 continue;
             }
         }
-        let redispatched = restore_item(backend, &item_id, &claim.owner, &reason);
+        let (redispatched, promote, parked_at_cap) =
+            restore_item(backend, &item_id, &claim.owner, &reason, &pr_status);
         released.push(Released {
             item_id,
             owner: claim.owner,
             reason,
             redispatched,
+            promote,
+            parked_at_cap,
         });
     }
     memory.suspects = suspects;
@@ -195,11 +244,25 @@ pub(crate) fn sweep(
 /// items an operator parked (`paused`, `needs-manual-dispatch`). Once the
 /// any-reason dispatch-failure ceiling is reached the item goes to
 /// `needs-manual-dispatch` instead, same as the orphan reconcile does.
-/// Returns whether the item was re-armed.
-fn restore_item(conn: &Connection, item_id: &str, owner: &str, reason: &str) -> bool {
+/// Returns `(re-armed, merged PR to promote, parked at the ceiling)`.
+fn restore_item(
+    conn: &Connection,
+    item_id: &str,
+    owner: &str,
+    reason: &str,
+    pr_status: &impl Fn(&agentflare_backend::item::Item) -> crate::worktree::PrCiStatus,
+) -> (bool, bool, bool) {
     let Ok(item) = agentflare_backend::item::get(conn, item_id) else {
-        return false;
+        return (false, false, false);
     };
+    let status = pr_status(&item);
+    let promote = matches!(status, crate::worktree::PrCiStatus::Merged);
+    let merging = matches!(
+        &status,
+        crate::worktree::PrCiStatus::Passing { auto_merge, .. }
+            | crate::worktree::PrCiStatus::AwaitingReview { auto_merge, .. }
+            if auto_merge.enabled
+    );
     let group = agentflare_backend::state::get(conn, &item.state_id)
         .map(|s| s.group_name)
         .unwrap_or_default();
@@ -219,10 +282,12 @@ fn restore_item(conn: &Connection, item_id: &str, owner: &str, reason: &str) -> 
         .unwrap_or(false);
 
     let mut redispatched = false;
+    let mut parked_at_cap = false;
     let mut outcome = String::new();
-    if finished || parked || item.assignee_agent.is_none() {
+    if finished || parked || item.assignee_agent.is_none() || promote || merging {
         // Nothing to re-queue; the release alone frees the item.
     } else if at_cap {
+        parked_at_cap = true;
         for name in [
             crate::supervisor::READY_LABEL,
             crate::supervisor::DISPATCHED_LABEL,
@@ -251,7 +316,7 @@ fn restore_item(conn: &Connection, item_id: &str, owner: &str, reason: &str) -> 
          ({reason}).{outcome}"
     );
     let _ = agentflare_backend::comment::create(conn, item_id, "agentflare-supervisor", &body);
-    redispatched
+    (redispatched, promote, parked_at_cap)
 }
 
 /// The daemon's per-tick entry point (see `dashboard::server`'s discovery
@@ -269,10 +334,60 @@ pub(crate) fn run_sweep(
         let _ = crate::sessions::prune(conn, now);
     }
     let mut memory = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
-    let released = mcp
-        .with_backend_db(|conn| sweep(conn, sessions.as_ref(), Some(queue), &mut memory, now))
+    // PR state is a GitHub round-trip: fetch it for the claims about to be
+    // released BEFORE the sweep takes the backend DB lock, never inside it.
+    let repo_root = mcp.worktree_repo_root();
+    let candidates = mcp
+        .with_backend_db(|conn| {
+            confirmed_dead_items(conn, sessions.as_ref(), Some(queue), &memory, now)
+        })
         .unwrap_or_default();
+    let statuses: std::cell::RefCell<std::collections::HashMap<_, _>> = candidates
+        .iter()
+        .map(|item| {
+            (
+                item.id.clone(),
+                crate::worktree::pr_ci_status(item, &repo_root),
+            )
+        })
+        .collect::<std::collections::HashMap<_, _>>()
+        .into();
+    let released = mcp
+        .with_backend_db(|conn| {
+            sweep_with(
+                conn,
+                sessions.as_ref(),
+                Some(queue),
+                &mut memory,
+                now,
+                |item| {
+                    statuses
+                        .borrow_mut()
+                        .remove(&item.id)
+                        .unwrap_or(crate::worktree::PrCiStatus::Unknown)
+                },
+            )
+        })
+        .unwrap_or_default();
+    for r in released.iter().filter(|r| r.promote) {
+        if let Ok(item) =
+            mcp.with_backend_db(|conn| agentflare_backend::item::get(conn, &r.item_id))
+            && let Ok(item) = item
+        {
+            crate::supervisor::promote_merged_item(mcp, &item, &mcp.worktree_repo_root());
+        }
+    }
     for r in &released {
+        if r.parked_at_cap
+            && crate::supervisor::first_time_gated(&r.item_id)
+            && let Ok(Some(item)) =
+                mcp.with_backend_db(|conn| agentflare_backend::item::get(conn, &r.item_id).ok())
+        {
+            crate::supervisor::notify_human_gate(
+                &item,
+                "dispatch-failure ceiling reached — parked on needs-manual-dispatch",
+            );
+        }
         eprintln!(
             "agentflare-supervisor: released claim on item {} held by {} ({}){}",
             r.item_id,

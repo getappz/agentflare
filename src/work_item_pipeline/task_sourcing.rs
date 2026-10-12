@@ -81,6 +81,29 @@ pub(crate) fn detect_tdd_mode(metadata: &serde_json::Value) -> bool {
     metadata["tdd"].as_bool().unwrap_or(false)
 }
 
+/// Whether SDD prompts should require matching real CI/PR check output (item
+/// #299): `task_type=bugfix` always enables it; otherwise the item
+/// description must mention a failing CI check, `cargo fmt`, or `gh pr
+/// checks`.
+pub(crate) fn detect_verify_against_ci(
+    item_description: &str,
+    metadata: &serde_json::Value,
+) -> bool {
+    if metadata["task_type"].as_str() == Some("bugfix") {
+        return true;
+    }
+    if metadata["verify_against_ci"].as_bool() == Some(true) {
+        return true;
+    }
+    let normalized = item_description.to_lowercase();
+    normalized.contains("cargo fmt")
+        || normalized.contains("gh pr checks")
+        || normalized.contains("failing check")
+        || normalized.contains("ci check")
+        || normalized.contains("pr checks")
+}
+
+
 /// Parses `### Task N: <title>` headings (the convention this codebase's
 /// own plans already use — see docs on item #110) into a task list; falls
 /// back to a single synthesized task from the item's own description when

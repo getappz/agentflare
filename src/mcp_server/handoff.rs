@@ -1,18 +1,5 @@
 use super::*;
 
-/// The project's `ready-for-work` label id, if the project has that label at
-/// all — skipped (returns `None`) rather than creating it out of nowhere.
-/// Shared by both branches of `handoff_impl` below: a brand-new handed-off
-/// item, and an existing item that's safe to queue (see the `Some(id)`
-/// branch's own comment for what "safe" means there).
-fn ready_label_id(conn: &rusqlite::Connection, project_id: &str) -> Option<String> {
-    agentflare_backend::label::list_by_project(conn, project_id)
-        .ok()?
-        .into_iter()
-        .find(|l| l.name == crate::supervisor::READY_LABEL)
-        .map(|l| l.id)
-}
-
 /// Merges `"task_type"` into an existing metadata JSON string, same
 /// defensive-coercion pattern as `work_item_pipeline::persist_run_id` (a
 /// non-object existing value, e.g. a double-encoded string, must not panic
@@ -223,6 +210,13 @@ impl AgentflareMcp {
         self.with_backend_db(|conn| {
             let project = self.resolve_project(conn)?;
             let ws_id = Self::resolve_workspace_id(conn)?;
+            let ready_id = agentflare_backend::label::ensure_project_label(
+                conn,
+                &project.id,
+                crate::supervisor::READY_LABEL,
+            )
+            .map_err(map_backend_err)?
+            .id;
 
             let item = match &item_id {
                 Some(id) => {
@@ -246,18 +240,47 @@ impl AgentflareMcp {
                             None,
                         ));
                     }
-                    let mut metadata_str = merge_handoff_depth(&incumbent.metadata, next_depth);
-                    if let Some(t) = &task_type {
-                        metadata_str = merge_task_type(&metadata_str, t);
-                    }
-                    let metadata = Some(metadata_str);
-                    let input = agentflare_backend::item::UpdateItem {
-                        assignee_agent: Some(recipient.clone()),
-                        metadata,
-                        ..Default::default()
-                    };
-                    let item = agentflare_backend::item::update(conn, id, input)
-                        .map_err(map_backend_err)?;
+                    // Metadata goes through `merge_item_metadata` (read-current +
+                    // write inside one IMMEDIATE transaction), never a
+                    // wholesale rewrite of the snapshot above: a dispatch's
+                    // `persist_run_id` landing between that `get` and this
+                    // write would otherwise have its `workflow_run_id`
+                    // silently reverted (item #353). The assignee rides in a
+                    // separate field-only update that leaves `metadata`
+                    // untouched, so the two writes commute. Both run in one
+                    // IMMEDIATE transaction so either both commit or neither
+                    // does (`merge_item_metadata` joins the open tx).
+                    let item = crate::mcp_server::in_immediate_tx(
+                        conn,
+                        agentflare_backend::error::Error::from,
+                        || {
+                            crate::mcp_server::merge_item_metadata(conn, id, |meta| {
+                                let current = meta
+                                    .get(HANDOFF_DEPTH_KEY)
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                meta.insert(
+                                    HANDOFF_DEPTH_KEY.into(),
+                                    serde_json::Value::from(next_depth.max(current + 1)),
+                                );
+                                if let Some(t) = &task_type {
+                                    meta.insert(
+                                        "task_type".into(),
+                                        serde_json::Value::String(t.clone()),
+                                    );
+                                }
+                            })?;
+                            agentflare_backend::item::update(
+                                conn,
+                                id,
+                                agentflare_backend::item::UpdateItem {
+                                    assignee_agent: Some(recipient.clone()),
+                                    ..Default::default()
+                                },
+                            )
+                        },
+                    )
+                    .map_err(map_backend_err)?;
                     // Handing an item that another agent still holds to a
                     // different agent is a reassignment, same as
                     // `redispatch` with a new `assignee_agent`: cancel the
@@ -373,9 +396,9 @@ impl AgentflareMcp {
                             state.group_name.as_str(),
                             "backlog" | "unstarted" | "triage"
                         )
-                        && let Some(ready_id) = ready_label_id(conn, &project.id)
                     {
-                        let _ = agentflare_backend::item::add_label(conn, id, &ready_id);
+                        agentflare_backend::item::add_label(conn, id, &ready_id)
+                            .map_err(map_backend_err)?;
                     }
                     item
                 }
@@ -425,25 +448,23 @@ impl AgentflareMcp {
                                 None,
                             ));
                         }
-                        let mut metadata_str = merge_handoff_depth(&item.metadata, next_depth);
-                        if let Some(t) = &task_type {
-                            metadata_str = merge_task_type(&metadata_str, t);
-                        }
-                        if let Some(t) = &thread_id
-                            && !metadata_str.contains("\"thread\"")
-                        {
-                            let mut v = crate::mcp_server::metadata_object(&metadata_str);
-                            v.insert("thread".into(), serde_json::Value::String(t.clone()));
-                            metadata_str = serde_json::Value::Object(v).to_string();
-                        }
-                        agentflare_backend::item::update(
-                            conn,
-                            &item.id,
-                            agentflare_backend::item::UpdateItem {
-                                metadata: Some(metadata_str),
-                                ..Default::default()
-                            },
-                        )
+                        crate::mcp_server::merge_item_metadata(conn, &item.id, |meta| {
+                            let mut s = merge_handoff_depth(
+                                &serde_json::Value::Object(meta.clone()).to_string(),
+                                next_depth,
+                            );
+                            if let Some(t) = &task_type {
+                                s = merge_task_type(&s, t);
+                            }
+                            if let Some(t) = &thread_id
+                                && !s.contains("\"thread\"")
+                            {
+                                let mut v = crate::mcp_server::metadata_object(&s);
+                                v.insert("thread".into(), serde_json::Value::String(t.clone()));
+                                s = serde_json::Value::Object(v).to_string();
+                            }
+                            *meta = crate::mcp_server::metadata_object(&s);
+                        })
                         .map_err(map_backend_err)?
                     } else {
                         let state_id =
@@ -466,9 +487,7 @@ impl AgentflareMcp {
                         metadata =
                             Some(merge_handoff_depth(metadata.as_deref().unwrap_or("{}"), 1));
                         // A brand-new handed-off item is real, undone work —
-                        // labeling it `ready-for-work` (when the project has
-                        // that label at all; skipped otherwise rather than
-                        // creating it out of nowhere) lets the supervisor's
+                        // labeling it `ready-for-work` lets the supervisor's
                         // discovery loop pick it up without a human doing
                         // that by hand. Its own `resolve_confirmed_agent`
                         // gate already handles a non-autonomous recipient
@@ -479,7 +498,6 @@ impl AgentflareMcp {
                         // may already be claimed, in progress, or done, and
                         // silently re-queuing those for dispatch would be
                         // wrong.
-                        let ready_label_id = ready_label_id(conn, &project.id);
                         let input = agentflare_backend::item::CreateItem {
                             project_id: project.id.clone(),
                             state_id,
@@ -492,7 +510,7 @@ impl AgentflareMcp {
                             external_source: None,
                             external_id: None,
                             metadata,
-                            label_ids: ready_label_id.into_iter().collect(),
+                            label_ids: vec![ready_id.clone()],
                             assignee_ids: vec![],
                             dependency_ids: vec![],
                             start_date: None,
@@ -545,7 +563,7 @@ impl AgentflareMcp {
 
             let mime_type = Self::infer_mime_type(ext);
 
-            let result = self.with_store(|store| -> Result<serde_json::Value, ErrorData> {
+            let mut result = self.with_store(|store| -> Result<serde_json::Value, ErrorData> {
                 let prefix = format!("item_attachment/{}", item.id);
                 let existing = store
                     .doc_list(&ws_id)
@@ -622,6 +640,10 @@ impl AgentflareMcp {
                 }
             }
 
+            crate::quota::failover::attach_warning(
+                &mut result,
+                crate::quota::failover::unavailability_warning(&recipient),
+            );
             Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
         })?
     }
@@ -828,11 +850,13 @@ mod tests {
 
     fn init_test_repo(root: &std::path::Path) {
         let run = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(root)
-                .status()
-                .unwrap();
+            std::process::Command::new(
+                std::env::var_os("AGENTFLARE_TEST_GIT").unwrap_or_else(|| "git".into()),
+            )
+            .args(args)
+            .current_dir(root)
+            .status()
+            .unwrap();
         };
         run(&["init", "-b", "master"]);
         run(&["config", "user.email", "test@test.com"]);
@@ -974,18 +998,73 @@ mod tests {
     }
 
     #[test]
-    fn new_item_is_not_labeled_when_the_project_has_no_ready_for_work_label() {
+    fn new_handoff_without_ready_for_work_label_creates_and_attaches_it() {
         let (_tmp, mcp) = test_mcp();
-        // Deliberately not seeding the label — this project hasn't opted
-        // into autonomous dispatch, so nothing should be created out of
-        // nowhere and the handoff must still succeed.
-        let resp = mcp.handoff_impl(base_request()).unwrap();
-        let item_id = serde_json::from_str::<serde_json::Value>(&resp).unwrap()["item_id"]
+        let response = mcp.handoff_impl(base_request()).unwrap();
+        let item_id = serde_json::from_str::<serde_json::Value>(&response).unwrap()["item_id"]
             .as_str()
             .unwrap()
             .to_string();
+        mcp.with_backend_db(|conn| {
+            let project = mcp.resolve_project(conn).unwrap();
+            let ready = agentflare_backend::label::get_by_name(
+                conn,
+                &project.id,
+                crate::supervisor::READY_LABEL,
+            )
+            .unwrap();
+            assert!(
+                agentflare_backend::item::list_labels(conn, &item_id)
+                    .unwrap()
+                    .contains(&ready.id)
+            );
+        })
+        .unwrap();
+    }
 
-        assert!(item_label_names(&mcp, &item_id).is_empty());
+    #[test]
+    fn existing_item_handoff_without_ready_for_work_label_creates_and_attaches_it() {
+        let (_tmp, mcp) = test_mcp();
+        seed_ready_for_work_label(&mcp);
+        let first = mcp.handoff_impl(base_request()).unwrap();
+        let item_id = serde_json::from_str::<serde_json::Value>(&first).unwrap()["item_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        mcp.with_backend_db(|conn| {
+            let project = mcp.resolve_project(conn).unwrap();
+            let label = agentflare_backend::label::get_by_name(
+                conn,
+                &project.id,
+                crate::supervisor::READY_LABEL,
+            )
+            .unwrap();
+            agentflare_backend::label::delete(conn, &label.id).unwrap();
+        })
+        .unwrap();
+
+        mcp.handoff_impl(HandoffRequest {
+            item_id: Some(item_id.clone()),
+            recipient: "opencode".into(),
+            ..base_request()
+        })
+        .unwrap();
+        mcp.with_backend_db(|conn| {
+            let item = agentflare_backend::item::get(conn, &item_id).unwrap();
+            assert_eq!(item.assignee_agent.as_deref(), Some("opencode"));
+            let ready = agentflare_backend::label::get_by_name(
+                conn,
+                &item.project_id,
+                crate::supervisor::READY_LABEL,
+            )
+            .unwrap();
+            assert!(
+                agentflare_backend::item::list_labels(conn, &item_id)
+                    .unwrap()
+                    .contains(&ready.id)
+            );
+        })
+        .unwrap();
     }
 
     #[test]
@@ -1049,6 +1128,7 @@ mod tests {
     #[test]
     fn a_handoff_to_an_alias_of_the_claim_holder_keeps_its_claim() {
         let (_tmp, mcp) = test_mcp();
+        seed_ready_for_work_label(&mcp);
         let first = mcp.handoff_impl(base_request()).unwrap();
         let item_id = serde_json::from_str::<serde_json::Value>(&first).unwrap()["item_id"]
             .as_str()
@@ -1201,6 +1281,7 @@ mod tests {
             ..base_request()
         };
         let (_tmp, mcp) = test_mcp();
+        seed_ready_for_work_label(&mcp);
         let reply = mcp.handoff_impl(req).unwrap();
         let item_id = serde_json::from_str::<serde_json::Value>(&reply).unwrap()["item_id"]
             .as_str()
@@ -1228,6 +1309,7 @@ mod tests {
         // instead of relying on prose. Also asserts the merge is real (an
         // unrelated pre-existing key, e.g. `size`, survives).
         let (_tmp, mcp) = test_mcp();
+        seed_ready_for_work_label(&mcp);
         let first = mcp.handoff_impl(base_request()).unwrap();
         let item_id = serde_json::from_str::<serde_json::Value>(&first).unwrap()["item_id"]
             .as_str()
@@ -1265,6 +1347,55 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&metadata).unwrap();
         assert_eq!(parsed["task_type"], "implementation");
         assert_eq!(parsed["size"], "M");
+    }
+
+    #[test]
+    fn an_explicit_item_id_handoff_preserves_a_dispatch_written_workflow_run_id() {
+        // Item #353: the explicit-`item_id` branch used to rewrite the whole
+        // metadata blob from the snapshot it read at the top, so a dispatch's
+        // `persist_run_id` landing in between had its `workflow_run_id`
+        // silently reverted — the next tick/resume could no longer find the
+        // live run. Metadata must merge into the current row instead.
+        let (_tmp, mcp) = test_mcp();
+        seed_ready_for_work_label(&mcp);
+        let first = mcp.handoff_impl(base_request()).unwrap();
+        let item_id = serde_json::from_str::<serde_json::Value>(&first).unwrap()["item_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // A dispatch lands after the handoff created the item.
+        mcp.with_backend_db(|conn| {
+            crate::mcp_server::merge_item_metadata(conn, &item_id, |meta| {
+                meta.insert(
+                    "workflow_run_id".into(),
+                    serde_json::Value::String("run-live".to_string()),
+                );
+            })
+            .unwrap();
+        })
+        .unwrap();
+
+        let reply = HandoffRequest {
+            item_id: Some(item_id.clone()),
+            task_type: Some("bugfix".to_string()),
+            completed: "more".to_string(),
+            remaining: "less".to_string(),
+            ..base_request()
+        };
+        mcp.handoff_impl(reply).unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(
+            &mcp.with_backend_db(|conn| {
+                agentflare_backend::item::get(conn, &item_id)
+                    .unwrap()
+                    .metadata
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(parsed["workflow_run_id"], "run-live");
+        assert_eq!(parsed["task_type"], "bugfix");
+        assert_eq!(parsed["handoff_depth"], 2);
     }
 
     #[test]
@@ -1358,6 +1489,7 @@ mod tests {
         // Item #219: first 10 hops on the same thread succeed with
         // incrementing depth; the 11th is rejected before any new asset.
         let (_tmp, mcp) = test_mcp();
+        seed_ready_for_work_label(&mcp);
         let thread = "thread-ping-pong".to_string();
         let mut req = base_request();
         req.thread_id = Some(thread.clone());
@@ -1408,6 +1540,7 @@ mod tests {
     fn handoff_thread_reuse_path_bumps_depth_and_rejects_past_cap() {
         // Depth must survive the thread-reuse path too (no item_id).
         let (_tmp, mcp) = test_mcp();
+        seed_ready_for_work_label(&mcp);
         let thread = "thread-reuse-depth".to_string();
         let mut req = base_request();
         req.thread_id = Some(thread.clone());
@@ -1595,6 +1728,7 @@ mod tests {
     #[test]
     fn allow_secrets_bypasses_the_scan() {
         let (_tmp, mcp) = test_mcp();
+        seed_ready_for_work_label(&mcp);
         let req = HandoffRequest {
             content: "ghp_abcdefghijklmnopqrstuvwxyz012345".to_string(),
             allow_secrets: Some(true),
@@ -1606,6 +1740,7 @@ mod tests {
     #[test]
     fn clean_handoff_passes_unchanged() {
         let (_tmp, mcp) = test_mcp();
+        seed_ready_for_work_label(&mcp);
         mcp.handoff_impl(base_request()).unwrap();
     }
 }

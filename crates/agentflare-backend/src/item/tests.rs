@@ -1698,6 +1698,62 @@ fn claim_succeeds_once_plan_approved() {
     assert_eq!(outcome, ClaimOutcome::Acquired);
 }
 
+/// Item #300 / live #281: a post-dispatch metadata write that carries a
+/// stale `plan_status: "pending"` (same `plan_asset_id`) must not erase the
+/// approval record when going through `item::update` directly — the path
+/// orphan reconcile / `merge_item_metadata` / handoff use, bypassing MCP
+/// `restore_plan_transition_fields`.
+#[test]
+fn update_preserves_approval_against_stale_pending_metadata() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "_planimm");
+    let item = create(
+        &conn,
+        CreateItem {
+            project_id: pid,
+            state_id: sid,
+            name: "approved item".into(),
+            description: None,
+            priority: None,
+            parent_id: None,
+            assignee_agent: None,
+            sort_order: None,
+            external_source: None,
+            external_id: None,
+            metadata: Some(
+                r#"{"plan_required":true,"plan_status":"approved","plan_approved_at":5,"plan_approved_by":"human","plan_asset_id":"a"}"#
+                    .into(),
+            ),
+            label_ids: vec![],
+            assignee_ids: vec![],
+            dependency_ids: vec![],
+            start_date: None,
+            due_date: None,
+        },
+    )
+    .unwrap();
+
+    update(
+        &conn,
+        &item.id,
+        UpdateItem {
+            metadata: Some(
+                r#"{"plan_required":true,"plan_status":"pending","plan_asset_id":"a","workflow_run_id":"01a0d24a"}"#
+                    .into(),
+            ),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let got = get(&conn, &item.id).unwrap();
+    let meta: serde_json::Value = serde_json::from_str(&got.metadata).unwrap();
+    assert_eq!(meta["plan_status"], "approved");
+    assert_eq!(meta["plan_approved_at"], 5);
+    assert_eq!(meta["plan_approved_by"], "human");
+    assert_eq!(meta["workflow_run_id"], "01a0d24a");
+}
+
 #[test]
 fn resolve_id_passes_through_uuid_unchanged() {
     let conn = db::open_in_memory().unwrap();
@@ -2005,6 +2061,17 @@ fn make_label(conn: &Connection, pid: &str, name: &str) -> crate::label::Label {
 }
 
 #[test]
+fn redispatch_without_ready_label_creates_and_attaches_it() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let item = make_item(&conn, &pid, &sid);
+    let outcome = redispatch(&conn, &item.id, Some("claude-code")).unwrap();
+    assert!(matches!(outcome, RedispatchOutcome::Ready { .. }));
+    let ready = crate::label::get_by_name(&conn, &pid, "ready-for-work").unwrap();
+    assert!(list_labels(&conn, &item.id).unwrap().contains(&ready.id));
+}
+
+#[test]
 fn redispatch_resets_state_clears_stale_labels_reattaches_ready_and_normalizes_assignee() {
     let conn = db::open_in_memory().unwrap();
     let (pid, sid) = seed_project(&conn, "");
@@ -2042,6 +2109,7 @@ fn redispatch_resets_state_clears_stale_labels_reattaches_ready_and_normalizes_a
 fn redispatch_explicit_assignee_overrides_the_items_existing_one() {
     let conn = db::open_in_memory().unwrap();
     let (pid, sid) = seed_project(&conn, "");
+    make_label(&conn, &pid, "ready-for-work");
     let item = make_item(&conn, &pid, &sid);
     claim(&conn, &item.id, "opencode:1", 1000, TTL).unwrap();
 
@@ -2062,6 +2130,7 @@ fn redispatch_explicit_assignee_overrides_the_items_existing_one() {
 fn redispatch_to_a_different_agent_clears_a_model_scoped_to_the_old_one() {
     let conn = db::open_in_memory().unwrap();
     let (pid, sid) = seed_project(&conn, "");
+    make_label(&conn, &pid, "ready-for-work");
     let item = make_item(&conn, &pid, &sid);
     claim(&conn, &item.id, "opencode:1", 1000, TTL).unwrap();
     update(
@@ -2095,6 +2164,7 @@ fn redispatch_to_a_different_agent_clears_a_model_scoped_to_the_old_one() {
 fn redispatch_to_the_same_agent_keeps_the_model_override() {
     let conn = db::open_in_memory().unwrap();
     let (pid, sid) = seed_project(&conn, "");
+    make_label(&conn, &pid, "ready-for-work");
     let item = make_item(&conn, &pid, &sid);
     claim(&conn, &item.id, "claude-code:1", 1000, TTL).unwrap();
     update(
@@ -2127,6 +2197,7 @@ fn redispatch_to_the_same_agent_keeps_the_model_override() {
 fn redispatch_clears_a_stale_pr_reference_from_a_prior_attempt() {
     let conn = db::open_in_memory().unwrap();
     let (pid, sid) = seed_project(&conn, "");
+    make_label(&conn, &pid, "ready-for-work");
     let item = make_item(&conn, &pid, &sid);
     claim(&conn, &item.id, "claude-code:1", 1000, TTL).unwrap();
     update(
@@ -2180,6 +2251,8 @@ fn redispatch_rejects_a_completed_item() {
     );
 }
 
+#[path = "tests_claim_planning.rs"]
+mod tests_claim_planning;
 #[path = "tests_finalize.rs"]
 mod tests_finalize;
 #[path = "tests_labels.rs"]

@@ -29,6 +29,7 @@ mod mcp;
 mod memory;
 mod message;
 mod optimize;
+mod pr;
 mod project;
 mod review;
 mod run;
@@ -155,7 +156,19 @@ pub enum Commands {
     Serve(serve::ServeArgs),
     /// Vent friction or feedback encountered during an agent session.
     Vent(vent::VentArgs),
+    /// Open stamped PRs and manage cross-instance PR ownership.
+    Pr(pr::PrArgs),
     /// Manage work items in the agentflare project queue.
+    ///
+    /// Automatic failover moves an item to another installed agent when the
+    /// current one is rate limited, out of credit, over its subscription's
+    /// usage threshold, or its CLI invocation is broken. Two item-metadata
+    /// keys scope this per item (set via `agentflare item update --metadata`,
+    /// not a work flag): `"failover": false` pins the item to its current
+    /// assignee_agent, and `"allowed_agents": ["codex", "opencode"]`
+    /// restricts any failover move to that list. The usage threshold and the
+    /// operator-wide on/off/allow-list are `~/.agentflare/config.toml`'s
+    /// `[failover]` table.
     Work(work::WorkArgs),
     /// Search and fetch cached third-party API documentation.
     Docs(docs::DocsArgs),
@@ -213,6 +226,7 @@ impl Commands {
             Self::Serve(cmd) => cmd.run(),
             Self::Daemon(cmd) => cmd.run(),
             Self::Vent(cmd) => vent::run(cmd),
+            Self::Pr(cmd) => cmd.run(),
             Self::Work(cmd) => cmd.run(),
             Self::Docs(cmd) => docs::run(cmd),
             Self::Workflow(cmd) => cmd.run(),

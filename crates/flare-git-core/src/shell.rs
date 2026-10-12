@@ -21,22 +21,42 @@ use std::sync::OnceLock;
 /// step, so resolving through it -- always excluding this process's own
 /// directory -- is immune to the same failure mode regardless of which
 /// binary this crate ends up linked into.
-/// `true` for a cargo build-profile directory (`.../target/debug` or
-/// `.../target/release`) -- Cargo prepends this to PATH for every test/run
+/// `true` for a cargo build-profile directory (`.../{target,cargo-target}/
+/// {debug,release}`) -- Cargo prepends this to PATH for every test/run
 /// process (so build-script DLLs resolve), and any `[[bin]]` target in the
 /// same workspace lands directly in it. Excluding only "this process's own
 /// directory" isn't enough: a workspace that redirects `target-dir`
 /// globally (e.g. `~/.cargo/target`, as this repo's `~/.cargo/config.toml`
 /// does for sccache) means EVERY crate's test binaries share that PATH
 /// entry with `flare-git-shim`'s freshly-built `git.exe`. Detected
-/// structurally (name is "debug"/"release", parent is named "target") so
+/// structurally (name is "debug"/"release", parent is "target" or
+/// lean-ctx's "cargo-target") so
 /// it works regardless of where the target dir physically lives.
 fn is_cargo_target_profile_dir(p: &Path) -> bool {
     let comps: Vec<_> = p.components().collect();
     comps.windows(2).any(|w| {
-        w[0].as_os_str() == "target"
+        (w[0].as_os_str() == "target" || w[0].as_os_str() == "cargo-target")
             && (w[1].as_os_str() == "debug" || w[1].as_os_str() == "release")
     })
+}
+
+#[cfg(test)]
+#[test]
+fn excludes_lean_ctx_cargo_target_from_git_search() {
+    assert!(is_cargo_target_profile_dir(Path::new(
+        "cache/cargo-target/debug/deps"
+    )));
+    assert!(is_cargo_target_profile_dir(Path::new(
+        "cache/cargo-target/release"
+    )));
+    // Only the profile dirs: a bare `cargo-target` or a non-profile child is
+    // not a build-profile dir.
+    assert!(!is_cargo_target_profile_dir(Path::new(
+        "cache/cargo-target"
+    )));
+    assert!(!is_cargo_target_profile_dir(Path::new(
+        "cache/cargo-target/bin"
+    )));
 }
 
 /// `~/.agentflare/shims` -- the PATH-shim install dir (mirrored here since

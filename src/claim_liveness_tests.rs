@@ -325,3 +325,67 @@ fn a_paused_items_released_claim_is_not_requeued() {
         crate::supervisor::READY_LABEL
     ));
 }
+
+#[test]
+fn a_dead_claim_with_a_merged_pr_is_not_requeued() {
+    let conn = backend();
+    let sessions = sessions_db();
+    let project = seed_project(&conn);
+    let now = 1_000_000;
+    let item = claimed_item(&conn, &project, "merged", "codex:gone", now);
+    touch(&sessions, "codex:gone", DEAD_PID, now);
+    let mut memory = SweepMemory::default();
+    let status = |_: &agentflare_backend::item::Item| crate::worktree::PrCiStatus::Merged;
+    assert!(sweep_with(&conn, Some(&sessions), None, &mut memory, now + 12, status).is_empty());
+    let released = sweep_with(&conn, Some(&sessions), None, &mut memory, now + 24, status);
+    assert_eq!(released.len(), 1);
+    assert!(released[0].promote);
+    assert!(!released[0].redispatched);
+    assert!(!has_label(
+        &conn,
+        &item,
+        &project,
+        crate::supervisor::READY_LABEL
+    ));
+    assert!(
+        agentflare_backend::item::promote_in_review_to_completed_if_pr(&conn, &item, None).unwrap()
+    );
+    let completed = agentflare_backend::item::get(&conn, &item).unwrap();
+    assert_eq!(
+        agentflare_backend::state::get(&conn, &completed.state_id)
+            .unwrap()
+            .group_name,
+        "completed"
+    );
+}
+
+#[test]
+fn a_dead_claim_with_green_auto_merge_is_not_requeued() {
+    let conn = backend();
+    let sessions = sessions_db();
+    let project = seed_project(&conn);
+    let now = 1_000_000;
+    let item = claimed_item(&conn, &project, "merging", "codex:gone", now);
+    touch(&sessions, "codex:gone", DEAD_PID, now);
+    let mut memory = SweepMemory::default();
+    let status = |_: &agentflare_backend::item::Item| crate::worktree::PrCiStatus::Passing {
+        number: 1,
+        labels: vec![],
+        head_sha: None,
+        auto_merge: crate::worktree::AutoMergeRef {
+            enabled: true,
+            ..Default::default()
+        },
+    };
+    assert!(sweep_with(&conn, Some(&sessions), None, &mut memory, now + 12, status).is_empty());
+    let released = sweep_with(&conn, Some(&sessions), None, &mut memory, now + 24, status);
+    assert_eq!(released.len(), 1);
+    assert!(!released[0].redispatched);
+    assert!(!released[0].promote);
+    assert!(!has_label(
+        &conn,
+        &item,
+        &project,
+        crate::supervisor::READY_LABEL
+    ));
+}

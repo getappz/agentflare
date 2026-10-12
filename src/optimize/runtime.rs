@@ -121,6 +121,8 @@ const VERIFICATION_COMMAND_MARKERS: &[&str] = &[
     "cargo build",
     "cargo check",
     "cargo clippy",
+    "cargo fmt",
+    "gh pr checks",
     "npm test",
     "npm run test",
     "npm run build",
@@ -777,6 +779,12 @@ mod tests {
     fn model_routing_still_flags_real_locate_and_where_is_prompts() {
         assert!(model_routing_nudge("please locate the missing file").is_some());
         assert!(model_routing_nudge("where is the auth check?").is_some());
+    }
+
+    #[test]
+    fn is_verification_command_matches_cargo_fmt_and_gh_pr_checks() {
+        assert!(is_verification_command("cargo fmt --check"));
+        assert!(is_verification_command("gh pr checks 800"));
     }
 
     #[test]

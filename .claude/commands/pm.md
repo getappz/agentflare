@@ -9,8 +9,8 @@ it is that subcommand's arguments.
 ## Bare `/pm` (no arguments) — start the PM day
 
 1. Load the `pm` skill (covers both reporting and PM mode) and enter PM
-   mode — Part 2 of the skill: create and dispatch work instead of
-   implementing it yourself — until `/pm mode off`.
+   mode — Part 2 of the skill: create and dispatch work (you make small
+   mechanical changes yourself) — until `/pm mode off`.
 2. Run the daily kickoff, in this order:
    a. **Standup** — `/pm:standup` workflow (last 24h): what shipped, what's in
       flight per assignee, what's stuck.

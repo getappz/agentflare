@@ -30,19 +30,26 @@ fn prepend_dir(shim: Option<PathBuf>, path: Option<OsString>) -> Option<OsString
 /// it sees the same value.
 pub fn agent_path(base: Option<OsString>) -> Option<OsString> {
     installed()?;
-    prepend_dir(shim_dir_in(&dirs::data_dir()?), base)
+    prepend_dir(shim_dir_in(&dirs::data_local_dir()?), base)
 }
 
 fn installed() -> Option<PathBuf> {
-    let on_path = std::env::var_os("PATH").and_then(|p| {
-        std::env::split_paths(&p)
-            .map(|d| d.join("mbx"))
-            .find(|c| c.is_file())
-    });
+    let cwd = std::env::current_dir().ok()?;
+    let base = std::env::var_os("PATH");
+    let path = crate::mise_install::append_mise_path(base.as_deref(), &cwd).or(base);
+    let on_path = path.and_then(|p| find_mbx(&p));
     on_path.or_else(|| {
-        let c = dirs::home_dir()?.join(".cargo/bin/mbx");
+        let c = dirs::home_dir()?
+            .join(".cargo/bin")
+            .join(format!("mbx{}", std::env::consts::EXE_SUFFIX));
         c.is_file().then_some(c)
     })
+}
+
+fn find_mbx(path: &OsString) -> Option<PathBuf> {
+    std::env::split_paths(path)
+        .map(|dir| dir.join(format!("mbx{}", std::env::consts::EXE_SUFFIX)))
+        .find(|candidate| candidate.is_file())
 }
 
 fn cache_dir() -> Option<PathBuf> {
@@ -145,6 +152,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(shim_dir_in(tmp.path()), Some(bin));
+    }
+
+    #[test]
+    fn installed_name_uses_platform_executable_suffix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp
+            .path()
+            .join(format!("mbx{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&bin, "").unwrap();
+        let path = std::env::join_paths([tmp.path()]).unwrap();
+        assert_eq!(find_mbx(&path), Some(bin));
     }
 
     #[test]

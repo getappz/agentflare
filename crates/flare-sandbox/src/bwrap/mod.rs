@@ -12,6 +12,10 @@
 //! workspaces, so that machinery isn't needed here.
 mod bwrap_install;
 
+#[cfg(test)]
+#[path = "persist_mount_tests.rs"]
+mod persist_mount_tests;
+
 use crate::{AgentProfile, AgentStateMount, MountPolicy, SandboxConfig};
 use crate::{events, identity, paths};
 use std::path::{Path, PathBuf};
@@ -115,6 +119,38 @@ fn build_bwrap_args(
     bwrap_args
 }
 
+/// `node_modules` dirs under `cwd` (itself and two levels down, like
+/// `flare-git-core::deps`) that agentflare hard-linked from the shared
+/// dependency store (item #329). Hard links share inodes with the store and
+/// other worktrees, so the job gets a private tmp overlay: reads pass
+/// through, writes never reach the shared bytes.
+fn shared_deps_dirs(cwd: &Path) -> Vec<PathBuf> {
+    const MARKER: &str = "node_modules/.agentflare-deps";
+    let mut found = Vec::new();
+    let mut level = vec![cwd.to_path_buf()];
+    for _ in 0..3 {
+        let mut next = Vec::new();
+        for dir in level {
+            if dir.join(MARKER).is_file() {
+                found.push(dir.join("node_modules"));
+            }
+            for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                if e.file_type().is_ok_and(|t| t.is_dir())
+                    && !name.starts_with('.')
+                    && name != "node_modules"
+                    && name != "target"
+                {
+                    next.push(e.path());
+                }
+            }
+        }
+        level = next;
+    }
+    found
+}
+
 fn build_bwrap_args_with_home(
     cwd: Option<&Path>,
     command: &str,
@@ -178,6 +214,14 @@ fn build_bwrap_args_with_home(
                 bwrap_args.push(git_str);
             }
             _ => {}
+        }
+
+        for nm in shared_deps_dirs(cwd) {
+            let nm = path_to_string(&nm);
+            bwrap_args.push("--overlay-src".to_string());
+            bwrap_args.push(nm.clone());
+            bwrap_args.push("--tmp-overlay".to_string());
+            bwrap_args.push(nm);
         }
 
         bwrap_args.push("--chdir".to_string());
@@ -327,6 +371,9 @@ fn matching_profile<'a>(command: &str, config: &'a SandboxConfig) -> Option<&'a 
 /// needs somewhere to create its own state). `EphemeralEmpty` always mounts
 /// an empty tmpfs: nothing readable, nothing persisted -- the credential
 /// posture OpenShell enforces by never handing agents real credentials.
+/// `Persist` binds the host directory read-write (`--bind-try`): reads see
+/// it and writes persist -- only for state whose own protocol requires
+/// persistence across jobs (rotation-based OAuth, item #355).
 fn push_agent_state_mount(
     bwrap_args: &mut Vec<String>,
     command: &str,
@@ -368,6 +415,33 @@ fn push_agent_state_mount(
             return;
         }
         MountPolicy::OverlayEphemeral => {}
+        MountPolicy::Persist => {
+            // Writable bind, persisting to the host (item #355): same shape
+            // as `writable_home_dirs` above, scoped to this agent's profile.
+            // A missing dir gets no mount at all (`--bind-try` would skip it
+            // anyway); a present-but-unresolvable one (symlink, dangling
+            // symlink, escape above $HOME) is skipped with an event instead
+            // of binding the wrong directory.
+            match paths::resolve_existing_home_dir(home_path, mount.relative_path) {
+                Some(resolved) => {
+                    let dir_str = path_to_string(&resolved);
+                    bwrap_args.push("--bind-try".to_string());
+                    bwrap_args.push(dir_str.clone());
+                    bwrap_args.push(dir_str);
+                }
+                None if paths::join_validated_home_dir(home_path, mount.relative_path)
+                    .is_some_and(|p| std::fs::symlink_metadata(&p).is_ok()) =>
+                {
+                    events::emit(&events::SandboxEvent::skipped_mount(
+                        command,
+                        mount.relative_path,
+                        "symlink-or-escape",
+                    ));
+                }
+                None => {}
+            }
+            return;
+        }
     }
     if let Some(resolved) = paths::resolve_existing_home_dir(home_path, mount.relative_path) {
         let dir_str = path_to_string(&resolved);
@@ -612,6 +686,40 @@ pub(super) fn is_executable(path: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::AgentProfile;
+
+    #[test]
+    fn provisioned_node_modules_gets_a_private_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(dir.path()).unwrap();
+        for nm in [cwd.join("node_modules"), cwd.join("web/node_modules")] {
+            std::fs::create_dir_all(&nm).unwrap();
+        }
+        std::fs::write(cwd.join("node_modules/.agentflare-deps"), "k").unwrap();
+        // web/node_modules is a plain install: no overlay.
+        assert_eq!(shared_deps_dirs(&cwd), [cwd.join("node_modules")]);
+    }
+
+    #[test]
+    fn provisioned_node_modules_overlay_lands_in_bwrap_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(cwd.join("node_modules")).unwrap();
+        std::fs::write(cwd.join("node_modules/.agentflare-deps"), "k").unwrap();
+        let args = build_bwrap_args_with_home(
+            Some(&cwd),
+            "/bin/true",
+            &[],
+            None,
+            false,
+            &SandboxConfig::default(),
+        );
+        let nm = path_to_string(&cwd.join("node_modules"));
+        let at = |flag: &str| args.iter().position(|a| a == flag).unwrap();
+        let (src, tmp) = (at("--overlay-src"), at("--tmp-overlay"));
+        assert_eq!(args[src + 1], nm);
+        assert_eq!(args[tmp + 1], nm);
+        assert!(src < tmp, "overlay-src must precede its --tmp-overlay");
+    }
 
     fn agent(binary_name: &'static str, mounts: &'static [AgentStateMount]) -> SandboxConfig {
         SandboxConfig {

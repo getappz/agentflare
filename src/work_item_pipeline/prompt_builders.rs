@@ -8,14 +8,19 @@
 /// from already-completed role replies, not to run verification itself.
 const RESUME_VERIFICATION_NOTE: &str = "A later fix round may resume this conversation, but each round runs as a separate process: anything you background dies with it, and the resumed round has no way to check on it. Never run build, test, or lint commands as a background task planning to report back later -- run all verification synchronously in the foreground and wait for it to complete before ending your turn.";
 
+const VERIFY_AGAINST_CI_NOTE: &str = "This task is about a failing CI check or pull request — do not substitute unrelated build/test commands and do not claim \"already done\" from logic review alone. Run the exact failing check locally (Rust formatting: `cargo fmt --check`, then `cargo fmt` if it fails). Run `gh pr checks` against this branch's open PR (or the PR number named in the task) and confirm every check passes before you finish. Your status must say what those commands showed, not only that other tests passed.";
+
 /// Builds the prompt for the implementer role: given a task, it must implement
 /// it. If `fix_context` is provided (a prior reviewer's findings), the prompt
 /// instructs them to address those issues. When `tdd` is set (item #179),
-/// appends explicit red-green-refactor instructions.
+/// appends explicit red-green-refactor instructions. When `verify_against_ci`
+/// is set (item #299), requires matching the failing CI check and `gh pr
+/// checks` output.
 pub(crate) fn build_implementer_prompt(
     task: &SddTask,
     fix_context: Option<&str>,
     tdd: bool,
+    verify_against_ci: bool,
 ) -> String {
     let mut prompt = format!(
         "You are implementing one task from a larger plan.\n\nTask: {}\n\n{}\n",
@@ -30,6 +35,9 @@ pub(crate) fn build_implementer_prompt(
         prompt.push_str(
             "\nFollow test-driven development for this task: write a failing test first, confirm it fails, then write the minimal code to pass it, then refactor. Do not write implementation code before its test.\n"
         );
+    }
+    if verify_against_ci {
+        prompt.push_str(&format!("\n{VERIFY_AGAINST_CI_NOTE}\n"));
     }
     prompt.push_str(&format!("\n{RESUME_VERIFICATION_NOTE}\n"));
     prompt.push_str("\nReply with a short status: what you did, tests run, and any concerns.\n");
@@ -78,19 +86,27 @@ pub(crate) fn build_review_analyst_prompt(
 /// Builds the prompt for the task reviewer role: given a task and the
 /// implementer's report, review it for spec compliance and code quality.
 /// When `tdd` is set (item #179), also requires test-first evidence in the
-/// implementer's report as a review criterion.
+/// implementer's report as a review criterion. When `verify_against_ci` is set
+/// (item #299), requires evidence of the specific CI commands and `gh pr
+/// checks`.
 pub(crate) fn build_task_reviewer_prompt(
     task: &SddTask,
     implementer_report: &str,
     tdd: bool,
+    verify_against_ci: bool,
 ) -> String {
     let tdd_note = if tdd {
         " Also check for test-first evidence: the report must show a failing test was written and confirmed before the implementation change, not just tests added at the end. Missing that sequence is a REVIEW_ISSUES finding even if the code otherwise works."
     } else {
         ""
     };
+    let ci_note = if verify_against_ci {
+        " Also verify the implementer ran the specific failing CI command named in the task (e.g. `cargo fmt --check`) and `gh pr checks` on the relevant PR in the foreground, and that the report quotes their outcomes. Generic build/test success without those is REVIEW_ISSUES."
+    } else {
+        ""
+    };
     format!(
-        "Review this task's implementation for spec compliance and code quality.{tdd_note}\n\nTask: {}\n{}\n\nImplementer's report:\n{implementer_report}\n\n{RESUME_VERIFICATION_NOTE}\n\nReply REVIEW_APPROVED if both spec and quality pass, or REVIEW_ISSUES: followed by a bulleted list of findings.\n",
+        "Review this task's implementation for spec compliance and code quality.{tdd_note}{ci_note}\n\nTask: {}\n{}\n\nImplementer's report:\n{implementer_report}\n\n{RESUME_VERIFICATION_NOTE}\n\nReply REVIEW_APPROVED if both spec and quality pass, or REVIEW_ISSUES: followed by a bulleted list of findings.\n",
         task.title, task.body
     )
 }

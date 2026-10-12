@@ -9,18 +9,33 @@
 //! where a convention is already known, akitaonrails/ai-jail's own
 //! `command_state_paths` table -- adopting *which* directories each agent
 //! needs, not its write policy (ai-jail persists these with a real
-//! read-write bind; agentflare deliberately keeps every agent-state write
-//! ephemeral, see `OverlayEphemeral`'s doc comment).
+//! read-write bind; agentflare keeps agent-state writes ephemeral by default,
+//! see `OverlayEphemeral`'s doc comment, with a per-agent opt-out where
+//! discarding writes corrupts shared state -- claude-code's OAuth rotation,
+//! item #355).
 
 use flare_sandbox::{AgentProfile, AgentStateMount, MountPolicy, SandboxConfig};
 use std::path::{Path, PathBuf};
 
 const OVERLAY: MountPolicy = MountPolicy::OverlayEphemeral;
+const PERSIST: MountPolicy = MountPolicy::Persist;
 
 const fn mount(relative_path: &'static str) -> AgentStateMount {
     AgentStateMount {
         relative_path,
         policy: OVERLAY,
+        diagnostic_log: None,
+    }
+}
+
+/// Like [`mount`], but the directory is bound read-write so the job's writes
+/// persist to the host -- only for state whose own protocol requires it
+/// (claude-code's rotating OAuth credentials, item #355). Every other
+/// agent-state mount stays [`OVERLAY`].
+const fn persist_mount(relative_path: &'static str) -> AgentStateMount {
+    AgentStateMount {
+        relative_path,
+        policy: PERSIST,
         diagnostic_log: None,
     }
 }
@@ -51,7 +66,21 @@ const fn mount_with_diagnostic_log(
 /// authenticate. API Error: 401 OAuth access token has expired" against the
 /// stale token (item #127, confirmed live: every sandboxed job hit it while
 /// the same token refreshed fine interactively).
-const CLAUDE_STATE: &[AgentStateMount] = &[mount(".claude")];
+///
+/// A real writable bind (`Persist`), not the default `OverlayEphemeral`:
+/// Anthropic rotates BOTH tokens on every refresh, consuming the old refresh
+/// token server-side. An overlay would let the job's own refresh succeed yet
+/// discard the rotated pair on exit, leaving the host file holding dead
+/// credentials -- the next process that needs a refresh (another job, or the
+/// host login itself) fails with "Failed to authenticate: OAuth session
+/// expired and could not be refreshed", and the CLI then wipes the
+/// credentials file outright (item #355, confirmed live: a sandboxed refresh
+/// succeeded in-job while a replay of the same pre-refresh file failed and
+/// zeroed it). Persisting also shares `.oauth_refresh.lock` across
+/// concurrent jobs, so their refreshes serialize the same way concurrent
+/// unsandboxed processes already do instead of stampeding on one stale
+/// refresh token.
+const CLAUDE_STATE: &[AgentStateMount] = &[persist_mount(".claude")];
 
 /// opencode's own dirs -- unlike claude-code/codex/gemini's headless modes,
 /// `opencode run` unconditionally writes into `.local/share/opencode` on
@@ -313,6 +342,41 @@ mod tests {
             assert!(
                 !profile.state_mounts.is_empty(),
                 "{} has no state mounts -- remove the profile instead of leaving it empty",
+                profile.binary_name
+            );
+        }
+    }
+
+    #[test]
+    fn claude_state_mount_persists_for_oauth_rotation() {
+        // Item #355: Anthropic rotates both OAuth tokens on every refresh,
+        // consuming the old refresh token server-side. An ephemeral overlay
+        // would let a job's own refresh succeed yet discard the rotated pair
+        // on exit, leaving the host file holding dead credentials -- the
+        // next refresh attempt fails with "OAuth session expired and could
+        // not be refreshed" and the CLI wipes the file. Every other profile
+        // stays overlay-ephemeral.
+        let claude = AGENT_PROFILES
+            .iter()
+            .find(|p| p.binary_name == "claude")
+            .expect("claude profile must exist");
+        assert!(
+            claude
+                .state_mounts
+                .iter()
+                .any(|m| m.relative_path == ".claude" && m.policy == MountPolicy::Persist),
+            ".claude must be a Persist mount: {claude:?}"
+        );
+        for profile in AGENT_PROFILES {
+            if profile.binary_name == "claude" {
+                continue;
+            }
+            assert!(
+                profile
+                    .state_mounts
+                    .iter()
+                    .all(|m| m.policy == MountPolicy::OverlayEphemeral),
+                "{} must stay overlay-ephemeral: {profile:?}",
                 profile.binary_name
             );
         }

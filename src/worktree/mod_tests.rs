@@ -34,10 +34,14 @@ fn pr_body_falls_back_to_the_placeholder_when_summary_is_blank() {
 
 #[test]
 fn pr_footer_names_agent_machine_and_item() {
+    let instance = crate::github::bridge::config::stable_instance_id();
     assert_eq!(
-        pr_footer("claude-code", "kumar-laptop", 42, "item-uuid"),
-        "---\n_Opened by `claude-code` on **kumar-laptop** for item #42 via agentflare._\n\
-             <!-- agentflare-item-id: item-uuid -->"
+        pr_footer("claude-code", "kumar-laptop", 42, "item-uuid", "task/42-slug"),
+        format!(
+            "---\n_Opened by `claude-code` on **kumar-laptop** (`{instance}`) for item #42 via agentflare._\n\
+              <!-- agentflare-item-id: item-uuid -->\n\
+              <!-- agentflare-origin: v=1 instance={instance} item=item-uuid seq=42 branch=task/42-slug -->"
+        )
     );
 }
 
@@ -617,6 +621,16 @@ fn pr_ci_status_from_batch_reports_passing_when_only_a_merge_queue_blocks_green_
 }
 
 #[test]
+fn pr_ci_status_from_batch_reports_passing_when_a_merge_queue_blocks_a_checkless_pr() {
+    let mut data = batch_data(false, Some(true), Some("blocked"), vec![], vec![]);
+    data.merge_queue_enabled = true;
+    assert!(matches!(
+        pr_ci_status_from_batch(101, &data),
+        PrCiStatus::Passing { number: 101, .. }
+    ));
+}
+
+#[test]
 fn pr_ci_status_from_batch_awaiting_review_carries_the_auto_merge_handle() {
     let mut data = batch_data(
         false,
@@ -706,6 +720,21 @@ fn pr_ci_status_from_batch_reports_pending_when_blocked_despite_green_checks() {
     assert!(matches!(
         pr_ci_status_from_batch(101, &data),
         PrCiStatus::Pending { .. }
+    ));
+}
+
+#[test]
+fn pr_ci_status_from_batch_checks_actions_when_some_required_contexts_are_missing() {
+    let data = batch_data(
+        false,
+        Some(true),
+        Some("blocked"),
+        vec![required(check("fmt", "completed", Some("success")))],
+        vec![],
+    );
+    assert!(matches!(
+        pr_ci_status_from_batch(101, &data),
+        PrCiStatus::MissingCi { .. }
     ));
 }
 
@@ -818,6 +847,24 @@ fn pr_ci_status_from_batch_decides_on_required_contexts_only_when_any_are_marked
 }
 
 #[test]
+fn pr_ci_status_from_batch_blocked_with_optional_context_stays_pending_not_missing_ci() {
+    let data = batch_data(
+        false,
+        Some(true),
+        Some("blocked"),
+        vec![
+            required(check("build", "completed", Some("success"))),
+            check("optional-lint", "completed", Some("success")),
+        ],
+        vec![],
+    );
+    assert!(matches!(
+        pr_ci_status_from_batch(101, &data),
+        PrCiStatus::Pending { .. }
+    ));
+}
+
+#[test]
 fn pr_ci_status_from_batch_counts_a_pending_required_legacy_status() {
     let data = batch_data(
         false,
@@ -851,7 +898,7 @@ fn pr_ci_status_from_batch_keeps_a_checkless_pr_pending_until_github_says_mergea
         assert!(
             matches!(
                 pr_ci_status_from_batch(101, &data),
-                PrCiStatus::Pending { .. }
+                PrCiStatus::MissingCi { .. }
             ),
             "{state}"
         );
@@ -871,6 +918,108 @@ fn pr_ci_status_from_batch_keeps_a_checkless_pr_pending_until_github_says_mergea
 }
 
 #[test]
+fn missing_ci_waits_for_a_queued_run() {
+    let data = batch_data(false, Some(true), Some("blocked"), vec![], vec![]);
+    let server = crate::github::test_support::MockServer::start(vec![
+        crate::github::test_support::MockResponse::json(
+            200,
+            r#"{"workflow_runs":[{"id":1,"status":"queued","html_url":"u"}]}"#,
+        ),
+        crate::github::test_support::MockResponse::json(
+            200,
+            r#"{"workflow_runs":[{"id":1,"status":"queued","html_url":"u"}]}"#,
+        ),
+    ]);
+    let client = server.client(Some("tok"));
+    let repo = repo_id("o", "r");
+    assert!(matches!(
+        pending_if_ci_running(pr_ci_status_from_batch(101, &data), &client, &repo),
+        PrCiStatus::Pending { .. }
+    ));
+    let seen = Mutex::new(HashMap::from([(
+        "o/r#101".into(),
+        Instant::now() - Duration::from_secs(300),
+    )]));
+    let retries = Mutex::new(HashMap::new());
+    assert!(!retry_missing_ci_with_client(
+        &client,
+        &repo,
+        101,
+        "abc123",
+        &seen,
+        &retries,
+    )
+    .unwrap());
+    assert!(seen.lock().unwrap().is_empty());
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].method, "GET");
+}
+
+#[test]
+fn missing_ci_retries_an_absent_run_after_observation_grace() {
+    use crate::github::test_support::{MockResponse, MockServer};
+
+    let server = MockServer::start(vec![
+        MockResponse::json(200, r#"{"workflow_runs":[]}"#),
+        MockResponse::json(200, r#"{"workflow_runs":[]}"#),
+        MockResponse::json(200, r#"{"workflow_runs":[]}"#),
+        MockResponse::json(200, r#"{"tree":{"sha":"tree123"}}"#),
+        MockResponse::json(200, r#"{"number":101,"html_url":"u","state":"open","title":"t","head":{"ref":"feat/x","sha":"abc123","repo":{"full_name":"o/r"}}}"#),
+        MockResponse::json(200, r#"{"object":{"sha":"abc123"}}"#),
+        MockResponse::json(201, r#"{"sha":"new123"}"#),
+        MockResponse::json(200, r#"{"object":{"sha":"new123"}}"#),
+    ]);
+    let client = server.client(Some("tok"));
+    let repo = repo_id("o", "r");
+    let seen = Mutex::new(HashMap::new());
+    let retries = Mutex::new(HashMap::new());
+    let data = batch_data(false, Some(true), Some("blocked"), vec![], vec![]);
+    assert!(matches!(
+        pending_if_ci_running(pr_ci_status_from_batch(101, &data), &client, &repo),
+        PrCiStatus::MissingCi { .. }
+    ));
+    assert!(!retry_missing_ci_with_client(
+        &client,
+        &repo,
+        101,
+        "abc123",
+        &seen,
+        &retries,
+    )
+    .unwrap());
+    let key = "o/r#101".to_string();
+    *seen.lock().unwrap().get_mut(&key).unwrap() = Instant::now() - Duration::from_secs(120);
+    assert!(retry_missing_ci_with_client(
+        &client,
+        &repo,
+        101,
+        "abc123",
+        &seen,
+        &retries,
+    )
+    .unwrap());
+    assert!(seen.lock().unwrap().is_empty());
+    assert_eq!(retries.lock().unwrap().get(&key), Some(&1));
+    // A new head must not get a second recovery push for the same PR.
+    assert!(!retry_missing_ci_with_client(
+        &client,
+        &repo,
+        101,
+        "def456",
+        &seen,
+        &retries,
+    )
+    .unwrap());
+    let requests = server.requests();
+    assert_eq!(requests.len(), 8);
+    assert_eq!(requests[6].method, "POST");
+    assert_eq!(requests[6].path, "/repos/o/r/git/commits");
+    assert_eq!(requests[7].method, "PATCH");
+    assert_eq!(requests[7].path, "/repos/o/r/git/refs/heads/feat/x");
+}
+
+#[test]
 fn pr_ci_status_from_batch_falls_back_to_the_rollup_state_when_no_context_is_listed() {
     let mut data = batch_data(false, Some(true), Some("clean"), vec![], vec![]);
     data.rollup_state = Some("FAILURE".to_string());
@@ -882,6 +1031,52 @@ fn pr_ci_status_from_batch_falls_back_to_the_rollup_state_when_no_context_is_lis
     assert!(matches!(
         pr_ci_status_from_batch(101, &data),
         PrCiStatus::Pending { .. }
+    ));
+}
+
+#[test]
+fn pr_ci_status_rest_path_treats_merge_queue_blocked_as_passing_not_missing_ci() {
+    let server = crate::github::test_support::MockServer::start(vec![
+        crate::github::test_support::MockResponse::json(
+            200,
+            r#"{"number":701,"html_url":"u","state":"open","title":"t","mergeable":true,"mergeable_state":"blocked","head":{"ref":"b","sha":"abc123"}}"#,
+        ),
+        crate::github::test_support::MockResponse::json(200, r#"{"check_runs":[]}"#),
+        crate::github::test_support::MockResponse::json(200, r#"{"state":"pending","statuses":[]}"#),
+        crate::github::test_support::MockResponse::json(
+            200,
+            r#"{"data":{"repository":{"pr701":{"id":"PR_kw","merged":false,"mergeable":"MERGEABLE","mergeStateStatus":"BLOCKED",
+                "baseRefName":"main","isMergeQueueEnabled":true,"isInMergeQueue":false,"autoMergeRequest":null,
+                "labels":{"nodes":[]},"commits":{"nodes":[]}}}}}"#,
+        ),
+    ]);
+    let client = server.client(Some("tok"));
+    let repo = repo_id("o", "r");
+    let item = item_with_metadata(701, r#"{"pr":{"number":701,"branch":"b"}}"#);
+    assert!(matches!(
+        pr_ci_status_impl(&item, Path::new("/does/not/exist"), &client, &repo),
+        PrCiStatus::Passing { number: 701, .. }
+    ));
+}
+
+#[test]
+fn pr_ci_status_rest_path_stays_pending_when_merge_queue_flags_are_unavailable() {
+    // Same checkless blocked PR, but GraphQL has no answer: unknown flags must
+    // not read as "no merge queue" (that would be MissingCi and a CI retry).
+    let server = crate::github::test_support::MockServer::start(vec![
+        crate::github::test_support::MockResponse::json(
+            200,
+            r#"{"number":702,"html_url":"u","state":"open","title":"t","mergeable":true,"mergeable_state":"blocked","head":{"ref":"b","sha":"abc123"}}"#,
+        ),
+        crate::github::test_support::MockResponse::json(200, r#"{"check_runs":[]}"#),
+        crate::github::test_support::MockResponse::json(200, r#"{"state":"pending","statuses":[]}"#),
+    ]);
+    let client = server.client(Some("tok"));
+    let repo = repo_id("o", "r");
+    let item = item_with_metadata(702, r#"{"pr":{"number":702,"branch":"b"}}"#);
+    assert!(matches!(
+        pr_ci_status_impl(&item, Path::new("/does/not/exist"), &client, &repo),
+        PrCiStatus::Pending { number: 702, .. }
     ));
 }
 
@@ -1128,6 +1323,26 @@ fn is_own_pr_true_for_an_unmarked_pr_on_this_items_branch() {
     .unwrap();
     assert!(is_own_pr(&pr, &item));
 }
+// Item #347 phase 2: a PR stamped by another instance is never this item's
+// own, even when the visible sequence-number marker matches -- sequence
+// numbers are per instance.
+#[test]
+fn is_own_pr_false_for_a_pr_stamped_by_a_foreign_instance() {
+    let me = crate::github::bridge::config::stable_instance_id();
+    let foreign = format!("{me}-other-instance");
+    let body = format!(
+        "_Opened by `a` on **m** for item #259 via agentflare._\n{}",
+        crate::github::pulls::origin_tag(&foreign, "my-uuid", 259, "task/259-x")
+    );
+    let pr: crate::github::models::PullRequest = serde_json::from_value(serde_json::json!({
+        "number": 688, "html_url": "u", "state": "open", "title": "t", "body": body,
+        "head": {"ref": "task/259-x", "sha": "abc"}
+    }))
+    .unwrap();
+    let item = item_with_metadata(259, "{}");
+    assert!(!is_own_pr(&pr, &item));
+}
+
 // Item #595: a closed/merged PR on the same branch name stamped with the
 // same sequence number but tagged for a different item's UUID must not be
 // trusted as this item's own PR.

@@ -872,6 +872,16 @@ mod tests {
             }"#,
         )
         .unwrap();
+        #[cfg(windows)]
+        let mut json = json;
+        #[cfg(windows)]
+        {
+            json.steps[0].command = Some(vec![
+                "cmd".into(),
+                "/C".into(),
+                "echo hello {{params.who}}".into(),
+            ]);
+        }
 
         let wf = compile_workflow(&json, send).unwrap();
         let engine = WorkflowEngine::<PipelineData, InMemoryStore<PipelineData>>::new();
@@ -918,6 +928,16 @@ mod tests {
             }"#,
         )
         .unwrap();
+        #[cfg(windows)]
+        let mut json = json;
+        #[cfg(windows)]
+        {
+            json.steps[0].command = Some(vec![
+                "cmd".into(),
+                "/C".into(),
+                "echo oops >&2 & exit /b 3".into(),
+            ]);
+        }
 
         let wf = compile_workflow(&json, send).unwrap();
         let engine = WorkflowEngine::<PipelineData, InMemoryStore<PipelineData>>::new();
@@ -964,6 +984,12 @@ mod tests {
             }"#,
         )
         .unwrap();
+        #[cfg(windows)]
+        let mut json = json;
+        #[cfg(windows)]
+        {
+            json.steps[1].command = Some(vec!["cmd".into(), "/C".into(), "echo done".into()]);
+        }
 
         let wf = compile_workflow(&json, send).unwrap();
         let engine = WorkflowEngine::<PipelineData, InMemoryStore<PipelineData>>::new();

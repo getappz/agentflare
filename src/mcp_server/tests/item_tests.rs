@@ -623,6 +623,12 @@ fn submit_plan_cannot_downgrade_a_stored_human_approver() {
 /// The other half of Fix 1: the channel-only route (a human's Telegram tap,
 /// routed by `supervisor::handle_telegram_callback`) is the ONE way the same
 /// item does get approved.
+///
+/// Item #300 / live #281 follow-up: CLI `approve-plan` and the daemon's
+/// Telegram tap both build an `AgentflareMcp` with `agent: None` (no
+/// `AGENTFLARE_AGENT` for a human). Writing `serde_json::json!(None)`
+/// stored `plan_approved_by: null`, so the audit field looked unset even
+/// though `plan_status`/`plan_approved_at` were set.
 #[test]
 fn channel_approve_plan_succeeds_for_a_human_approver_item() {
     let (tmp, s) = harness();
@@ -643,6 +649,15 @@ fn channel_approve_plan_succeeds_for_a_human_approver_item() {
     let item = agentflare_backend::item::get(&conn, &item_id).unwrap();
     let metadata: serde_json::Value = serde_json::from_str(&item.metadata).unwrap();
     assert_eq!(metadata["plan_status"], "approved");
+    assert!(
+        metadata["plan_approved_at"].as_i64().is_some(),
+        "channel approve must record plan_approved_at: {metadata}"
+    );
+    assert_eq!(
+        metadata["plan_approved_by"].as_str(),
+        Some("human"),
+        "channel approve with no MCP agent identity must still record a non-null plan_approved_by (item #300): {metadata}"
+    );
 }
 
 /// Live incident, item #281: a human approved a plan, the supervisor
@@ -690,12 +705,13 @@ fn update_with_unrelated_metadata_does_not_erase_an_existing_approval() {
         metadata["plan_status"], "approved",
         "an unrelated metadata write must not revert the approval: {metadata}"
     );
-    assert!(
-        metadata.get("plan_approved_by").is_some(),
-        "plan_approved_by must survive an unrelated metadata write: {metadata}"
+    assert_eq!(
+        metadata["plan_approved_by"].as_str(),
+        Some("human"),
+        "plan_approved_by must survive an unrelated metadata write as a non-null string: {metadata}"
     );
     assert!(
-        metadata.get("plan_approved_at").is_some(),
+        metadata["plan_approved_at"].as_i64().is_some(),
         "plan_approved_at must survive an unrelated metadata write: {metadata}"
     );
     assert_eq!(metadata["workflow_run_id"], "01a0b3ad-test-run");
@@ -2649,4 +2665,83 @@ fn item_claim_errors_for_second_claimant_but_own_reclaim_succeeds() {
     })
     .unwrap();
     assert!(held.contains("\"status\":\"held\""), "{held}");
+}
+
+#[test]
+fn item_update_state_to_completed_removes_the_clean_worktree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_root = repo_dir.path().to_path_buf();
+    let run_git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo_root)
+            .output()
+            .unwrap()
+    };
+    run_git(&["init", "-b", "master"]);
+    run_git(&["config", "user.email", "test@test.com"]);
+    run_git(&["config", "user.name", "Test"]);
+    run_git(&["commit", "--allow-empty", "-m", "initial"]);
+    let s = AgentflareMcp {
+        backend_db_override: Some(tmp.path().join("backend.db")),
+        backend_project_link_override: Some(tmp.path().join("project.json")),
+        worktree_repo_root_override: Some(repo_root.clone()),
+        ..Default::default()
+    };
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+    let project_id = created["project_id"].as_str().unwrap().to_string();
+    let wt = repo_root.join(format!(".worktrees/task/{}", created["sequence_id"]));
+    crate::claims::with_owner_override("claude-code:job", || {
+        s.item_claim(ItemRequest {
+            action: "claim".into(),
+            id: Some(id.clone()),
+            ..Default::default()
+        })
+    })
+    .unwrap();
+    assert!(wt.exists(), "claim should create {}", wt.display());
+    let completed_state_id = {
+        let conn = backend_conn(&tmp);
+        agentflare_backend::state::list_by_project(&conn, &project_id)
+            .unwrap()
+            .into_iter()
+            .find(|st| st.group_name == "completed")
+            .unwrap()
+            .id
+    };
+    s.item(Parameters(ItemRequest {
+        action: "update_state".into(),
+        id: Some(id),
+        state_id: Some(completed_state_id),
+        ..Default::default()
+    }))
+    .unwrap();
+    assert!(!wt.exists(), "completed item left {}", wt.display());
+}
+
+#[test]
+fn record_failover_posts_one_comment_per_distinct_move() {
+    use agent_registry::Agent;
+    let (tmp, s) = harness();
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Test"))).unwrap()).unwrap();
+    let id = created["id"].as_str().unwrap();
+    let marker = crate::dispatch_failure_ceiling::AGENT_FAILOVER_MARKER;
+    let moves = |tmp: &tempfile::TempDir| {
+        agentflare_backend::comment::list_by_item(&backend_conn(tmp), id)
+            .unwrap()
+            .into_iter()
+            .filter(|c| c.body.contains(marker))
+            .count()
+    };
+    let (cc, cur) = (Agent::ClaudeCode, Agent::Cursor);
+    let why = "seven_day usage 74% >= threshold 70%";
+    crate::quota::failover::record_failover(&s, id, cc, cur, why).unwrap();
+    crate::quota::failover::record_failover(&s, id, cc, cur, why).unwrap();
+    assert_eq!(moves(&tmp), 1, "an identical retry must not repost");
+    crate::quota::failover::record_failover(&s, id, cc, cur, "cursor is out of credit").unwrap();
+    assert_eq!(moves(&tmp), 2, "a changed reason is a new move");
 }

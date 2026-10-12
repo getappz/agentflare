@@ -88,84 +88,7 @@ fn metadata_to_json_string(value: serde_json::Value) -> String {
     }
 }
 
-/// Strips the plan-gate transition fields (`plan_status`, `plan_approved_by`,
-/// `plan_approved_at`, `plan_rejection_reason`) out of caller-supplied
-/// `create`/`update` metadata before it's persisted. Those fields are
-/// server-authoritative: only `item_submit_plan`/`set_plan_status` (approve/
-/// reject) may set them, since they write through `agentflare_backend::item`
-/// directly rather than this MCP entry point. Without this, a caller could
-/// `item(action="create", metadata={"plan_required":true,"plan_approver":
-/// "human","plan_status":"approved"})` and start an item already
-/// "approved", walking straight past the gate it claims to have
-/// (CodeRabbit finding on item #573's PR). `plan_required`/`plan_approver`
-/// themselves are left untouched -- those are the caller's explicit gating
-/// choice, handled separately by `default_plan_gate_patch`.
-fn strip_plan_transition_fields(metadata_str: &str) -> String {
-    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(metadata_str) else {
-        return metadata_str.to_string();
-    };
-    if let Some(obj) = value.as_object_mut() {
-        for key in PLAN_TRANSITION_FIELDS {
-            obj.remove(key);
-        }
-    }
-    value.to_string()
-}
-
-/// Server-authoritative plan-gate transition fields -- see
-/// `strip_plan_transition_fields`/`restore_plan_transition_fields`.
-const PLAN_TRANSITION_FIELDS: [&str; 4] = [
-    "plan_status",
-    "plan_approved_by",
-    "plan_approved_at",
-    "plan_rejection_reason",
-];
-
-/// `item_update`'s counterpart to `strip_plan_transition_fields`: an update
-/// (unlike a create) is patching metadata onto an item that may already
-/// carry a real, human-set approval, so blindly deleting these keys from the
-/// outgoing metadata doesn't just refuse a *forged* value -- it destroys a
-/// legitimate one every single time, because `UpdateItem::metadata` replaces
-/// the column wholesale rather than merging (see `merge_metadata_patch`'s doc
-/// comment). Any internal read-merge-write helper that copies the item's
-/// current metadata forward while patching in an unrelated key (e.g.
-/// `work_item_pipeline::persist_run_id` adding `workflow_run_id`,
-/// `persist_comment_cursor` advancing `last_seen_comment_at`,
-/// `supervisor::persist_repair_track`'s CodeRabbit bookkeeping -- all three
-/// go through this same `item_update` entry point) would otherwise silently
-/// wipe out `plan_status`/`plan_approved_by`/`plan_approved_at` the moment it
-/// ran after a human approved the plan (live incident, item #281: a human's
-/// approval was erased minutes after the supervisor's own dispatch persisted
-/// its `workflow_run_id`).
-///
-/// Instead of deleting the caller-supplied value, each field is forced to
-/// whatever the item's row in the DB currently holds *right now*, discarding
-/// whatever the caller/helper put there -- exactly like the delete used to,
-/// EXCEPT when the current value is the caller's own unrelated pass-through
-/// copy, in which case this makes the write a no-op for that field instead of
-/// a destructive one. The only two writers allowed to actually change these
-/// fields (`item_submit_plan`, `set_plan_status` -- approve/reject) both
-/// write through `agentflare_backend::item::update` directly, bypassing this
-/// MCP entry point entirely, so they are unaffected.
-fn restore_plan_transition_fields(metadata_str: &str, current_metadata: &str) -> String {
-    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(metadata_str) else {
-        return metadata_str.to_string();
-    };
-    let current = serde_json::from_str::<serde_json::Value>(current_metadata).ok();
-    if let Some(obj) = value.as_object_mut() {
-        for key in PLAN_TRANSITION_FIELDS {
-            match current.as_ref().and_then(|c| c.get(key)) {
-                Some(v) => {
-                    obj.insert(key.to_string(), v.clone());
-                }
-                None => {
-                    obj.remove(key);
-                }
-            }
-        }
-    }
-    value.to_string()
-}
+use super::item_plan_transition::{restore_plan_transition_fields, strip_plan_transition_fields};
 
 /// Applies Task 1's default plan-gate policy
 /// (`agentflare_backend::item::plan_default_policy`) to `metadata_str` for an
@@ -1076,7 +999,14 @@ impl AgentflareMcp {
                 )
                 .map_err(internal_err)?;
             }
-            Ok(serde_json::to_string_pretty(&item).unwrap_or_default())
+            let mut resp = serde_json::to_value(&item).unwrap_or_default();
+            crate::quota::failover::attach_warning(
+                &mut resp,
+                req.assignee_agent
+                    .as_deref()
+                    .and_then(crate::quota::failover::unavailability_warning),
+            );
+            Ok(serde_json::to_string_pretty(&resp).unwrap_or_default())
         }
     }
 
@@ -1095,10 +1025,21 @@ impl AgentflareMcp {
                 req.state_group.as_deref().and_then(non_empty),
             )?;
             let id = self.resolve_item_id(conn, &raw)?;
+            let completed = agentflare_backend::state::get(conn, &state_id)
+                .map(|s| s.group_name == "completed")
+                .map_err(map_backend_err)?;
             let item = agentflare_backend::item::update_state(conn, &id, &state_id)
                 .map_err(map_backend_err)?;
-            Ok(serde_json::to_string_pretty(&item).unwrap_or_default())
+            Ok((item, completed))
         })?
+        .map(|(item, completed)| {
+            // Same as `check_merge`'s promote: a finished item's clean
+            // worktree goes away (a dirty one is left alone).
+            if completed {
+                crate::worktree::cleanup_worktree(&item, &self.worktree_repo_root());
+            }
+            serde_json::to_string_pretty(&item).unwrap_or_default()
+        })
     }
 
     pub(super) fn item_delete(&self, req: ItemRequest) -> Result<String, ErrorData> {
@@ -1457,7 +1398,12 @@ impl AgentflareMcp {
             }
             let mut patch = serde_json::json!({ "plan_status": new_status });
             if new_status == "approved" {
-                patch["plan_approved_by"] = serde_json::json!(self.agent.clone());
+                // Channel/CLI approve often has agent=None; never store JSON null (#300).
+                patch["plan_approved_by"] =
+                    serde_json::json!(agentflare_backend::item::plan_gate::approved_by_identity(
+                        self.agent.as_deref(),
+                        matches!(route, PlanStatusRoute::ChannelApprove),
+                    ));
                 patch["plan_approved_at"] = serde_json::json!(crate::claims::now());
             }
             if let Some(reason) = &reason {
@@ -1913,7 +1859,7 @@ impl AgentflareMcp {
             let item = agentflare_backend::item::get(conn, &item_id).map_err(map_backend_err)?;
             let state =
                 agentflare_backend::state::get(conn, &item.state_id).map_err(map_backend_err)?;
-            let in_review = state.group_name == "in_review";
+            let in_review = matches!(state.group_name.as_str(), "in_review" | "started");
             Ok::<_, ErrorData>((item_id, item, in_review))
         })??;
         if !in_review && req.force == Some(true) {
@@ -1937,25 +1883,36 @@ impl AgentflareMcp {
             })
             .to_string());
         }
+        let promoted = self.promote_verified_merged_item(&item_id, &item, &repo_root)?;
+        Ok(serde_json::json!({"item_id": item_id, "promoted": promoted}).to_string())
+    }
+
+    pub(crate) fn promote_verified_merged_item(
+        &self,
+        item_id: &str,
+        item: &agentflare_backend::item::Item,
+        repo_root: &std::path::Path,
+    ) -> Result<bool, ErrorData> {
         let promoted = self.with_backend_db(|conn| {
             // Compare-and-set on the PR verified merged above: a redispatch +
             // new PR landing during that network check must not complete the
             // item off the old one.
             agentflare_backend::item::promote_in_review_to_completed_if_pr(
                 conn,
-                &item_id,
-                crate::worktree::pr_number_from_metadata(&item),
+                item_id,
+                crate::worktree::pr_number_from_metadata(item),
             )
             .map_err(map_backend_err)
         })??;
         if promoted {
+            self.cancel_all_jobs_for_item(item_id);
             self.with_backend_db(|conn| {
-                crate::supervisor::cascade_unblock_dependents(conn, &item_id);
+                crate::supervisor::cascade_unblock_dependents(conn, item_id);
             })?;
-            crate::worktree::cleanup_worktree(&item, &repo_root);
-            crate::worktree::relabel_pr_completed(&item, &repo_root);
+            crate::worktree::cleanup_worktree(item, repo_root);
+            crate::worktree::relabel_pr_completed(item, repo_root);
         }
-        Ok(serde_json::json!({"item_id": item_id, "promoted": promoted}).to_string())
+        Ok(promoted)
     }
 
     pub(super) fn item_cancel(&self, req: ItemRequest) -> Result<String, ErrorData> {
@@ -2622,6 +2579,10 @@ impl AgentflareMcp {
                             "reason": "another agent already holds a live claim on this item",
                         });
                     }
+                    crate::quota::failover::attach_warning(
+                        &mut resp,
+                        crate::quota::failover::unavailability_warning(&assignee_agent),
+                    );
                     Ok(resp.to_string())
                 },
                 agentflare_backend::item::RedispatchOutcome::NoAssignee => {

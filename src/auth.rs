@@ -251,7 +251,11 @@ pub fn status(agent: Option<&str>, json: bool) {
     let mut results = Vec::new();
     for cat in &agents {
         let profiles = list_profiles(cat.agent_key);
-        if profiles.is_empty() {
+        // Quota state is shown even for an agent with no saved profiles
+        // (claude-code / opencode on a single credential), which used to
+        // print nothing at all.
+        let availability = crate::quota::failover::availability_state(cat.agent_key);
+        if profiles.is_empty() && availability.is_none() {
             continue;
         }
         let active = detect_active(cat);
@@ -260,6 +264,7 @@ pub fn status(agent: Option<&str>, json: bool) {
                 "agent": cat.agent_key,
                 "profiles": profiles,
                 "active": active,
+                "availability": availability,
             }));
         } else {
             println!("{}:", cat.agent_key);
@@ -271,8 +276,11 @@ pub fn status(agent: Option<&str>, json: bool) {
                 };
                 println!("  {p}{mark}");
             }
-            if active.is_none() {
+            if active.is_none() && !profiles.is_empty() {
                 println!("  (no matching profile)");
+            }
+            if let Some(state) = &availability {
+                println!("  unavailable: {state}");
             }
             println!();
         }

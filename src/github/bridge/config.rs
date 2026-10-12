@@ -314,6 +314,36 @@ pub fn write_machine_name(name: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// Default friendly name, AWS-instance-id style: `i-flare-<instance hex>`,
+/// e.g. `i-flare-51bb8de6c33b` for `flared:51bb8de6c33b`. Derived only from
+/// the instance id, never the hostname: hostnames reach public `beacon:<name>`
+/// labels and PR footers (the id is hashed from the machine id so the raw
+/// identity is not exposed), collide across machines, and say nothing a
+/// claim marker can be matched against. The full hex maps 1:1 to the
+/// `owner=flared:<hex>` markers. A friendly name is still one
+/// `agentflare config set machine-name` away.
+pub fn default_machine_name(instance_id: &str) -> String {
+    let id: String = instance_id
+        .rsplit(':')
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(12)
+        .collect();
+    format!("i-flare-{}", if id.is_empty() { "unknown" } else { &id })
+}
+
+/// Sets `[bridge].machine_name` to [`default_machine_name`] when none is set.
+/// Never overwrites an existing name. `Some(name)` only when it wrote one.
+pub fn ensure_machine_name() -> Option<String> {
+    if read_machine_name().is_some() {
+        return None;
+    }
+    let name = default_machine_name(&stable_instance_id());
+    write_machine_name(&name).ok().map(|_| name)
+}
+
 /// Removes `[bridge].machine_name`, falling `machine_label()` back to the
 /// hashed instance id. A noop (not an error) if it was never set — same
 /// contract as `clear_project_bridge_settings`.
@@ -334,6 +364,31 @@ pub fn clear_machine_name() -> Result<PathBuf, String> {
     }
     atomic_write_toml(&path, &doc)?;
     Ok(path)
+}
+
+/// How long `worktree::discover_untracked_prs` waits before adopting an
+/// unstamped PR with no local branch evidence (item #347 phase 2): the
+/// window in which the workstation that actually opened the PR is expected
+/// to stamp or claim it first, so two instances sharing one repo don't race
+/// to adopt each other's fresh hand-opened PRs. `0` disables the wait
+/// (today's immediate first-claim-wins). Reads
+/// `AGENTFLARE_BRIDGE_DISCOVERY_GRACE_SECS`, else `[bridge]
+/// discovery_grace_secs` from the user-home config file, else the default.
+pub const DEFAULT_DISCOVERY_GRACE_SECS: u64 = 600;
+
+pub fn discovery_grace_secs() -> u64 {
+    std::env::var("AGENTFLARE_BRIDGE_DISCOVERY_GRACE_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .or_else(|| {
+            let content = std::fs::read_to_string(home_config_path()).ok()?;
+            let doc = content.parse::<toml::Value>().ok()?;
+            let n = bridge_table(&doc)?
+                .get("discovery_grace_secs")?
+                .as_integer()?;
+            u64::try_from(n).ok()
+        })
+        .unwrap_or(DEFAULT_DISCOVERY_GRACE_SECS)
 }
 
 #[derive(Debug, Clone)]
@@ -674,6 +729,20 @@ mod tests {
         for v in ["0", "false", "no", "", "banana"] {
             let c = BridgeConfig::from_values(Some(v), None, None, None, None, "a".to_string());
             assert!(!c.enabled, "{v} should not enable");
+        }
+    }
+
+    #[test]
+    fn discovery_grace_secs_reads_the_env_override() {
+        let _guard = agent_registry::detect::PATH_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("AGENTFLARE_BRIDGE_DISCOVERY_GRACE_SECS", "42");
+        }
+        assert_eq!(discovery_grace_secs(), 42);
+        unsafe {
+            std::env::remove_var("AGENTFLARE_BRIDGE_DISCOVERY_GRACE_SECS");
         }
     }
 
@@ -1136,6 +1205,34 @@ mod tests {
     fn machine_label_falls_back_to_stable_instance_id_when_unset() {
         crate::paths::test_support::with_temp_home(|| {
             assert_eq!(machine_label(), stable_instance_id());
+        });
+    }
+
+    #[test]
+    fn default_machine_name_is_i_flare_plus_the_instance_hex() {
+        assert_eq!(
+            default_machine_name("flared:51bb8de6c33b"),
+            "i-flare-51bb8de6c33b"
+        );
+        // Distinct machines get distinct names; no hostname is involved.
+        assert_ne!(
+            default_machine_name("flared:51bb8de6c33b"),
+            default_machine_name("flared:c997d745ae66")
+        );
+        // A pid-scoped fallback id is sanitised, never empty.
+        assert_eq!(default_machine_name("flared:"), "i-flare-unknown");
+        validate_instance_id(&default_machine_name("claude-code:12-ab")).unwrap();
+    }
+
+    #[test]
+    fn ensure_machine_name_writes_once_and_never_overwrites() {
+        crate::paths::test_support::with_temp_home(|| {
+            let first = ensure_machine_name().expect("unset, so it writes a default");
+            assert_eq!(read_machine_name().as_deref(), Some(first.as_str()));
+            assert!(ensure_machine_name().is_none(), "second call is a no-op");
+            write_machine_name("kumar-laptop").unwrap();
+            assert!(ensure_machine_name().is_none());
+            assert_eq!(read_machine_name().as_deref(), Some("kumar-laptop"));
         });
     }
 

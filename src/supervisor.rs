@@ -491,6 +491,7 @@ pub(crate) fn run_discovery_tick(
     // for workers this tick -- a lone project may use the whole pool.
     let contended = batches.iter().filter(|b| !b.items.is_empty()).count() > 1;
     let project_cap = per_project_work_cap();
+    let mut gate_held = 0usize;
 
     for batch in batches {
         let ProjectBatch {
@@ -571,12 +572,9 @@ pub(crate) fn run_discovery_tick(
                     // the host's own CPU-pressure tier, not agent identity.
                     // Both gates must pass before a dispatch proceeds.
                     if host_policy.blocks_dispatch() {
-                        eprintln!(
-                            "agentflare-supervisor: item #{} ({}) is ready-for-work but the host resource gate is {}",
-                            item.sequence_id,
-                            item.id,
-                            host_policy.as_str()
-                        );
+                        // Counted, not logged per item: the transition
+                        // summary below reports it once per tick.
+                        gate_held += 1;
                         result.waiting += 1;
                         continue;
                     }
@@ -630,6 +628,7 @@ pub(crate) fn run_discovery_tick(
             }
         }
     }
+    report_gate_state(host_policy, gate_held);
     result
 }
 
@@ -1108,39 +1107,24 @@ fn persist_repair_track(
     silent_bump: bool,
     completed: Option<&str>,
 ) {
-    let Ok(raw) = mcp.item_get(ItemRequest {
-        action: "get".into(),
-        id: Some(item_id.to_string()),
-        ..Default::default()
-    }) else {
-        return;
-    };
-    let Ok(item) = serde_json::from_str::<agentflare_backend::item::Item>(&raw) else {
-        return;
-    };
-    let mut merged = serde_json::from_str::<serde_json::Value>(&item.metadata)
-        .ok()
-        .and_then(|v| v.as_object().cloned())
-        .map(serde_json::Value::Object)
-        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
-    if let Some(fp) = announced {
-        merged[announced_key] = serde_json::Value::String(fp.to_string());
-    }
-    if silent_bump {
-        let current = merged
-            .get(silent_key)
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        merged[silent_key] = serde_json::Value::from(current + 1);
-    }
-    if let Some(fp) = completed {
-        merged[completed_key] = serde_json::Value::String(fp.to_string());
-    }
-    let _ = mcp.item_update(ItemRequest {
-        action: "update".into(),
-        id: Some(item_id.to_string()),
-        metadata: Some(merged),
-        ..Default::default()
+    let _ = mcp.with_backend_db(|conn| {
+        let id = mcp.resolve_item_id(conn, item_id)?;
+        crate::mcp_server::merge_item_metadata(conn, &id, |merged| {
+            if let Some(fp) = announced {
+                merged.insert(announced_key.into(), serde_json::Value::String(fp.into()));
+            }
+            if silent_bump {
+                let current = merged
+                    .get(silent_key)
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                merged.insert(silent_key.into(), serde_json::Value::from(current + 1));
+            }
+            if let Some(fp) = completed {
+                merged.insert(completed_key.into(), serde_json::Value::String(fp.into()));
+            }
+        })
+        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))
     });
 }
 
@@ -1493,6 +1477,7 @@ pub(crate) fn run_review_sweep(
             }
         }
         if let (Some(repo), Ok(client)) = &resolved {
+            let repo_root = mcp.worktree_repo_root();
             let discovered = mcp
                 .with_backend_db(|conn| {
                     crate::worktree::discover_untracked_prs(
@@ -1503,6 +1488,17 @@ pub(crate) fn run_review_sweep(
                         &in_review_state_id,
                         &known_pr_numbers,
                         &discovery_owner,
+                        &|branch| {
+                            flare_git_core::shell::run_in_ok(
+                                &repo_root,
+                                &[
+                                    "rev-parse",
+                                    "--verify",
+                                    "--quiet",
+                                    &format!("refs/heads/{branch}"),
+                                ],
+                            )
+                        },
                     )
                 })
                 .unwrap_or(0);
@@ -1545,6 +1541,11 @@ pub(crate) fn run_review_sweep(
             let status = match data {
                 Some(data) => crate::worktree::pr_ci_status_from_batch(number, data),
                 None => crate::worktree::PrCiStatus::Unknown,
+            };
+            let status = if let (Some(repo), Ok(client)) = &resolved {
+                crate::worktree::pending_if_ci_running(status, client, repo)
+            } else {
+                status
             };
             handle_pr_status(
                 mcp,
@@ -1761,6 +1762,23 @@ fn handle_pr_status(
             }
             result.skipped += 1;
         }
+        crate::worktree::PrCiStatus::MissingCi { number, head_sha } => {
+            if !crate::worktree::item_may_retry_missing_ci(item, repo_root, number) {
+                result.skipped += 1;
+                return;
+            }
+            if let Some(head) = head_sha.as_deref() {
+                nudge_paused_review_for_pending(mcp, item, repo_root, number, head);
+                if crate::worktree::retry_missing_ci(repo_root, number, head) {
+                    // A recovery push changes the judged head; an armed merge
+                    // must wait for the sweep to judge that new head again.
+                    disarm_our_auto_merge(mcp, item, repo_root, number, "required CI is missing");
+                    result.updated += 1;
+                    return;
+                }
+            }
+            result.skipped += 1;
+        }
         crate::worktree::PrCiStatus::Unknown => {
             result.skipped += 1;
         }
@@ -1883,7 +1901,7 @@ fn job_in_flight(queue: &agentflare_jobs::Queue, item_id: &str) -> bool {
 pub(crate) mod notify;
 pub(crate) use notify::*;
 mod merge;
-use merge::*;
+pub(crate) use merge::*;
 mod auto_merge;
 use auto_merge::*;
 mod review_bots;
@@ -1897,9 +1915,8 @@ use review_bots::*;
 /// CodeRabbit-findings fetch it would otherwise throw away immediately (item
 /// #273 follow-up: that fetch used to run unconditionally on every tick for
 /// as long as a PR sat gated or in-flight).
-fn already_gated_or_in_flight(
+fn item_gated(
     mcp: &AgentflareMcp,
-    queue: &agentflare_jobs::Queue,
     item: &agentflare_backend::item::Item,
     label_id_by_name: &std::collections::HashMap<String, String>,
 ) -> bool {
@@ -1913,15 +1930,51 @@ fn already_gated_or_in_flight(
     // the cap could still enter self-repair on the very next sweep tick,
     // defeating the cap. The stray-item recovery path already excludes both
     // gates for the same reason (see `stray_candidates` above).
-    let already_gated = [NEEDS_HUMAN_GATE_LABEL, NEEDS_MANUAL_LABEL]
+    [NEEDS_HUMAN_GATE_LABEL, NEEDS_MANUAL_LABEL]
         .iter()
         .any(|name| {
             label_id_by_name
                 .get(*name)
                 .zip(item_label_ids.as_ref())
                 .is_some_and(|(gate_id, ids)| ids.contains(gate_id))
-        });
-    already_gated || job_in_flight(queue, &item.id)
+        })
+}
+
+fn already_gated_or_in_flight(
+    mcp: &AgentflareMcp,
+    queue: &agentflare_jobs::Queue,
+    item: &agentflare_backend::item::Item,
+    label_id_by_name: &std::collections::HashMap<String, String>,
+) -> bool {
+    item_gated(mcp, item, label_id_by_name) || job_in_flight(queue, &item.id)
+}
+
+/// True when `holder` (the worktree that has the PR's branch checked out) is
+/// not `own`, the item's own worktree path: a repair claim would then die at
+/// `git worktree add` ("already used by worktree"), burning a failure-cap
+/// strike and eventually gating the item on `needs-manual-dispatch`.
+fn is_foreign_worktree(holder: Option<&std::path::Path>, own: &std::path::Path) -> bool {
+    let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    holder.is_some_and(|h| canon(h) != canon(own))
+}
+
+/// Defer-worthy collision: another item's worktree holds this PR's branch
+/// (item #341 -- PR #849's `#334` beside `#330`). Same reasoning as the
+/// live-claim deferral in `self_repair_or_gate`: nothing can run yet, so
+/// don't spend an attempt on it.
+pub(super) fn branch_held_by_foreign_worktree(
+    item: &agentflare_backend::item::Item,
+    folder_path: &str,
+) -> bool {
+    let repo = std::path::Path::new(folder_path);
+    // The branch worktree creation would use, so legacy items without
+    // `metadata.pr.branch` are covered too.
+    let branch = flare_git_core::worktree::resolve_item_task_branch(item, repo);
+    let own = flare_git_core::worktree::item_worktree_path(repo, item.sequence_id);
+    is_foreign_worktree(
+        flare_git_core::doctor::worktree_holding_branch(repo, &branch).as_deref(),
+        &own,
+    )
 }
 
 /// Which in-progress PR stage label a self-repair dispatch should remove
@@ -2057,6 +2110,12 @@ fn self_repair_or_gate(
             ),
         );
         return SelfRepairOutcome::Skipped;
+    }
+
+    // Item #341: after the cap handling above, so an exhausted item still
+    // reaches its human gate while the branch stays occupied.
+    if branch_held_by_foreign_worktree(item, folder_path) {
+        return SelfRepairOutcome::Deferred;
     }
 
     // Item #114: while the item's claim is still live (within its
