@@ -179,23 +179,19 @@ pub fn ask_with(
     result
 }
 
+#[cfg(not(test))]
 fn breaker_path() -> std::path::PathBuf {
-    #[cfg(test)]
-    {
-        // Own subdirectory: with_state chmods the parent dir to 0700, which
-        // fails on a shared dir like /tmp.
-        return std::env::temp_dir()
-            .join(format!("agentflare-breaker-test-{}", std::process::id()))
-            .join(format!(
-                "{}.json",
-                std::thread::current()
-                    .name()
-                    .unwrap_or("unnamed")
-                    .replace(':', "_")
-            ));
-    }
-    #[cfg(not(test))]
     breaker::path()
+}
+
+/// Tests: one fresh private dir per test thread (with_state chmods the parent
+/// to 0700, which fails on a shared dir like /tmp), removed on thread exit.
+#[cfg(test)]
+fn breaker_path() -> std::path::PathBuf {
+    thread_local! {
+        static DIR: tempfile::TempDir = tempfile::tempdir().unwrap();
+    }
+    DIR.with(|d| d.path().join("breaker.json"))
 }
 
 fn send(
