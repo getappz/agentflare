@@ -55,6 +55,7 @@ stable_deref_trait = { version = "1", default-features = false, features = ["all
 tinystr = { version = "0.8", default-features = false, features = ["alloc", "zerovec"] }
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "test-util"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["codec"] }
 tower = { version = "0.5", default-features = false, features = ["log", "make", "util"] }
 tracing = { version = "0.1", features = ["log"] }
 tracing-core = { version = "0.1" }
@@ -92,7 +93,7 @@ libc = { version = "0.2", features = ["extra_traits"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "aws_lc_rs", "logging", "ring", "std", "tls12"] }
 rustls-webpki = { version = "0.103", default-features = false, features = ["aws-lc-rs", "ring", "std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "ring", "tls12"] }
-tokio-util = { version = "0.7", features = ["codec", "io"] }
+tokio-util = { version = "0.7", default-features = false, features = ["io"] }
 tower = { version = "0.5", default-features = false, features = ["retry", "timeout"] }
 
 [target.x86_64-unknown-linux-gnu.build-dependencies]
@@ -109,7 +110,7 @@ libc = { version = "0.2", features = ["extra_traits"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "aws_lc_rs", "logging", "ring", "std", "tls12"] }
 rustls-webpki = { version = "0.103", default-features = false, features = ["aws-lc-rs", "ring", "std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "ring", "tls12"] }
-tokio-util = { version = "0.7", features = ["codec", "io"] }
+tokio-util = { version = "0.7", default-features = false, features = ["io"] }
 tower = { version = "0.5", default-features = false, features = ["retry", "timeout"] }
 
 [target.x86_64-apple-darwin.build-dependencies]
@@ -126,7 +127,7 @@ libc = { version = "0.2", features = ["extra_traits"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "aws_lc_rs", "logging", "ring", "std", "tls12"] }
 rustls-webpki = { version = "0.103", default-features = false, features = ["aws-lc-rs", "ring", "std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "ring", "tls12"] }
-tokio-util = { version = "0.7", features = ["codec", "io"] }
+tokio-util = { version = "0.7", default-features = false, features = ["io"] }
 tower = { version = "0.5", default-features = false, features = ["retry", "timeout"] }
 
 [target.aarch64-apple-darwin.build-dependencies]
@@ -140,7 +141,7 @@ hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "ht
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "aws_lc_rs", "logging", "ring", "std", "tls12"] }
 rustls-webpki = { version = "0.103", default-features = false, features = ["aws-lc-rs", "ring", "std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "ring", "tls12"] }
-tokio-util = { version = "0.7", features = ["codec", "io"] }
+tokio-util = { version = "0.7", default-features = false, features = ["io"] }
 tower = { version = "0.5", default-features = false, features = ["retry", "timeout"] }
 winapi = { version = "0.3", default-features = false, features = ["cfg", "evntrace", "fileapi", "handleapi", "in6addr", "inaddr", "minwinbase", "ntsecapi", "processthreadsapi", "std", "winbase", "windef", "winerror", "winioctl", "winsock2"] }
 windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse"] }
