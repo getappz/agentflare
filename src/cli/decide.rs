@@ -48,6 +48,7 @@ impl DecideArgs {
         match self.cmd {
             DecideCmd::Ping => ping(),
             DecideCmd::Report { site } => {
+                println!("breaker: {}", decide::breaker::status());
                 let rows = decide::shadow::load(&decide::shadow::log_path());
                 print!(
                     "{}",
@@ -78,6 +79,7 @@ impl DecideArgs {
 }
 
 fn ping() {
+    println!("breaker: {}", decide::breaker::status());
     for (name, source) in decide::credential_sources() {
         println!("{name}: from {}", source.label());
     }

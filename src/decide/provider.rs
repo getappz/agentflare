@@ -27,6 +27,8 @@ pub enum DecideError {
     Malformed(String),
     #[error("AGENTFLARE_JEV_BASE_URL must be https, or http to a loopback IP address")]
     InvalidBaseUrl,
+    #[error("decision backend temporarily unavailable (circuit breaker open)")]
+    Unavailable,
     #[error("decision budget exhausted: {0}")]
     Budget(&'static str),
 }
