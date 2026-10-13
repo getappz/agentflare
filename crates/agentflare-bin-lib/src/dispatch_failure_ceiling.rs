@@ -55,17 +55,31 @@ pub const AGENT_UNAVAILABLE_MARKER: &str = "## agentflare work — agent unavail
 /// [`stopped_on_request`]).
 pub const STOPPED_ON_REQUEST_MARKER: &str = "## agentflare work — stopped on request";
 
+/// Signature git prints when a branch is checked out in another worktree.
+/// A failure carrying it is a collision with a sibling checkout, not a
+/// defect in the item.
+pub const WORKTREE_COLLISION_MARKER: &str = "is already used by worktree at";
+
+/// Whether a failure comment body is a worktree-branch collision.
+pub fn is_worktree_branch_collision(body: &str) -> bool {
+    failure_reason(body).is_some_and(|r| r.contains(WORKTREE_COLLISION_MARKER))
+}
+
 /// Outcome comments that say nothing about whether the item itself is
 /// broken -- a cycle whose latest outcome is one of these is skipped by both
-/// counts: it neither adds to a streak nor breaks one.
+/// counts: it neither adds to a streak nor breaks one. A worktree collision
+/// is neutral too; it never gates the item (the supervisor defers dispatch
+/// while another worktree holds the branch, and re-checks every tick, so
+/// repeats are paced by the tick rather than by a cap).
 fn is_neutral_outcome(body: &str) -> bool {
-    [
-        AGENT_FAILOVER_MARKER,
-        AGENT_UNAVAILABLE_MARKER,
-        STOPPED_ON_REQUEST_MARKER,
-    ]
-    .iter()
-    .any(|m| body.starts_with(m))
+    is_worktree_branch_collision(body)
+        || [
+            AGENT_FAILOVER_MARKER,
+            AGENT_UNAVAILABLE_MARKER,
+            STOPPED_ON_REQUEST_MARKER,
+        ]
+        .iter()
+        .any(|m| body.starts_with(m))
 }
 
 /// A segment's latest outcome comment is a neutral one (a later real failure
@@ -534,6 +548,32 @@ mod tests {
         ];
         assert_eq!(consecutive_identical_failure_count(&only_neutral), 0);
         assert_eq!(consecutive_failure_count_any_reason(&only_neutral), 0);
+    }
+
+    #[test]
+    fn worktree_collision_cycles_are_neutral_for_both_caps() {
+        let err = "judge reply was not valid JSON";
+        let collision = format!(
+            "{WORK_FAILURE_MARKER}\n\nfatal: 'task/1-x' is already used by worktree at '/w/1'"
+        );
+        let comments = vec![
+            comment(&format!("{DISPATCH_MARKER}\n\njob: a")),
+            comment(&format!("{WORK_FAILURE_MARKER}\n\n{err}")),
+            comment(&format!("{DISPATCH_MARKER}\n\njob: b")),
+            comment(&collision),
+            comment(&format!("{DISPATCH_MARKER}\n\njob: c")),
+            comment(&collision),
+            comment(&format!("{DISPATCH_MARKER}\n\njob: d")),
+            comment(&format!("{WORK_FAILURE_MARKER}\n\n{err}")),
+        ];
+        assert_eq!(consecutive_identical_failure_count(&comments), 2);
+        assert_eq!(consecutive_failure_count_any_reason(&comments), 2);
+        let only = vec![
+            comment(&format!("{DISPATCH_MARKER}\n\njob: a")),
+            comment(&collision),
+        ];
+        assert_eq!(consecutive_identical_failure_count(&only), 0);
+        assert_eq!(consecutive_failure_count_any_reason(&only), 0);
     }
 
     #[test]
