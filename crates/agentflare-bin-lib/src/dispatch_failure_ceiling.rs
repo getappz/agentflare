@@ -577,6 +577,23 @@ mod tests {
     }
 
     #[test]
+    fn many_collisions_never_reach_either_cap_so_the_item_is_never_gated() {
+        let collision = format!(
+            "{WORK_FAILURE_MARKER}\n\nfatal: 'task/1-x' is already used by worktree at '/w/1'"
+        );
+        let mut comments = Vec::new();
+        for i in 0..20 {
+            comments.push(comment(&format!("{DISPATCH_MARKER}\n\njob: {i}")));
+            comments.push(comment(&collision));
+        }
+        assert!(consecutive_identical_failure_count(&comments) < DISPATCH_FAILURE_CAP);
+        assert!(consecutive_failure_count_any_reason(&comments) < DISPATCH_FAILURE_CAP_ANY_REASON);
+        assert!(!is_worktree_branch_collision(&format!(
+            "{DISPATCH_MARKER}\n\nis already used by worktree at"
+        )));
+    }
+
+    #[test]
     fn a_real_failure_on_a_later_retry_of_the_same_job_still_counts() {
         let comments = vec![
             comment(&format!("{DISPATCH_MARKER}\n\njob: a")),
