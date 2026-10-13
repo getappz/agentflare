@@ -1287,6 +1287,125 @@ struct ReviewBatch {
     stray_candidates: Vec<(agentflare_backend::item::Item, u64)>,
 }
 
+/// One batch per project dir. A failing lookup in one project is logged and
+/// that project skipped, so it can't blind the sweep for every other project
+/// (same isolation as `batch_pr_status` per chunk).
+fn collect_review_batches(
+    conn: &rusqlite::Connection,
+    dirs: Vec<agentflare_backend::project_dir::ProjectDir>,
+) -> Vec<ReviewBatch> {
+    let mut batches = Vec::new();
+    for dir in dirs {
+        let project_id = dir.project_id.clone();
+        match build_review_batch(conn, dir) {
+            Ok(Some(batch)) => batches.push(batch),
+            Ok(None) => {}
+            Err(e) => eprintln!("review sweep: skipping project {project_id}: lookup failed: {e}"),
+        }
+    }
+    batches
+}
+
+fn build_review_batch(
+    conn: &rusqlite::Connection,
+    dir: agentflare_backend::project_dir::ProjectDir,
+) -> agentflare_backend::error::Result<Option<ReviewBatch>> {
+    let items = agentflare_backend::item::list_by_project(conn, &dir.project_id)?;
+    let states = agentflare_backend::state::list_by_project(conn, &dir.project_id)?;
+    let state_by_id: std::collections::HashMap<&str, &agentflare_backend::state::State> =
+        states.iter().map(|s| (s.id.as_str(), s)).collect();
+    // Every item, not just in_review ones -- an item could already be
+    // tracking a PR from `started` (agent still working) or any other
+    // state, and `discover_untracked_prs` must never create a second
+    // item for a PR one of those already owns.
+    let known_pr_numbers = crate::worktree::tracked_pr_numbers(&items);
+    let Some(in_review_state_id) = states
+        .iter()
+        .find(|s| s.group_name == "in_review")
+        .map(|s| s.id.clone())
+    else {
+        // No in_review state group in this project at all -- nothing
+        // for this sweep to do here regardless of discovery.
+        return Ok(None);
+    };
+    let in_review: Vec<_> = items
+        .iter()
+        .filter(|i| {
+            state_by_id
+                .get(i.state_id.as_str())
+                .is_some_and(|s| s.group_name == "in_review")
+        })
+        .cloned()
+        .collect();
+    let labels = agentflare_backend::label::list_by_project(conn, &dir.project_id)?;
+    let mut label_id_by_name = std::collections::HashMap::new();
+    for l in &labels {
+        label_id_by_name.insert(l.name.clone(), l.id.clone());
+    }
+    // Self-heal items #234: an item can regress out of the
+    // "in_review" group (e.g. a self-repair job's claim getting
+    // reconciled as orphaned/failed) while its PR is still open and
+    // tracked -- once that happens, this sweep's query above can
+    // never see it again, even after the PR merges on GitHub (item
+    // #233 sat stuck in "Backlog" for hours after its PR merged).
+    // Collect candidates for recovery here; whether each one
+    // actually gets restored to "in_review" is decided once a repo
+    // and GitHub client are available below (`stray_pr_is_still_relevant`),
+    // never on metadata presence alone -- a first attempt at this
+    // fix restored on metadata + claim-liveness only, which also
+    // silently overrode `NEEDS_MANUAL_LABEL`'s dispatch-failure cap
+    // and `NEEDS_DECISION_LABEL`'s go/no-go gate (review finding on
+    // item #234's first attempt), so both are excluded here too.
+    let now = crate::claims::now();
+    let requested_ttl = crate::mcp_server::types::backend_claim_ttl_secs();
+    let mut stray_candidates = Vec::new();
+    for item in &items {
+        if state_by_id.get(item.state_id.as_str()).is_some_and(|s| {
+            matches!(
+                s.group_name.as_str(),
+                "in_review" | "completed" | "cancelled"
+            )
+        }) {
+            continue;
+        }
+        let Some(number) = crate::worktree::pr_number_from_metadata(item) else {
+            continue;
+        };
+        let item_label_ids = agentflare_backend::item::list_labels(conn, &item.id)
+            .ok()
+            .unwrap_or_default();
+        let gated = [NEEDS_MANUAL_LABEL, NEEDS_DECISION_LABEL]
+            .iter()
+            .any(|name| {
+                label_id_by_name
+                    .get(*name)
+                    .is_some_and(|id| item_label_ids.contains(id))
+            });
+        if gated {
+            continue;
+        }
+        let ttl = agentflare_backend::claim::effective_ttl_secs(conn, &item.id, requested_ttl);
+        let has_live_claim =
+            agentflare_backend::claim::live_claim_on_item(conn, &item.id, now, ttl)
+                .ok()
+                .flatten()
+                .is_some();
+        if has_live_claim {
+            continue;
+        }
+        stray_candidates.push((item.clone(), number));
+    }
+    Ok(Some(ReviewBatch {
+        folder_path: dir.folder_path,
+        project_id: dir.project_id,
+        in_review_state_id,
+        known_pr_numbers,
+        items: in_review,
+        label_id_by_name,
+        stray_candidates,
+    }))
+}
+
 /// One pass: across every project registered in `project_dirs` (mirrors
 /// `run_discovery_tick`'s item #63 fix -- not just whichever project this
 /// daemon process happens to have been started from) -- list items in the
@@ -1322,105 +1441,7 @@ pub(crate) fn run_review_sweep(
 
     let fetched = mcp.with_backend_db(|conn| {
         let dirs = agentflare_backend::project_dir::list(conn).ok()?;
-        let mut batches = Vec::new();
-        for dir in dirs {
-            let items = agentflare_backend::item::list_by_project(conn, &dir.project_id).ok()?;
-            let states = agentflare_backend::state::list_by_project(conn, &dir.project_id).ok()?;
-            let state_by_id: std::collections::HashMap<&str, &agentflare_backend::state::State> =
-                states.iter().map(|s| (s.id.as_str(), s)).collect();
-            // Every item, not just in_review ones -- an item could already be
-            // tracking a PR from `started` (agent still working) or any other
-            // state, and `discover_untracked_prs` must never create a second
-            // item for a PR one of those already owns.
-            let known_pr_numbers = crate::worktree::tracked_pr_numbers(&items);
-            let Some(in_review_state_id) = states
-                .iter()
-                .find(|s| s.group_name == "in_review")
-                .map(|s| s.id.clone())
-            else {
-                // No in_review state group in this project at all -- nothing
-                // for this sweep to do here regardless of discovery.
-                continue;
-            };
-            let in_review: Vec<_> = items
-                .iter()
-                .filter(|i| {
-                    state_by_id
-                        .get(i.state_id.as_str())
-                        .is_some_and(|s| s.group_name == "in_review")
-                })
-                .cloned()
-                .collect();
-            let labels = agentflare_backend::label::list_by_project(conn, &dir.project_id).ok()?;
-            let mut label_id_by_name = std::collections::HashMap::new();
-            for l in &labels {
-                label_id_by_name.insert(l.name.clone(), l.id.clone());
-            }
-            // Self-heal items #234: an item can regress out of the
-            // "in_review" group (e.g. a self-repair job's claim getting
-            // reconciled as orphaned/failed) while its PR is still open and
-            // tracked -- once that happens, this sweep's query above can
-            // never see it again, even after the PR merges on GitHub (item
-            // #233 sat stuck in "Backlog" for hours after its PR merged).
-            // Collect candidates for recovery here; whether each one
-            // actually gets restored to "in_review" is decided once a repo
-            // and GitHub client are available below (`stray_pr_is_still_relevant`),
-            // never on metadata presence alone -- a first attempt at this
-            // fix restored on metadata + claim-liveness only, which also
-            // silently overrode `NEEDS_MANUAL_LABEL`'s dispatch-failure cap
-            // and `NEEDS_DECISION_LABEL`'s go/no-go gate (review finding on
-            // item #234's first attempt), so both are excluded here too.
-            let now = crate::claims::now();
-            let requested_ttl = crate::mcp_server::types::backend_claim_ttl_secs();
-            let mut stray_candidates = Vec::new();
-            for item in &items {
-                if state_by_id.get(item.state_id.as_str()).is_some_and(|s| {
-                    matches!(
-                        s.group_name.as_str(),
-                        "in_review" | "completed" | "cancelled"
-                    )
-                }) {
-                    continue;
-                }
-                let Some(number) = crate::worktree::pr_number_from_metadata(item) else {
-                    continue;
-                };
-                let item_label_ids = agentflare_backend::item::list_labels(conn, &item.id)
-                    .ok()
-                    .unwrap_or_default();
-                let gated = [NEEDS_MANUAL_LABEL, NEEDS_DECISION_LABEL]
-                    .iter()
-                    .any(|name| {
-                        label_id_by_name
-                            .get(*name)
-                            .is_some_and(|id| item_label_ids.contains(id))
-                    });
-                if gated {
-                    continue;
-                }
-                let ttl =
-                    agentflare_backend::claim::effective_ttl_secs(conn, &item.id, requested_ttl);
-                let has_live_claim =
-                    agentflare_backend::claim::live_claim_on_item(conn, &item.id, now, ttl)
-                        .ok()
-                        .flatten()
-                        .is_some();
-                if has_live_claim {
-                    continue;
-                }
-                stray_candidates.push((item.clone(), number));
-            }
-            batches.push(ReviewBatch {
-                folder_path: dir.folder_path,
-                project_id: dir.project_id,
-                in_review_state_id,
-                known_pr_numbers,
-                items: in_review,
-                label_id_by_name,
-                stray_candidates,
-            });
-        }
-        Some(batches)
+        Some(collect_review_batches(conn, dirs))
     });
     let Ok(Some(batches)) = fetched else {
         return result;
