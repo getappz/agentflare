@@ -544,6 +544,16 @@ fn restore_after_terminal_failure(
             crate::dispatch_failure_ceiling::consecutive_failure_count_any_reason(&comments);
         let at_cap = identical_count >= crate::dispatch_failure_ceiling::DISPATCH_FAILURE_CAP
             || any_reason_count >= crate::dispatch_failure_ceiling::DISPATCH_FAILURE_CAP_ANY_REASON;
+        if comments
+            .iter()
+            .rev()
+            .find(|c| crate::dispatch_failure_ceiling::failure_reason(&c.body).is_some())
+            .is_some_and(|c| crate::dispatch_failure_ceiling::is_worktree_branch_collision(&c.body))
+        {
+            eprintln!(
+                "agentflare-jobs: item {item_id}: worktree branch collision; neutral for the dispatch-failure caps, leaving un-gated"
+            );
+        }
         let ready_id = find(crate::supervisor::READY_LABEL);
         if !at_cap && ready_id.is_none() {
             // Below cap with no ready-for-work label to restore onto: the
