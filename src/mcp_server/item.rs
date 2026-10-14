@@ -1300,11 +1300,25 @@ impl AgentflareMcp {
                 "plan_approver": approver,
             })
             .to_string();
-            let notify = (approver == "human").then_some((item, plan_asset_id));
+            // Read the plan's bytes here (local file) so the Telegram card can
+            // attach them; best-effort, the card still goes out without it.
+            let notify = (approver == "human").then(|| {
+                let plan_file = agentflare_backend::asset::get(conn, &plan_asset_id)
+                    .ok()
+                    .and_then(|a| {
+                        agentflare_backend::asset::read_file(
+                            &crate::paths::agentflare_dir(),
+                            &a.storage_path,
+                        )
+                        .ok()
+                        .map(|bytes| (a.filename, bytes))
+                    });
+                (item, plan_asset_id, plan_file)
+            });
             Ok::<_, ErrorData>((response, notify))
         })??;
-        if let Some((item, plan_asset_id)) = notify {
-            crate::supervisor::notify_plan_approval_gate(&item, &plan_asset_id);
+        if let Some((item, plan_asset_id, plan_file)) = notify {
+            crate::supervisor::notify_plan_approval_gate(&item, &plan_asset_id, plan_file);
         }
         Ok(response)
     }

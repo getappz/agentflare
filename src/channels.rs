@@ -324,6 +324,40 @@ pub fn send_telegram_card(
     send(Platform::Telegram, &req)
 }
 
+/// Multipart body for Telegram's `sendDocument` (ureq 2 has no multipart
+/// support). Returns `(content_type, body)`.
+fn build_telegram_document_body(chat_id: &str, filename: &str, bytes: &[u8]) -> (String, Vec<u8>) {
+    let boundary = "agentflare-doc-boundary-7f3a9c";
+    let filename = filename.replace(['"', '\r', '\n'], "_");
+    let mut body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat_id}\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"{filename}\"\r\n\
+         Content-Type: application/octet-stream\r\n\r\n"
+    )
+    .into_bytes();
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    (format!("multipart/form-data; boundary={boundary}"), body)
+}
+
+/// Send `bytes` to a Telegram chat as a document attachment named
+/// `filename` (used to put a plan's content next to its approval card).
+pub fn send_telegram_document(chat_id: &str, filename: &str, bytes: &[u8]) -> Result<(), String> {
+    let token = telegram_token()?;
+    let url = format!("https://api.telegram.org/bot{}/sendDocument", *token);
+    let (content_type, body) = build_telegram_document_body(chat_id, filename, bytes);
+    let (status, text) = match http_agent()
+        .post(&url)
+        .set("Content-Type", &content_type)
+        .send_bytes(&body)
+    {
+        Ok(resp) => (resp.status(), resp.into_string().unwrap_or_default()),
+        Err(ureq::Error::Status(code, resp)) => (code, resp.into_string().unwrap_or_default()),
+        Err(e) => return Err(describe_send_error(Platform::Telegram, &e)),
+    };
+    interpret_response(Platform::Telegram, status, &text)
+}
+
 /// Poll Telegram for updates since `offset` (pass `last_update_id + 1`, same
 /// convention as the Bot API's own `getUpdates`). Short-polls (`timeout: 0`)
 /// since this is called from a fixed-interval supervisor tick rather than a
@@ -552,6 +586,16 @@ mod tests {
         );
         println!("send_telegram_card result: {result:?}");
         assert!(result.is_ok(), "send failed: {result:?}");
+    }
+
+    #[test]
+    fn document_body_is_multipart_with_chat_and_file() {
+        let (ct, body) = build_telegram_document_body("42", "plan\".md", b"# Plan");
+        let body = String::from_utf8(body).unwrap();
+        assert!(ct.contains("boundary=agentflare-doc-boundary-7f3a9c"));
+        assert!(body.contains("name=\"chat_id\"\r\n\r\n42"));
+        assert!(body.contains("filename=\"plan_.md\""));
+        assert!(body.contains("\r\n\r\n# Plan\r\n--agentflare-doc-boundary-7f3a9c--"));
     }
 
     #[test]
