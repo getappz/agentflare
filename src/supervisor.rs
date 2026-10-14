@@ -1285,6 +1285,18 @@ struct ReviewBatch {
     /// restored to "in_review" here -- see `stray_pr_is_still_relevant`'s
     /// doc comment for why that has to wait until a live GitHub PR check.
     stray_candidates: Vec<(agentflare_backend::item::Item, u64)>,
+    /// `projects.external_id` (`git:<owner>/<repo>`) when the project was
+    /// auto-provisioned from a git remote; `None` for path-keyed/manual ones.
+    expected_repo_key: Option<String>,
+}
+
+/// Whether the repo the registry row's folder resolves to is the repo the
+/// project was provisioned for. Unknown expectation (non-`git:` key) passes.
+fn repo_matches_project(expected_key: Option<&str>, repo: &crate::github::RepoId) -> bool {
+    match expected_key.and_then(|k| k.strip_prefix("git:")) {
+        Some(expected) => expected.eq_ignore_ascii_case(&repo.to_string()),
+        None => true,
+    }
 }
 
 /// One batch per project dir. A failing lookup in one project is logged and
@@ -1395,6 +1407,10 @@ fn build_review_batch(
         }
         stray_candidates.push((item.clone(), number));
     }
+    let expected_repo_key = agentflare_backend::project::get(conn, &dir.project_id)
+        .ok()
+        .filter(|p| p.external_source.as_deref() == Some("agentflare-repo"))
+        .and_then(|p| p.external_id);
     Ok(Some(ReviewBatch {
         folder_path: dir.folder_path,
         project_id: dir.project_id,
@@ -1403,6 +1419,7 @@ fn build_review_batch(
         items: in_review,
         label_id_by_name,
         stray_candidates,
+        expected_repo_key,
     }))
 }
 
@@ -1456,6 +1473,7 @@ pub(crate) fn run_review_sweep(
             mut items,
             label_id_by_name,
             stray_candidates,
+            expected_repo_key,
         } = batch;
         let repo_root = std::path::PathBuf::from(&folder_path);
         // Every per-item call below (`item_check_merge`, `comment_impl`,
@@ -1498,32 +1516,40 @@ pub(crate) fn run_review_sweep(
             }
         }
         if let (Some(repo), Ok(client)) = &resolved {
-            let repo_root = mcp.worktree_repo_root();
-            let discovered = mcp
-                .with_backend_db(|conn| {
-                    crate::worktree::discover_untracked_prs(
-                        conn,
-                        client,
-                        repo,
-                        &project_id,
-                        &in_review_state_id,
-                        &known_pr_numbers,
-                        &discovery_owner,
-                        &|branch| {
-                            flare_git_core::shell::run_in_ok(
-                                &repo_root,
-                                &[
-                                    "rev-parse",
-                                    "--verify",
-                                    "--quiet",
-                                    &format!("refs/heads/{branch}"),
-                                ],
-                            )
-                        },
-                    )
-                })
-                .unwrap_or(0);
-            result.discovered += discovered;
+            if !repo_matches_project(expected_repo_key.as_deref(), repo) {
+                eprintln!(
+                    "review sweep: project {project_id} expects {} but folder {folder_path} resolves to {repo}; \
+                     skipping PR discovery (project_dirs row looks repointed)",
+                    expected_repo_key.as_deref().unwrap_or("?")
+                );
+            } else {
+                let repo_root = mcp.worktree_repo_root();
+                let discovered = mcp
+                    .with_backend_db(|conn| {
+                        crate::worktree::discover_untracked_prs(
+                            conn,
+                            client,
+                            repo,
+                            &project_id,
+                            &in_review_state_id,
+                            &known_pr_numbers,
+                            &discovery_owner,
+                            &|branch| {
+                                flare_git_core::shell::run_in_ok(
+                                    &repo_root,
+                                    &[
+                                        "rev-parse",
+                                        "--verify",
+                                        "--quiet",
+                                        &format!("refs/heads/{branch}"),
+                                    ],
+                                )
+                            },
+                        )
+                    })
+                    .unwrap_or(0);
+                result.discovered += discovered;
+            }
         }
 
         // Items carrying `metadata.pr.number` (set by `push_and_open_pr` at
@@ -2352,3 +2378,34 @@ mod review_bots_tests;
 #[cfg(test)]
 #[path = "supervisor_self_repair_tests.rs"]
 mod self_repair_tests;
+
+#[cfg(test)]
+mod repo_guard_tests {
+    use super::repo_matches_project;
+    use crate::github::RepoId;
+
+    fn id(o: &str, r: &str) -> RepoId {
+        RepoId {
+            owner: o.into(),
+            repo: r.into(),
+        }
+    }
+
+    #[test]
+    fn mismatched_repo_is_refused_matching_and_unknown_pass() {
+        assert!(repo_matches_project(
+            Some("git:getappz/agentflare"),
+            &id("getappz", "agentflare")
+        ));
+        assert!(repo_matches_project(
+            Some("git:GetAppz/AgentFlare"),
+            &id("getappz", "agentflare")
+        ));
+        assert!(!repo_matches_project(
+            Some("git:getappz/instadocs"),
+            &id("getappz", "agentflare")
+        ));
+        assert!(repo_matches_project(Some("path:/x"), &id("a", "b")));
+        assert!(repo_matches_project(None, &id("a", "b")));
+    }
+}
