@@ -330,6 +330,16 @@ pub(crate) fn discover_untracked_prs_with_clock(
         {
             continue;
         }
+        // A PR whose base lives in another repo was listed from a mismatched
+        // project/repo pairing; never adopt it. (Fork heads stay allowed.)
+        if pr
+            .base
+            .as_ref()
+            .and_then(|b| b.repo.as_ref())
+            .is_some_and(|r| !r.full_name.eq_ignore_ascii_case(&repo.to_string()))
+        {
+            continue;
+        }
         let Some(branch) = pr.head.as_ref().map(|h| h.git_ref.clone()) else {
             continue;
         };
