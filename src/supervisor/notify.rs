@@ -226,10 +226,10 @@ fn request_channel_approval(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Document first so the card (with its buttons) is the last message.
-    if let Some((filename, bytes)) = attachment {
-        if let Err(e) = crate::channels::send_telegram_document(&chat_id, filename, bytes) {
-            eprintln!("agentflare-supervisor: telegram document notify failed: {e}");
-        }
+    if let Some((filename, bytes)) = attachment
+        && let Err(e) = crate::channels::send_telegram_document(&chat_id, filename, bytes)
+    {
+        eprintln!("agentflare-supervisor: telegram document notify failed: {e}");
     }
     let buttons: Vec<(&str, &str)> = button.into_iter().collect();
     if let Err(e) = crate::channels::send_telegram_card(&chat_id, card_text, &buttons) {
