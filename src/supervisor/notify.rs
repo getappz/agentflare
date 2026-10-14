@@ -206,7 +206,11 @@ pub(crate) fn changed_since_last(key: &str, text: &str) -> bool {
 /// `notify_human_gate`: no-ops without a configured chat id, and a send
 /// failure only logs -- a notification failure must never block the gate
 /// itself.
-fn request_channel_approval(card_text: &str, button: Option<(&str, &str)>) {
+fn request_channel_approval(
+    card_text: &str,
+    button: Option<(&str, &str)>,
+    attachment: Option<(&str, &[u8])>,
+) {
     if test_notify_disabled() {
         return;
     }
@@ -221,6 +225,12 @@ fn request_channel_approval(card_text: &str, button: Option<(&str, &str)>) {
     let _turn_guard = turn_lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Document first so the card (with its buttons) is the last message.
+    if let Some((filename, bytes)) = attachment
+        && let Err(e) = crate::channels::send_telegram_document(&chat_id, filename, bytes)
+    {
+        eprintln!("agentflare-supervisor: telegram document notify failed: {e}");
+    }
     let buttons: Vec<(&str, &str)> = button.into_iter().collect();
     if let Err(e) = crate::channels::send_telegram_card(&chat_id, card_text, &buttons) {
         eprintln!("agentflare-supervisor: telegram card notify failed: {e}");
@@ -329,6 +339,7 @@ pub(crate) fn notify_pr_approval_gate(
     request_channel_approval(
         &text,
         wants_label.then_some(("\u{2705} Approve", callback.as_str())),
+        None,
     );
 }
 
@@ -337,10 +348,12 @@ pub(crate) fn notify_pr_approval_gate(
 /// (not the callback data, which stays a plain item reference) purely so
 /// a human reading the notification knows which asset to open. Same
 /// fail-open contract as `notify_human_gate`: no-ops without a configured
-/// chat id, and a send failure only logs.
+/// chat id, and a send failure only logs. `plan_file` (filename, bytes) is
+/// sent as a document just before the card so the plan can be read in-chat.
 pub(crate) fn notify_plan_approval_gate(
     item: &agentflare_backend::item::Item,
     plan_asset_id: &str,
+    plan_file: Option<(String, Vec<u8>)>,
 ) {
     let text = format!(
         "\u{1F4CB} <b>agentflare</b> plan needs review\n\
@@ -351,7 +364,11 @@ pub(crate) fn notify_plan_approval_gate(
         html_escape(plan_asset_id),
     );
     let callback = format!("approve_plan:{}", item.id);
-    request_channel_approval(&text, Some(("\u{2705} Approve", callback.as_str())));
+    request_channel_approval(
+        &text,
+        Some(("\u{2705} Approve", callback.as_str())),
+        plan_file.as_ref().map(|(n, b)| (n.as_str(), b.as_slice())),
+    );
 }
 
 /// Parse an "Approve" button's `callback_data` (`approve_plan:{item_id}`)
