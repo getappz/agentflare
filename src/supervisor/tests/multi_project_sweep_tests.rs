@@ -208,3 +208,29 @@ fn run_discovery_tick_skips_a_project_whose_folder_is_gone_but_dispatches_the_re
     assert_eq!(queue.count_active_with_arg(&live_path, Some(2)).unwrap(), 1);
     assert_eq!(queue.count_active_with_arg(&live_path, Some(1)).unwrap(), 0);
 }
+
+#[test]
+fn one_projects_failing_lookup_does_not_stop_batches_for_the_others() {
+    let (repo_a, repo_b) = (throwaway_repo(), throwaway_repo());
+    let mcp = test_mcp();
+    let item_a = seed_in_review_item_in_project(&mcp, "proj-a", &repo_a.path().to_string_lossy());
+    let item_b = seed_in_review_item_in_project(&mcp, "proj-b", &repo_b.path().to_string_lossy());
+    let (project_a, project_b) = (project_of(&mcp, &item_a), project_of(&mcp, &item_b));
+    let batch_projects = mcp
+        .with_backend_db(|conn| {
+            // Poison project A's states so `state::list_by_project` errors.
+            conn.execute(
+                "UPDATE states SET sequence = 'x' WHERE project_id = ?1",
+                [&project_a],
+            )
+            .unwrap();
+            let dirs = agentflare_backend::project_dir::list(conn).unwrap();
+            collect_review_batches(conn, dirs)
+                .into_iter()
+                .map(|b| b.project_id)
+                .collect::<Vec<_>>()
+        })
+        .unwrap();
+    assert!(batch_projects.contains(&project_b), "{batch_projects:?}");
+    assert!(!batch_projects.contains(&project_a), "{batch_projects:?}");
+}
