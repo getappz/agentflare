@@ -292,9 +292,7 @@ pub fn liveness_of(s: &Session, now: i64) -> Liveness {
     }
     let host = this_host();
     let mine = host_is_machine_unique(&host) && s.host == host;
-    if mine
-        && let Some(pid) = s.pid
-    {
+    if mine && let Some(pid) = s.pid {
         return if crate::ipc::process::is_alive(pid) {
             Liveness::Live
         } else {
@@ -423,10 +421,7 @@ mod tests {
             Liveness::Unverifiable
         );
         end(&c, "codex:remote", 102).unwrap();
-        assert_eq!(
-            liveness(&c, "codex:remote", 103).unwrap(),
-            Liveness::Exited
-        );
+        assert_eq!(liveness(&c, "codex:remote", 103).unwrap(), Liveness::Exited);
     }
 
     #[test]
