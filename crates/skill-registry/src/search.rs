@@ -106,11 +106,13 @@ pub fn search(
          ORDER BY score
          LIMIT ?2",
     )?;
-    let mut rows: Vec<SkillHit> = stmt
-        // Over-fetch: duplicates dropped by `dedupe_hits` must not eat slots.
-        .query_map(
-            rusqlite::params![fts, clamped_limit(limit.saturating_mul(2))],
-            |r| {
+    // Over-fetch, doubling until `limit` distinct hits survive `dedupe_hits`
+    // or the index is exhausted, so duplicate sources never eat result slots.
+    let mut fetch = limit.saturating_mul(2);
+    let mut rows: Vec<SkillHit> = loop {
+        let n = clamped_limit(fetch);
+        let mut rows = stmt
+            .query_map(rusqlite::params![fts, n], |r| {
                 Ok(SkillHit {
                     name: r.get(0)?,
                     source: r.get(1)?,
@@ -124,9 +126,15 @@ pub fn search(
                     install_hint: None,
                     remote_url: None,
                 })
-            },
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let exhausted = (rows.len() as i64) < n;
+        dedupe_hits(&mut rows);
+        if rows.len() >= limit || exhausted || (n as usize) < fetch {
+            break rows;
+        }
+        fetch = fetch.saturating_mul(2);
+    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -139,7 +147,6 @@ pub fn search(
         let sample = beta_sample(h.bandit_alpha, h.bandit_beta);
         h.score *= 0.8 + 0.2 * sample;
     }
-    dedupe_hits(&mut rows);
     rows.truncate(limit);
     Ok(rows)
 }
@@ -856,6 +863,38 @@ mod tests {
         })
         .unwrap();
         assert_eq!(semantic.len(), 3, "{semantic:?}");
+    }
+
+    #[test]
+    fn many_duplicate_sources_still_fill_the_limit() {
+        let mut conn = open_in_memory().unwrap();
+        let mk = |name: &str, source: &str| SkillEntry {
+            name: name.into(),
+            source: source.into(),
+            path: PathBuf::from(format!("/{source}/{name}/SKILL.md")),
+            description: format!("{name} helps with product planning"),
+            body: String::new(),
+            neg_text: String::new(),
+            tags: String::new(),
+            category: String::new(),
+            est_tokens: 100,
+            mtime: 1,
+            bandit_alpha: 1.0,
+            bandit_beta: 1.0,
+            shadow_path: None,
+        };
+        let mut entries = Vec::new();
+        for name in ["pm", "roadmap"] {
+            for i in 0..5 {
+                entries.push(mk(name, &format!("src{i}")));
+            }
+        }
+        entries.push(mk("backlog", "user"));
+        rebuild(&mut conn, &entries).unwrap();
+        // 10 duplicate rows precede the third distinct skill; a fixed 2x
+        // over-fetch (6 rows) would return only 2 hits.
+        let hits = search(&conn, "product planning", 3, MatchMode::All).unwrap();
+        assert_eq!(hits.len(), 3, "{hits:?}");
     }
 
     #[test]
