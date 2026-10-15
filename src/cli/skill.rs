@@ -907,14 +907,14 @@ fn resolve_guide(name: &str) -> Option<(String, Vec<(String, String)>)> {
             let p = e.path();
             if p.is_dir() {
                 stack.push(p);
-            } else if p.extension().is_some_and(|x| x == "md") && companions.len() < 32 {
-                if let Ok(content) = std::fs::read_to_string(&p)
-                    && let Ok(rel) = p
-                        .strip_prefix(&dir)
-                        .map(|r| r.to_string_lossy().into_owned())
-                {
-                    companions.push((rel, content));
-                }
+            } else if p.extension().is_some_and(|x| x == "md")
+                && companions.len() < 32
+                && let Ok(content) = std::fs::read_to_string(&p)
+                && let Ok(rel) = p
+                    .strip_prefix(&dir)
+                    .map(|r| r.to_string_lossy().into_owned())
+            {
+                companions.push((rel, content));
             }
         }
     }
