@@ -267,6 +267,28 @@ fn hit_by_key(conn: &Connection, name: &str, source: &str) -> rusqlite::Result<O
     .optional()
 }
 
+/// Hits scoring below this [`SkillHit::confidence`] are "no good local match".
+pub const MIN_CONFIDENCE: f64 = 0.5;
+
+impl SkillHit {
+    /// Calibrated 0..1 match confidence. Keyword hits carry a raw bm25 score
+    /// (negative, lower-is-better); that maps through `s / (s + 1)`. Blended
+    /// semantic scores are already higher-is-better and are only clamped.
+    pub fn confidence(&self) -> f64 {
+        if self.score < 0.0 {
+            let s = -self.score;
+            s / (s + 1.0)
+        } else {
+            self.score.clamp(0.0, 1.0)
+        }
+    }
+
+    /// True when [`Self::confidence`] clears [`MIN_CONFIDENCE`].
+    pub fn is_confident(&self) -> bool {
+        self.confidence() >= MIN_CONFIDENCE
+    }
+}
+
 /// `search()` blended with semantic (embedding) similarity, degrading
 /// exactly to `search()`'s own ranking when `embed_query` returns `None`
 /// (no `semantic` feature, no model, or a failed call) -- byte-identical to
@@ -934,6 +956,64 @@ mod tests {
         // over-fetch (6 rows) would return only 2 hits.
         let hits = search(&conn, "product planning", 3, MatchMode::All).unwrap();
         assert_eq!(hits.len(), 3, "{hits:?}");
+    }
+
+    #[test]
+    fn threshold_separates_good_match_from_miss() {
+        let mut conn = open_in_memory().unwrap();
+        let mk = |name: &str, desc: &str| SkillEntry {
+            name: name.into(),
+            source: "claude-user".into(),
+            path: PathBuf::from(format!("/x/{name}/SKILL.md")),
+            description: desc.into(),
+            body: String::new(),
+            neg_text: String::new(),
+            tags: String::new(),
+            category: String::new(),
+            est_tokens: 100,
+            mtime: 1,
+            bandit_alpha: 1.0,
+            bandit_beta: 1.0,
+            shadow_path: None,
+        };
+        rebuild(
+            &mut conn,
+            &[
+                mk(
+                    "systematic-debugging",
+                    "Use when encountering any bug, test failure, or unexpected behavior",
+                ),
+                mk(
+                    "hormozi-offer",
+                    "Build a Grand Slam Offer from any idea, product, or service",
+                ),
+                mk(
+                    "idea-to-product",
+                    "Run the full Lean Offer System from idea to sellable offer",
+                ),
+            ],
+        )
+        .unwrap();
+        let good = search_semantic_relaxed(&conn, "bug test failure", 5, |_| None).unwrap();
+        assert_eq!(good[0].name, "systematic-debugging");
+        assert!(
+            good[0].is_confident(),
+            "{} {:?}",
+            good[0].confidence(),
+            good[0]
+        );
+
+        let miss = search_semantic_relaxed(
+            &conn,
+            "should we adopt the idea and build our own",
+            5,
+            |_| None,
+        )
+        .unwrap();
+        for h in &miss {
+            assert!(!h.is_confident(), "{} scored {}", h.name, h.confidence());
+        }
+        assert!(good[0].confidence() > MIN_CONFIDENCE);
     }
 
     #[test]

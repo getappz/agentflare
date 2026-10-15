@@ -401,7 +401,11 @@ mod tests {
             shadow_path: None,
         };
         let entries = vec![
-            mk("live", "claude-plugin:cv", _tmp.path().join("plug/live/SKILL.md")),
+            mk(
+                "live",
+                "claude-plugin:cv",
+                _tmp.path().join("plug/live/SKILL.md"),
+            ),
             mk("live", "codex", _tmp.path().join("codex-live-SKILL.md")),
         ];
         rebuild(&mut conn, &entries).unwrap();
