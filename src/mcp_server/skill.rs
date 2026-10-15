@@ -68,7 +68,14 @@ impl AgentflareMcp {
                 } else {
                     local
                 };
-                Ok(serde_json::to_string_pretty(&hits).unwrap_or_default())
+                let json = serde_json::to_string_pretty(&hits).unwrap_or_default();
+                // Don't silently degrade to keyword-only ranking.
+                Ok(match crate::memory::engine::unavailable_reason() {
+                    Some(why) => format!(
+                        "warning: semantic skill search unavailable ({why}); results are keyword-only\n{json}"
+                    ),
+                    None => json,
+                })
             }
             "load" => {
                 let name = req

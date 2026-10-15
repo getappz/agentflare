@@ -7,18 +7,25 @@ mod imp {
     use agentflare_store::embedding_pipeline::EmbeddingEngine;
     use std::sync::OnceLock;
 
+    static ENGINE: OnceLock<Result<EmbeddingEngine, String>> = OnceLock::new();
+
+    fn load() -> &'static Result<EmbeddingEngine, String> {
+        ENGINE.get_or_init(|| match EmbeddingEngine::load_default() {
+            Ok(e) => Ok(e),
+            Err(err) => {
+                // One log line per process, not per call.
+                eprintln!("[memory] embedding engine unavailable: {err}");
+                Err(err.to_string())
+            }
+        })
+    }
+
     fn engine() -> Option<&'static EmbeddingEngine> {
-        static ENGINE: OnceLock<Option<EmbeddingEngine>> = OnceLock::new();
-        ENGINE
-            .get_or_init(|| match EmbeddingEngine::load_default() {
-                Ok(e) => Some(e),
-                Err(err) => {
-                    // One log line per process, not per call.
-                    eprintln!("[memory] embedding engine unavailable: {err}");
-                    None
-                }
-            })
-            .as_ref()
+        load().as_ref().ok()
+    }
+
+    pub fn unavailable_reason() -> Option<String> {
+        load().as_ref().err().cloned()
     }
 
     pub fn embed_doc(text: &str) -> Option<Vec<f32>> {
@@ -47,6 +54,10 @@ mod imp {
     pub fn model_name() -> Option<String> {
         None
     }
+
+    pub fn unavailable_reason() -> Option<String> {
+        Some("this build has no `semantic` feature".to_string())
+    }
 }
 
-pub use imp::{embed_doc, embed_query, model_name};
+pub use imp::{embed_doc, embed_query, model_name, unavailable_reason};
