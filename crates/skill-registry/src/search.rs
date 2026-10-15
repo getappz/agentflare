@@ -798,6 +798,45 @@ mod tests {
     }
 
     #[test]
+    fn natural_language_fixture_debug_failing_test_finds_systematic_debugging() {
+        let mut conn = open_in_memory().unwrap();
+        let mk = |name: &str, desc: &str| SkillEntry {
+            name: name.into(),
+            source: "claude-user".into(),
+            path: PathBuf::from(format!("/x/{name}/SKILL.md")),
+            description: desc.into(),
+            body: String::new(),
+            neg_text: String::new(),
+            tags: String::new(),
+            category: String::new(),
+            est_tokens: 100,
+            mtime: 1,
+            bandit_alpha: 1.0,
+            bandit_beta: 1.0,
+            shadow_path: None,
+        };
+        rebuild(
+            &mut conn,
+            &[
+                mk(
+                    "systematic-debugging",
+                    "Use when encountering any bug, test failure, or unexpected behavior",
+                ),
+                mk(
+                    "hormozi-offer",
+                    "Build a Grand Slam Offer from any idea, product, or service",
+                ),
+                mk("win-cleanup", "Free disk space on a Windows system"),
+            ],
+        )
+        .unwrap();
+        // "debug" and "failing" are not literal words in the description, so
+        // the all-words default returns nothing; the relaxed path must not.
+        let hits = search_semantic_relaxed(&conn, "debug failing test", 5, |_| None).unwrap();
+        assert_eq!(hits[0].name, "systematic-debugging", "{hits:?}");
+    }
+
+    #[test]
     fn identical_skill_from_two_sources_is_returned_once() {
         let mut conn = open_in_memory().unwrap();
         let mk = |source: &str| SkillEntry {
