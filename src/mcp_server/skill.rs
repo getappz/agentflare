@@ -35,9 +35,25 @@ impl AgentflareMcp {
                         25,
                     )
                 });
+                // No explicit mode: all-words, then any-word if that finds
+                // nothing. An explicit "all" stays strict.
+                let relaxed = req.mode.is_none();
                 let local = self
                     .with_fresh_registry(|reg| {
-                        reg.search_semantic(&query, limit, mode, crate::memory::engine::embed_query)
+                        if relaxed {
+                            reg.search_semantic_relaxed(
+                                &query,
+                                limit,
+                                crate::memory::engine::embed_query,
+                            )
+                        } else {
+                            reg.search_semantic(
+                                &query,
+                                limit,
+                                mode,
+                                crate::memory::engine::embed_query,
+                            )
+                        }
                     })?
                     .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                 let hits = if local.len() < limit {

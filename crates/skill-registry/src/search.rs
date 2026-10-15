@@ -135,7 +135,16 @@ pub fn search(
         let sample = beta_sample(h.bandit_alpha, h.bandit_beta);
         h.score *= 0.8 + 0.2 * sample;
     }
+    dedupe_hits(&mut rows);
     Ok(rows)
+}
+
+/// Drop later hits that repeat an earlier hit's (name, description): the same
+/// skill indexed from two sources (e.g. `pm` from the builtin set and a
+/// project copy). Keeps the first, i.e. the better-ranked one.
+fn dedupe_hits(hits: &mut Vec<SkillHit>) {
+    let mut seen = std::collections::HashSet::new();
+    hits.retain(|h| seen.insert((h.name.clone(), h.description.clone())));
 }
 
 /// Fold registry-fallback hits into an already-fetched local result set, up
@@ -306,7 +315,24 @@ pub fn search_semantic(
             out.push(hit);
         }
     }
+    dedupe_hits(&mut out);
     Ok(out)
+}
+
+/// `search_semantic` for callers that did not pick a mode: all-words first,
+/// then any-word when that finds nothing, so a natural-language query with
+/// one stray word ("debug failing test") does not come back empty.
+pub fn search_semantic_relaxed(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+    embed_query: impl Fn(&str) -> Option<Vec<f32>>,
+) -> rusqlite::Result<Vec<SkillHit>> {
+    let hits = search_semantic(conn, query, limit, MatchMode::All, &embed_query)?;
+    if !hits.is_empty() {
+        return Ok(hits);
+    }
+    search_semantic(conn, query, limit, MatchMode::Any, &embed_query)
 }
 
 #[cfg(test)]
@@ -741,5 +767,38 @@ mod tests {
             1,
             "a skill matched by both bm25 and the vector side must appear once, blended"
         );
+    }
+
+    #[test]
+    fn relaxed_search_retries_with_any_when_all_finds_nothing() {
+        let conn = seed();
+        // "please" is in no description, so the all-words default misses.
+        let strict = search(&conn, "windows disk please", 5, MatchMode::All).unwrap();
+        assert!(strict.is_empty());
+        let hits = search_semantic_relaxed(&conn, "windows disk please", 5, |_| None).unwrap();
+        assert_eq!(hits[0].name, "win-cleanup");
+    }
+
+    #[test]
+    fn identical_skill_from_two_sources_is_returned_once() {
+        let mut conn = open_in_memory().unwrap();
+        let mk = |source: &str| SkillEntry {
+            name: "pm".into(),
+            source: source.into(),
+            path: PathBuf::from(format!("/{source}/pm/SKILL.md")),
+            description: "Product management for any project".into(),
+            body: String::new(),
+            neg_text: String::new(),
+            tags: String::new(),
+            category: String::new(),
+            est_tokens: 100,
+            mtime: 1,
+            bandit_alpha: 1.0,
+            bandit_beta: 1.0,
+            shadow_path: None,
+        };
+        rebuild(&mut conn, &[mk("agentflare-builtin"), mk("claude-project")]).unwrap();
+        let hits = search(&conn, "product management", 5, MatchMode::All).unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
     }
 }

@@ -228,6 +228,18 @@ impl Registry {
             .map_err(|e| LoadError::Db(e.to_string()))
     }
 
+    /// `search_semantic` with no explicit mode: all-words, then any-word if
+    /// that finds nothing. See `crate::search::search_semantic_relaxed`.
+    pub fn search_semantic_relaxed(
+        &self,
+        query: &str,
+        limit: usize,
+        embed_query: impl Fn(&str) -> Option<Vec<f32>>,
+    ) -> Result<Vec<SkillHit>, LoadError> {
+        crate::search::search_semantic_relaxed(&self.conn, query, limit, embed_query)
+            .map_err(|e| LoadError::Db(e.to_string()))
+    }
+
     /// Compute and store embeddings for up to `limit` indexed skills that
     /// don't have one yet. See `crate::embed_store::backfill`.
     pub fn backfill_embeddings(
