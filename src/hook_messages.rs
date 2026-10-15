@@ -55,6 +55,9 @@ pub(crate) fn takes_mail_on(agent: &str, surface: MailSurface) -> bool {
 pub(crate) struct HookSession {
     pub session_id: Option<String>,
     pub cwd: Option<String>,
+    /// SessionEnd's `reason` (`clear` | `logout` | `prompt_input_exit` |
+    /// `other` on Claude Code; absent on hosts that don't send one).
+    pub reason: Option<String>,
 }
 
 pub(crate) fn parse_session(input: &str) -> HookSession {
@@ -76,6 +79,7 @@ pub(crate) fn parse_session(input: &str) -> HookSession {
     HookSession {
         session_id: s("session_id").or_else(|| s("conversation_id")),
         cwd,
+        reason: s("reason"),
     }
 }
 
@@ -219,7 +223,12 @@ pub(crate) fn context_output(agent: &str, event: &str, context: &str) -> Value {
 }
 
 /// Ends the hook's session (SessionEnd). A dispatched job's session is
-/// never ended here: one agent turn ending isn't the job ending.
+/// never ended here: one agent turn ending isn't the job ending. A `clear`
+/// reason isn't an exit either -- the conversation continues under a fresh
+/// transcript, so the row is refreshed, not ended: ending it would read as
+/// `Liveness::Exited` and release the session's item claim mid-work.
+/// Every other reason (logout, prompt_input_exit, other, or absent) ends
+/// the row as before.
 pub(crate) fn end(agent: &str, session: &HookSession) {
     if identity::job_owner().is_some() {
         return;
@@ -227,6 +236,23 @@ pub(crate) fn end(agent: &str, session: &HookSession) {
     let Some(sid) = &session.session_id else {
         return;
     };
+    if session.reason.as_deref() == Some("clear") {
+        // Session boundary, not exit: keep the row live and fresh so
+        // claim liveness can't mistake the transcript reset for death.
+        if let Some(conn) = messages::open_fast() {
+            let key = identity::hook_key(agent, sid);
+            let _ = crate::sessions::touch(
+                &conn,
+                &crate::sessions::Touch {
+                    key: &key,
+                    cwd: session.cwd.as_deref(),
+                    ..Default::default()
+                },
+                now(),
+            );
+        }
+        return;
+    }
     if let Some(conn) = messages::open_fast() {
         let key = identity::hook_key(agent, sid);
         if crate::sessions::end(&conn, &key, now()).is_err()
@@ -436,9 +462,18 @@ mod tests {
             (s.session_id.as_deref(), s.cwd.as_deref()),
             (Some("abc"), Some("/r"))
         );
+        assert_eq!(s.reason, None);
         let cursor = parse_session(r#"{"conversation_id":"c1"}"#);
         assert_eq!(cursor.session_id.as_deref(), Some("c1"));
         assert!(parse_session("not json").session_id.is_none());
+    }
+
+    #[test]
+    fn parse_session_reads_the_session_end_reason() {
+        let s = parse_session(r#"{"session_id":"abc","reason":"clear"}"#);
+        assert_eq!(s.reason.as_deref(), Some("clear"));
+        let s = parse_session(r#"{"session_id":"abc","reason":""}"#);
+        assert_eq!(s.reason, None, "blank reasons stay absent");
     }
 
     #[test]
@@ -682,11 +717,56 @@ mod tests {
             let session = HookSession {
                 session_id: Some("s9".into()),
                 cwd: None,
+                reason: None,
             };
             end("claude-code", &session);
             let c = crate::db::open().unwrap();
             let s = sessions::get(&c, "claude-code:s9").unwrap().unwrap();
             assert!(s.ended_at.is_some(), "an ended session must not stay live");
+        });
+    }
+
+    /// A `/clear` SessionEnd is a transcript reset, not an exit: the row
+    /// must stay live (and fresh) so claim liveness keeps judging the
+    /// still-working owner live instead of releasing its claim mid-work.
+    #[test]
+    fn end_on_clear_refreshes_the_session_instead_of_ending_it() {
+        if identity::job_owner().is_some() {
+            return; // a dispatched job's session is never ended by its hooks
+        }
+        crate::paths::test_support::with_temp_home(|| {
+            let c = crate::db::open().unwrap();
+            crate::sessions::touch(
+                &c,
+                &crate::sessions::Touch {
+                    key: "claude-code:s-clear",
+                    pid: Some(std::process::id()),
+                    ..Default::default()
+                },
+                100,
+            )
+            .unwrap();
+            let session = HookSession {
+                session_id: Some("s-clear".into()),
+                cwd: None,
+                reason: Some("clear".into()),
+            };
+            end("claude-code", &session);
+            let s = sessions::get(&c, "claude-code:s-clear").unwrap().unwrap();
+            assert!(s.ended_at.is_none(), "/clear must not end the session");
+            assert_eq!(
+                crate::sessions::liveness(&c, "claude-code:s-clear", 101).unwrap(),
+                crate::sessions::Liveness::Live
+            );
+            // Any other reason still ends it.
+            let session = HookSession {
+                session_id: Some("s-clear".into()),
+                cwd: None,
+                reason: Some("logout".into()),
+            };
+            end("claude-code", &session);
+            let s = sessions::get(&c, "claude-code:s-clear").unwrap().unwrap();
+            assert!(s.ended_at.is_some(), "logout must end the session");
         });
     }
 
