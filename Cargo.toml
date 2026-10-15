@@ -120,7 +120,9 @@ default = []
 # Measured to save ~900 tokens/turn of context-window space, but that's
 # mostly cache-read traffic (cheap) — no confirmed $ savings yet.
 skill-overrides-sync = []
-# Local ONNX embeddings for hybrid memory recall. Off by default: pulls the
+# Local ONNX embeddings for hybrid memory + skill recall. Off by default for
+# dev builds, but ENABLED in the release workflow (.github/workflows/release.yml);
+# the model downloads on first use. Costs: pulls the
 # ort runtime via agentflare-store. Without it (or without a downloaded
 # model) recall is FTS-only — byte-identical to pre-semantic behavior.
 semantic = ["agentflare-store/embeddings"]

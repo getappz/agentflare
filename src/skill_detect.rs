@@ -314,11 +314,10 @@ pub fn find_skills_budget(
         }
         if let Ok(hits) = registry.search(&query, limit, skill_registry::MatchMode::Any) {
             for hit in hits {
-                if seen.contains_key(&hit.name) {
+                if seen.contains_key(&hit.name) || !hit.is_confident() {
                     continue;
                 }
-                // bm25 is lower-is-better (negative); flip so higher = better.
-                let score = (-hit.score).max(0.0) * intent.confidence;
+                let score = hit.confidence * intent.confidence;
                 let reason = format!("matches {} task", intent.task_type.as_str());
                 seen.insert(hit.name.clone(), ());
                 results.push(RankedSkill {
@@ -344,10 +343,10 @@ pub fn find_skills_budget(
             )
         {
             for hit in hits {
-                if seen.contains_key(&hit.name) {
+                if seen.contains_key(&hit.name) || !hit.is_confident() {
                     continue;
                 }
-                let score = (-hit.score).max(0.0) * 0.6;
+                let score = hit.confidence * 0.6;
                 let reason = "keyword match".to_string();
                 seen.insert(hit.name.clone(), ());
                 results.push(RankedSkill {
@@ -388,12 +387,8 @@ pub fn find_skills_budget(
     });
     results.truncate(limit);
 
-    // Fusion: normalize scores to 0-1 range and blend with intent confidence
-    let max_score = results.iter().map(|r| r.score).fold(0.0_f64, f64::max);
-    if max_score > 0.0 {
-        for r in results.iter_mut() {
-            r.score = (r.score / max_score) * intent.confidence;
-        }
+    for r in results.iter_mut() {
+        r.score = r.score.clamp(0.0, 1.0);
     }
 
     // Budget-aware capping: accumulate est_tokens and drop tail that exceeds budget
@@ -757,5 +752,39 @@ mod tests {
                 s.score
             );
         }
+    }
+
+    #[test]
+    fn weak_keyword_overlap_is_below_threshold_and_dropped() {
+        let (_tmp, reg) = registry_with(&[
+            (
+                "systematic-debugging",
+                "Use when encountering any bug, test failure, or unexpected behavior",
+            ),
+            (
+                "hormozi-offer",
+                "Build a Grand Slam Offer from any idea, product, or service",
+            ),
+            (
+                "idea-to-product",
+                "Run the full Lean Offer System from idea to sellable offer",
+            ),
+        ]);
+        let intent = IntentClassification {
+            task_type: TaskType::Explore,
+            confidence: 0.9,
+            keywords: "should we adopt the idea and build our own"
+                .split(' ')
+                .map(String::from)
+                .collect(),
+            targets: vec![],
+        };
+        let skills = find_skills(&intent, &reg, 5, |_| None, |_| None).unwrap();
+        assert!(
+            !skills
+                .iter()
+                .any(|s| s.name == "hormozi-offer" || s.name == "idea-to-product"),
+            "{skills:?}"
+        );
     }
 }

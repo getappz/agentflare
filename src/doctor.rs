@@ -272,6 +272,12 @@ pub fn run(agent: Option<&str>, json: bool) {
         }
 
         println!("{}", mbx.format_text());
+        match crate::memory::engine::unavailable_reason() {
+            Some(why) => {
+                println!("semantic search: unavailable ({why}); skill search is keyword-only")
+            }
+            None => println!("semantic search: ok"),
+        }
         match &machine_name {
             Some(name) => println!("machine-name: {name}"),
             None => println!(

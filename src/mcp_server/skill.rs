@@ -56,6 +56,9 @@ impl AgentflareMcp {
                         }
                     })?
                     .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                // "No good local match": weak hits are dropped so the registry
+                // fallback below gets the chance to fill in.
+                let local: Vec<_> = local.into_iter().filter(|h| h.is_confident()).collect();
                 let hits = if local.len() < limit {
                     let remaining = limit - local.len();
                     let query_owned = query.clone();
@@ -70,12 +73,10 @@ impl AgentflareMcp {
                 };
                 let json = serde_json::to_string_pretty(&hits).unwrap_or_default();
                 // Don't silently degrade to keyword-only ranking.
-                Ok(match crate::memory::engine::unavailable_reason() {
-                    Some(why) => format!(
-                        "warning: semantic skill search unavailable ({why}); results are keyword-only\n{json}"
-                    ),
-                    None => json,
-                })
+                Ok(with_semantic_warning(
+                    json,
+                    crate::memory::engine::unavailable_reason(),
+                ))
             }
             "load" => {
                 let name = req
@@ -304,5 +305,33 @@ Use for general-purpose skill scaffolding. Replace this content with your skill-
             )),
             _ => None,
         }
+    }
+}
+
+/// Prefix `json` with a one-line warning when semantic search is unavailable,
+/// so keyword-only ranking is never silent.
+fn with_semantic_warning(json: String, unavailable: Option<String>) -> String {
+    match unavailable {
+        Some(why) => format!(
+            "warning: semantic skill search unavailable ({why}); results are keyword-only
+{json}"
+        ),
+        None => json,
+    }
+}
+
+#[cfg(test)]
+mod semantic_warning_tests {
+    use super::with_semantic_warning;
+
+    #[test]
+    fn warns_when_semantic_unavailable_and_passes_json_through_otherwise() {
+        let out = with_semantic_warning("[]".into(), Some("no model".into()));
+        assert!(out.starts_with("warning: semantic skill search unavailable (no model)"));
+        assert!(out.ends_with(
+            "
+[]"
+        ));
+        assert_eq!(with_semantic_warning("[]".into(), None), "[]");
     }
 }

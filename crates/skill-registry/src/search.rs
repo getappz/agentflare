@@ -13,6 +13,9 @@ pub struct SkillHit {
     pub est_tokens: i64,
     pub compressed: bool,
     pub score: f64,
+    /// Calibrated 0..1 match confidence (see [`MIN_CONFIDENCE`]); 0.0 for
+    /// registry-fallback hits, which are not local matches.
+    pub confidence: f64,
     pub last_used_at: i64,
     pub bandit_alpha: f64,
     pub bandit_beta: f64,
@@ -123,11 +126,15 @@ pub fn search(
                     bandit_alpha: r.get(6)?,
                     bandit_beta: r.get(7)?,
                     score: r.get(8)?,
+                    confidence: 0.0,
                     install_hint: None,
                     remote_url: None,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        for h in &mut rows {
+            h.confidence = bm25_confidence(h.score);
+        }
         let exhausted = (rows.len() as i64) < n;
         dedupe_hits(&mut rows);
         if rows.len() >= limit || exhausted || (n as usize) < fetch {
@@ -151,12 +158,12 @@ pub fn search(
     Ok(rows)
 }
 
-/// Drop later hits that repeat an earlier hit's (name, description): the same
+/// Drop later hits that repeat an earlier hit's (name, description, size): the same
 /// skill indexed from two sources (e.g. `pm` from the builtin set and a
 /// project copy). Keeps the first, i.e. the better-ranked one.
 fn dedupe_hits(hits: &mut Vec<SkillHit>) {
     let mut seen = std::collections::HashSet::new();
-    hits.retain(|h| seen.insert((h.name.clone(), h.description.clone())));
+    hits.retain(|h| seen.insert((h.name.clone(), h.description.clone(), h.est_tokens)));
 }
 
 /// Fold registry-fallback hits into an already-fetched local result set, up
@@ -178,6 +185,7 @@ pub fn merge_registry_hits(
         est_tokens: 0,
         compressed: false,
         score: gateway_registry::REGISTRY_FALLBACK_SCORE,
+        confidence: 0.0,
         last_used_at: 0,
         bandit_alpha: 1.0,
         bandit_beta: 1.0,
@@ -259,6 +267,7 @@ fn hit_by_key(conn: &Connection, name: &str, source: &str) -> rusqlite::Result<O
                 bandit_alpha: r.get(6)?,
                 bandit_beta: r.get(7)?,
                 score: 0.0,
+                confidence: 0.0,
                 install_hint: None,
                 remote_url: None,
             })
@@ -267,25 +276,21 @@ fn hit_by_key(conn: &Connection, name: &str, source: &str) -> rusqlite::Result<O
     .optional()
 }
 
-/// Hits scoring below this [`SkillHit::confidence`] are "no good local match".
+/// Hits whose [`SkillHit::confidence`] is below this are "no good local match".
 pub const MIN_CONFIDENCE: f64 = 0.5;
 
-impl SkillHit {
-    /// Calibrated 0..1 match confidence. Keyword hits carry a raw bm25 score
-    /// (negative, lower-is-better); that maps through `s / (s + 1)`. Blended
-    /// semantic scores are already higher-is-better and are only clamped.
-    pub fn confidence(&self) -> f64 {
-        if self.score < 0.0 {
-            let s = -self.score;
-            s / (s + 1.0)
-        } else {
-            self.score.clamp(0.0, 1.0)
-        }
-    }
+/// Calibrate a raw bm25 score (negative, lower-is-better) to 0..1 via
+/// `s / (s + 1)`. Absolute, unlike the min-max blend in `search_semantic`,
+/// so a lone weak hit is not promoted to 1.0.
+fn bm25_confidence(score: f64) -> f64 {
+    let s = (-score).max(0.0);
+    s / (s + 1.0)
+}
 
+impl SkillHit {
     /// True when [`Self::confidence`] clears [`MIN_CONFIDENCE`].
     pub fn is_confident(&self) -> bool {
-        self.confidence() >= MIN_CONFIDENCE
+        self.confidence >= MIN_CONFIDENCE
     }
 }
 
@@ -325,6 +330,10 @@ pub fn search_semantic(
     let mut merged = agentflare_store::retrieval::merge_ranked(&bm25_scored, &vec_hits, 0.6, 0.4);
     merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
+    // Confidence stays absolute: the stronger of the keyword calibration and
+    // the raw cosine, not the (relative) blended score.
+    let cosine: std::collections::HashMap<(String, String), f64> = vec_hits.into_iter().collect();
+
     let mut by_key: std::collections::HashMap<(String, String), SkillHit> = bm25_hits
         .into_iter()
         .map(|h| ((h.name.clone(), h.source.clone()), h))
@@ -346,9 +355,17 @@ pub fn search_semantic(
                 hit
             }),
         };
+        let hit = hit.map(|mut hit| {
+            let cos = cosine
+                .get(&(name.clone(), source.clone()))
+                .copied()
+                .unwrap_or(0.0);
+            hit.confidence = hit.confidence.max(cos.clamp(0.0, 1.0));
+            hit
+        });
         if let Some(hit) = hit {
             // Same skill from two sources: keep the better-ranked one.
-            if seen.insert((hit.name.clone(), hit.description.clone())) {
+            if seen.insert((hit.name.clone(), hit.description.clone(), hit.est_tokens)) {
                 out.push(hit);
             }
         }
@@ -654,6 +671,7 @@ mod tests {
                 est_tokens: 100,
                 compressed: false,
                 score: 1.0,
+                confidence: 0.0,
                 last_used_at: recent,
                 bandit_alpha: 1.0,
                 bandit_beta: 1.0,
@@ -667,6 +685,7 @@ mod tests {
                 est_tokens: 100,
                 compressed: false,
                 score: 1.0,
+                confidence: 0.0,
                 last_used_at: stale,
                 bandit_alpha: 1.0,
                 bandit_beta: 1.0,
@@ -694,6 +713,7 @@ mod tests {
             est_tokens: 100,
             compressed: false,
             score: 0.5,
+            confidence: 0.0,
             last_used_at: 0,
             bandit_alpha: 1.0,
             bandit_beta: 1.0,
@@ -999,7 +1019,7 @@ mod tests {
         assert!(
             good[0].is_confident(),
             "{} {:?}",
-            good[0].confidence(),
+            good[0].confidence,
             good[0]
         );
 
@@ -1011,9 +1031,24 @@ mod tests {
         )
         .unwrap();
         for h in &miss {
-            assert!(!h.is_confident(), "{} scored {}", h.name, h.confidence());
+            assert!(!h.is_confident(), "{} scored {}", h.name, h.confidence);
         }
-        assert!(good[0].confidence() > MIN_CONFIDENCE);
+        assert!(good[0].confidence > MIN_CONFIDENCE);
+    }
+
+    #[test]
+    fn semantic_confidence_is_absolute_not_min_max_normalized() {
+        let conn = seed();
+        // Unrelated query vector: even the top blended hit must not look
+        // confident, though min-max normalization alone would score it 1.0.
+        crate::embed_store::upsert(&conn, "live", "claude-user", &[1.0, 0.0], "test").unwrap();
+        let miss =
+            search_semantic(&conn, "zzz", 3, MatchMode::Any, |_| Some(vec![0.0, 1.0])).unwrap();
+        assert!(miss.iter().all(|h| !h.is_confident()), "{miss:?}");
+        let hit =
+            search_semantic(&conn, "zzz", 3, MatchMode::Any, |_| Some(vec![1.0, 0.0])).unwrap();
+        assert_eq!(hit[0].name, "live");
+        assert!(hit[0].is_confident(), "{hit:?}");
     }
 
     #[test]
