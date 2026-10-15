@@ -367,4 +367,49 @@ mod tests {
             Err(LoadError::NotFound(_))
         ));
     }
+
+    fn counters(conn: &Connection, name: &str, source: &str) -> (i64, f64) {
+        conn.query_row(
+            "SELECT last_used_at, bandit_alpha FROM skills WHERE name = ?1 AND source = ?2",
+            [name, source],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn load_records_usage_and_rebuild_keeps_it() {
+        let (_tmp, mut conn) = seed_with_files();
+        load(&conn, "claude-plugin:cv:live", false).unwrap();
+        let (used, alpha) = counters(&conn, "live", "claude-plugin:cv");
+        assert!(used > 0);
+        assert_eq!(alpha, 2.0);
+
+        let mk = |name: &str, source: &str, path: PathBuf| SkillEntry {
+            name: name.into(),
+            source: source.into(),
+            path,
+            description: "d".into(),
+            body: String::new(),
+            neg_text: String::new(),
+            tags: String::new(),
+            category: String::new(),
+            est_tokens: 10,
+            mtime: 1,
+            bandit_alpha: 1.0,
+            bandit_beta: 1.0,
+            shadow_path: None,
+        };
+        let entries = vec![
+            mk("live", "claude-plugin:cv", _tmp.path().join("plug/live/SKILL.md")),
+            mk("live", "codex", _tmp.path().join("codex-live-SKILL.md")),
+        ];
+        rebuild(&mut conn, &entries).unwrap();
+        assert_eq!(counters(&conn, "live", "claude-plugin:cv"), (used, alpha));
+
+        // Removed then re-added: counters restart rather than resurrect.
+        rebuild(&mut conn, &entries[1..]).unwrap();
+        rebuild(&mut conn, &entries).unwrap();
+        assert_eq!(counters(&conn, "live", "claude-plugin:cv"), (0, 1.0));
+    }
 }
