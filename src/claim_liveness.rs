@@ -6,28 +6,30 @@
 //!
 //! An owner is judged, first match wins:
 //! 1. a daemon job owner `<agent>:<job-id>` by its `agent_jobs` row -- a
-//!    finished job is dead; a queued one is live; a running one is live
+//!    finished job has exited; a queued one is live; a running one is live
 //!    unless its registered session says its process is gone;
 //! 2. the live session registry (`crate::sessions`);
 //! 3. the per-process fallback owner `<agent>:<pid>-<hex>`
 //!    (`claims::owner_id`) by whether that pid still runs here -- only
 //!    after the claim has also been silent for `sessions::STALE_AFTER_SECS`,
 //!    because the claim ledger doesn't record which host a pid lives on;
-//! 4. otherwise unknown, which keeps today's TTL behavior.
+//! 4. otherwise unverifiable, which keeps today's TTL behavior.
 //!
-//! A dead verdict must repeat on two consecutive sweeps before anything is
+//! An exited verdict must repeat on two consecutive sweeps before anything is
 //! released, so a session that is just registering can't lose its claim to
 //! a single racy read.
 
 use rusqlite::Connection;
 
-/// What the sweep concluded about a claim owner.
+/// What the sweep concluded about a claim owner. One canonical vocabulary
+/// (`sessions::Liveness`): `Exited` needs positive proof, anything less is
+/// `Unverifiable` and keeps TTL behavior -- loss of contact never releases.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OwnerLiveness {
     Live,
-    /// Dead, with a short human-readable reason.
-    Dead(String),
-    Unknown,
+    /// Exited, with a short human-readable reason.
+    Exited(String),
+    Unverifiable,
 }
 
 /// The instance half of an `<agent>:<instance>` owner.
@@ -69,7 +71,7 @@ pub(crate) fn judge_owner(
     let session = || {
         sessions
             .and_then(|conn| crate::sessions::liveness(conn, owner, now).ok())
-            .unwrap_or(crate::sessions::Liveness::Unknown)
+            .unwrap_or(crate::sessions::Liveness::Unverifiable)
     };
     if let Some(id) = instance {
         // A job executing in this very process is live by definition, even
@@ -81,36 +83,36 @@ pub(crate) fn judge_owner(
             return match job.state {
                 agentflare_jobs::JobState::Queued => OwnerLiveness::Live,
                 agentflare_jobs::JobState::Running => match session() {
-                    crate::sessions::Liveness::Dead => OwnerLiveness::Dead(format!(
+                    crate::sessions::Liveness::Exited => OwnerLiveness::Exited(format!(
                         "job {id} is marked running but its process has exited"
                     )),
                     _ => OwnerLiveness::Live,
                 },
-                state => OwnerLiveness::Dead(format!("job {id} is {}", job_state_name(state))),
+                state => OwnerLiveness::Exited(format!("job {id} is {}", job_state_name(state))),
             };
         }
     }
     match session() {
         crate::sessions::Liveness::Live => return OwnerLiveness::Live,
-        crate::sessions::Liveness::Dead => {
-            return OwnerLiveness::Dead("its session has ended".to_string());
+        crate::sessions::Liveness::Exited => {
+            return OwnerLiveness::Exited("its session has ended".to_string());
         }
-        crate::sessions::Liveness::Unknown => {}
+        crate::sessions::Liveness::Unverifiable => {}
     }
     if let Some(pid) = instance.and_then(fallback_pid) {
         if crate::ipc::process::is_alive(pid) {
             return OwnerLiveness::Live;
         }
         if now - heartbeat_at > crate::sessions::STALE_AFTER_SECS {
-            return OwnerLiveness::Dead(format!("process {pid} is no longer running"));
+            return OwnerLiveness::Exited(format!("process {pid} is no longer running"));
         }
     }
-    OwnerLiveness::Unknown
+    OwnerLiveness::Unverifiable
 }
 
-/// Dead verdicts seen on the previous sweep, keyed by `(item_id, owner)`.
+/// Exited verdicts seen on the previous sweep, keyed by `(item_id, owner)`.
 /// Only the previous sweep's sightings are kept, so a verdict that flips
-/// back to live (or unknown) in between starts the confirmation over.
+/// back to live (or unverifiable) in between starts the confirmation over.
 #[derive(Debug, Default)]
 pub(crate) struct SweepMemory {
     suspects: std::collections::HashSet<(String, String)>,
@@ -132,7 +134,7 @@ pub(crate) struct Released {
 }
 
 /// One liveness sweep over every active item claim in `backend`. Releases a
-/// claim only when its owner was judged dead on this sweep AND the previous
+/// claim only when its owner was judged exited on this sweep AND the previous
 /// one, then restores the item for redispatch (see `restore_item`).
 #[cfg(test)]
 pub(crate) fn sweep(
@@ -147,10 +149,10 @@ pub(crate) fn sweep(
     })
 }
 
-/// The items `sweep_with` will release this tick: owner dead now AND already
+/// The items `sweep_with` will release this tick: owner exited now AND already
 /// suspected on the previous sweep. Lets `run_sweep` look up their PR state
 /// before taking the DB lock for the sweep itself.
-fn confirmed_dead_items(
+fn confirmed_exited_items(
     backend: &Connection,
     sessions: Option<&Connection>,
     queue: Option<&agentflare_jobs::Queue>,
@@ -165,7 +167,7 @@ fn confirmed_dead_items(
         .filter(|c| {
             matches!(
                 judge_owner(&c.owner, c.heartbeat_at, now, sessions, queue),
-                OwnerLiveness::Dead(_)
+                OwnerLiveness::Exited(_)
             ) && memory
                 .suspects
                 .contains(&(c.key[0].clone(), c.owner.clone()))
@@ -197,7 +199,7 @@ fn sweep_with(
             continue;
         }
         let item_id = claim.key[0].clone();
-        let OwnerLiveness::Dead(reason) =
+        let OwnerLiveness::Exited(reason) =
             judge_owner(&claim.owner, claim.heartbeat_at, now, sessions, queue)
         else {
             continue;
@@ -214,7 +216,7 @@ fn sweep_with(
             Ok(false) => continue,
             Err(e) => {
                 eprintln!(
-                    "agentflare-supervisor: could not release dead claim on {item_id} held by {}: {e}",
+                    "agentflare-supervisor: could not release exited claim on {item_id} held by {}: {e}",
                     claim.owner
                 );
                 suspects.insert(key);
@@ -236,7 +238,7 @@ fn sweep_with(
     released
 }
 
-/// After a dead owner's claim is released: comment once on the item and,
+/// After an exited owner's claim is released: comment once on the item and,
 /// when it is still unfinished work, re-arm it for the discovery tick via
 /// `item::redispatch` (backlog + `ready-for-work`, stale dispatch labels
 /// cleared). Items that must not be re-queued are only commented on:
@@ -320,8 +322,8 @@ fn restore_item(
 }
 
 /// The daemon's per-tick entry point (see `dashboard::server`'s discovery
-/// ticker): one sweep across every project's claims, with the dead-verdict
-/// memory carried between ticks. Also prunes long-dead session rows.
+/// ticker): one sweep across every project's claims, with the exited-verdict
+/// memory carried between ticks. Also prunes long-exited session rows.
 pub(crate) fn run_sweep(
     mcp: &crate::mcp_server::AgentflareMcp,
     queue: &agentflare_jobs::Queue,
@@ -339,7 +341,7 @@ pub(crate) fn run_sweep(
     let repo_root = mcp.worktree_repo_root();
     let candidates = mcp
         .with_backend_db(|conn| {
-            confirmed_dead_items(conn, sessions.as_ref(), Some(queue), &memory, now)
+            confirmed_exited_items(conn, sessions.as_ref(), Some(queue), &memory, now)
         })
         .unwrap_or_default();
     let statuses: std::cell::RefCell<std::collections::HashMap<_, _>> = candidates

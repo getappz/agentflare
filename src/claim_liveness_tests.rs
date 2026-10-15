@@ -2,7 +2,7 @@ use super::*;
 
 const TTL: i64 = 14_400;
 /// A pid that can't be running (above any real pid_max).
-const DEAD_PID: u32 = u32::MAX - 7;
+const EXITED_PID: u32 = u32::MAX - 7;
 
 fn backend() -> Connection {
     agentflare_backend::db::open_in_memory().unwrap()
@@ -133,14 +133,14 @@ fn has_label(conn: &Connection, item_id: &str, project_id: &str, name: &str) -> 
 }
 
 #[test]
-fn a_dead_sessions_claim_is_released_on_the_second_tick_and_a_live_one_is_kept() {
+fn an_exited_sessions_claim_is_released_on_the_second_tick_and_a_live_one_is_kept() {
     let conn = backend();
     let sessions = sessions_db();
     let project = seed_project(&conn);
     let now = 1_000_000;
-    let dead = claimed_item(&conn, &project, "dead", "claude-code:dead-session", now);
+    let exited = claimed_item(&conn, &project, "exited", "claude-code:exited-session", now);
     let live = claimed_item(&conn, &project, "live", "claude-code:live-session", now);
-    touch(&sessions, "claude-code:dead-session", DEAD_PID, now);
+    touch(&sessions, "claude-code:exited-session", EXITED_PID, now);
     touch(
         &sessions,
         "claude-code:live-session",
@@ -151,15 +151,15 @@ fn a_dead_sessions_claim_is_released_on_the_second_tick_and_a_live_one_is_kept()
 
     assert!(sweep(&conn, Some(&sessions), None, &mut memory, now + 12).is_empty());
     assert!(
-        owner_of(&conn, &dead).is_some(),
-        "one dead sighting is not enough"
+        owner_of(&conn, &exited).is_some(),
+        "one exited sighting is not enough"
     );
 
     let released = sweep(&conn, Some(&sessions), None, &mut memory, now + 24);
     assert_eq!(released.len(), 1, "{released:?}");
-    assert_eq!(released[0].item_id, dead);
+    assert_eq!(released[0].item_id, exited);
     assert!(released[0].redispatched);
-    assert_eq!(owner_of(&conn, &dead), None);
+    assert_eq!(owner_of(&conn, &exited), None);
     assert_eq!(
         owner_of(&conn, &live).as_deref(),
         Some("claude-code:live-session")
@@ -167,21 +167,21 @@ fn a_dead_sessions_claim_is_released_on_the_second_tick_and_a_live_one_is_kept()
     // Re-armed for the discovery tick, with the one-line explanation.
     assert!(has_label(
         &conn,
-        &dead,
+        &exited,
         &project,
         crate::supervisor::READY_LABEL
     ));
-    let comments = agentflare_backend::comment::list_by_item(&conn, &dead).unwrap();
+    let comments = agentflare_backend::comment::list_by_item(&conn, &exited).unwrap();
     assert!(
         comments.iter().any(|c| c
             .body
-            .contains("claim released: owner claude-code:dead-session is no longer running")),
+            .contains("claim released: owner claude-code:exited-session is no longer running")),
         "{comments:?}"
     );
 }
 
 #[test]
-fn a_dead_verdict_must_repeat_on_consecutive_ticks() {
+fn an_exited_verdict_must_repeat_on_consecutive_ticks() {
     let conn = backend();
     let sessions = sessions_db();
     let project = seed_project(&conn);
@@ -189,12 +189,12 @@ fn a_dead_verdict_must_repeat_on_consecutive_ticks() {
     let item = claimed_item(&conn, &project, "flappy", "codex:s", now);
     let mut memory = SweepMemory::default();
 
-    touch(&sessions, "codex:s", DEAD_PID, now);
+    touch(&sessions, "codex:s", EXITED_PID, now);
     assert!(sweep(&conn, Some(&sessions), None, &mut memory, now + 12).is_empty());
     // The session re-registered under a live process in between.
     touch(&sessions, "codex:s", std::process::id(), now + 20);
     assert!(sweep(&conn, Some(&sessions), None, &mut memory, now + 24).is_empty());
-    touch(&sessions, "codex:s", DEAD_PID, now + 30);
+    touch(&sessions, "codex:s", EXITED_PID, now + 30);
     assert!(sweep(&conn, Some(&sessions), None, &mut memory, now + 36).is_empty());
     assert!(owner_of(&conn, &item).is_some());
     assert_eq!(
@@ -245,7 +245,7 @@ fn a_job_owners_claim_is_released_once_its_job_row_is_terminal() {
 }
 
 #[test]
-fn a_running_job_whose_process_exited_is_dead_but_this_processes_own_job_never_is() {
+fn a_running_job_whose_process_exited_is_exited_but_this_processes_own_job_never_is() {
     let sessions = sessions_db();
     let queue = test_queue();
     let job = queue
@@ -257,27 +257,27 @@ fn a_running_job_whose_process_exited_is_dead_but_this_processes_own_job_never_i
         judge_owner(&owner, 0, 10, Some(&sessions), Some(&queue)),
         OwnerLiveness::Live
     );
-    touch(&sessions, &owner, DEAD_PID, 5);
+    touch(&sessions, &owner, EXITED_PID, 5);
     assert!(matches!(
         judge_owner(&owner, 0, 10, Some(&sessions), Some(&queue)),
-        OwnerLiveness::Dead(_)
+        OwnerLiveness::Exited(_)
     ));
     queue.fail(&job.id, "done", None, true).unwrap();
     let _running_here = agentflare_jobs::cancel::register(&job.id, || false);
     assert_eq!(
         judge_owner(&owner, 0, 10, Some(&sessions), Some(&queue)),
         OwnerLiveness::Live,
-        "a job executing in this process is never judged dead"
+        "a job executing in this process is never judged exited"
     );
 }
 
 #[test]
-fn fallback_pid_owners_need_a_dead_pid_and_a_silent_claim() {
-    let owner = format!("claude-code:{DEAD_PID}-0123456789abcdef");
+fn fallback_pid_owners_need_an_exited_pid_and_a_silent_claim() {
+    let owner = format!("claude-code:{EXITED_PID}-0123456789abcdef");
     let now = 100_000;
     assert_eq!(
         judge_owner(&owner, now - 60, now, None, None),
-        OwnerLiveness::Unknown,
+        OwnerLiveness::Unverifiable,
         "recently heartbeated: may be a pid on another host"
     );
     assert!(matches!(
@@ -288,14 +288,14 @@ fn fallback_pid_owners_need_a_dead_pid_and_a_silent_claim() {
             None,
             None
         ),
-        OwnerLiveness::Dead(_)
+        OwnerLiveness::Exited(_)
     ));
     let alive = format!("claude-code:{}-0123456789abcdef", std::process::id());
     assert_eq!(judge_owner(&alive, 0, now, None, None), OwnerLiveness::Live);
-    // Any other owner shape is unknown: TTL behavior as before.
+    // Any other owner shape is unverifiable: TTL behavior as before.
     assert_eq!(
         judge_owner("cli:my-session", 0, now, None, None),
-        OwnerLiveness::Unknown
+        OwnerLiveness::Unverifiable
     );
 }
 
@@ -312,7 +312,7 @@ fn a_paused_items_released_claim_is_not_requeued() {
         .find(|l| l.name == crate::supervisor::PAUSED_LABEL)
         .unwrap();
     agentflare_backend::item::add_label(&conn, &item, &paused.id).unwrap();
-    touch(&sessions, "codex:gone", DEAD_PID, now);
+    touch(&sessions, "codex:gone", EXITED_PID, now);
     let mut memory = SweepMemory::default();
     sweep(&conn, Some(&sessions), None, &mut memory, now + 12);
     let released = sweep(&conn, Some(&sessions), None, &mut memory, now + 24);
@@ -327,13 +327,13 @@ fn a_paused_items_released_claim_is_not_requeued() {
 }
 
 #[test]
-fn a_dead_claim_with_a_merged_pr_is_not_requeued() {
+fn an_exited_claim_with_a_merged_pr_is_not_requeued() {
     let conn = backend();
     let sessions = sessions_db();
     let project = seed_project(&conn);
     let now = 1_000_000;
     let item = claimed_item(&conn, &project, "merged", "codex:gone", now);
-    touch(&sessions, "codex:gone", DEAD_PID, now);
+    touch(&sessions, "codex:gone", EXITED_PID, now);
     let mut memory = SweepMemory::default();
     let status = |_: &agentflare_backend::item::Item| crate::worktree::PrCiStatus::Merged;
     assert!(sweep_with(&conn, Some(&sessions), None, &mut memory, now + 12, status).is_empty());
@@ -360,13 +360,13 @@ fn a_dead_claim_with_a_merged_pr_is_not_requeued() {
 }
 
 #[test]
-fn a_dead_claim_with_green_auto_merge_is_not_requeued() {
+fn an_exited_claim_with_green_auto_merge_is_not_requeued() {
     let conn = backend();
     let sessions = sessions_db();
     let project = seed_project(&conn);
     let now = 1_000_000;
     let item = claimed_item(&conn, &project, "merging", "codex:gone", now);
-    touch(&sessions, "codex:gone", DEAD_PID, now);
+    touch(&sessions, "codex:gone", EXITED_PID, now);
     let mut memory = SweepMemory::default();
     let status = |_: &agentflare_backend::item::Item| crate::worktree::PrCiStatus::Passing {
         number: 1,
