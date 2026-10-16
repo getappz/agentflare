@@ -2,7 +2,7 @@
 //! item.rs/claim.rs/comment.rs). Thin wrapper over `crate::workflow` service:
 //! run/status/complete_event/list for durable agent pipelines.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::*;
 
@@ -12,14 +12,7 @@ impl AgentflareMcp {
         // tempdirs (see the tests below); an MCP caller-supplied path is
         // never honored in production, since that would let any client
         // point the workflow store at an arbitrary file on disk.
-        let db_path = if cfg!(test) {
-            req.db_path
-                .as_deref()
-                .map(PathBuf::from)
-                .unwrap_or_else(crate::workflow::default_db_path)
-        } else {
-            crate::workflow::default_db_path()
-        };
+        let db_path = resolve_workflow_db_path(req.db_path.as_deref(), !cfg!(test));
 
         match req.action.as_str() {
             "run" => {
@@ -110,12 +103,167 @@ impl AgentflareMcp {
                 .map_err(|e| ErrorData::invalid_params(e, None))?;
                 Ok(serde_json::to_string_pretty(&metrics).unwrap_or_default())
             }
+            action if action.starts_with("schedule_") => self.schedule_impl(&req, &db_path).await,
             other => Err(ErrorData::invalid_params(
                 format!("unknown action: {other}"),
                 None,
             )),
         }
     }
+
+    /// Schedule actions share the workflow tool. `schedule_fire` only enqueues.
+    async fn schedule_impl(&self, req: &WorkflowRequest, db: &Path) -> Result<String, ErrorData> {
+        let invalid = |e: String| ErrorData::invalid_params(e, None);
+        let now = db_kit::ids::now();
+        let repo = || -> Result<String, ErrorData> {
+            crate::schedule::canonical_repo_root(&self.worktree_repo_root().to_string_lossy())
+                .map_err(invalid)
+        };
+        match req.action.as_str() {
+            "schedule_create" => {
+                let name = req
+                    .schedule_name
+                    .as_deref()
+                    .or(req.schedule.as_deref())
+                    .ok_or_else(|| invalid("schedule_name is required".into()))?;
+                let workflow_name = req
+                    .workflow_name
+                    .as_deref()
+                    .ok_or_else(|| invalid("workflow_name is required".into()))?;
+                let every = req
+                    .every
+                    .as_deref()
+                    .ok_or_else(|| invalid("every is required".into()))?;
+                let row = crate::schedule::admin::create(
+                    db,
+                    crate::schedule::admin::NewSchedule {
+                        name: name.to_string(),
+                        repo_root: repo()?,
+                        workflow_name: workflow_name.to_string(),
+                        params: crate::schedule::admin::parse_params(req.params.as_deref())
+                            .map_err(invalid)?,
+                        every_secs: crate::schedule::admin::parse_interval(every)
+                            .map_err(invalid)?,
+                        grace_secs: req
+                            .grace
+                            .as_deref()
+                            .map(crate::schedule::admin::parse_grace)
+                            .transpose()
+                            .map_err(invalid)?,
+                        overlap: req.overlap.clone().unwrap_or_else(|| "skip".into()),
+                    },
+                    now,
+                )
+                .await
+                .map_err(invalid)?;
+                Ok(to_json(&row))
+            }
+            "schedule_list" => {
+                let root = if req.all { None } else { Some(repo()?) };
+                let rows = crate::schedule::admin::list(db, root.as_deref())
+                    .await
+                    .map_err(invalid)?;
+                Ok(to_json(&rows))
+            }
+            "schedule_show" => {
+                let token = schedule_token(req)?;
+                let row = crate::schedule::admin::show(db, Some(&repo()?), token)
+                    .await
+                    .map_err(invalid)?;
+                Ok(to_json(&row))
+            }
+            "schedule_update" => {
+                let token = schedule_token(req)?;
+                let row = crate::schedule::admin::update(
+                    db,
+                    Some(&repo()?),
+                    token,
+                    crate::schedule::admin::SchedulePatch {
+                        workflow_name: req.workflow_name.clone(),
+                        params: crate::schedule::admin::parse_params(req.params.as_deref())
+                            .map_err(invalid)?,
+                        every_secs: req
+                            .every
+                            .as_deref()
+                            .map(crate::schedule::admin::parse_interval)
+                            .transpose()
+                            .map_err(invalid)?,
+                        grace_secs: req
+                            .grace
+                            .as_deref()
+                            .map(crate::schedule::admin::parse_grace)
+                            .transpose()
+                            .map_err(invalid)?,
+                        overlap: req.overlap.clone(),
+                    },
+                    now,
+                )
+                .await
+                .map_err(invalid)?;
+                Ok(to_json(&row))
+            }
+            "schedule_enable" | "schedule_disable" => {
+                let token = schedule_token(req)?;
+                let enabled = req.action == "schedule_enable";
+                let row =
+                    crate::schedule::admin::set_enabled(db, Some(&repo()?), token, enabled, now)
+                        .await
+                        .map_err(invalid)?;
+                Ok(to_json(&row))
+            }
+            "schedule_remove" => {
+                let token = schedule_token(req)?;
+                crate::schedule::admin::remove(db, Some(&repo()?), token)
+                    .await
+                    .map_err(invalid)?;
+                Ok(r#"{"status":"removed"}"#.to_string())
+            }
+            "schedule_fire" => {
+                let token = schedule_token(req)?;
+                let receipt =
+                    crate::schedule::admin::enqueue_manual(db, Some(&repo()?), token, now)
+                        .await
+                        .map_err(invalid)?;
+                Ok(to_json(&receipt))
+            }
+            "schedule_runs" => {
+                let token = schedule_token(req)?;
+                let limit = match req.limit {
+                    Some(n) => {
+                        Some(i64::try_from(n).map_err(|_| invalid("limit must be >= 0".into()))?)
+                    }
+                    None => None,
+                };
+                let rows = crate::schedule::admin::runs(db, Some(&repo()?), token, limit)
+                    .await
+                    .map_err(invalid)?;
+                Ok(to_json(&rows))
+            }
+            other => Err(ErrorData::invalid_params(
+                format!("unknown action: {other}"),
+                None,
+            )),
+        }
+    }
+}
+
+/// Production ignores a caller-supplied `db_path`. Tests pass `production: false`.
+pub(crate) fn resolve_workflow_db_path(requested: Option<&str>, production: bool) -> PathBuf {
+    if !production && let Some(path) = requested.map(str::trim).filter(|s| !s.is_empty()) {
+        return PathBuf::from(path);
+    }
+    crate::workflow::default_db_path()
+}
+
+fn schedule_token(req: &WorkflowRequest) -> Result<&str, ErrorData> {
+    req.schedule
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ErrorData::invalid_params("schedule is required", None))
+}
+
+fn to_json(value: &impl serde::Serialize) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -368,5 +516,172 @@ mod tests {
             .unwrap();
         let names: Vec<String> = serde_json::from_str(&out).unwrap();
         assert_eq!(names, vec!["greet".to_string()]);
+    }
+
+    fn write_workflow(repo: &Path, name: &str) {
+        let dir = repo.join(".agentflare").join("workflows");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{name}.json")),
+            format!(r#"{{"name":"{name}","steps":[{{"name":"s","command":["/bin/true"]}}]}}"#),
+        )
+        .unwrap();
+    }
+
+    fn mcp_at(repo: &Path) -> AgentflareMcp {
+        AgentflareMcp {
+            worktree_repo_root_override: Some(repo.to_path_buf()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn production_db_path_cannot_redirect_storage() {
+        let evil = "/tmp/agentflare-not-the-workflow-store.db";
+        let path = resolve_workflow_db_path(Some(evil), true);
+        assert_eq!(path, crate::workflow::default_db_path());
+        assert_ne!(path, PathBuf::from(evil));
+        let test_path = resolve_workflow_db_path(Some(evil), false);
+        assert_eq!(test_path, PathBuf::from(evil));
+    }
+
+    #[tokio::test]
+    async fn schedule_actions_round_trip_on_an_isolated_db() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("wf.db");
+        let repo = tempfile::tempdir().unwrap();
+        write_workflow(repo.path(), "echo");
+        let mcp = mcp_at(repo.path());
+
+        let mut create = req("schedule_create", &db);
+        create.schedule_name = Some("nightly".into());
+        create.workflow_name = Some("echo".into());
+        create.every = Some("2m".into());
+        create.grace = Some("30s".into());
+        create.params = Some(r#"{"who":"ada"}"#.into());
+        let created: serde_json::Value =
+            serde_json::from_str(&mcp.workflow(Parameters(create)).await.unwrap()).unwrap();
+        assert_eq!(created["name"], "nightly");
+        assert_eq!(created["every_secs"], 120);
+        assert_eq!(created["effective_grace_secs"], 30);
+        assert_eq!(created["params"]["who"], "ada");
+        let id = created["id"].as_str().unwrap().to_string();
+
+        let listed: serde_json::Value = serde_json::from_str(
+            &mcp.workflow(Parameters(req("schedule_list", &db)))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+
+        let mut show = req("schedule_show", &db);
+        show.schedule = Some(id.clone());
+        let shown: serde_json::Value =
+            serde_json::from_str(&mcp.workflow(Parameters(show)).await.unwrap()).unwrap();
+        assert_eq!(shown["workflow_name"], "echo");
+
+        let mut update = req("schedule_update", &db);
+        update.schedule = Some("nightly".into());
+        update.every = Some("3m".into());
+        update.overlap = Some("allow".into());
+        let updated: serde_json::Value =
+            serde_json::from_str(&mcp.workflow(Parameters(update)).await.unwrap()).unwrap();
+        assert_eq!(updated["every_secs"], 180);
+        assert_eq!(updated["overlap"], "allow");
+
+        let mut disable = req("schedule_disable", &db);
+        disable.schedule = Some(id.clone());
+        let disabled: serde_json::Value =
+            serde_json::from_str(&mcp.workflow(Parameters(disable)).await.unwrap()).unwrap();
+        assert_eq!(disabled["enabled"], false);
+
+        let mut enable = req("schedule_enable", &db);
+        enable.schedule = Some("nightly".into());
+        let enabled: serde_json::Value =
+            serde_json::from_str(&mcp.workflow(Parameters(enable)).await.unwrap()).unwrap();
+        assert_eq!(enabled["enabled"], true);
+
+        let mut fire = req("schedule_fire", &db);
+        fire.schedule = Some("nightly".into());
+        let receipt: serde_json::Value =
+            serde_json::from_str(&mcp.workflow(Parameters(fire)).await.unwrap()).unwrap();
+        assert_eq!(receipt["status"], "queued");
+        assert!(receipt["occurrence_id"].is_string());
+
+        let runs_n: i64 = rusqlite::Connection::open(&db)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM workflow_runs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(runs_n, 0, "schedule_fire must not start a workflow");
+
+        let mut runs = req("schedule_runs", &db);
+        runs.schedule = Some(id.clone());
+        let history: serde_json::Value =
+            serde_json::from_str(&mcp.workflow(Parameters(runs)).await.unwrap()).unwrap();
+        assert_eq!(history.as_array().unwrap()[0]["status"], "queued");
+        assert!(history.as_array().unwrap()[0]["run_id"].is_null());
+
+        let mut remove = req("schedule_remove", &db);
+        remove.schedule = Some(id);
+        let gone = mcp.workflow(Parameters(remove)).await.unwrap();
+        assert!(gone.contains("removed"));
+
+        let mut missing = req("schedule_show", &db);
+        missing.schedule = Some("nightly".into());
+        assert!(mcp.workflow(Parameters(missing)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn schedule_list_is_scoped_and_validation_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("wf.db");
+        let repo_a = tempfile::tempdir().unwrap();
+        let repo_b = tempfile::tempdir().unwrap();
+        write_workflow(repo_a.path(), "echo");
+        let mcp_a = mcp_at(repo_a.path());
+        let mcp_b = mcp_at(repo_b.path());
+
+        let mut create = req("schedule_create", &db);
+        create.schedule_name = Some("nightly".into());
+        create.workflow_name = Some("echo".into());
+        create.every = Some("1m".into());
+        let created: serde_json::Value =
+            serde_json::from_str(&mcp_a.workflow(Parameters(create)).await.unwrap()).unwrap();
+        let id = created["id"].as_str().unwrap();
+
+        let listed: serde_json::Value = serde_json::from_str(
+            &mcp_b
+                .workflow(Parameters(req("schedule_list", &db)))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(listed.as_array().unwrap().is_empty());
+
+        let mut all = req("schedule_list", &db);
+        all.all = true;
+        let everyone: serde_json::Value =
+            serde_json::from_str(&mcp_b.workflow(Parameters(all)).await.unwrap()).unwrap();
+        assert_eq!(everyone.as_array().unwrap().len(), 1);
+
+        let mut show = req("schedule_show", &db);
+        show.schedule = Some(id.into());
+        assert!(mcp_b.workflow(Parameters(show)).await.is_ok());
+
+        let mut bad = req("schedule_create", &db);
+        bad.schedule_name = Some("other".into());
+        bad.workflow_name = Some("echo".into());
+        bad.every = Some("30s".into());
+        let err = mcp_a.workflow(Parameters(bad)).await.unwrap_err();
+        assert!(format!("{err}").contains("minimum is 60"));
+
+        let mut reserved = req("schedule_create", &db);
+        reserved.schedule_name = Some("other".into());
+        reserved.workflow_name = Some("echo".into());
+        reserved.every = Some("1m".into());
+        reserved.params = Some(r#"{"schedule":1}"#.into());
+        let err = mcp_a.workflow(Parameters(reserved)).await.unwrap_err();
+        assert!(format!("{err}").contains("reserves top-level key `schedule`"));
     }
 }

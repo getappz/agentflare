@@ -42,6 +42,7 @@ mod vault;
 mod vent;
 pub(crate) mod work;
 mod workflow;
+mod workflow_schedule;
 
 use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Parser, Subcommand};
@@ -236,6 +237,95 @@ impl Commands {
             Self::Job(cmd) => cmd.run(),
             Self::Project(cmd) => cmd.run(),
             Self::Store(cmd) => cmd.run(),
+        }
+    }
+}
+
+/// Parse a duration. Units: `s` seconds, `m` minutes, `h` hours, `d` days,
+/// `w` weeks, `M` 30-day months. `m` and `M` are distinct. Segments may be
+/// concatenated or whitespace-separated (`30s 5m`, `2h30m`). Unitless,
+/// negative, unknown units, and overflow are rejected.
+pub(crate) fn parse_duration(input: &str) -> Result<std::time::Duration, String> {
+    let bad = || format!("invalid duration '{input}' (use e.g. 30s, 5m, 12h, 7d, 2w, 3M)");
+    let s = input.trim();
+    if s.is_empty() || s.as_bytes().first() == Some(&b'-') {
+        return Err(bad());
+    }
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut total: u64 = 0;
+    let mut saw = false;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        if !bytes[i].is_ascii_digit() {
+            return Err(bad());
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            return Err(bad());
+        }
+        let unit_secs: u64 = match bytes[i] {
+            b's' => 1,
+            b'm' => 60,
+            b'h' => 3600,
+            b'd' => 86_400,
+            b'w' => 7 * 86_400,
+            b'M' => 30 * 86_400,
+            _ => return Err(bad()),
+        };
+        i += 1;
+        let n: u64 = s[start..i - 1].parse().map_err(|_| bad())?;
+        let part = n.checked_mul(unit_secs).ok_or_else(bad)?;
+        total = total.checked_add(part).ok_or_else(bad)?;
+        saw = true;
+    }
+    if !saw {
+        return Err(bad());
+    }
+    Ok(std::time::Duration::from_secs(total))
+}
+
+#[cfg(test)]
+mod duration_tests {
+    use super::parse_duration;
+    use std::time::Duration;
+
+    #[test]
+    fn parses_s_m_and_month_distinctly() {
+        assert_eq!(parse_duration("30s").unwrap(), Duration::from_secs(30));
+        assert_eq!(parse_duration("5m").unwrap(), Duration::from_secs(5 * 60));
+        assert_eq!(
+            parse_duration("1M").unwrap(),
+            Duration::from_secs(30 * 86_400)
+        );
+        assert_ne!(parse_duration("1m").unwrap(), parse_duration("1M").unwrap());
+        assert_eq!(
+            parse_duration("30s 5m 2h 1d 1w 3M").unwrap(),
+            Duration::from_secs(30 + 5 * 60 + 2 * 3600 + 86_400 + 7 * 86_400 + 3 * 30 * 86_400)
+        );
+        assert_eq!(
+            parse_duration("2h30m").unwrap(),
+            Duration::from_secs(2 * 3600 + 30 * 60)
+        );
+        for bad in [
+            "soon",
+            "",
+            "d",
+            "7",
+            "7x",
+            "-1d",
+            "5 m",
+            "999999999999999999h",
+        ] {
+            assert!(parse_duration(bad).is_err(), "{bad:?} must be rejected");
         }
     }
 }

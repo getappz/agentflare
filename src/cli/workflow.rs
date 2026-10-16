@@ -32,6 +32,9 @@ pub enum WorkflowCommand {
     /// Aggregate instance/step metrics across runs — counts by status,
     /// average duration, token totals, per-step breakdown.
     Metrics(MetricsArgs),
+    /// Interval schedules for project workflows. `fire` only enqueues;
+    /// the daemon executes.
+    Schedule(super::workflow_schedule::ScheduleArgs),
 }
 
 #[derive(Args)]
@@ -209,6 +212,7 @@ impl WorkflowArgs {
                     println!("{name}");
                 }
             }
+            WorkflowCommand::Schedule(args) => super::workflow_schedule::run(args),
             WorkflowCommand::Metrics(args) => {
                 match crate::workflow::workflow_metrics(
                     args.workflow_id.as_deref(),

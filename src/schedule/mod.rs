@@ -1,17 +1,14 @@
 //! Durable interval scheduling for project-local JSON workflows (item #366
 //! Phase 1, PR-B): `schedules` / `schedule_runs` / `workflow_start_receipts`
 //! storage, a daemon-owned 60 s ticker, and the eager terminal-outcome hook.
-//! CLI/MCP surfaces (PR-C) enqueue and administer here; only the daemon's
+//! CLI/MCP surfaces enqueue and administer here; only the daemon's
 //! `Scheduler` executes.
 
-// The admin/CRUD half of this subtree (schedule CRUD, validation, manual
-// receipts) is PR-C (#370) CLI/MCP surface: it ships here with full test
-// coverage so the daemon half can build on it, and lights up in production
-// when PR-C wires the commands. Silence `dead_code` for the subtree until
-// then — PR-C removes this once the commands land — rather than scattering
-// per-item allows.
+// Test-only scheduler helpers (`open`, `store`, `drain_fires`) and unread
+// claim fields warn on the binary target. CLI/MCP use the store directly.
 #![allow(dead_code)]
 
+pub(crate) mod admin;
 pub(crate) mod store;
 pub(crate) mod tick;
 
@@ -151,7 +148,7 @@ pub struct LaunchSpec {
 
 /// Durable manual-fire acceptance: the request is queued, never executed by
 /// the client.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct FireReceipt {
     pub occurrence_id: String,
     pub status: String,

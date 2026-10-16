@@ -1459,7 +1459,7 @@ pub(crate) struct SearchRequest {
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct WorkflowRequest {
     #[schemars(
-        description = "Action: run|status|complete_event|cancel|list|list_definitions|metrics"
+        description = "Action: run|status|complete_event|cancel|list|list_definitions|metrics|schedule_create|schedule_list|schedule_show|schedule_update|schedule_enable|schedule_disable|schedule_remove|schedule_fire|schedule_runs"
     )]
     pub(crate) action: String,
     #[schemars(
@@ -1507,6 +1507,33 @@ pub(crate) struct WorkflowRequest {
     )]
     #[serde(default)]
     pub(crate) since: Option<String>,
+    #[schemars(
+        description = "Schedule name or id (schedule_show, schedule_update, schedule_enable, schedule_disable, schedule_remove, schedule_fire, schedule_runs; also accepted as the name on schedule_create)"
+    )]
+    #[serde(default)]
+    pub(crate) schedule: Option<String>,
+    #[schemars(description = "Schedule name on schedule_create")]
+    #[serde(default)]
+    pub(crate) schedule_name: Option<String>,
+    #[schemars(
+        description = "Interval duration for schedule_create/schedule_update (30s, 5m, 2h, 1d, 1w, 3M). m is minutes, M is 30 days. At least 60 seconds."
+    )]
+    #[serde(default)]
+    pub(crate) every: Option<String>,
+    #[schemars(
+        description = "Grace duration for schedule_create/schedule_update. 0s admits only the exact slot."
+    )]
+    #[serde(default)]
+    pub(crate) grace: Option<String>,
+    #[schemars(description = "Overlap policy: skip (default) or allow")]
+    #[serde(default)]
+    pub(crate) overlap: Option<String>,
+    #[schemars(description = "schedule_list: include every repository, not only the caller's")]
+    #[serde(default)]
+    pub(crate) all: bool,
+    #[schemars(description = "schedule_runs: newest N occurrences")]
+    #[serde(default)]
+    pub(crate) limit: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
