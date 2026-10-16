@@ -140,6 +140,7 @@
 
     #[test]
     #[ignore = "subprocess fixture for inherited output pipes"]
+    #[allow(clippy::zombie_processes, reason = "the regression requires the parent to exit while its helper retains the pipes")]
     fn capture_pipe_holder_fixture() {
         match std::env::var("AGENTFLARE_TEST_PIPE_ROLE").as_deref() {
             Ok("parent") => {
