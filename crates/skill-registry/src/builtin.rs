@@ -26,6 +26,21 @@ const BUILTIN_SKILLS: &[BuiltinSkill] = &[BuiltinSkill {
     ],
 }];
 
+/// Names of all skills compiled into the binary.
+pub fn names() -> Vec<&'static str> {
+    BUILTIN_SKILLS.iter().map(|s| s.name).collect()
+}
+
+/// Version-matched guide for a builtin skill: `(SKILL.md, companions)`.
+/// Served from `include_str!` so it can never drift from the running binary
+/// (Orca `skills get` pattern).
+pub fn get(name: &str) -> Option<(&'static str, &'static [(&'static str, &'static str)])> {
+    BUILTIN_SKILLS
+        .iter()
+        .find(|s| s.name == name)
+        .map(|s| (s.skill_md, s.companions))
+}
+
 fn write_if_changed(path: &Path, content: &str) -> std::io::Result<()> {
     if std::fs::read_to_string(path).is_ok_and(|s| s == content) {
         return Ok(());
@@ -55,6 +70,19 @@ pub fn materialize(dir: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn get_returns_version_matched_pm_guide() {
+        let (body, companions) = get("pm").expect("builtin pm");
+        assert!(body.contains("name: pm"));
+        assert!(companions.iter().any(|(p, _)| *p == "reference/rubric.md"));
+        assert!(names().contains(&"pm"));
+    }
+
+    #[test]
+    fn get_returns_none_for_unknown() {
+        assert!(get("definitely-not-a-real-skill-xyz").is_none());
+    }
 
     #[test]
     fn materialize_writes_pm_skill_and_companions() {

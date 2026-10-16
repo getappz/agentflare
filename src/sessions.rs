@@ -92,13 +92,21 @@ pub struct Touch<'a> {
     pub team: Option<&'a str>,
 }
 
+/// One canonical liveness verdict, shared by every judge (claim sweeps,
+/// message delivery, status surfaces): no synonyms. `Exited` requires
+/// positive proof -- an ended row or a same-host pid check that fails.
+/// Silence, a missing row, or a row that is definitively another host's is
+/// `Unverifiable`: loss of contact is never evidence of exit, and an
+/// unverifiable owner never triggers a destructive action (claim release,
+/// redispatch); it keeps plain TTL behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Liveness {
     Live,
-    Dead,
-    /// No registry row: nothing to judge by (e.g. a session from before this
-    /// registry existed). Callers fall back to their own TTL.
-    Unknown,
+    Exited,
+    /// No row, or no positive proof either way (e.g. a session from before
+    /// this registry existed, or a stale row on another host). Callers fall
+    /// back to their own TTL.
+    Unverifiable,
 }
 
 /// This machine's identity for pid-liveness checks: a session row whose
@@ -233,9 +241,9 @@ const COLUMNS: &str =
     "key, agent, name, item_id, cwd, host, pid, started_at, last_seen_at, ended_at, team, busy";
 
 /// Deletes `key`'s row outright (unlike [`end`], which records it as
-/// ended -- i.e. `Liveness::Dead` -- for claim liveness). For a key that
+/// ended -- i.e. `Liveness::Exited` -- for claim liveness). For a key that
 /// was only ever a stand-in, whose owner may still be alive and holding
-/// claims under it: no row means `Liveness::Unknown`, so claim liveness
+/// claims under it: no row means `Liveness::Unverifiable`, so claim liveness
 /// falls back to its own pid/TTL checks instead of releasing them.
 pub fn forget(conn: &Connection, key: &str) -> rusqlite::Result<bool> {
     Ok(conn.execute("DELETE FROM agent_sessions WHERE key = ?1", [key])? > 0)
@@ -272,34 +280,37 @@ fn host_is_machine_unique(host: &str) -> bool {
     host.contains('@') || host.starts_with("machine-id:")
 }
 
-/// Judges one session: an ended row is dead; a row on this host with a pid is
-/// judged by whether that pid exists (exact, and works for a session idle
-/// for hours) -- only when the host identity includes the machine id;
-/// otherwise by `last_seen_at` against [`STALE_AFTER_SECS`].
+/// Judges one session: an ended row has exited; a row on this host with a
+/// pid is judged by whether that pid exists (exact, and works for a session
+/// idle for hours) -- only when the host identity includes the machine id;
+/// otherwise by `last_seen_at` against [`STALE_AFTER_SECS`]. A stale row
+/// that is definitively another host's (machine-unique host that is not
+/// ours) is `Unverifiable`, never `Exited`: its silence proves nothing here.
 pub fn liveness_of(s: &Session, now: i64) -> Liveness {
     if s.ended_at.is_some() {
-        return Liveness::Dead;
+        return Liveness::Exited;
     }
     let host = this_host();
-    if host_is_machine_unique(&host)
-        && s.host == host
-        && let Some(pid) = s.pid
-    {
+    let mine = host_is_machine_unique(&host) && s.host == host;
+    if mine && let Some(pid) = s.pid {
         return if crate::ipc::process::is_alive(pid) {
             Liveness::Live
         } else {
-            Liveness::Dead
+            Liveness::Exited
         };
     }
     if now - s.last_seen_at <= STALE_AFTER_SECS {
-        Liveness::Live
-    } else {
-        Liveness::Dead
+        return Liveness::Live;
     }
+    // Positively foreign and quiet: loss of contact, not proof of exit.
+    if !mine && host_is_machine_unique(&s.host) && s.host != host {
+        return Liveness::Unverifiable;
+    }
+    Liveness::Exited
 }
 
 pub fn liveness(conn: &Connection, key: &str, now: i64) -> rusqlite::Result<Liveness> {
-    Ok(get(conn, key)?.map_or(Liveness::Unknown, |s| liveness_of(&s, now)))
+    Ok(get(conn, key)?.map_or(Liveness::Unverifiable, |s| liveness_of(&s, now)))
 }
 
 /// Every session not known to be dead, most recently seen first.
@@ -357,11 +368,11 @@ mod tests {
             Liveness::Live
         );
         touch_key(&c, "claude-code:b", Some(u32::MAX - 7), 0);
-        assert_eq!(liveness(&c, "claude-code:b", 1).unwrap(), Liveness::Dead);
+        assert_eq!(liveness(&c, "claude-code:b", 1).unwrap(), Liveness::Exited);
     }
 
     #[test]
-    fn a_session_without_pid_goes_stale_by_age_and_ended_is_dead() {
+    fn a_session_without_pid_goes_stale_by_age_and_ended_is_exited() {
         let c = conn();
         touch_key(&c, "codex:x", None, 100);
         assert_eq!(
@@ -370,16 +381,47 @@ mod tests {
         );
         assert_eq!(
             liveness(&c, "codex:x", 101 + STALE_AFTER_SECS).unwrap(),
-            Liveness::Dead
+            Liveness::Exited
         );
         touch_key(&c, "codex:y", None, 100);
         end(&c, "codex:y", 101).unwrap();
-        assert_eq!(liveness(&c, "codex:y", 102).unwrap(), Liveness::Dead);
-        assert_eq!(liveness(&c, "nobody:1", 102).unwrap(), Liveness::Unknown);
-        // Forgetting a row makes it unknown, not dead.
+        assert_eq!(liveness(&c, "codex:y", 102).unwrap(), Liveness::Exited);
+        assert_eq!(
+            liveness(&c, "nobody:1", 102).unwrap(),
+            Liveness::Unverifiable
+        );
+        // Forgetting a row makes it unverifiable, not exited.
         touch_key(&c, "codex:z", None, 100);
         assert!(forget(&c, "codex:z").unwrap());
-        assert_eq!(liveness(&c, "codex:z", 102).unwrap(), Liveness::Unknown);
+        assert_eq!(
+            liveness(&c, "codex:z", 102).unwrap(),
+            Liveness::Unverifiable
+        );
+    }
+
+    /// A stale row that is definitively another host's is unverifiable:
+    /// its silence is loss of contact, not proof of exit. A fresh one is
+    /// still live (a heartbeat is evidence either way), and an ended one
+    /// is exited (explicit proof travels with the row).
+    #[test]
+    fn a_stale_foreign_session_is_unverifiable_not_exited() {
+        let c = conn();
+        touch_key(&c, "codex:remote", None, 100);
+        c.execute(
+            "UPDATE agent_sessions SET host = 'otherbox@foreign-machine-id' WHERE key = 'codex:remote'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            liveness(&c, "codex:remote", 100 + STALE_AFTER_SECS).unwrap(),
+            Liveness::Live
+        );
+        assert_eq!(
+            liveness(&c, "codex:remote", 101 + STALE_AFTER_SECS).unwrap(),
+            Liveness::Unverifiable
+        );
+        end(&c, "codex:remote", 102).unwrap();
+        assert_eq!(liveness(&c, "codex:remote", 103).unwrap(), Liveness::Exited);
     }
 
     #[test]
