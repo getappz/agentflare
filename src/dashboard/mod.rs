@@ -5,7 +5,7 @@ mod data;
 mod gate;
 mod messages;
 mod orphan_reconcile;
-mod server;
+pub(crate) mod server;
 
 pub fn serve(host: &str, port: u16, open: bool, yes_expose: bool) {
     let runtime = tokio::runtime::Runtime::new().expect("failed to build tokio runtime");

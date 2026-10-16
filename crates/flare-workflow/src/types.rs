@@ -497,6 +497,28 @@ impl<D: WorkflowData> WorkflowState<D> {
     }
 }
 
+/// Outcome of an idempotent start attempt (`start_workflow_once_with_params` /
+/// `create_start_once`): whether this call committed a fresh run (and may
+/// launch its driver) or found a durable receipt from an earlier start (and
+/// must not launch anything).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartOnceResult {
+    Created(WorkflowRunId),
+    Existing(WorkflowRunId),
+}
+
+impl StartOnceResult {
+    pub fn run_id(self) -> WorkflowRunId {
+        match self {
+            Self::Created(id) | Self::Existing(id) => id,
+        }
+    }
+
+    pub fn was_created(self) -> bool {
+        matches!(self, Self::Created(_))
+    }
+}
+
 /// Result returned by a step execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepResult {

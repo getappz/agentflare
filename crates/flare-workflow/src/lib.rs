@@ -28,7 +28,7 @@ pub mod variables;
 pub mod waits;
 
 pub use definition::{StepCondition, StepDefinition, ValidationError, WorkflowDefinition};
-pub use engine::WorkflowEngine;
+pub use engine::{OrphanCancelDisposition, TerminalCallback, WorkflowEngine};
 pub use events::{EventBus, EventSubscriber, LoggingSubscriber, WorkflowEvent};
 pub use executor::{FunctionStep, StepExecutor, noop_executor};
 pub use json::{
@@ -40,3 +40,7 @@ pub use sqlite_store::{SqliteStore, SqliteStoreError};
 pub use store::{InMemoryStore, StateStore, smoke_test};
 pub use types::*;
 pub use variables::{capture_output, expand_variables};
+
+#[cfg(test)]
+#[path = "tests_schedule_start.rs"]
+mod tests_schedule_start;
