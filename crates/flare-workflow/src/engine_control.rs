@@ -122,6 +122,8 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             self.event_bus
                 .publish(WorkflowEvent::WorkflowCancelled { run_id })
                 .await;
+            self.notify_terminal(run_id, WorkflowStatus::Cancelled, None)
+                .await;
         }
         Ok(())
     }

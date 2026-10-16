@@ -71,6 +71,7 @@ mod quota;
 mod review;
 mod rollup;
 mod rule_text;
+mod schedule;
 mod sessions;
 mod shell;
 mod shim_install;

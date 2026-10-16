@@ -68,7 +68,7 @@ pub(crate) fn agent_send_hook() -> SendMessage {
                 args,
                 hard_cap_secs,
                 idle_timeout_secs,
-                cwd: _,
+                cwd,
                 owner: _,
                 persona,
             } = inv;
@@ -82,12 +82,16 @@ pub(crate) fn agent_send_hook() -> SendMessage {
             }
             extra_args.extend(args);
             let request_json = pin_stream_json(&agent, &mut extra_args);
-            // No projected scratch dir here: the persona definition is
-            // whatever the ambient cwd's `.claude/agents/` holds.
-            let agents_dir = std::env::current_dir()
-                .unwrap_or_default()
-                .join(".claude")
-                .join("agents");
+            // Persona definitions resolve against the step's own working
+            // directory (a schedule's repo root), not the daemon's ambient
+            // cwd — same reason the launch below honors `cwd`.
+            let agents_dir = match &cwd {
+                Some(dir) => dir.join(".claude").join("agents"),
+                None => std::env::current_dir()
+                    .unwrap_or_default()
+                    .join(".claude")
+                    .join("agents"),
+            };
             let prompt = apply_persona(
                 &agent,
                 persona.as_deref(),
@@ -103,8 +107,13 @@ pub(crate) fn agent_send_hook() -> SendMessage {
             // before it, or the call already happened on whatever thread
             // invoked this closure before the returned future was ever
             // polled/awaited.
-            let outcome = tokio::task::spawn_blocking(move || {
-                crate::agent_launch::run_headless(
+            let outcome = tokio::task::spawn_blocking(move || match cwd {
+                // Explicit step cwd (e.g. a schedule's repo root): run the
+                // agent subprocess there instead of the daemon's ambient
+                // cwd — required for scheduler-owned runs, which never
+                // re-enter any dispatcher's chdir span.
+                Some(cwd) => crate::agent_launch::run_headless_in(
+                    &cwd,
                     agent_registry::REGISTRY,
                     &agent,
                     &prompt,
@@ -112,7 +121,16 @@ pub(crate) fn agent_send_hook() -> SendMessage {
                     idle_timeout,
                     &extra_args,
                     request_json,
-                )
+                ),
+                None => crate::agent_launch::run_headless(
+                    agent_registry::REGISTRY,
+                    &agent,
+                    &prompt,
+                    hard_cap,
+                    idle_timeout,
+                    &extra_args,
+                    request_json,
+                ),
             })
             .await
             .map_err(|e| format!("agent task panicked: {e}"))?;

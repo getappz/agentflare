@@ -39,6 +39,82 @@ pub(super) fn start_work_dispatch(queue: &agentflare_jobs::Queue) {
     );
 }
 
+/// Daemon-owned workflow-schedule ticker (item #366 Phase 1): boots the
+/// `Scheduler` on its own `WorkflowEngine<PipelineData>` + store pair over
+/// `default_db_path()` and ticks every 60 s. Deliberately independent of
+/// `start_work_dispatch`'s smoke-test / register / recover gate — a
+/// work-item recovery failure leaves schedules firing. Never calls
+/// `recover`/`resume_run`/`try_resume` on the scheduler engine: occurrence
+/// linkage goes through start receipts, and resuming here would break
+/// at-most-once fire semantics.
+pub(super) fn spawn_schedule_ticker() -> tokio::task::JoinHandle<()> {
+    spawn_schedule_ticker_every(
+        crate::workflow::default_db_path(),
+        crate::workflow::agent_send_hook(),
+        crate::schedule::TICK_INTERVAL_SECS,
+    )
+}
+
+/// Test seam: same ticker over an isolated database with an injectable send
+/// hook and tick interval. Production always passes the 60 s constant.
+pub(crate) fn spawn_schedule_ticker_every(
+    db_path: std::path::PathBuf,
+    send: flare_workflow::json::SendMessage,
+    interval_secs: u64,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let store = match crate::schedule::ScheduleStore::open(&db_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("agentflare-schedule: ticker off (store open failed): {e}");
+                return;
+            }
+        };
+        let wf_store = match flare_workflow::sqlite_store::SqliteStore::open_file(&db_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("agentflare-schedule: ticker off (workflow store open failed): {e}");
+                return;
+            }
+        };
+        let engine = flare_workflow::engine::WorkflowEngine::with_store(wf_store)
+            .with_runtime_handle(crate::workflow::blocking_runtime_handle());
+        let scheduler = crate::schedule::Scheduler::new(store, engine, send);
+        let mut ticker =
+            tokio::time::interval(std::time::Duration::from_secs(interval_secs.max(1)));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            match scheduler.tick_once(chrono::Utc::now()).await {
+                Ok(summary) => {
+                    if summary.admitted > 0
+                        || summary.skipped_missed > 0
+                        || summary.skipped_overlap > 0
+                        || summary.reconciled > 0
+                        || summary.fired > 0
+                        || !summary.errors.is_empty()
+                    {
+                        eprintln!(
+                            "agentflare-schedule: tick admitted={} missed={} overlap={} \
+                             reconciled={} fired={} pruned={} errors={:?}",
+                            summary.admitted,
+                            summary.skipped_missed,
+                            summary.skipped_overlap,
+                            summary.reconciled,
+                            summary.fired,
+                            summary.pruned,
+                            summary.errors,
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("agentflare-schedule: tick failed: {e}");
+                }
+            }
+        }
+    })
+}
+
 /// Retries `engine().recover()` every `PIPELINE_RECOVERY_RETRY_INTERVAL`
 /// after it failed at boot, logging each failure, and starts work dispatch
 /// the first time it succeeds.

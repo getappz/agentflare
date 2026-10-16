@@ -32,6 +32,9 @@ use crate::waits::WakeAt;
 mod control;
 #[path = "engine_lease.rs"]
 mod lease;
+#[path = "engine_start_once.rs"]
+mod start_once;
+pub use start_once::{OrphanCancelDisposition, TerminalCallback};
 
 pub use lease::DEFAULT_LEASE_TTL;
 use lease::process_executor_id;
@@ -223,6 +226,8 @@ pub struct WorkflowEngine<D: WorkflowData, S: StateStore<D> = InMemoryStore<D>> 
     superseded: RunIdSet,
     /// See [`patch_run_data`](Self::patch_run_data).
     data_patches: DataPatches<D>,
+    /// Eager terminal-outcome hook (see `TerminalCallback`); `None` by default.
+    terminal_callback: Arc<parking_lot::Mutex<Option<TerminalCallback>>>,
 }
 
 impl<D: WorkflowData> WorkflowEngine<D, InMemoryStore<D>> {
@@ -248,6 +253,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             driving: Arc::new(parking_lot::Mutex::new(HashSet::new())),
             superseded: Arc::new(parking_lot::Mutex::new(HashSet::new())),
             data_patches: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            terminal_callback: Arc::new(parking_lot::Mutex::new(None)),
         }
     }
 
@@ -1067,6 +1073,8 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 self.event_bus
                     .publish(WorkflowEvent::WorkflowCompleted { run_id, duration })
                     .await;
+                self.notify_terminal(run_id, WorkflowStatus::Completed, None)
+                    .await;
             }
         }
 
@@ -1125,8 +1133,10 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             .publish(WorkflowEvent::WorkflowFailed {
                 run_id,
                 failed_step: failed_step.unwrap_or_else(|| StepId::new("internal_scheduler")),
-                error: error_message,
+                error: error_message.clone(),
             })
+            .await;
+        self.notify_terminal(run_id, WorkflowStatus::Failed, Some(error_message))
             .await;
         Ok(())
     }
@@ -1459,6 +1469,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             driving: Arc::clone(&self.driving),
             superseded: Arc::clone(&self.superseded),
             data_patches: Arc::clone(&self.data_patches),
+            terminal_callback: Arc::clone(&self.terminal_callback),
         }
     }
 }

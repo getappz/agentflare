@@ -16,10 +16,13 @@ use rusqlite_migration::{M, Migrations};
 
 use crate::journal;
 use crate::store::StateStore;
+#[path = "sqlite_start_once.rs"]
+mod start_once;
 use crate::types::{
     JournalEntry, MetricsFilter, StepId, StepMetrics, StepStatus, WorkflowContext, WorkflowData,
     WorkflowError, WorkflowMetrics, WorkflowResult, WorkflowRunId, WorkflowState, WorkflowStatus,
 };
+pub(crate) use start_once::OrphanCancelOutcome;
 
 /// Error opening/creating a SQLite store.
 #[derive(Debug, thiserror::Error)]
@@ -112,6 +115,57 @@ impl<D: WorkflowData> SqliteStore<D> {
                  ALTER TABLE step_state ADD COLUMN input_tokens INTEGER;
                  ALTER TABLE step_state ADD COLUMN output_tokens INTEGER;",
             ),
+            // Workflow schedules (Phase 1, item #366 PR-B): interval
+            // schedules, occurrence history, and durable start receipts share
+            // this file, so they migrate here — never a second migration
+            // list on `workflows.db`.
+            M::up(
+                "CREATE TABLE schedules (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    repo_root TEXT NOT NULL,
+                    workflow_name TEXT NOT NULL,
+                    params TEXT,
+                    every_secs INTEGER NOT NULL CHECK (every_secs >= 60),
+                    grace_secs INTEGER CHECK (grace_secs IS NULL OR grace_secs >= 0),
+                    overlap TEXT NOT NULL DEFAULT 'skip' CHECK (overlap IN ('skip','allow')),
+                    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+                    next_fire_at INTEGER NOT NULL,
+                    last_fire_at INTEGER,
+                    frozen_error TEXT,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    UNIQUE (repo_root, name)
+                );
+                CREATE INDEX schedules_due ON schedules(enabled, next_fire_at);
+                CREATE TABLE schedule_runs (
+                    id TEXT PRIMARY KEY,
+                    schedule_id TEXT NOT NULL REFERENCES schedules(id) ON DELETE CASCADE,
+                    slot INTEGER NOT NULL,
+                    trigger TEXT NOT NULL CHECK (trigger IN ('scheduled','manual')),
+                    status TEXT NOT NULL CHECK (status IN (
+                        'queued','dispatching','dispatched',
+                        'completed','failed','cancelled','interrupted','evicted',
+                        'dispatch_failed','skipped_missed','skipped_overlap'
+                    )),
+                    launch_spec TEXT,
+                    start_deadline_at INTEGER,
+                    dispatch_started_at INTEGER,
+                    run_id TEXT,
+                    error TEXT,
+                    created_at INTEGER NOT NULL,
+                    finished_at INTEGER
+                );
+                CREATE UNIQUE INDEX schedule_runs_scheduled_slot
+                    ON schedule_runs(schedule_id, slot) WHERE trigger = 'scheduled';
+                CREATE INDEX schedule_runs_open ON schedule_runs(schedule_id, status);
+                CREATE INDEX schedule_runs_queue ON schedule_runs(status, created_at);
+                CREATE TABLE workflow_start_receipts (
+                    start_key TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL UNIQUE,
+                    created_at INTEGER NOT NULL
+                );",
+            ),
         ])
     }
 
@@ -142,6 +196,14 @@ impl<D: WorkflowData> SqliteStore<D> {
         }
     }
 
+    /// Open the workflow database with the full migration list and hand back
+    /// the raw connection, for sibling tables (`schedules`, `schedule_runs`,
+    /// `workflow_start_receipts`) sharing the file. One migration list owns
+    /// the file; this is how other owners open it without forking that list.
+    pub fn open_shared_connection(path: &std::path::Path) -> Result<Connection, SqliteStoreError> {
+        db_kit::open_file(path, &Self::migrations()).map_err(SqliteStoreError::Open)
+    }
+
     /// Write a state row plus its step_state/run_vars projections atomically.
     ///
     /// `step_states`/`variables` are fixed-growing maps within a run's
@@ -150,11 +212,23 @@ impl<D: WorkflowData> SqliteStore<D> {
     /// this crate removes entries), so a targeted UPSERT of each row is
     /// always sufficient — no per-write DELETE-all pass is needed.
     fn write_state(conn: &Connection, state: &WorkflowState<D>) -> WorkflowResult<()> {
-        let json = Self::serialize(state)?;
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| WorkflowError::Store(format!("begin tx: {e}")))?;
+        Self::write_state_rows(&tx, state)?;
+        tx.commit()
+            .map_err(|e| WorkflowError::Store(format!("commit: {e}")))?;
+        Ok(())
+    }
 
+    /// Transaction-neutral row writer behind [`Self::write_state`]: runs on
+    /// the caller's transaction so atomic multi-table commits (start receipt
+    /// + run + journal) can reuse it without nesting `BEGIN`s.
+    fn write_state_rows(
+        tx: &rusqlite::Transaction<'_>,
+        state: &WorkflowState<D>,
+    ) -> WorkflowResult<()> {
+        let json = Self::serialize(state)?;
         tx.execute(
             "INSERT INTO workflow_runs
                (id, workflow_id, status, current_step, input, output, error, state_json, created_at, updated_at)
@@ -215,8 +289,6 @@ impl<D: WorkflowData> SqliteStore<D> {
             .map_err(|e| WorkflowError::Store(format!("upsert run_vars: {e}")))?;
         }
 
-        tx.commit()
-            .map_err(|e| WorkflowError::Store(format!("commit: {e}")))?;
         Ok(())
     }
 

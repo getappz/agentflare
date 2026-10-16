@@ -205,6 +205,18 @@ pub fn compile_workflow(
     json: &JsonWorkflow,
     send: SendMessage,
 ) -> Result<WorkflowDefinition<PipelineData>, String> {
+    compile_workflow_in(json, send, None)
+}
+
+/// Like [`compile_workflow`], but every agent and command step runs in `cwd`
+/// when set: agent steps carry it in `StepInvocation::cwd` for the send hook,
+/// command steps spawn with it as their process working directory. `None`
+/// preserves the ambient-cwd behavior.
+pub fn compile_workflow_in(
+    json: &JsonWorkflow,
+    send: SendMessage,
+    cwd: Option<std::path::PathBuf>,
+) -> Result<WorkflowDefinition<PipelineData>, String> {
     let mut wf = WorkflowDefinition::new(json.name.clone(), json.name.clone());
 
     // Previous step that produced the input channel, per OpenFang chaining.
@@ -250,6 +262,7 @@ pub fn compile_workflow(
                 }
                 Arc::new(CommandExecutor {
                     command: command.clone(),
+                    cwd: cwd.clone(),
                 })
             }
             (None, Some(agent)) => Arc::new(PromptExecutor {
@@ -260,6 +273,7 @@ pub fn compile_workflow(
                 args: s.args.clone(),
                 hard_cap_secs: s.hard_cap_secs,
                 idle_timeout_secs: s.idle_timeout_secs,
+                cwd: cwd.clone(),
                 persona: s.persona.clone(),
             }),
         };
@@ -373,6 +387,7 @@ struct PromptExecutor {
     args: Vec<String>,
     hard_cap_secs: Option<u64>,
     idle_timeout_secs: Option<u64>,
+    cwd: Option<std::path::PathBuf>,
     persona: Option<String>,
 }
 
@@ -387,7 +402,7 @@ impl StepExecutor<PipelineData> for PromptExecutor {
             args: self.args.clone(),
             hard_cap_secs: self.hard_cap_secs,
             idle_timeout_secs: self.idle_timeout_secs,
-            cwd: None,
+            cwd: self.cwd.clone(),
             owner: None,
             persona: self.persona.clone(),
         };
@@ -416,6 +431,7 @@ impl StepExecutor<PipelineData> for PromptExecutor {
 /// fails the step with stderr attached.
 struct CommandExecutor {
     command: Vec<String>,
+    cwd: Option<std::path::PathBuf>,
 }
 
 #[async_trait]
@@ -439,6 +455,9 @@ impl StepExecutor<PipelineData> for CommandExecutor {
         // completion in the background.
         let mut std_cmd = flare_process::command(&program);
         std_cmd.args(&args);
+        if let Some(cwd) = &self.cwd {
+            std_cmd.current_dir(cwd);
+        }
         let output = tokio::process::Command::from(std_cmd)
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true)

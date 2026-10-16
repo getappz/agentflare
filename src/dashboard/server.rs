@@ -691,7 +691,7 @@ pub fn router(queue: Queue) -> Router {
 }
 
 #[path = "dispatch_boot.rs"]
-mod dispatch_boot;
+pub(crate) mod dispatch_boot;
 use dispatch_boot::*;
 
 fn is_local_bind(host: &str) -> bool {
@@ -849,6 +849,7 @@ pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {
         }
     }
     spawn_binary_staleness_watchdog(crate::daemon::BinarySnapshot::capture());
+    spawn_schedule_ticker();
     spawn_job_cleanup(queue.clone());
 
     let listener = tokio::net::TcpListener::bind((host, port))
