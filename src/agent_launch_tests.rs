@@ -138,6 +138,56 @@
         assert_eq!(out.stdout, "xxxxx");
     }
 
+    #[test]
+    #[ignore = "subprocess fixture for inherited output pipes"]
+    fn capture_pipe_holder_fixture() {
+        match std::env::var("AGENTFLARE_TEST_PIPE_ROLE").as_deref() {
+            Ok("parent") => {
+                use std::io::Write;
+                std::io::stdout().write_all(&vec![b'x'; 131_072]).unwrap();
+                std::io::stderr().write_all(&vec![b'y'; 131_072]).unwrap();
+                println!("parent output before exit");
+                eprintln!("parent error before exit");
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--ignored", "--exact",
+                        "agent_launch::tests::capture_pipe_holder_fixture", "--nocapture",
+                    ])
+                    .env("AGENTFLARE_TEST_PIPE_ROLE", "holder")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .spawn()
+                    .unwrap();
+            }
+            Ok("holder") => std::thread::sleep(Duration::from_secs(8)),
+            _ => panic!("fixture must be launched by its regression test"),
+        }
+    }
+
+    #[test]
+    fn run_captured_bounds_pipe_drain_after_child_exit() {
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "--ignored", "--exact",
+            "agent_launch::tests::capture_pipe_holder_fixture", "--nocapture",
+        ])
+        .env("AGENTFLARE_TEST_PIPE_ROLE", "parent");
+        let start = Instant::now();
+        let out = run_captured(cmd, Duration::from_secs(30), Duration::from_secs(30), None)
+            .unwrap();
+        assert!(out.success);
+        assert!(out.stdout.contains("parent output before exit"));
+        assert!(out.stderr.contains("parent error before exit"));
+        assert!(out.stdout.contains(&"x".repeat(131_072)));
+        assert!(out.stderr.contains(&"y".repeat(131_072)));
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "an exited agent's helper kept its inherited output pipes open: {:?}",
+            start.elapsed(),
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn run_captured_kills_the_child_when_its_job_is_cancelled() {

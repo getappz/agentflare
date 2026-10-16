@@ -7,7 +7,7 @@ use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -243,6 +243,54 @@ pub fn run_captured_for_job(
     )
 }
 
+#[cfg(windows)]
+fn available_output_bytes<P: std::os::windows::io::AsRawHandle>(
+    pipe: &P,
+    maximum: usize,
+) -> std::io::Result<Option<usize>> {
+    let mut available = 0;
+    // SAFETY: the reader owns this live pipe and is its only reader; no concurrent I/O
+    // can consume the available bytes between this query and the following read.
+    let ok = unsafe {
+        windows_sys::Win32::System::Pipes::PeekNamedPipe(
+            pipe.as_raw_handle(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            &mut available,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((available > 0).then_some((available as usize).min(maximum)))
+}
+
+#[cfg(unix)]
+fn available_output_bytes<P: std::os::fd::AsRawFd>(
+    pipe: &P,
+    maximum: usize,
+) -> std::io::Result<Option<usize>> {
+    let mut fd = libc::pollfd {
+        fd: pipe.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: poll borrows one valid descriptor and never outlives this stack value.
+    let ready = unsafe { libc::poll(&mut fd, 1, 0) };
+    if ready < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((ready > 0).then_some(maximum))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn available_output_bytes<P>(_: &P, maximum: usize) -> std::io::Result<Option<usize>> {
+    // shortcut: other platforms retain blocking reads; add readiness before supporting them.
+    Ok(Some(maximum))
+}
+
 /// `run_captured_for_job` with an explicit [`StallConfig`] (tests pass
 /// short windows instead of mutating the process env).
 pub(crate) fn run_captured_with_stall(
@@ -298,11 +346,13 @@ pub(crate) fn run_captured_with_stall(
     }
 
     let activity = Arc::new(AtomicU64::new(0));
+    let stop_readers = Arc::new(AtomicBool::new(false));
     let output_progress = Arc::new(std::sync::Mutex::new(OutputProgress::new(Instant::now())));
 
     let mut pipe = child.stdout.take().expect("stdout piped above");
     let stdout_activity = activity.clone();
     let stdout_progress = output_progress.clone();
+    let stdout_stop = stop_readers.clone();
     let reader = std::thread::spawn(move || {
         let mut buf: Vec<u8> = Vec::new();
         let mut chunk = [0u8; 8192];
@@ -310,8 +360,17 @@ pub(crate) fn run_captured_with_stall(
         // `activity` reflects bytes as they arrive, not only once the child
         // exits — the wait loop below needs that to detect a stalled child
         // before it closes its pipes.
-        loop {
-            match pipe.read(&mut chunk) {
+        while !stdout_stop.load(Ordering::Relaxed) {
+            let capacity = match available_output_bytes(&pipe, chunk.len()) {
+                Ok(Some(capacity)) => capacity,
+                Ok(None) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            };
+            match pipe.read(&mut chunk[..capacity]) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     buf.extend_from_slice(&chunk[..n]);
@@ -327,11 +386,21 @@ pub(crate) fn run_captured_with_stall(
     let mut err_pipe = child.stderr.take().expect("stderr piped above");
     let stderr_activity = activity.clone();
     let stderr_progress = output_progress.clone();
+    let stderr_stop = stop_readers.clone();
     let err_reader = std::thread::spawn(move || {
         let mut buf: Vec<u8> = Vec::new();
         let mut chunk = [0u8; 8192];
-        loop {
-            match err_pipe.read(&mut chunk) {
+        while !stderr_stop.load(Ordering::Relaxed) {
+            let capacity = match available_output_bytes(&err_pipe, chunk.len()) {
+                Ok(Some(capacity)) => capacity,
+                Ok(None) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            };
+            match err_pipe.read(&mut chunk[..capacity]) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     buf.extend_from_slice(&chunk[..n]);
@@ -434,6 +503,14 @@ pub(crate) fn run_captured_with_stall(
         std::thread::sleep(Duration::from_millis(20));
     };
 
+    // Helpers can inherit the pipes after their agent exits; EOF must not defeat timeouts.
+    let drain_started = Instant::now();
+    while !(reader.is_finished() && err_reader.is_finished())
+        && drain_started.elapsed() < Duration::from_secs(1)
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    stop_readers.store(true, Ordering::Relaxed);
     let stdout = reader.join().unwrap_or_default();
     let stderr = err_reader.join().unwrap_or_default();
     let killed_early = stalled || exhausted.is_some();
