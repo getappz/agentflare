@@ -241,7 +241,7 @@ fn stage_and_attach_asset(
 /// kills a real, longer task as a false positive — item #43's cause (and
 /// cursor-agent's default `text` format, item #183's). `parse_claude_reply`
 /// reads the reply off stream-json's final line.
-fn build_extra_args(
+pub(crate) fn build_extra_args(
     agent: agent_registry::Agent,
     max_turns: Option<u64>,
     max_cost_usd: Option<f64>,

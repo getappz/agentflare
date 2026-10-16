@@ -1,6 +1,32 @@
 use super::*;
 
 #[test]
+fn recovered_cursor_launch_restores_autonomy_and_streaming() {
+    let role_args = vec!["--resume".to_string(), "session-379".to_string()];
+    let args = work_item_launch_args("cursor", &[], &role_args);
+    assert_eq!(
+        args,
+        [
+            "--force",
+            "--trust",
+            "--approve-mcps",
+            "--output-format",
+            "stream-json",
+            "--resume",
+            "session-379"
+        ]
+    );
+}
+
+#[test]
+fn work_item_launch_keeps_explicit_options_and_role_args() {
+    let extra = vec!["--model".to_string(), "chosen-model".to_string()];
+    let role = vec!["--resume".to_string(), "session-379".to_string()];
+    let args = work_item_launch_args("cursor", &extra, &role);
+    assert_eq!(args, ["--model", "chosen-model", "--resume", "session-379"]);
+}
+
+#[test]
 fn sdd_pipeline_has_two_steps_with_correct_dependency() {
     let send: flare_workflow::json::SendMessage =
         std::sync::Arc::new(|_: flare_workflow::json::StepInvocation| {
