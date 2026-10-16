@@ -23,6 +23,16 @@ async fn t36_execution_runs_in_schedule_repo() {
     // No process-wide chdir anywhere: the daemon's ambient cwd is wherever
     // the test runner sits, and execution must still land in repo_b.
     let repo_b = h.repo("b");
+    // Portable print-cwd: `pwd` is not a native Windows binary (Git's
+    // coreutils shim prints a POSIX path `std::fs::canonicalize` cannot
+    // resolve), so ask the native shell on Windows instead.
+    #[cfg(windows)]
+    h.write_wf(
+        &repo_b,
+        "w",
+        r#"{"name":"w","steps":[{"name":"s","command":["cmd","/c","cd"]}]}"#,
+    );
+    #[cfg(not(windows))]
     h.write_wf(
         &repo_b,
         "w",

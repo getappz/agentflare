@@ -162,7 +162,8 @@ impl<D: WorkflowData> WorkflowEngine<D, SqliteStore<D>> {
     /// run whose executor lease is stale or missing at `now`): rechecks
     /// status and lease atomically under the store's mutation protection,
     /// persists the disposition consistently, and publishes a cancellation
-    /// event plus the terminal callback only when state actually changed.
+    /// event only when state actually changed. The terminal callback is NOT
+    /// invoked: the caller maps the returned disposition itself.
     /// Never use unconditional `cancel_workflow` here and assume
     /// interruption — a paused run or a fresh lease must survive.
     pub async fn cancel_if_orphaned(
