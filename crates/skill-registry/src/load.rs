@@ -228,6 +228,18 @@ impl Registry {
             .map_err(|e| LoadError::Db(e.to_string()))
     }
 
+    /// `search_semantic` with no explicit mode: all-words, then any-word if
+    /// that finds nothing. See `crate::search::search_semantic_relaxed`.
+    pub fn search_semantic_relaxed(
+        &self,
+        query: &str,
+        limit: usize,
+        embed_query: impl Fn(&str) -> Option<Vec<f32>>,
+    ) -> Result<Vec<SkillHit>, LoadError> {
+        crate::search::search_semantic_relaxed(&self.conn, query, limit, embed_query)
+            .map_err(|e| LoadError::Db(e.to_string()))
+    }
+
     /// Compute and store embeddings for up to `limit` indexed skills that
     /// don't have one yet. See `crate::embed_store::backfill`.
     pub fn backfill_embeddings(
@@ -354,5 +366,54 @@ mod tests {
             load(&conn, "nope", false),
             Err(LoadError::NotFound(_))
         ));
+    }
+
+    fn counters(conn: &Connection, name: &str, source: &str) -> (i64, f64) {
+        conn.query_row(
+            "SELECT last_used_at, bandit_alpha FROM skills WHERE name = ?1 AND source = ?2",
+            [name, source],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn load_records_usage_and_rebuild_keeps_it() {
+        let (_tmp, mut conn) = seed_with_files();
+        load(&conn, "claude-plugin:cv:live", false).unwrap();
+        let (used, alpha) = counters(&conn, "live", "claude-plugin:cv");
+        assert!(used > 0);
+        assert_eq!(alpha, 2.0);
+
+        let mk = |name: &str, source: &str, path: PathBuf| SkillEntry {
+            name: name.into(),
+            source: source.into(),
+            path,
+            description: "d".into(),
+            body: String::new(),
+            neg_text: String::new(),
+            tags: String::new(),
+            category: String::new(),
+            est_tokens: 10,
+            mtime: 1,
+            bandit_alpha: 1.0,
+            bandit_beta: 1.0,
+            shadow_path: None,
+        };
+        let entries = vec![
+            mk(
+                "live",
+                "claude-plugin:cv",
+                _tmp.path().join("plug/live/SKILL.md"),
+            ),
+            mk("live", "codex", _tmp.path().join("codex-live-SKILL.md")),
+        ];
+        rebuild(&mut conn, &entries).unwrap();
+        assert_eq!(counters(&conn, "live", "claude-plugin:cv"), (used, alpha));
+
+        // Removed then re-added: counters restart rather than resurrect.
+        rebuild(&mut conn, &entries[1..]).unwrap();
+        rebuild(&mut conn, &entries).unwrap();
+        assert_eq!(counters(&conn, "live", "claude-plugin:cv"), (0, 1.0));
     }
 }

@@ -314,10 +314,10 @@ pub fn find_skills_budget(
         }
         if let Ok(hits) = registry.search(&query, limit, skill_registry::MatchMode::Any) {
             for hit in hits {
-                if seen.contains_key(&hit.name) {
+                if seen.contains_key(&hit.name) || !hit.is_confident() {
                     continue;
                 }
-                let score = hit.score * intent.confidence;
+                let score = hit.confidence * intent.confidence;
                 let reason = format!("matches {} task", intent.task_type.as_str());
                 seen.insert(hit.name.clone(), ());
                 results.push(RankedSkill {
@@ -343,10 +343,10 @@ pub fn find_skills_budget(
             )
         {
             for hit in hits {
-                if seen.contains_key(&hit.name) {
+                if seen.contains_key(&hit.name) || !hit.is_confident() {
                     continue;
                 }
-                let score = hit.score * 0.6;
+                let score = hit.confidence * 0.6;
                 let reason = "keyword match".to_string();
                 seen.insert(hit.name.clone(), ());
                 results.push(RankedSkill {
@@ -387,12 +387,8 @@ pub fn find_skills_budget(
     });
     results.truncate(limit);
 
-    // Fusion: normalize scores to 0-1 range and blend with intent confidence
-    let max_score = results.iter().map(|r| r.score).fold(0.0_f64, f64::max);
-    if max_score > 0.0 {
-        for r in results.iter_mut() {
-            r.score = (r.score / max_score) * intent.confidence;
-        }
+    for r in results.iter_mut() {
+        r.score = r.score.clamp(0.0, 1.0);
     }
 
     // Budget-aware capping: accumulate est_tokens and drop tail that exceeds budget
@@ -688,5 +684,107 @@ mod tests {
         let mut results = vec![ranked("a", 0.42)];
         rerank_with_embeddings(&mut results, &[1.0, 0.0], &HashMap::new());
         assert_eq!(results[0].score, 0.42);
+    }
+
+    /// Seed a file-backed skills DB (Registry has no in-memory constructor)
+    /// and open a `Registry` on it.
+    fn registry_with(skills: &[(&str, &str)]) -> (tempfile::TempDir, skill_registry::Registry) {
+        use skill_registry::db::{open_db, rebuild};
+        use skill_registry::sources::SkillEntry;
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("skills.db");
+        let entries: Vec<SkillEntry> = skills
+            .iter()
+            .map(|(name, desc)| SkillEntry {
+                name: (*name).into(),
+                source: "test".into(),
+                path: tmp.path().join(name).join("SKILL.md"),
+                description: (*desc).into(),
+                body: String::new(),
+                neg_text: String::new(),
+                tags: String::new(),
+                category: String::new(),
+                est_tokens: 100,
+                mtime: 1,
+                bandit_alpha: 1.0,
+                bandit_beta: 1.0,
+                shadow_path: None,
+            })
+            .collect();
+        let mut conn = open_db(&db_path).unwrap();
+        rebuild(&mut conn, &entries).unwrap();
+        drop(conn);
+        let reg = skill_registry::Registry::open_default(&db_path).unwrap();
+        (tmp, reg)
+    }
+
+    #[test]
+    fn find_skills_ranks_best_bm25_match_first_with_scores_in_unit_range() {
+        // bm25 is lower-is-better (negative); the best match must come first
+        // and every score must land in 0..=1 (it used to print as -452%).
+        let (_tmp, reg) = registry_with(&[
+            (
+                "systematic-debugging",
+                "Use when encountering any bug, test failure, or unexpected behavior",
+            ),
+            (
+                "dispatching-parallel-agents",
+                "Use when running independent test suites in parallel",
+            ),
+            (
+                "hormozi-offer",
+                "Build a Grand Slam Offer from any idea, product, or service",
+            ),
+        ]);
+        let intent = IntentClassification {
+            task_type: TaskType::FixBug,
+            confidence: 0.95,
+            keywords: vec!["bug".into(), "test".into(), "failure".into()],
+            targets: vec![],
+        };
+        let skills = find_skills(&intent, &reg, 3, |_| None, |_| None).unwrap();
+        assert_eq!(skills[0].name, "systematic-debugging", "{skills:?}");
+        for s in &skills {
+            assert!(
+                (0.0..=1.0).contains(&s.score),
+                "score out of range: {} = {}",
+                s.name,
+                s.score
+            );
+        }
+    }
+
+    #[test]
+    fn weak_keyword_overlap_is_below_threshold_and_dropped() {
+        let (_tmp, reg) = registry_with(&[
+            (
+                "systematic-debugging",
+                "Use when encountering any bug, test failure, or unexpected behavior",
+            ),
+            (
+                "hormozi-offer",
+                "Build a Grand Slam Offer from any idea, product, or service",
+            ),
+            (
+                "idea-to-product",
+                "Run the full Lean Offer System from idea to sellable offer",
+            ),
+        ]);
+        let intent = IntentClassification {
+            task_type: TaskType::Explore,
+            confidence: 0.9,
+            keywords: "should we adopt the idea and build our own"
+                .split(' ')
+                .map(String::from)
+                .collect(),
+            targets: vec![],
+        };
+        let skills = find_skills(&intent, &reg, 5, |_| None, |_| None).unwrap();
+        assert!(
+            !skills
+                .iter()
+                .any(|s| s.name == "hormozi-offer" || s.name == "idea-to-product"),
+            "{skills:?}"
+        );
     }
 }

@@ -172,6 +172,16 @@ pub fn delete_skill(conn: &Connection, name: &str, source: &str) -> rusqlite::Re
 
 pub fn rebuild(conn: &mut Connection, entries: &[SkillEntry]) -> rusqlite::Result<()> {
     let tx = conn.transaction()?;
+    // Usage feedback (load() bumps these) must survive a rebuild: the table
+    // is wiped and reinserted from sources, which carry default counters.
+    let usage: std::collections::HashMap<(String, String), (i64, f64, f64)> = {
+        let mut st =
+            tx.prepare("SELECT name, source, last_used_at, bandit_alpha, bandit_beta FROM skills")?;
+        let rows = st.query_map([], |r| {
+            Ok(((r.get(0)?, r.get(1)?), (r.get(2)?, r.get(3)?, r.get(4)?)))
+        })?;
+        rows.collect::<Result<_, _>>()?
+    };
     // skills_fts follows along through the AFTER DELETE / AFTER INSERT
     // triggers -- including the OR IGNORE case below, where no row is
     // inserted and so nothing is indexed.
@@ -181,9 +191,13 @@ pub fn rebuild(conn: &mut Connection, entries: &[SkillEntry]) -> rusqlite::Resul
         // roll back the whole rebuild and disable every skill_search/skill_load.
         let mut ins = tx.prepare(
             "INSERT OR IGNORE INTO skills (name, source, path, description, body, neg_text, tags, category, est_tokens, mtime, last_used_at, bandit_alpha, bandit_beta, shadow_path)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?12, ?13, ?11)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?14, ?12, ?13, ?11)",
         )?;
         for e in entries {
+            let (last_used, alpha, beta) = usage
+                .get(&(e.name.clone(), e.source.clone()))
+                .copied()
+                .unwrap_or((0, e.bandit_alpha, e.bandit_beta));
             ins.execute(params![
                 e.name,
                 e.source,
@@ -198,8 +212,9 @@ pub fn rebuild(conn: &mut Connection, entries: &[SkillEntry]) -> rusqlite::Resul
                 e.shadow_path
                     .as_ref()
                     .map(|p| p.to_string_lossy().to_string()),
-                e.bandit_alpha,
-                e.bandit_beta,
+                alpha,
+                beta,
+                last_used,
             ])?;
         }
     }
@@ -210,6 +225,27 @@ pub fn rebuild(conn: &mut Connection, entries: &[SkillEntry]) -> rusqlite::Resul
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn rebuild_preserves_usage_counters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut conn = open_db(&tmp.path().join("s.db")).unwrap();
+        rebuild(&mut conn, &[entry("a", "src", "d")]).unwrap();
+        conn.execute(
+            "UPDATE skills SET last_used_at = 42, bandit_alpha = 3.0, bandit_beta = 2.0",
+            [],
+        )
+        .unwrap();
+        rebuild(&mut conn, &[entry("a", "src", "d"), entry("b", "src", "d")]).unwrap();
+        let got: (i64, f64, f64) = conn
+            .query_row(
+                "SELECT last_used_at, bandit_alpha, bandit_beta FROM skills WHERE name = 'a'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(got, (42, 3.0, 2.0));
+    }
 
     /// Rows the index can actually reach. Deliberately not
     /// `SELECT count(*) FROM skills_fts`: now that the table is

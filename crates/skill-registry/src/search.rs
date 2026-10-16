@@ -13,6 +13,9 @@ pub struct SkillHit {
     pub est_tokens: i64,
     pub compressed: bool,
     pub score: f64,
+    /// Calibrated 0..1 match confidence (see [`MIN_CONFIDENCE`]); 0.0 for
+    /// registry-fallback hits, which are not local matches.
+    pub confidence: f64,
     pub last_used_at: i64,
     pub bandit_alpha: f64,
     pub bandit_beta: f64,
@@ -106,23 +109,39 @@ pub fn search(
          ORDER BY score
          LIMIT ?2",
     )?;
-    let mut rows: Vec<SkillHit> = stmt
-        .query_map(rusqlite::params![fts, clamped_limit(limit)], |r| {
-            Ok(SkillHit {
-                name: r.get(0)?,
-                source: r.get(1)?,
-                description: r.get(2)?,
-                est_tokens: r.get(3)?,
-                compressed: r.get(4)?,
-                last_used_at: r.get(5)?,
-                bandit_alpha: r.get(6)?,
-                bandit_beta: r.get(7)?,
-                score: r.get(8)?,
-                install_hint: None,
-                remote_url: None,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    // Over-fetch, doubling until `limit` distinct hits survive `dedupe_hits`
+    // or the index is exhausted, so duplicate sources never eat result slots.
+    let mut fetch = limit.saturating_mul(2);
+    let mut rows: Vec<SkillHit> = loop {
+        let n = clamped_limit(fetch);
+        let mut rows = stmt
+            .query_map(rusqlite::params![fts, n], |r| {
+                Ok(SkillHit {
+                    name: r.get(0)?,
+                    source: r.get(1)?,
+                    description: r.get(2)?,
+                    est_tokens: r.get(3)?,
+                    compressed: r.get(4)?,
+                    last_used_at: r.get(5)?,
+                    bandit_alpha: r.get(6)?,
+                    bandit_beta: r.get(7)?,
+                    score: r.get(8)?,
+                    confidence: 0.0,
+                    install_hint: None,
+                    remote_url: None,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for h in &mut rows {
+            h.confidence = bm25_confidence(h.score);
+        }
+        let exhausted = (rows.len() as i64) < n;
+        dedupe_hits(&mut rows);
+        if rows.len() >= limit || exhausted || (n as usize) < fetch {
+            break rows;
+        }
+        fetch = fetch.saturating_mul(2);
+    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -135,7 +154,16 @@ pub fn search(
         let sample = beta_sample(h.bandit_alpha, h.bandit_beta);
         h.score *= 0.8 + 0.2 * sample;
     }
+    rows.truncate(limit);
     Ok(rows)
+}
+
+/// Drop later hits that repeat an earlier hit's (name, description, size): the same
+/// skill indexed from two sources (e.g. `pm` from the builtin set and a
+/// project copy). Keeps the first, i.e. the better-ranked one.
+fn dedupe_hits(hits: &mut Vec<SkillHit>) {
+    let mut seen = std::collections::HashSet::new();
+    hits.retain(|h| seen.insert((h.name.clone(), h.description.clone(), h.est_tokens)));
 }
 
 /// Fold registry-fallback hits into an already-fetched local result set, up
@@ -157,6 +185,7 @@ pub fn merge_registry_hits(
         est_tokens: 0,
         compressed: false,
         score: gateway_registry::REGISTRY_FALLBACK_SCORE,
+        confidence: 0.0,
         last_used_at: 0,
         bandit_alpha: 1.0,
         bandit_beta: 1.0,
@@ -238,12 +267,31 @@ fn hit_by_key(conn: &Connection, name: &str, source: &str) -> rusqlite::Result<O
                 bandit_alpha: r.get(6)?,
                 bandit_beta: r.get(7)?,
                 score: 0.0,
+                confidence: 0.0,
                 install_hint: None,
                 remote_url: None,
             })
         },
     )
     .optional()
+}
+
+/// Hits whose [`SkillHit::confidence`] is below this are "no good local match".
+pub const MIN_CONFIDENCE: f64 = 0.5;
+
+/// Calibrate a raw bm25 score (negative, lower-is-better) to 0..1 via
+/// `s / (s + 1)`. Absolute, unlike the min-max blend in `search_semantic`,
+/// so a lone weak hit is not promoted to 1.0.
+fn bm25_confidence(score: f64) -> f64 {
+    let s = (-score).max(0.0);
+    s / (s + 1.0)
+}
+
+impl SkillHit {
+    /// True when [`Self::confidence`] clears [`MIN_CONFIDENCE`].
+    pub fn is_confident(&self) -> bool {
+        self.confidence >= MIN_CONFIDENCE
+    }
 }
 
 /// `search()` blended with semantic (embedding) similarity, degrading
@@ -282,12 +330,17 @@ pub fn search_semantic(
     let mut merged = agentflare_store::retrieval::merge_ranked(&bm25_scored, &vec_hits, 0.6, 0.4);
     merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
+    // Confidence stays absolute: the stronger of the keyword calibration and
+    // the raw cosine, not the (relative) blended score.
+    let cosine: std::collections::HashMap<(String, String), f64> = vec_hits.into_iter().collect();
+
     let mut by_key: std::collections::HashMap<(String, String), SkillHit> = bm25_hits
         .into_iter()
         .map(|h| ((h.name.clone(), h.source.clone()), h))
         .collect();
 
     let mut out = Vec::with_capacity(limit);
+    let mut seen = std::collections::HashSet::new();
     for ((name, source), blended) in merged {
         if out.len() >= limit {
             break;
@@ -302,11 +355,41 @@ pub fn search_semantic(
                 hit
             }),
         };
+        let hit = hit.map(|mut hit| {
+            let cos = cosine
+                .get(&(name.clone(), source.clone()))
+                .copied()
+                .unwrap_or(0.0);
+            hit.confidence = hit.confidence.max(cos.clamp(0.0, 1.0));
+            hit
+        });
         if let Some(hit) = hit {
-            out.push(hit);
+            // Same skill from two sources: keep the better-ranked one.
+            if seen.insert((hit.name.clone(), hit.description.clone(), hit.est_tokens)) {
+                out.push(hit);
+            }
         }
     }
     Ok(out)
+}
+
+/// `search_semantic` for callers that did not pick a mode: all-words first,
+/// then any-word when that finds nothing, so a natural-language query with
+/// one stray word ("debug failing test") does not come back empty.
+pub fn search_semantic_relaxed(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+    embed_query: impl Fn(&str) -> Option<Vec<f32>>,
+) -> rusqlite::Result<Vec<SkillHit>> {
+    // Decide on the keyword side: with embeddings present the vector side
+    // returns top-k regardless, so the merged result is never empty.
+    let mode = if search(conn, query, 1, MatchMode::All)?.is_empty() {
+        MatchMode::Any
+    } else {
+        MatchMode::All
+    };
+    search_semantic(conn, query, limit, mode, embed_query)
 }
 
 #[cfg(test)]
@@ -588,6 +671,7 @@ mod tests {
                 est_tokens: 100,
                 compressed: false,
                 score: 1.0,
+                confidence: 0.0,
                 last_used_at: recent,
                 bandit_alpha: 1.0,
                 bandit_beta: 1.0,
@@ -601,6 +685,7 @@ mod tests {
                 est_tokens: 100,
                 compressed: false,
                 score: 1.0,
+                confidence: 0.0,
                 last_used_at: stale,
                 bandit_alpha: 1.0,
                 bandit_beta: 1.0,
@@ -628,6 +713,7 @@ mod tests {
             est_tokens: 100,
             compressed: false,
             score: 0.5,
+            confidence: 0.0,
             last_used_at: 0,
             bandit_alpha: 1.0,
             bandit_beta: 1.0,
@@ -741,5 +827,240 @@ mod tests {
             1,
             "a skill matched by both bm25 and the vector side must appear once, blended"
         );
+    }
+
+    #[test]
+    fn relaxed_search_retries_with_any_when_all_finds_nothing() {
+        let conn = seed();
+        // "please" is in no description, so the all-words default misses.
+        let strict = search(&conn, "windows disk please", 5, MatchMode::All).unwrap();
+        assert!(strict.is_empty());
+        let hits = search_semantic_relaxed(&conn, "windows disk please", 5, |_| None).unwrap();
+        assert_eq!(hits[0].name, "win-cleanup");
+    }
+
+    #[test]
+    fn natural_language_fixture_debug_failing_test_finds_systematic_debugging() {
+        let mut conn = open_in_memory().unwrap();
+        let mk = |name: &str, desc: &str| SkillEntry {
+            name: name.into(),
+            source: "claude-user".into(),
+            path: PathBuf::from(format!("/x/{name}/SKILL.md")),
+            description: desc.into(),
+            body: String::new(),
+            neg_text: String::new(),
+            tags: String::new(),
+            category: String::new(),
+            est_tokens: 100,
+            mtime: 1,
+            bandit_alpha: 1.0,
+            bandit_beta: 1.0,
+            shadow_path: None,
+        };
+        rebuild(
+            &mut conn,
+            &[
+                mk(
+                    "systematic-debugging",
+                    "Use when encountering any bug, test failure, or unexpected behavior",
+                ),
+                mk(
+                    "hormozi-offer",
+                    "Build a Grand Slam Offer from any idea, product, or service",
+                ),
+                mk("win-cleanup", "Free disk space on a Windows system"),
+            ],
+        )
+        .unwrap();
+        // "debug" and "failing" are not literal words in the description, so
+        // the all-words default returns nothing; the relaxed path must not.
+        let hits = search_semantic_relaxed(&conn, "debug failing test", 5, |_| None).unwrap();
+        assert_eq!(hits[0].name, "systematic-debugging", "{hits:?}");
+    }
+
+    #[test]
+    fn identical_skill_from_two_sources_is_returned_once() {
+        let mut conn = open_in_memory().unwrap();
+        let mk = |source: &str| SkillEntry {
+            name: "pm".into(),
+            source: source.into(),
+            path: PathBuf::from(format!("/{source}/pm/SKILL.md")),
+            description: "Product management for any project".into(),
+            body: String::new(),
+            neg_text: String::new(),
+            tags: String::new(),
+            category: String::new(),
+            est_tokens: 100,
+            mtime: 1,
+            bandit_alpha: 1.0,
+            bandit_beta: 1.0,
+            shadow_path: None,
+        };
+        rebuild(&mut conn, &[mk("agentflare-builtin"), mk("claude-project")]).unwrap();
+        let hits = search(&conn, "product management", 5, MatchMode::All).unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+    }
+
+    #[test]
+    fn duplicates_do_not_eat_limit_slots() {
+        let mut conn = open_in_memory().unwrap();
+        let mk = |name: &str, source: &str| SkillEntry {
+            name: name.into(),
+            source: source.into(),
+            path: PathBuf::from(format!("/{source}/{name}/SKILL.md")),
+            description: format!("{name} helps with product planning"),
+            body: String::new(),
+            neg_text: String::new(),
+            tags: String::new(),
+            category: String::new(),
+            est_tokens: 100,
+            mtime: 1,
+            bandit_alpha: 1.0,
+            bandit_beta: 1.0,
+            shadow_path: None,
+        };
+        rebuild(
+            &mut conn,
+            &[
+                mk("pm", "builtin"),
+                mk("pm", "project"),
+                mk("roadmap", "user"),
+                mk("backlog", "user"),
+            ],
+        )
+        .unwrap();
+        let hits = search(&conn, "product planning", 3, MatchMode::All).unwrap();
+        assert_eq!(hits.len(), 3, "{hits:?}");
+        for (name, source) in [
+            ("pm", "builtin"),
+            ("pm", "project"),
+            ("roadmap", "user"),
+            ("backlog", "user"),
+        ] {
+            crate::embed_store::upsert(&conn, name, source, &[1.0, 0.0], "test").unwrap();
+        }
+        let semantic = search_semantic(&conn, "product planning", 3, MatchMode::All, |_| {
+            Some(vec![1.0, 0.0])
+        })
+        .unwrap();
+        assert_eq!(semantic.len(), 3, "{semantic:?}");
+    }
+
+    #[test]
+    fn many_duplicate_sources_still_fill_the_limit() {
+        let mut conn = open_in_memory().unwrap();
+        let mk = |name: &str, source: &str| SkillEntry {
+            name: name.into(),
+            source: source.into(),
+            path: PathBuf::from(format!("/{source}/{name}/SKILL.md")),
+            description: format!("{name} helps with product planning"),
+            body: String::new(),
+            neg_text: String::new(),
+            tags: String::new(),
+            category: String::new(),
+            est_tokens: 100,
+            mtime: 1,
+            bandit_alpha: 1.0,
+            bandit_beta: 1.0,
+            shadow_path: None,
+        };
+        let mut entries = Vec::new();
+        for name in ["pm", "roadmap"] {
+            for i in 0..5 {
+                entries.push(mk(name, &format!("src{i}")));
+            }
+        }
+        entries.push(mk("backlog", "user"));
+        rebuild(&mut conn, &entries).unwrap();
+        // 10 duplicate rows precede the third distinct skill; a fixed 2x
+        // over-fetch (6 rows) would return only 2 hits.
+        let hits = search(&conn, "product planning", 3, MatchMode::All).unwrap();
+        assert_eq!(hits.len(), 3, "{hits:?}");
+    }
+
+    #[test]
+    fn threshold_separates_good_match_from_miss() {
+        let mut conn = open_in_memory().unwrap();
+        let mk = |name: &str, desc: &str| SkillEntry {
+            name: name.into(),
+            source: "claude-user".into(),
+            path: PathBuf::from(format!("/x/{name}/SKILL.md")),
+            description: desc.into(),
+            body: String::new(),
+            neg_text: String::new(),
+            tags: String::new(),
+            category: String::new(),
+            est_tokens: 100,
+            mtime: 1,
+            bandit_alpha: 1.0,
+            bandit_beta: 1.0,
+            shadow_path: None,
+        };
+        rebuild(
+            &mut conn,
+            &[
+                mk(
+                    "systematic-debugging",
+                    "Use when encountering any bug, test failure, or unexpected behavior",
+                ),
+                mk(
+                    "hormozi-offer",
+                    "Build a Grand Slam Offer from any idea, product, or service",
+                ),
+                mk(
+                    "idea-to-product",
+                    "Run the full Lean Offer System from idea to sellable offer",
+                ),
+            ],
+        )
+        .unwrap();
+        let good = search_semantic_relaxed(&conn, "bug test failure", 5, |_| None).unwrap();
+        assert_eq!(good[0].name, "systematic-debugging");
+        assert!(
+            good[0].is_confident(),
+            "{} {:?}",
+            good[0].confidence,
+            good[0]
+        );
+
+        let miss = search_semantic_relaxed(
+            &conn,
+            "should we adopt the idea and build our own",
+            5,
+            |_| None,
+        )
+        .unwrap();
+        for h in &miss {
+            assert!(!h.is_confident(), "{} scored {}", h.name, h.confidence);
+        }
+        assert!(good[0].confidence > MIN_CONFIDENCE);
+    }
+
+    #[test]
+    fn semantic_confidence_is_absolute_not_min_max_normalized() {
+        let conn = seed();
+        // Unrelated query vector: even the top blended hit must not look
+        // confident, though min-max normalization alone would score it 1.0.
+        crate::embed_store::upsert(&conn, "live", "claude-user", &[1.0, 0.0], "test").unwrap();
+        let miss =
+            search_semantic(&conn, "zzz", 3, MatchMode::Any, |_| Some(vec![0.0, 1.0])).unwrap();
+        assert!(miss.iter().all(|h| !h.is_confident()), "{miss:?}");
+        let hit =
+            search_semantic(&conn, "zzz", 3, MatchMode::Any, |_| Some(vec![1.0, 0.0])).unwrap();
+        assert_eq!(hit[0].name, "live");
+        assert!(hit[0].is_confident(), "{hit:?}");
+    }
+
+    #[test]
+    fn relaxed_search_still_retries_any_when_stored_vectors_exist() {
+        let conn = seed();
+        // Vectors exist for unrelated skills; the vector side returns top-k
+        // regardless, so the strict result is never empty on its own.
+        crate::embed_store::upsert(&conn, "live", "claude-user", &[0.0, 1.0], "test").unwrap();
+        crate::embed_store::upsert(&conn, "cv-usage", "claude-user", &[0.0, 1.0], "test").unwrap();
+        let hits =
+            search_semantic_relaxed(&conn, "windows disk please", 5, |_| Some(vec![0.0, 1.0]))
+                .unwrap();
+        assert!(hits.iter().any(|h| h.name == "win-cleanup"), "{hits:?}");
     }
 }
