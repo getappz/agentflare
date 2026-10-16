@@ -886,8 +886,7 @@ fn real_agent_send_hook(
     extra_args: Vec<String>,
 ) -> flare_workflow::json::SendMessage {
     std::sync::Arc::new(move |inv: flare_workflow::json::StepInvocation| {
-        let mut all_args = extra_args.clone();
-        all_args.extend(inv.args.clone());
+        let all_args = work_item_launch_args(&inv.agent, &extra_args, &inv.args);
         let flare_workflow::json::StepInvocation {
             agent,
             prompt,
@@ -970,6 +969,19 @@ fn real_agent_send_hook(
             }
         })
     })
+}
+
+fn work_item_launch_args(agent: &str, extra_args: &[String], role_args: &[String]) -> Vec<String> {
+    // Boot recovery has no dispatch argv; restore the same noninteractive defaults.
+    let mut args = if extra_args.is_empty() {
+        agent_registry::agent_by_name(agent)
+            .map(|agent| crate::cli::work::build_extra_args(agent, None, None, None))
+            .unwrap_or_default()
+    } else {
+        extra_args.to_vec()
+    };
+    args.extend_from_slice(role_args);
+    args
 }
 
 /// Test seam: same pipeline, one injected `SendMessage` shared by the

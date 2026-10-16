@@ -797,8 +797,8 @@ pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {
             // crashed run's actual target item and prompts, not a
             // placeholder. `--timeout`/`--idle-timeout`/extra CLI args
             // from the original dispatch aren't persisted, so a resumed
-            // run falls back to the defaults here — an accepted
-            // trade-off, not an identity gap.
+            // run falls back to the defaults here. The send hook restores
+            // each agent's autonomy/streaming defaults at invocation time.
             let boot_mcp = std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default());
             let boot_definition = crate::work_item_pipeline::build_work_item_pipeline(
                 boot_mcp,
