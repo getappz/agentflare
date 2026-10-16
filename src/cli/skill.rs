@@ -61,6 +61,23 @@ pub enum SkillAction {
         #[arg(long)]
         yes: bool,
     },
+    /// Print the version-matched guide for a skill, served from this binary.
+    /// Mirrors Orca's `skills get`: the text can never drift from the binary
+    /// that will run the workflow. Builtins (`pm`, flare-code modes) come
+    /// from `include_str!`; anything else resolves from installed skills.
+    Get {
+        /// Skill name (e.g. `pm`, `review`, or an installed skill).
+        name: String,
+        /// Include companion references inline after the guide.
+        #[arg(long)]
+        full: bool,
+        /// Print only this companion reference (e.g. `reference/rubric.md`).
+        #[arg(long)]
+        reference: Option<String>,
+        /// List companion reference names and exit.
+        #[arg(long)]
+        references: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -859,6 +876,86 @@ fn run_provision(path: &str, yes: bool) -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
+/// Resolve a skill guide to `(body, companions)`.
+///
+/// Resolution order: compiled-in builtins (`pm` + references) first, then
+/// flare-code sub-skills (single-file, no companions), then installed skills
+/// on disk. Builtins are version-matched by construction (`include_str!`).
+fn resolve_guide(name: &str) -> Option<(String, Vec<(String, String)>)> {
+    if let Some((body, companions)) = skill_registry::builtin::get(name) {
+        return Some((
+            body.to_string(),
+            companions
+                .iter()
+                .map(|(p, c)| ((*p).to_string(), (*c).to_string()))
+                .collect(),
+        ));
+    }
+    if let Some(body) = flare_code::sub_skills::get(name) {
+        return Some((body.to_string(), Vec::new()));
+    }
+    let dir = home_skills().join(name);
+    let body = std::fs::read_to_string(dir.join("SKILL.md")).ok()?;
+    let mut companions = Vec::new();
+    // Collect sibling markdown files as references (bounded: 32 files).
+    let mut stack = vec![dir.join("reference")];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "md")
+                && companions.len() < 32
+                && let Ok(content) = std::fs::read_to_string(&p)
+                && let Ok(rel) = p
+                    .strip_prefix(&dir)
+                    .map(|r| r.to_string_lossy().into_owned())
+            {
+                companions.push((rel, content));
+            }
+        }
+    }
+    companions.sort_by(|a, b| a.0.cmp(&b.0));
+    Some((body, companions))
+}
+
+fn run_get(name: &str, full: bool, reference: Option<&str>, references: bool) {
+    let Some((body, companions)) = resolve_guide(name) else {
+        crate::ui::error(&format!("skill '{name}' not found"));
+        crate::ui::info("use `agentflare skill list` for installed skills");
+        std::process::exit(1);
+    };
+    if references {
+        if companions.is_empty() {
+            crate::ui::info(&format!("skill '{name}' has no references"));
+            return;
+        }
+        for (rel, _) in &companions {
+            println!("  {rel}");
+        }
+        return;
+    }
+    if let Some(want) = reference {
+        match companions.iter().find(|(rel, _)| rel == want) {
+            Some((_, content)) => print!("{content}"),
+            None => {
+                crate::ui::error(&format!("reference '{want}' not found in skill '{name}'"));
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    print!("{body}");
+    if full {
+        for (rel, content) in &companions {
+            println!("\n<!-- bundled-reference: {rel} -->\n{content}");
+        }
+    }
+}
+
 impl SkillArgs {
     pub fn run(self) {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -923,6 +1020,12 @@ impl SkillArgs {
                     std::process::exit(1);
                 }
             }
+            SkillAction::Get {
+                name,
+                full,
+                reference,
+                references,
+            } => run_get(&name, full, reference.as_deref(), references),
         }
     }
 }
@@ -1036,6 +1139,25 @@ mod tests {
                 "expected {installed:?} to exist after install"
             );
         });
+    }
+
+    #[test]
+    fn resolve_guide_serves_builtin_pm_with_companions() {
+        let (body, companions) = resolve_guide("pm").expect("builtin pm guide");
+        assert!(body.contains("name: pm"));
+        assert!(companions.iter().any(|(p, _)| p == "reference/rubric.md"));
+    }
+
+    #[test]
+    fn resolve_guide_serves_flare_code_sub_skill() {
+        let (body, companions) = resolve_guide("review").expect("flare-code review guide");
+        assert!(!body.is_empty());
+        assert!(companions.is_empty());
+    }
+
+    #[test]
+    fn resolve_guide_returns_none_for_unknown() {
+        assert!(resolve_guide("definitely-not-a-real-skill-xyz").is_none());
     }
 
     #[test]

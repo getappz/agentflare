@@ -1451,11 +1451,11 @@ impl AgentflareMcp {
     }
 
     /// When `item_id`'s claim is held by someone other than `caller` whose
-    /// owner is known dead (`claim_liveness::judge_owner`: its job finished,
+    /// owner is known exited (`claim_liveness::judge_owner`: its job finished,
     /// its session ended, its process is gone), release that claim so the
     /// caller's `release`/`done` below treats it like an abandoned one right
     /// away instead of refusing until the multi-hour TTL lapses. A live or
-    /// unknown holder is left alone -- the TTL gate still applies to it.
+    /// unverifiable holder is left alone -- the TTL gate still applies to it.
     fn release_dead_holders_claim(&self, conn: &Connection, item_id: &str, caller: &str, now: i64) {
         let Ok(Some(holder)) =
             agentflare_backend::claim::live_claim_on_item(conn, item_id, now, i64::MAX / 4)
@@ -1472,7 +1472,7 @@ impl AgentflareMcp {
             crate::db::open().ok()
         };
         let queue = self.job_queue().ok().flatten();
-        if let crate::claim_liveness::OwnerLiveness::Dead(reason) =
+        if let crate::claim_liveness::OwnerLiveness::Exited(reason) =
             crate::claim_liveness::judge_owner(
                 &holder.owner,
                 now - holder.age_secs,
@@ -1482,7 +1482,7 @@ impl AgentflareMcp {
             )
         {
             eprintln!(
-                "agentflare: releasing item {item_id}'s claim held by dead owner {} ({reason})",
+                "agentflare: releasing item {item_id}'s claim held by exited owner {} ({reason})",
                 holder.owner
             );
             let _ = agentflare_backend::claim::release(conn, item_id, &holder.owner);
