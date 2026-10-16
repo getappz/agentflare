@@ -68,7 +68,7 @@ pub(crate) fn agent_send_hook() -> SendMessage {
                 args,
                 hard_cap_secs,
                 idle_timeout_secs,
-                cwd: _,
+                cwd,
                 owner: _,
                 persona,
             } = inv;
@@ -83,11 +83,9 @@ pub(crate) fn agent_send_hook() -> SendMessage {
             extra_args.extend(args);
             let request_json = pin_stream_json(&agent, &mut extra_args);
             // No projected scratch dir here: the persona definition is
-            // whatever the ambient cwd's `.claude/agents/` holds.
-            let agents_dir = std::env::current_dir()
-                .unwrap_or_default()
-                .join(".claude")
-                .join("agents");
+            // whatever the invocation cwd's `.claude/agents/` holds (the
+            // ambient cwd's when the step carries none).
+            let agents_dir = persona_agents_dir(cwd.as_deref());
             let prompt = apply_persona(
                 &agent,
                 persona.as_deref(),
@@ -103,8 +101,13 @@ pub(crate) fn agent_send_hook() -> SendMessage {
             // before it, or the call already happened on whatever thread
             // invoked this closure before the returned future was ever
             // polled/awaited.
-            let outcome = tokio::task::spawn_blocking(move || {
-                crate::agent_launch::run_headless(
+            let outcome = tokio::task::spawn_blocking(move || match &cwd {
+                // Explicit cwd (a workflow compiled with
+                // `compile_workflow_in`, e.g. a schedule's repo root) instead
+                // of the ambient process cwd, which is the daemon's own when
+                // the run is driven there. Never a process-wide chdir.
+                Some(cwd) => crate::agent_launch::run_headless_in(
+                    cwd,
                     agent_registry::REGISTRY,
                     &agent,
                     &prompt,
@@ -112,7 +115,16 @@ pub(crate) fn agent_send_hook() -> SendMessage {
                     idle_timeout,
                     &extra_args,
                     request_json,
-                )
+                ),
+                None => crate::agent_launch::run_headless(
+                    agent_registry::REGISTRY,
+                    &agent,
+                    &prompt,
+                    hard_cap,
+                    idle_timeout,
+                    &extra_args,
+                    request_json,
+                ),
             })
             .await
             .map_err(|e| format!("agent task panicked: {e}"))?;
@@ -164,6 +176,16 @@ fn pin_stream_json(agent: &str, extra_args: &mut Vec<String>) -> bool {
         }
     }
     true
+}
+
+/// Where [`agent_send_hook`] resolves a step's persona definition from: the
+/// invocation's own cwd when it carries one, otherwise the ambient process
+/// cwd — in both cases its `.claude/agents/`.
+fn persona_agents_dir(cwd: Option<&Path>) -> PathBuf {
+    cwd.map(Path::to_path_buf)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+        .join(".claude")
+        .join("agents")
 }
 
 /// Applies a step's `persona`: on Claude Code, `--agent <name>` so the
@@ -1643,6 +1665,49 @@ mod persona_tests {
         );
         assert!(args.is_empty(), "no unconfirmed flags: {args:?}");
         assert_eq!(prompt, "# CEO\nThink Day 1.\n\nPitch one idea.");
+    }
+
+    /// Spec T35: persona resolution honors the invocation cwd (no agent
+    /// binary involved — only the directory lookup and the fold).
+    #[test]
+    fn persona_resolution_honors_the_invocation_cwd() {
+        let repo = tempfile::tempdir().unwrap();
+        let agents_dir = persona_agents_dir(Some(repo.path()));
+        assert_eq!(agents_dir, repo.path().join(".claude").join("agents"));
+        assert_eq!(
+            persona_agents_dir(None),
+            std::env::current_dir()
+                .unwrap()
+                .join(".claude")
+                .join("agents"),
+            "no cwd on the invocation keeps the ambient-cwd lookup"
+        );
+
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("ceo-bezos.md"),
+            "---\nname: ceo-bezos\n---\n# CEO\nThink Day 1.\n",
+        )
+        .unwrap();
+        let mut args = Vec::new();
+        let prompt = apply_persona(
+            "opencode",
+            Some("ceo-bezos"),
+            &agents_dir,
+            &mut args,
+            "Pitch one idea.".to_string(),
+        );
+        assert_eq!(
+            prompt, "# CEO\nThink Day 1.\n\nPitch one idea.",
+            "the definition under the invocation cwd is what gets folded in"
+        );
+        assert!(
+            !std::env::current_dir()
+                .unwrap()
+                .join(".claude/agents/ceo-bezos.md")
+                .exists(),
+            "the definition lives only under the invocation cwd"
+        );
     }
 
     #[test]
