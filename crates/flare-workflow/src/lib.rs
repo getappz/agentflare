@@ -33,7 +33,7 @@ pub use events::{EventBus, EventSubscriber, LoggingSubscriber, WorkflowEvent};
 pub use executor::{FunctionStep, StepExecutor, noop_executor};
 pub use json::{
     JsonErrorMode, JsonMode, JsonStep, JsonWorkflow, PipelineData, SendMessage, StepInvocation,
-    compile_workflow,
+    compile_workflow, compile_workflow_in,
 };
 pub use retry::{Backoff, Retryable, apply_jitter};
 pub use sqlite_store::{SqliteStore, SqliteStoreError};

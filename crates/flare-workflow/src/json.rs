@@ -6,6 +6,7 @@
 //! run through the durable engine without writing Rust step closures.
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -205,6 +206,20 @@ pub fn compile_workflow(
     json: &JsonWorkflow,
     send: SendMessage,
 ) -> Result<WorkflowDefinition<PipelineData>, String> {
+    compile_workflow_in(json, send, None)
+}
+
+/// [`compile_workflow`] with an explicit working directory: every `command`
+/// step runs in `cwd`, and every agent step carries it as
+/// `StepInvocation::cwd`, so a workflow belonging to one repository executes
+/// there even when the driving process (e.g. the daemon) has some other
+/// ambient cwd. `None` keeps the ambient-cwd behavior. The process-wide cwd
+/// is never changed.
+pub fn compile_workflow_in(
+    json: &JsonWorkflow,
+    send: SendMessage,
+    cwd: Option<PathBuf>,
+) -> Result<WorkflowDefinition<PipelineData>, String> {
     let mut wf = WorkflowDefinition::new(json.name.clone(), json.name.clone());
 
     // Previous step that produced the input channel, per OpenFang chaining.
@@ -250,6 +265,7 @@ pub fn compile_workflow(
                 }
                 Arc::new(CommandExecutor {
                     command: command.clone(),
+                    cwd: cwd.clone(),
                 })
             }
             (None, Some(agent)) => Arc::new(PromptExecutor {
@@ -261,6 +277,7 @@ pub fn compile_workflow(
                 hard_cap_secs: s.hard_cap_secs,
                 idle_timeout_secs: s.idle_timeout_secs,
                 persona: s.persona.clone(),
+                cwd: cwd.clone(),
             }),
         };
         let mut def = StepDefinition::new(s.name.clone(), s.name.clone(), executor)
@@ -374,6 +391,7 @@ struct PromptExecutor {
     hard_cap_secs: Option<u64>,
     idle_timeout_secs: Option<u64>,
     persona: Option<String>,
+    cwd: Option<PathBuf>,
 }
 
 #[async_trait]
@@ -387,7 +405,7 @@ impl StepExecutor<PipelineData> for PromptExecutor {
             args: self.args.clone(),
             hard_cap_secs: self.hard_cap_secs,
             idle_timeout_secs: self.idle_timeout_secs,
-            cwd: None,
+            cwd: self.cwd.clone(),
             owner: None,
             persona: self.persona.clone(),
         };
@@ -416,6 +434,8 @@ impl StepExecutor<PipelineData> for PromptExecutor {
 /// fails the step with stderr attached.
 struct CommandExecutor {
     command: Vec<String>,
+    /// Working directory for the child; `None` inherits the process cwd.
+    cwd: Option<PathBuf>,
 }
 
 #[async_trait]
@@ -439,6 +459,9 @@ impl StepExecutor<PipelineData> for CommandExecutor {
         // completion in the background.
         let mut std_cmd = flare_process::command(&program);
         std_cmd.args(&args);
+        if let Some(cwd) = &self.cwd {
+            std_cmd.current_dir(cwd);
+        }
         let output = tokio::process::Command::from(std_cmd)
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true)
@@ -909,6 +932,118 @@ mod tests {
         // Only the agent step dispatched via `send`; the command step ran
         // as a subprocess.
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Spec T33: a command step compiled with `compile_workflow_in(.., cwd)`
+    /// runs in that directory, not the ambient process cwd.
+    #[tokio::test]
+    async fn command_step_runs_in_the_compiled_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = std::fs::canonicalize(dir.path()).unwrap();
+        assert_ne!(
+            std::env::current_dir().unwrap(),
+            expected,
+            "the test is only meaningful when the ambient cwd differs"
+        );
+
+        let json: JsonWorkflow = serde_json::from_str(
+            r#"{
+                "name": "pwd-pipeline",
+                "steps": [
+                    { "name": "pwd-step", "command": ["pwd"], "output_var": "where" }
+                ]
+            }"#,
+        )
+        .unwrap();
+        #[cfg(windows)]
+        let mut json = json;
+        #[cfg(windows)]
+        {
+            json.steps[0].command = Some(vec!["cmd".into(), "/C".into(), "cd".into()]);
+        }
+
+        let wf = compile_workflow_in(&json, mock_send(), Some(dir.path().to_path_buf())).unwrap();
+        let engine = WorkflowEngine::<PipelineData, InMemoryStore<PipelineData>>::new();
+        engine.register_workflow(wf).unwrap();
+        let run = engine
+            .start_workflow(
+                crate::types::WorkflowId::new("pwd-pipeline"),
+                PipelineData,
+                String::new(),
+            )
+            .await
+            .unwrap();
+        engine
+            .wait_for_completion(run, "wf", std::time::Duration::from_secs(10))
+            .await
+            .unwrap();
+
+        let state = engine.get_status(run).await.unwrap();
+        assert_eq!(state.status, WorkflowStatus::Completed);
+        let reported = state.variables.get("where").expect("pwd output captured");
+        assert_eq!(
+            std::fs::canonicalize(reported).unwrap(),
+            expected,
+            "command ran in the compiled cwd"
+        );
+        assert_ne!(
+            std::env::current_dir().unwrap(),
+            expected,
+            "the process-wide cwd was not changed"
+        );
+    }
+
+    /// Spec T34: the compiled cwd reaches the agent invocation; the legacy
+    /// `compile_workflow` entry point keeps `cwd: None`.
+    #[tokio::test]
+    async fn compiled_cwd_reaches_the_agent_invocation_and_legacy_compile_gives_none() {
+        async fn captured_cwd(
+            wf: WorkflowDefinition<PipelineData>,
+            captured: &std::sync::Mutex<Option<StepInvocation>>,
+        ) -> Option<PathBuf> {
+            let engine = WorkflowEngine::<PipelineData, InMemoryStore<PipelineData>>::new();
+            engine.register_workflow(wf).unwrap();
+            let run = engine
+                .start_workflow(
+                    crate::types::WorkflowId::new("cwd-step"),
+                    PipelineData,
+                    String::new(),
+                )
+                .await
+                .unwrap();
+            engine
+                .wait_for_completion(run, "wf", std::time::Duration::from_secs(10))
+                .await
+                .unwrap();
+            captured
+                .lock()
+                .unwrap()
+                .take()
+                .expect("send was called")
+                .cwd
+        }
+
+        let captured: std::sync::Arc<std::sync::Mutex<Option<StepInvocation>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_clone = std::sync::Arc::clone(&captured);
+        let send: SendMessage = Arc::new(move |inv: StepInvocation| {
+            *captured_clone.lock().unwrap() = Some(inv);
+            Box::pin(async move { Ok(("ok".to_string(), 0, 0)) })
+        });
+        let json: JsonWorkflow = serde_json::from_str(
+            r#"{
+                "name": "cwd-step",
+                "steps": [ { "name": "a", "agent": "writer", "prompt": "go" } ]
+            }"#,
+        )
+        .unwrap();
+
+        let repo = PathBuf::from("/srv/repos/b");
+        let wf = compile_workflow_in(&json, Arc::clone(&send), Some(repo.clone())).unwrap();
+        assert_eq!(captured_cwd(wf, &captured).await, Some(repo));
+
+        let wf = compile_workflow(&json, send).unwrap();
+        assert_eq!(captured_cwd(wf, &captured).await, None);
     }
 
     #[tokio::test]
