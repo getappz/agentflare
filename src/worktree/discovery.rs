@@ -1233,6 +1233,81 @@ mod tests {
         assert_eq!(created, 1);
     }
 
+    fn pr_json_with_repos(base_repo: &str, head_repo: &str) -> String {
+        format!(
+            r#"[{{"number":42,"html_url":"u","state":"open","title":"t","body":"hand opened","head":{{"ref":"fix/x","sha":"abc","repo":{{"full_name":"{head_repo}"}}}},"base":{{"ref":"main","sha":"def","repo":{{"full_name":"{base_repo}"}}}},"author_association":"OWNER","created_at":"2026-10-07T11:00:00Z"}}]"#
+        )
+    }
+
+    // Task #364: a PR whose base repo is not the scanned repo came from a
+    // repointed project_dirs row; it is never adopted and never claimed.
+    #[test]
+    fn discover_skips_a_pr_whose_base_repo_is_not_the_scanned_repo() {
+        let conn = agentflare_backend::db::open_in_memory().unwrap();
+        let (project_id, in_review_state_id) = test_project_with_in_review_state(&conn);
+        let server = crate::github::test_support::MockServer::start(vec![
+            crate::github::test_support::MockResponse::json(
+                200,
+                &pr_json_with_repos("other/repo", "other/repo"),
+            ),
+        ]);
+        let client = server.client(Some("tok"));
+        let repo = crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+
+        let created = discover_with_clock(
+            &conn,
+            &client,
+            &repo,
+            &project_id,
+            &in_review_state_id,
+            &|_| true,
+            clock_at("2026-10-07T12:00:00Z"),
+            600,
+        );
+
+        assert_eq!(created, 0);
+        assert!(
+            agentflare_backend::item::list_by_project(&conn, &project_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(server.requests().len(), 1, "list only, never a claim");
+    }
+
+    // A fork head with the right base repo is still adopted.
+    #[test]
+    fn discover_still_adopts_a_fork_head_with_matching_base_repo() {
+        let conn = agentflare_backend::db::open_in_memory().unwrap();
+        let (project_id, in_review_state_id) = test_project_with_in_review_state(&conn);
+        let mut responses = vec![crate::github::test_support::MockResponse::json(
+            200,
+            &pr_json_with_repos("o/r", "forker/r"),
+        )];
+        responses.extend(claim_win_responses("flared:box-a"));
+        let server = crate::github::test_support::MockServer::start(responses);
+        let client = server.client(Some("tok"));
+        let repo = crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+
+        let created = discover_with_clock(
+            &conn,
+            &client,
+            &repo,
+            &project_id,
+            &in_review_state_id,
+            &|_| true,
+            clock_at("2026-10-07T12:00:00Z"),
+            600,
+        );
+
+        assert_eq!(created, 1);
+    }
+
     // Local branch evidence adopts at once even inside the grace window --
     // this workstation can see the branch, so the PR is (also) its own work
     // to track, not a stranger's to wait on.

@@ -18,6 +18,34 @@ pub fn ensure_fresh_registry() {
     registry::ensure_fresh();
 }
 
+/// Look up a registry entry by its `MODEL`-prefix (e.g. `"openai"`,
+/// `"anthropic"`, `"xai"`, `"perplexity"`) and resolve it into a ready
+/// `ProviderEntry` for the current environment.
+///
+/// `None` when the prefix is unknown, or when a per-user
+/// `base_url_template` can't be resolved from the environment (see
+/// `registry::resolve`).
+///
+/// This is the one way to reach the embedded/cached provider registry from
+/// outside this crate — `providers::registry` itself stays private so its
+/// data can't silently drift from what `ProviderConfig::from_env()` uses
+/// internally. Embedders that build an explicit multi-provider
+/// `ProviderConfig` (rather than the single active-model-per-role shape
+/// `from_env()` assumes) call this once per provider they need.
+pub fn provider_entry(prefix: &str) -> Option<ProviderEntry> {
+    let spec = registry::find(prefix)?;
+    let (base_url, extra_headers) = registry::resolve(spec)?;
+    Some(ProviderEntry {
+        id: spec.id.clone(),
+        kind: spec.kind.clone(),
+        base_url,
+        api_key_env: spec.api_key_env.clone(),
+        default_model: None,
+        models: vec![],
+        extra_headers,
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub providers: Vec<ProviderEntry>,
