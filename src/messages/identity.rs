@@ -253,7 +253,7 @@ fn adopt_provisional(conn: &Connection, provisional: &str, key: &str) -> rusqlit
     }
     crate::messages::reroute_undelivered(&tx, provisional, key)?;
     // Forget, don't `end`: the provisional key is also this live MCP
-    // server's claim owner, and an ended row reads as `Liveness::Dead` --
+    // server's claim owner, and an ended row reads as `Liveness::Exited` --
     // claim liveness would release its claims.
     sessions::forget(&tx, provisional)?;
     tx.commit()?;
@@ -438,11 +438,11 @@ mod tests {
         let moved = crate::messages::take_undelivered(&c, "claude-code:sess-1", 5, 103).unwrap();
         assert_eq!(moved.len(), 1, "provisional mail follows the session");
         // The stand-in row is gone, not ended: its key is still this live
-        // server's claim owner, which must not read as dead.
+        // server's claim owner, which must not read as exited.
         assert!(sessions::get(&c, &provisional).unwrap().is_none());
         assert_eq!(
             sessions::liveness(&c, &provisional, 104).unwrap(),
-            sessions::Liveness::Unknown
+            sessions::Liveness::Unverifiable
         );
     }
 }
