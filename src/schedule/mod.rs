@@ -228,12 +228,23 @@ pub fn validate_params(params: &serde_json::Value) -> Result<(), String> {
 }
 
 /// Canonicalize a repo root for storage/comparison; reject nonexistent roots.
+///
+/// A linked worktree resolves to the main checkout first. CLI already does
+/// that from cwd; MCP `worktree_repo_root_override` does not, so the store
+/// boundary is what keeps both surfaces on one repository scope.
 pub fn canonical_repo_root(root: &str) -> Result<String, String> {
     let path = std::path::Path::new(root);
     if !path.is_dir() {
         return Err(format!("repo root does not exist: '{root}'"));
     }
-    std::fs::canonicalize(path)
+    let path = if flare_git_core::branch::is_linked_worktree(path) {
+        flare_git_core::branch::main_worktree_root(path)
+            .filter(|main| main.is_dir())
+            .unwrap_or_else(|| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    };
+    std::fs::canonicalize(&path)
         .map(|p| p.to_string_lossy().into_owned())
         .map_err(|e| format!("cannot canonicalize repo root '{root}': {e}"))
 }
