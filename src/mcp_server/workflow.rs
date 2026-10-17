@@ -551,6 +551,13 @@ mod tests {
         }
     }
 
+    /// Fixture git. `run_in` strips inherited repository-location variables
+    /// (`GIT_DIR`, `GIT_WORK_TREE`, and the rest of `GIT_LOCATION_ENV`) so a
+    /// hook-spawned test acts on `dir`, not the caller's checkout.
+    fn git(dir: &Path, args: &[&str]) {
+        flare_git_core::shell::run_in(dir, args).unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+    }
+
     #[test]
     fn production_db_path_cannot_redirect_storage() {
         let evil = "/tmp/agentflare-not-the-workflow-store.db";
@@ -706,18 +713,6 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let main = parent.path().join("main");
         std::fs::create_dir_all(&main).unwrap();
-        let git = |dir: &Path, args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .output()
-                .expect("git");
-            assert!(
-                out.status.success(),
-                "git {args:?}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        };
         git(&main, &["init", "-b", "master"]);
         git(&main, &["config", "user.email", "test@test.com"]);
         git(&main, &["config", "user.name", "Test"]);
