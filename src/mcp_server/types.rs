@@ -867,12 +867,12 @@ pub(crate) struct ItemRequest {
     #[serde(default)]
     pub(crate) label_name: Option<String>,
     #[schemars(
-        description = "Relation type: blocks|duplicate|relates_to (add_relation, remove_relation; list_relations optional filter — omit to return all three types)"
+        description = "Relation type: blocks|duplicate|relates_to (add_relation, remove_relation; list_relations optional filter — omit to return all three types). blocks is directional: add_relation id=X related_item_id=Y relation_type=blocks records that X depends on Y (Y blocks X). duplicate and relates_to are symmetric. list_relations on X returns what X depends on for blocks."
     )]
     #[serde(default)]
     pub(crate) relation_type: Option<String>,
     #[schemars(
-        description = "The other item ID this item relates to (UUID or numeric sequence_id) (add_relation, remove_relation; required for both)"
+        description = "The other item ID (UUID or numeric sequence_id) for add_relation/remove_relation. For blocks, this is what `id` depends on: add_relation id=X related_item_id=Y relation_type=blocks records that X depends on Y. list_relations on X returns that dependency."
     )]
     #[serde(default)]
     pub(crate) related_item_id: Option<String>,
