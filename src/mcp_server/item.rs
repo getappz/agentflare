@@ -767,13 +767,41 @@ impl AgentflareMcp {
                         .unwrap_or(false)
                 });
             }
+            // Structural signals are computed on the state-group candidate set,
+            // before the inbox narrow, so an item with an open dependency is
+            // still visible to `blocked` / `blocked_by`. Filtering after paging
+            // would silently return a short page. `compute_filter_signals`
+            // batches its lookups in a handful of queries, not one per item,
+            // and skips the expensive display-only annotations (near-duplicates
+            // is O(n^2)) — those are computed below, only for the returned page.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let stale_cutoff = now
+                - req
+                    .staleness_days
+                    .unwrap_or(14)
+                    .max(0)
+                    .saturating_mul(86_400);
+            let claim_ttl_secs = backend_claim_ttl_secs();
+            let filter_signals = compute_filter_signals(conn, &items, now, claim_ttl_secs)?;
+
             // #75: default the filter to the server-derived identity when the
             // caller omits it, so a bare `item(list)` behaves like an inbox
             // (mine + unassigned) instead of dumping every item. An explicit
             // value is still honored — this is a read-only visibility filter,
             // not an authorization boundary, so viewing a teammate's queue is
             // allowed. Falls back to no filter only when identity is undetected.
+            //
+            // Item #371: that implicit inbox used to run before blocking was
+            // known, so any item with an open dependency assigned to another
+            // agent vanished from `list` — including `blocked=true` — while
+            // `search` (no inbox filter) still returned it with `blocked_by`.
+            // The implicit filter keeps those rows. An explicit
+            // `assignee_agent` still narrows to that queue.
             let assignee = req.assignee_agent.clone().or_else(|| self.agent.clone());
+            let implicit_inbox = req.assignee_agent.is_none();
             if let Some(agent) = &assignee {
                 // A claimed item stores the claim owner's raw id
                 // (`<agent>:<instance>`, see `item::claim`), while `self.agent`
@@ -786,10 +814,13 @@ impl AgentflareMcp {
                 // items are always kept.
                 let wanted = agentflare_backend::item::agent_part(agent);
                 items.retain(|i| {
-                    i.assignee_agent
+                    let in_inbox = i
+                        .assignee_agent
                         .as_deref()
                         .map(|a| agentflare_backend::item::agent_part(a) == wanted)
-                        .unwrap_or(true)
+                        .unwrap_or(true);
+                    in_inbox
+                        || (implicit_inbox && filter_signals.get(&i.id).is_some_and(|s| s.blocked))
                 });
                 items.sort_by_key(|i| {
                     let is_open = state_by_id
@@ -804,27 +835,6 @@ impl AgentflareMcp {
                     (!is_open, !is_mine)
                 });
             }
-
-            // Structural filters (unassigned/blocked/has_comments/stale_claim/
-            // unestimated) need to run before pagination — filtering after
-            // paging would silently return a short page. `compute_filter_signals`
-            // batches its lookups over the whole (state_group/assignee-filtered)
-            // set in a handful of queries, not one per item, and deliberately
-            // skips the expensive display-only annotations (near-duplicates is
-            // O(n^2)) that don't gate any filter — those are computed below,
-            // only for the page actually being returned.
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            let stale_cutoff = now
-                - req
-                    .staleness_days
-                    .unwrap_or(14)
-                    .max(0)
-                    .saturating_mul(86_400);
-            let claim_ttl_secs = backend_claim_ttl_secs();
-            let filter_signals = compute_filter_signals(conn, &items, now, claim_ttl_secs)?;
             items.retain(|i| {
                 filter_signals
                     .get(&i.id)

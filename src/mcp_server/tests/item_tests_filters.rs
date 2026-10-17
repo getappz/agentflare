@@ -499,3 +499,154 @@ fn item_list_scopes_possible_duplicates_to_the_returned_page() {
         );
     }
 }
+
+/// Item #371: `list` dropped every item with an open `blocks` dependency.
+/// Repro was a chain A ← B ← C (B depends on A, C depends on B) while B and C
+/// were in progress under other agents. `search` still returned them with
+/// `blocked_by`; `list` (including `blocked=true`) did not. The implicit
+/// inbox filter must not hide those rows. `blocked=true` / `blocked=false`
+/// partition the chain.
+#[test]
+fn item_list_returns_open_dependency_chain_with_blocked_by() {
+    let tmp = tempfile::tempdir().unwrap();
+    let s = AgentflareMcp {
+        backend_db_override: Some(tmp.path().join("backend.db")),
+        backend_project_link_override: Some(tmp.path().join("project.json")),
+        agent: Some("claude-code".into()),
+        ..Default::default()
+    };
+
+    let a: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Chain A"))).unwrap()).unwrap();
+    let b: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Chain B"))).unwrap()).unwrap();
+    let c: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Chain C"))).unwrap()).unwrap();
+    let a_id = a["id"].as_str().unwrap().to_string();
+    let b_id = b["id"].as_str().unwrap().to_string();
+    let c_id = c["id"].as_str().unwrap().to_string();
+
+    for (id, assignee) in [
+        (&a_id, "claude-code"),
+        (&b_id, "opencode"),
+        (&c_id, "cursor"),
+    ] {
+        s.item(Parameters(ItemRequest {
+            action: "update".into(),
+            id: Some(id.clone()),
+            assignee_agent: Some(assignee.into()),
+            ..Default::default()
+        }))
+        .unwrap();
+    }
+
+    let started_state_id = {
+        let conn = backend_conn(&tmp);
+        let project_id = a["project_id"].as_str().unwrap();
+        agentflare_backend::state::list_by_project(&conn, project_id)
+            .unwrap()
+            .into_iter()
+            .find(|st| st.group_name == "started")
+            .unwrap()
+            .id
+    };
+    for id in [&a_id, &b_id, &c_id] {
+        s.item(Parameters(ItemRequest {
+            action: "update_state".into(),
+            id: Some(id.clone()),
+            state_id: Some(started_state_id.clone()),
+            ..Default::default()
+        }))
+        .unwrap();
+    }
+
+    // add_relation id=X related_item_id=Y relation_type=blocks → X depends on Y.
+    s.item(Parameters(ItemRequest {
+        action: "add_relation".into(),
+        id: Some(b_id.clone()),
+        related_item_id: Some(a_id.clone()),
+        relation_type: Some("blocks".into()),
+        ..Default::default()
+    }))
+    .unwrap();
+    s.item(Parameters(ItemRequest {
+        action: "add_relation".into(),
+        id: Some(c_id.clone()),
+        related_item_id: Some(b_id.clone()),
+        relation_type: Some("blocks".into()),
+        ..Default::default()
+    }))
+    .unwrap();
+
+    let listed: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "list".into(),
+            state_group: Some("started".into()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let by_id = |page: &serde_json::Value, id: &str| {
+        page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["id"] == id)
+            .unwrap_or_else(|| panic!("{id} missing from list: {page}"))
+            .clone()
+    };
+    let row_b = by_id(&listed, &b_id);
+    let row_c = by_id(&listed, &c_id);
+    assert_eq!(
+        row_b["blocked_by"].as_array().unwrap().as_slice(),
+        [a["id"].clone()]
+    );
+    assert_eq!(
+        row_c["blocked_by"].as_array().unwrap().as_slice(),
+        [b["id"].clone()]
+    );
+    assert_eq!(by_id(&listed, &a_id)["depended_on_by_count"], 1);
+    assert_eq!(row_b["depended_on_by_count"], 1);
+
+    let blocked: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "list".into(),
+            state_group: Some("started".into()),
+            blocked: Some(true),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let blocked_ids: Vec<&str> = blocked["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(blocked["total"], 2);
+    assert!(blocked_ids.contains(&b_id.as_str()));
+    assert!(blocked_ids.contains(&c_id.as_str()));
+    assert!(!blocked_ids.contains(&a_id.as_str()));
+
+    let unblocked: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "list".into(),
+            state_group: Some("started".into()),
+            blocked: Some(false),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let unblocked_ids: Vec<&str> = unblocked["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].as_str().unwrap())
+        .collect();
+    assert!(unblocked_ids.contains(&a_id.as_str()));
+    assert!(!unblocked_ids.contains(&b_id.as_str()));
+    assert!(!unblocked_ids.contains(&c_id.as_str()));
+}
