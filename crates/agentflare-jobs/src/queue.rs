@@ -404,6 +404,87 @@ impl Queue {
             .collect())
     }
 
+    /// Sweeps every `agent_jobs` row still `state = 'running'` whose own
+    /// `timeout_secs` (plus `grace_secs` slack) has already elapsed since
+    /// `started_at`, and reconciles it exactly like `reconcile_orphaned_running`
+    /// does above (terminal `failed`, log path/bytes persisted, returned so
+    /// the caller can release its item's claim).
+    ///
+    /// Unlike `reconcile_orphaned_running` -- which is only safe to call once,
+    /// right after `open`, because at that point no row can be legitimately
+    /// running yet -- this is safe to call repeatedly for the life of a
+    /// running daemon: a legitimately in-flight `in_process` job's own
+    /// watchdog already fails it the instant its `timeout_secs` elapses (see
+    /// `worker::run_in_process`'s `rx.recv_timeout`), so any row still
+    /// `running` past `timeout_secs + grace_secs` did NOT go through that
+    /// path -- its worker thread must have died first (e.g. panicked)
+    /// without ever reaching it. A daemon restart's boot-time sweep would
+    /// have caught that same row; this catches it without requiring one
+    /// (item #283: a daemon that never restarts had no periodic check at
+    /// all, leaving two items claimed-but-dead for ~16h until a human ran
+    /// `item redispatch`). `grace_secs` absorbs scheduling slack around the
+    /// worker's own timeout so this never races that watchdog and double-fails
+    /// a job that was about to complete on its own.
+    ///
+    /// Re-checks `state = 'running'` in the same `UPDATE` that marks a row
+    /// failed (rather than trusting the earlier `SELECT`), so a row that
+    /// legitimately finished in the gap between the two is left alone instead
+    /// of having its real outcome clobbered.
+    pub fn reconcile_stale_running(
+        &self,
+        grace_secs: i64,
+    ) -> Result<Vec<(String, crate::types::AgentJob)>, Error> {
+        const STALE_ERROR: &str = "orphaned: exceeded its own timeout without ever completing \
+                                    (its worker thread likely died mid-job)";
+        let now = db_kit::ids::now();
+        let conn = self.conn.lock();
+        let rows: Vec<(String, String, i64)> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, payload, started_at FROM agent_jobs
+                 WHERE state = 'running' AND started_at IS NOT NULL",
+            )?;
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut reconciled = Vec::new();
+        for (id, payload, started_at) in rows {
+            let Ok(job) = serde_json::from_str::<crate::types::AgentJob>(&payload) else {
+                continue;
+            };
+            if now < started_at + job.timeout_secs as i64 + grace_secs {
+                continue;
+            }
+            let stdout_path = self.log_dir.join(format!("{id}.stdout"));
+            let stderr_path = self.log_dir.join(format!("{id}.stderr"));
+            let stdout_bytes = std::fs::metadata(&stdout_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let stderr_bytes = std::fs::metadata(&stderr_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let affected = conn.execute(
+                "UPDATE agent_jobs
+                 SET state = 'failed', error = ?1, finished_at = ?2,
+                     stdout_log_path = ?3, stderr_log_path = ?4,
+                     stdout_bytes = ?5, stderr_bytes = ?6
+                 WHERE id = ?7 AND state = 'running'",
+                params![
+                    STALE_ERROR,
+                    now,
+                    stdout_path.to_string_lossy().as_ref(),
+                    stderr_path.to_string_lossy().as_ref(),
+                    stdout_bytes as i64,
+                    stderr_bytes as i64,
+                    id
+                ],
+            )?;
+            if affected > 0 {
+                reconciled.push((id, job));
+            }
+        }
+        Ok(reconciled)
+    }
+
     pub fn list(&self, state_filter: Option<JobState>) -> Result<Vec<JobInfo>, Error> {
         let conn = self.conn.lock();
         let (where_clause, state_val) = match state_filter {
@@ -920,6 +1001,76 @@ mod tests {
         // again for the life of this process, so this row stays running.
         queue.dequeue().unwrap();
         assert_eq!(queue.get(&info.id).unwrap().state, JobState::Running);
+    }
+
+    #[test]
+    fn reconcile_stale_running_reconciles_a_job_past_its_own_timeout_plus_grace() {
+        let (queue, _dir) = test_queue();
+        let job = AgentJob::new("agentflare-work")
+            .args(["item-1", "claude-code"])
+            .in_process()
+            .timeout(60);
+        let info = queue.enqueue(&job).unwrap();
+        queue.dequeue().unwrap();
+
+        // Simulate the job's own timeout + grace having already elapsed
+        // without a real sleep, exactly like the `not_before` tests above.
+        {
+            let conn = queue.conn.lock();
+            conn.execute(
+                "UPDATE agent_jobs SET started_at = ?1 WHERE id = ?2",
+                params![db_kit::ids::now() - 60 - 10 - 1, info.id],
+            )
+            .unwrap();
+        }
+
+        let reconciled = queue.reconcile_stale_running(10).unwrap();
+        assert_eq!(reconciled.len(), 1);
+        assert_eq!(reconciled[0].0, info.id);
+        assert_eq!(reconciled[0].1.args, vec!["item-1", "claude-code"]);
+
+        let stored = queue.get(&info.id).unwrap();
+        assert_eq!(stored.state, JobState::Failed);
+        assert!(stored.finished_at.is_some());
+        assert_eq!(
+            stored.error.as_deref(),
+            Some(
+                "orphaned: exceeded its own timeout without ever completing (its worker thread \
+                 likely died mid-job)"
+            )
+        );
+    }
+
+    #[test]
+    fn reconcile_stale_running_leaves_a_job_still_within_its_timeout_and_grace_alone() {
+        let (queue, _dir) = test_queue();
+        let job = AgentJob::new("agentflare-work")
+            .args(["item-1", "claude-code"])
+            .in_process()
+            .timeout(300);
+        let info = queue.enqueue(&job).unwrap();
+        queue.dequeue().unwrap();
+
+        assert!(queue.reconcile_stale_running(60).unwrap().is_empty());
+        assert_eq!(queue.get(&info.id).unwrap().state, JobState::Running);
+    }
+
+    #[test]
+    fn reconcile_stale_running_leaves_terminal_and_queued_jobs_untouched() {
+        let (queue, _dir) = test_queue();
+        let failed_job = AgentJob::new("true").max_retries(0);
+        let failed_info = queue.enqueue(&failed_job).unwrap();
+        queue.dequeue().unwrap();
+        queue.fail(&failed_info.id, "boom", None, false).unwrap();
+
+        let queued_info = queue.enqueue(&AgentJob::new("true")).unwrap();
+
+        assert!(queue.reconcile_stale_running(0).unwrap().is_empty());
+
+        let failed_stored = queue.get(&failed_info.id).unwrap();
+        assert_eq!(failed_stored.state, JobState::Failed);
+        assert_eq!(failed_stored.error.as_deref(), Some("boom"));
+        assert_eq!(queue.get(&queued_info.id).unwrap().state, JobState::Queued);
     }
 
     #[test]

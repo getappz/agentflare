@@ -160,6 +160,11 @@ const SUPERVISOR_TELEGRAM_POLL_INTERVAL: std::time::Duration = std::time::Durati
 /// running in-process via the daemon's stale, already-loaded job logic
 /// before self-restarting (item #68).
 const BINARY_STALENESS_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Cadence for `spawn_stale_job_watchdog`: a cheap SELECT over `running`
+/// rows, catching a job whose worker died on a live daemon (item #283).
+const STALE_JOB_WATCHDOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+/// Slack past a job's own `timeout_secs`; see `Queue::reconcile_stale_running`.
+const STALE_JOB_WATCHDOG_GRACE_SECS: i64 = 60;
 
 /// Runs for the lifetime of the process (like `snapshot_broadcaster`'s
 /// producer task): wakes on `JOB_CLEANUP_INTERVAL`, deletes finished jobs
@@ -178,6 +183,29 @@ fn spawn_job_cleanup(queue: agentflare_jobs::Queue) {
                 Ok(Ok(deleted)) => eprintln!("agentflare-jobs: cleaned up {deleted} old job(s)"),
                 Ok(Err(e)) => eprintln!("agentflare-jobs: cleanup failed: {e}"),
                 Err(e) => eprintln!("agentflare-jobs: cleanup task panicked: {e}"),
+            }
+        }
+    });
+}
+
+/// Wakes on `STALE_JOB_WATCHDOG_INTERVAL` and reconciles `running` rows well
+/// past their own `timeout_secs` -- the periodic counterpart to the boot-only
+/// `reconcile_orphaned_jobs` (item #283). Blocking work runs in `spawn_blocking`.
+fn spawn_stale_job_watchdog(queue: agentflare_jobs::Queue) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(STALE_JOB_WATCHDOG_INTERVAL);
+        loop {
+            ticker.tick().await;
+            let queue = queue.clone();
+            if let Err(e) = tokio::task::spawn_blocking(move || {
+                super::orphan_reconcile::reconcile_stale_running_jobs(
+                    &queue,
+                    STALE_JOB_WATCHDOG_GRACE_SECS,
+                );
+            })
+            .await
+            {
+                eprintln!("agentflare-jobs: stale-running watchdog task panicked: {e}");
             }
         }
     });
@@ -851,6 +879,7 @@ pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {
     spawn_binary_staleness_watchdog(crate::daemon::BinarySnapshot::capture());
     spawn_schedule_ticker();
     spawn_job_cleanup(queue.clone());
+    spawn_stale_job_watchdog(queue.clone());
 
     let listener = tokio::net::TcpListener::bind((host, port))
         .await

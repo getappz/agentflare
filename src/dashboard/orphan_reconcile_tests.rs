@@ -242,6 +242,100 @@
         });
     }
 
+    /// Item #283: same shape as the boot-sweep test above, but the daemon
+    /// never restarts -- the job's worker thread just died mid-job and the
+    /// row sat `running` past its own timeout. The periodic
+    /// `reconcile_stale_running_jobs` must release the claim and relabel the
+    /// item `ready-for-work` so discovery picks it up again on its own.
+    #[test]
+    fn reconcile_stale_running_jobs_releases_the_dead_jobs_item_claim() {
+        crate::paths::test_support::with_temp_home(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo_root).unwrap();
+            init_test_repo(&repo_root);
+
+            let mcp = crate::mcp_server::AgentflareMcp::for_project_dir(repo_root.clone());
+            let label_ids = seed_labels(
+                &mcp,
+                &[
+                    crate::supervisor::READY_LABEL,
+                    crate::supervisor::DISPATCHED_LABEL,
+                ],
+            );
+            let item_id = create_dispatched_item(&mcp, &label_ids[crate::supervisor::DISPATCHED_LABEL]);
+
+            // `.timeout(0)` + grace 0 so the row is stale the instant it is
+            // dequeued -- no real sleep needed.
+            let job = agentflare_jobs::AgentJob::new("agentflare-work")
+                .args([
+                    item_id.clone(),
+                    "claude-code".to_string(),
+                    repo_root.to_string_lossy().to_string(),
+                ])
+                .in_process()
+                .timeout(0);
+            let queue = test_queue();
+            let info = queue.enqueue(&job).unwrap();
+            crate::claims::with_owner_override(format!("claude-code:{}", info.id), || {
+                let claim_json = mcp
+                    .item_claim(crate::mcp_server::types::ItemRequest {
+                        action: "claim".to_string(),
+                        id: Some(item_id.clone()),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                let claim: serde_json::Value = serde_json::from_str(&claim_json).unwrap();
+                assert_eq!(claim["status"], "acquired");
+            });
+            queue.dequeue().unwrap();
+
+            reconcile_stale_running_jobs(&queue, 0);
+
+            let reconciled = queue.get(&info.id).unwrap();
+            assert_eq!(reconciled.state, JobState::Failed);
+            assert!(
+                reconciled
+                    .error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("exceeded its own timeout"),
+                "{:?}",
+                reconciled.error
+            );
+
+            let reclaim_json =
+                crate::claims::with_owner_override("claude-code:a-fresh-instance", || {
+                    mcp.item_claim(crate::mcp_server::types::ItemRequest {
+                        action: "claim".to_string(),
+                        id: Some(item_id.clone()),
+                        ..Default::default()
+                    })
+                    .unwrap()
+                });
+            let reclaim: serde_json::Value = serde_json::from_str(&reclaim_json).unwrap();
+            assert_eq!(
+                reclaim["status"], "acquired",
+                "stale job's claim must be released so the item is re-claimable: {reclaim}"
+            );
+
+            let labels = mcp
+                .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id))
+                .unwrap()
+                .unwrap();
+            assert!(
+                labels.contains(&label_ids[crate::supervisor::READY_LABEL]),
+                "item must be back on ready-for-work: {labels:?}"
+            );
+            assert!(!labels.contains(&label_ids[crate::supervisor::DISPATCHED_LABEL]));
+            let comments = mcp
+                .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &item_id))
+                .unwrap()
+                .unwrap();
+            assert!(comments.iter().any(|c| c.body.contains("worker thread died mid-job")));
+        });
+    }
+
     /// Items #185/#187: `reconcile_orphaned_jobs`'s earlier release (via
     /// `release_and_comment` under `with_owner_override`) is best-effort
     /// (`let _ = ...`) -- if it silently doesn't take, `restore_ready_for_work`
