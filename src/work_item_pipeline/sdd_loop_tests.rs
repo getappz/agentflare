@@ -1,6 +1,322 @@
 use super::sdd_test_support::*;
 use super::*;
 
+#[test]
+fn empty_completion_preserves_existing_reviewer_findings() {
+    let (_mcp, _backend, _repo, _item, _project, worktree) =
+        crate::mcp_server::tests::mcp_with_claimed_item("Keep completion findings");
+    let mut data = one_task_data();
+    data.worktree_path = worktree.to_string_lossy().into_owned();
+    data.review_issues = Some("Missing required cancellation handling.".into());
+    let mut ctx = WorkflowContext::new(Default::default(), data);
+    assert!(retry_empty_completion(&mut ctx).is_some());
+    let findings = ctx.data.review_issues.as_deref().unwrap();
+    assert!(findings.contains("Missing required cancellation handling."));
+    assert!(findings.contains("no committed changes"));
+}
+
+#[test]
+fn target_patch_during_judging_is_applied_before_completion() {
+    crate::paths::test_support::with_temp_home(|| {
+        crate::workflow::blocking_runtime().block_on(async {
+            let (_mcp, _backend, _repo, _item, _project, worktree) =
+                crate::mcp_server::tests::mcp_with_claimed_item("Judge target adoption");
+            let mut data = one_task_data();
+            data.worktree_path = worktree.to_string_lossy().into_owned();
+            data.target_branch = "master".into();
+            std::fs::write(worktree.join("prior.txt"), "parent work").unwrap();
+            checkpoint_implementer_turn(&mut data, 0).unwrap();
+            assert!(flare_git_core::shell::run_in_ok(
+                &worktree,
+                &["branch", "parent-task", "HEAD"]
+            ));
+            data.last_report = Some("Prior implementation.".into());
+            let hang_send: flare_workflow::json::SendMessage =
+                std::sync::Arc::new(|_| Box::pin(std::future::pending()));
+            let eng = engine();
+            eng.register_workflow(
+                flare_workflow::WorkflowDefinition::new(WORKFLOW_ID, "judge adoption")
+                    .add_step(build_sdd_loop_step(hang_send)),
+            )
+            .unwrap();
+            let run_id = eng
+                .start_workflow(WorkflowId::new(WORKFLOW_ID), data, String::new())
+                .await
+                .unwrap();
+            let mut ctx = eng.get_status(run_id).await.unwrap().context;
+            let send: flare_workflow::json::SendMessage = std::sync::Arc::new(move |inv| {
+                Box::pin(async move {
+                    let reply = if inv.prompt.contains("You are the judge") {
+                        engine()
+                            .patch_run_data(run_id, |data: &mut WorkItemData| {
+                                data.target_branch = "parent-task".into();
+                            })
+                            .await
+                            .unwrap();
+                        r#"{"action":"complete_pipeline","rationale":"done","ledger_line":"done"}"#
+                    } else {
+                        "REVIEW_APPROVED"
+                    };
+                    Ok((reply.to_string(), 0, 0))
+                })
+            });
+            sdd_step(send).executor.execute(&mut ctx).await.unwrap();
+            assert_eq!(ctx.data.target_branch, "parent-task");
+            assert_eq!(ctx.output, "CONTINUE");
+        });
+    });
+}
+
+#[tokio::test]
+async fn no_change_completion_returns_to_implementer_instead_of_finalizing() {
+    for action in ["complete_pipeline", "advance_task", "skip_task"] {
+        let (_mcp, _backend, _repo, _item, _project, worktree) =
+            crate::mcp_server::tests::mcp_with_claimed_item("No-change completion");
+        let decision: &'static str = match action {
+            "advance_task" => {
+                r#"{"action":"advance_task","rationale":"tests pass","ledger_line":"complete"}"#
+            }
+            "skip_task" => {
+                r#"{"action":"skip_task","rationale":"already done","ledger_line":"skipped"}"#
+            }
+            _ => {
+                r#"{"action":"complete_pipeline","rationale":"tests pass","ledger_line":"complete"}"#
+            }
+        };
+        let (send, calls) = mock_send(vec![
+            "Existing tests pass; no files changed.",
+            decision,
+            "Implemented the missing behavior.",
+            r#"{"action":"complete_pipeline","rationale":"implemented","ledger_line":"complete"}"#,
+            "REVIEW_APPROVED",
+            r#"{"action":"complete_pipeline","rationale":"reviewed","ledger_line":"complete"}"#,
+        ]);
+        let mut data = one_task_data();
+        data.worktree_path = worktree.to_string_lossy().into_owned();
+        let step = sdd_step(send);
+        let mut ctx = WorkflowContext::new(Default::default(), data);
+        let result = step.executor.execute(&mut ctx).await.unwrap();
+        assert!(matches!(result, StepResult::Success));
+        assert_eq!(
+            ctx.output, "CONTINUE",
+            "{action} must not finish an empty branch"
+        );
+        assert_eq!(ctx.data.current_task_index, 0);
+        assert_eq!(ctx.data.fix_round, 1);
+        assert!(ctx.data.last_report.is_none());
+        assert!(
+            ctx.data
+                .review_issues
+                .as_deref()
+                .unwrap()
+                .contains("no committed changes")
+        );
+
+        std::fs::write(worktree.join("implemented.txt"), "real implementation").unwrap();
+        step.executor.execute(&mut ctx).await.unwrap();
+        assert_eq!(
+            ctx.output, "CONTINUE",
+            "the correction still requires review"
+        );
+        step.executor.execute(&mut ctx).await.unwrap();
+        assert_eq!(ctx.output, "PIPELINE_COMPLETE");
+        assert!(ctx.data.review_issues.is_none());
+        assert!(calls.lock().unwrap()[2].1.contains("no committed changes"));
+    }
+}
+
+#[tokio::test]
+async fn preexisting_changes_count_only_against_the_actual_target() {
+    for parent_target in [false, true] {
+        let (_mcp, _backend, _repo, _item, _project, worktree) =
+            crate::mcp_server::tests::mcp_with_claimed_item("Completion target evidence");
+        let mut data = one_task_data();
+        data.worktree_path = worktree.to_string_lossy().into_owned();
+        std::fs::write(worktree.join("prior_work.txt"), "prior attempt").unwrap();
+        checkpoint_implementer_turn(&mut data, 0).unwrap();
+        if parent_target {
+            assert!(flare_git_core::shell::run_in_ok(
+                &worktree,
+                &["branch", "parent-task", "HEAD"]
+            ));
+            data.target_branch = "parent-task".into();
+        }
+        data.last_report = Some("Prior attempt implemented this.".into());
+        let (send, _) = mock_send(vec![
+            "REVIEW_APPROVED",
+            r#"{"action":"complete_pipeline","rationale":"verified","ledger_line":"complete"}"#,
+        ]);
+        let mut ctx = WorkflowContext::new(Default::default(), data);
+        sdd_step(send).executor.execute(&mut ctx).await.unwrap();
+        assert_eq!(ctx.output == "PIPELINE_COMPLETE", !parent_target);
+    }
+}
+
+#[tokio::test]
+async fn exhausted_legacy_task_list_cannot_complete_an_empty_branch() {
+    let (_mcp, _backend, _repo, _item, _project, worktree) =
+        crate::mcp_server::tests::mcp_with_claimed_item("Recovered empty completion");
+    let (send, calls) = mock_send(vec![]);
+    let mut data = one_task_data();
+    data.worktree_path = worktree.to_string_lossy().into_owned();
+    data.current_task_index = data.tasks.len();
+    let mut ctx = WorkflowContext::new(Default::default(), data);
+    sdd_step(send).executor.execute(&mut ctx).await.unwrap();
+    assert_eq!(ctx.output, "CONTINUE");
+    assert_eq!(ctx.data.current_task_index, 0);
+    assert!(calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn repeated_no_change_completion_uses_the_existing_fix_round_cap() {
+    let (_mcp, _backend, _repo, _item, _project, worktree) =
+        crate::mcp_server::tests::mcp_with_claimed_item("Bound no-change completion");
+    let replies = (0..=MAX_FIX_ROUNDS)
+        .flat_map(|_| {
+            [
+                "No changes needed.",
+                r#"{"action":"complete_pipeline","rationale":"done","ledger_line":"complete"}"#,
+            ]
+        })
+        .collect();
+    let (send, _) = mock_send(replies);
+    let mut data = one_task_data();
+    data.worktree_path = worktree.to_string_lossy().into_owned();
+    let step = sdd_step(send);
+    let mut ctx = WorkflowContext::new(Default::default(), data);
+    for _ in 0..MAX_FIX_ROUNDS {
+        assert!(matches!(
+            step.executor.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        ));
+        assert_ne!(ctx.output, "PIPELINE_COMPLETE");
+    }
+    assert!(matches!(
+        step.executor.execute(&mut ctx).await.unwrap(),
+        StepResult::Failed(_)
+    ));
+}
+
+#[tokio::test]
+async fn no_change_review_can_finish_but_design_spec_requires_a_deliverable() {
+    for design_spec in [false, true] {
+        let (_mcp, _backend, _repo, _item, _project, worktree) =
+            crate::mcp_server::tests::mcp_with_claimed_item("Review completion");
+        let (send, _) = mock_send(vec![
+            "Findings: no issue.",
+            r#"{"action":"complete_pipeline","rationale":"done","ledger_line":"complete"}"#,
+        ]);
+        let mut data = one_task_data();
+        data.review_only = true;
+        data.design_spec = design_spec;
+        data.worktree_path = worktree.to_string_lossy().into_owned();
+        let mut ctx = WorkflowContext::new(Default::default(), data);
+        sdd_step(send).executor.execute(&mut ctx).await.unwrap();
+        assert_eq!(ctx.output == "PIPELINE_COMPLETE", !design_spec);
+    }
+}
+
+#[tokio::test]
+async fn design_spec_document_is_checkpointed_before_completion() {
+    let (_mcp, _backend, _repo, _item, _project, worktree) =
+        crate::mcp_server::tests::mcp_with_claimed_item("Written design deliverable");
+    let mut data = one_task_data();
+    data.review_only = true;
+    data.design_spec = true;
+    data.worktree_path = worktree.to_string_lossy().into_owned();
+    let document = worktree.join("design.md");
+    let send: flare_workflow::json::SendMessage = std::sync::Arc::new(move |inv| {
+        let document = document.clone();
+        Box::pin(async move {
+            let reply = if inv.prompt.contains("You are the judge") {
+                r#"{"action":"complete_pipeline","rationale":"written","ledger_line":"complete"}"#
+            } else {
+                std::fs::write(document, "# Delivered design").unwrap();
+                "Wrote design.md."
+            };
+            Ok((reply.to_string(), 0, 0))
+        })
+    });
+    let mut ctx = WorkflowContext::new(Default::default(), data);
+    sdd_step(send).executor.execute(&mut ctx).await.unwrap();
+    assert_eq!(ctx.output, "PIPELINE_COMPLETE");
+    assert!(flare_git_core::worktree::branch_diverged(
+        &worktree, "HEAD", "master"
+    ));
+}
+
+#[tokio::test]
+async fn terminal_findings_complete_pipeline() {
+    assert_terminal_findings_flow("complete_pipeline").await;
+}
+
+#[tokio::test]
+async fn terminal_findings_advance_task() {
+    assert_terminal_findings_flow("advance_task").await;
+}
+
+#[tokio::test]
+async fn terminal_findings_skip_task() {
+    assert_terminal_findings_flow("skip_task").await;
+}
+
+async fn assert_terminal_findings_flow(action: &str) {
+    for fix_round in [0, MAX_FIX_ROUNDS] {
+        let (_mcp, _backend, _repo, _item, _project, worktree) =
+            crate::mcp_server::tests::mcp_with_claimed_item("Unresolved completion review");
+        let mut data = one_task_data();
+        data.worktree_path = worktree.to_string_lossy().into_owned();
+        std::fs::write(worktree.join("work.txt"), "partial implementation").unwrap();
+        checkpoint_implementer_turn(&mut data, 0).unwrap();
+        data.last_report = Some("Implemented.".into());
+        data.fix_round = fix_round;
+        let decision = match action {
+            "advance_task" => {
+                r#"{"action":"advance_task","rationale":"stop","ledger_line":"stop"}"#
+            }
+            "skip_task" => r#"{"action":"skip_task","rationale":"stop","ledger_line":"stop"}"#,
+            _ => r#"{"action":"complete_pipeline","rationale":"stop","ledger_line":"stop"}"#,
+        };
+        let (send, calls) = mock_send(vec![
+            "REVIEW_ISSUES: missing required behavior",
+            decision,
+            "Fixed the required behavior.",
+            decision,
+            "REVIEW_APPROVED",
+            decision,
+        ]);
+        let mut ctx = WorkflowContext::new(Default::default(), data);
+        let step = sdd_step(send);
+        step.executor.execute(&mut ctx).await.unwrap();
+        assert_eq!(
+            ctx.output == "PIPELINE_COMPLETE",
+            fix_round == MAX_FIX_ROUNDS
+        );
+        assert_eq!(
+            ctx.data.review_issues.as_deref(),
+            Some("missing required behavior")
+        );
+        assert_eq!(ctx.data.current_task_index, 0);
+        if fix_round < MAX_FIX_ROUNDS {
+            assert_eq!(ctx.data.fix_round, fix_round + 1);
+            step.executor.execute(&mut ctx).await.unwrap();
+            assert_eq!(ctx.output, "CONTINUE", "the fix still needs review");
+            assert!(
+                calls.lock().unwrap()[2]
+                    .1
+                    .contains("missing required behavior")
+            );
+            step.executor.execute(&mut ctx).await.unwrap();
+            if action != "complete_pipeline" {
+                assert_eq!(ctx.output, "CONTINUE");
+                step.executor.execute(&mut ctx).await.unwrap();
+            }
+            assert_eq!(ctx.output, "PIPELINE_COMPLETE");
+            assert!(ctx.data.review_issues.is_none());
+        }
+    }
+}
+
 #[tokio::test]
 async fn first_iteration_dispatches_implementer_then_judge() {
     let (send, calls) = mock_send(vec![

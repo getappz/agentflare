@@ -379,7 +379,7 @@ mod tests {
         {
             let cursor = std::io::Cursor::new(&mut buf);
             let mut writer = zip::ZipWriter::new(cursor);
-            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            let opts = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             for (path, body) in files {
                 writer.start_file(*path, opts).unwrap();
