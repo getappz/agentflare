@@ -22,6 +22,14 @@ pub struct StaleRule {
     pub path: PathBuf,
 }
 
+/// An agentflare hook whose baked binary path is not the running executable.
+#[derive(Debug, Serialize)]
+pub struct StaleHook {
+    pub host: String,
+    pub path: PathBuf,
+    pub command: String,
+}
+
 pub(crate) fn check_host(host: &str) -> Vec<CheckResult> {
     get_components(host)
         .into_iter()
@@ -166,6 +174,121 @@ fn transport_describe() -> String {
     describe
 }
 
+/// First token of a hook command, respecting a leading double-quoted path.
+fn command_binary(command: &str) -> Option<&str> {
+    let command = command.trim();
+    if let Some(rest) = command.strip_prefix('"') {
+        let end = rest.find('"')?;
+        let bin = &rest[..end];
+        return (!bin.is_empty()).then_some(bin);
+    }
+    let token = command.split_whitespace().next()?;
+    (!token.is_empty()).then_some(token)
+}
+
+fn is_agentflare_binary(bin: &str) -> bool {
+    matches!(
+        std::path::Path::new(bin)
+            .file_name()
+            .and_then(|n| n.to_str()),
+        Some("agentflare" | "agentflare.exe")
+    )
+}
+
+/// A bare `agentflare` resolves through PATH at hook time. A path (absolute
+/// or with a directory component) was baked by init and can go stale.
+fn is_baked_binary_path(bin: &str) -> bool {
+    let path = std::path::Path::new(bin);
+    path.is_absolute() || path.components().count() > 1
+}
+
+fn same_executable(hook: &std::path::Path, current: &std::path::Path) -> bool {
+    if hook == current {
+        return true;
+    }
+    match (std::fs::canonicalize(hook), std::fs::canonicalize(current)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// True when `command` invokes agentflare by a baked path that does not
+/// resolve to `current_exe`.
+pub(crate) fn hook_binary_is_stale(command: &str, current_exe: &std::path::Path) -> bool {
+    let Some(bin) = command_binary(command) else {
+        return false;
+    };
+    if !is_agentflare_binary(bin) || !is_baked_binary_path(bin) {
+        return false;
+    }
+    !same_executable(std::path::Path::new(bin), current_exe)
+}
+
+fn collect_commands(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(cmd) = map.get("command").and_then(serde_json::Value::as_str) {
+                out.push(cmd.to_string());
+            }
+            for child in map.values() {
+                collect_commands(child, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                collect_commands(child, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn stale_hooks_in(
+    host: &str,
+    path: &std::path::Path,
+    current_exe: &std::path::Path,
+) -> Vec<StaleHook> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    let mut commands = Vec::new();
+    collect_commands(&value, &mut commands);
+    commands
+        .into_iter()
+        .filter(|command| hook_binary_is_stale(command, current_exe))
+        .map(|command| StaleHook {
+            host: host.to_string(),
+            path: path.to_path_buf(),
+            command,
+        })
+        .collect()
+}
+
+fn hook_config_files() -> Vec<(&'static str, PathBuf)> {
+    let mut files = vec![
+        ("claude-code", crate::paths::claude_settings_path()),
+        (
+            "codex",
+            crate::paths::home().join(".codex").join("hooks.json"),
+        ),
+    ];
+    if let Ok(cwd) = std::env::current_dir() {
+        files.push(("cursor", cwd.join(".cursor").join("hooks.json")));
+    }
+    files
+}
+
+/// Wired hook commands whose binary path is not `current_exe`.
+pub(crate) fn stale_hook_binaries(current_exe: &std::path::Path) -> Vec<StaleHook> {
+    hook_config_files()
+        .into_iter()
+        .flat_map(|(host, path)| stale_hooks_in(host, &path, current_exe))
+        .collect()
+}
+
 pub(crate) fn stale_rules_for_host(host: &str) -> Vec<StaleRule> {
     rule_targets(host)
         .into_iter()
@@ -209,6 +332,8 @@ pub fn run(agent: Option<&str>, json: bool) {
         checks.extend(check_host(host));
         stale.extend(stale_rules_for_host(host));
     }
+    let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("agentflare"));
+    let stale_hooks = stale_hook_binaries(&current_exe);
 
     // Not a coding-agent host like the others in `hosts` -- appended after
     // so the per-agent loop above (which calls `get_components`/
@@ -226,13 +351,15 @@ pub fn run(agent: Option<&str>, json: bool) {
     // Advisory only: never part of `healthy`, so an unset name cannot make
     // `doctor` exit non-zero.
     let machine_name = crate::github::bridge::config::read_machine_name();
-    let healthy = checks.iter().all(|r| r.ok) && stale.is_empty() && mbx.ok();
+    let healthy =
+        checks.iter().all(|r| r.ok) && stale.is_empty() && stale_hooks.is_empty() && mbx.ok();
 
     if json {
         #[derive(Serialize)]
         struct Report<'a> {
             checks: &'a [CheckResult],
             stale_rules: &'a [StaleRule],
+            stale_hooks: &'a [StaleHook],
             mbx: &'a crate::mbx::MbxStatus,
             machine_name: Option<&'a str>,
             healthy: bool,
@@ -242,6 +369,7 @@ pub fn run(agent: Option<&str>, json: bool) {
             serde_json::to_string_pretty(&Report {
                 checks: &checks,
                 stale_rules: &stale,
+                stale_hooks: &stale_hooks,
                 mbx: &mbx,
                 machine_name: machine_name.as_deref(),
                 healthy,
@@ -257,9 +385,12 @@ pub fn run(agent: Option<&str>, json: bool) {
             let host_checks: Vec<&CheckResult> =
                 checks.iter().filter(|r| &r.host == host).collect();
             let host_stale: Vec<&StaleRule> = stale.iter().filter(|s| &s.host == host).collect();
+            let host_hooks: Vec<&StaleHook> =
+                stale_hooks.iter().filter(|s| &s.host == host).collect();
             let host_ok = host_checks.iter().filter(|r| r.ok).count();
             let host_total = host_checks.len();
-            let host_healthy = host_ok == host_total && host_stale.is_empty();
+            let host_healthy =
+                host_ok == host_total && host_stale.is_empty() && host_hooks.is_empty();
             let mark = if host_healthy { "✓" } else { "✗" };
 
             println!("{mark} {host:16} {host_ok}/{host_total} ok");
@@ -269,6 +400,20 @@ pub fn run(agent: Option<&str>, json: bool) {
             for s in &host_stale {
                 println!("    ⚠ stale rule: {}", s.path.display());
             }
+            for h in &host_hooks {
+                println!("    ⚠ stale hook binary: {}", h.command);
+            }
+        }
+        for h in stale_hooks
+            .iter()
+            .filter(|h| !display_hosts.iter().any(|host| host == &h.host))
+        {
+            println!(
+                "⚠ {} stale hook binary: {} ({})",
+                h.host,
+                h.command,
+                h.path.display()
+            );
         }
 
         println!("{}", mbx.format_text());
@@ -369,6 +514,65 @@ mod tests {
                 std::fs::write(&path, content).unwrap();
             }
             assert!(stale_rules_for_host("claude-code").is_empty());
+        });
+    }
+
+    #[test]
+    fn stale_hooks_in_flags_a_baked_path_that_is_not_the_current_executable() {
+        with_temp_home(|| {
+            let path = crate::paths::claude_settings_path();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let current = std::env::current_exe().unwrap();
+            std::fs::write(
+                &path,
+                serde_json::json!({
+                    "hooks": {
+                        "SessionStart": [{ "hooks": [
+                            { "command": "\"/old/1.7.0/agentflare\" optimize code hook session-start" },
+                            { "command": "\"agentflare\" hook session-start --agent claude-code" }
+                        ] }],
+                        "UserPromptSubmit": [{ "hooks": [
+                            { "command": "unrelated-tool --flag" }
+                        ] }]
+                    },
+                    "statusLine": {
+                        "type": "command",
+                        "command": format!("\"{}\" optimize code hook statusline", current.display())
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+            let stale = stale_hooks_in("claude-code", &path, &current);
+            assert_eq!(stale.len(), 1, "{stale:?}");
+            assert!(stale[0].command.contains("/old/1.7.0/agentflare"));
+
+            std::fs::write(
+                &path,
+                serde_json::json!({
+                    "hooks": {
+                        "SessionStart": [{ "hooks": [{
+                            "command": format!("\"{}\" optimize code hook session-start", current.display())
+                        }] }]
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+            assert!(stale_hooks_in("claude-code", &path, &current).is_empty());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_binary_is_stale_treats_a_symlink_to_the_current_executable_as_current() {
+        with_temp_home(|| {
+            let current = std::env::current_exe().unwrap();
+            let link = crate::paths::home().join("agentflare");
+            std::os::unix::fs::symlink(&current, &link).unwrap();
+            let command = format!("\"{}\" optimize code hook prompt-submit", link.display());
+            assert!(!hook_binary_is_stale(&command, &current));
         });
     }
 }
