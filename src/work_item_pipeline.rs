@@ -173,6 +173,9 @@ pub(crate) struct WorkItemData {
     /// back to ambient cwd in that case.
     #[serde(default)]
     pub worktree_path: String,
+    /// Actual PR target, including a parent task branch; old runs resolve the default.
+    #[serde(default)]
+    pub target_branch: String,
     /// SHA captured before the SDD loop's first checkpoint commit (item
     /// #193). `finalize` squashes back to this point before its own
     /// auto-commit, so the LOC-freeze gate sees one commit, not per-turn
@@ -431,6 +434,38 @@ fn checkpoint_implementer_turn(data: &mut WorkItemData, task_id: usize) -> Resul
     Ok(())
 }
 
+/// Catch empty implementation claims before finalization discards the run's context.
+fn retry_empty_completion(ctx: &mut WorkflowContext<WorkItemData>) -> Option<StepResult> {
+    if (ctx.data.review_only && !ctx.data.design_spec) || ctx.data.worktree_path.is_empty() {
+        return None;
+    }
+    let path = std::path::Path::new(&ctx.data.worktree_path);
+    let target = if ctx.data.target_branch.is_empty() {
+        flare_git_core::branch::resolve_default_branch(path)
+    } else {
+        ctx.data.target_branch.clone()
+    };
+    if flare_git_core::worktree::branch_diverged(path, "HEAD", &target) {
+        return None;
+    }
+    let reason = format!(
+        "Completion refused: no committed changes relative to {target}. Passing tests on unchanged \
+         code is not an implementation deliverable. Implement the requested scope and referenced \
+         requirements, run the relevant checks, and report the actual changes. If blocked, explain \
+         the blocker instead of claiming completion."
+    );
+    ctx.data.fix_round += 1;
+    if ctx.data.fix_round > MAX_FIX_ROUNDS || ctx.data.tasks.is_empty() {
+        return Some(StepResult::Failed(reason));
+    }
+    ctx.data.current_task_index = ctx.data.current_task_index.min(ctx.data.tasks.len() - 1);
+    ctx.data.review_issues = Some(reason.clone());
+    ctx.data.last_report = None;
+    ctx.data.ledger.push(reason);
+    ctx.output = "CONTINUE".to_string();
+    Some(StepResult::Success)
+}
+
 pub(crate) fn build_sdd_loop_step(
     send: flare_workflow::json::SendMessage,
 ) -> StepDefinition<WorkItemData> {
@@ -446,6 +481,9 @@ pub(crate) fn build_sdd_loop_step(
                 }
                 if ctx.data.tasks.is_empty() || ctx.data.current_task_index >= ctx.data.tasks.len()
                 {
+                    if let Some(result) = retry_empty_completion(ctx) {
+                        return Ok(result);
+                    }
                     ctx.data.reply_text =
                         synthesize_reply_text(ctx.data.last_report.as_deref(), &ctx.data.ledger);
                     ctx.output = SDD_PIPELINE_COMPLETE_MARKER.to_string();
@@ -632,7 +670,9 @@ pub(crate) fn build_sdd_loop_step(
                 ctx.input_tokens += in_tok;
                 ctx.output_tokens += out_tok;
 
-                if is_implementer_turn
+                let writes_deliverable = is_implementer_turn
+                    || matches!(role_kind, SddRole::Analyst { design_spec: true });
+                if writes_deliverable
                     && let Err(message) = checkpoint_implementer_turn(&mut ctx.data, task.id)
                 {
                     // `Failed`, not `Err`: retrying the step would re-run the
@@ -750,6 +790,27 @@ pub(crate) fn build_sdd_loop_step(
                     ctx.data.design_spec,
                     decision.action,
                 );
+
+                // A judge's prose cannot override the same Git evidence finalize requires.
+                let finishes_plan = decision.action == JudgeAction::CompletePipeline
+                    || (matches!(
+                        decision.action,
+                        JudgeAction::AdvanceTask | JudgeAction::SkipTask
+                    ) && ctx.data.current_task_index + 1 == ctx.data.tasks.len());
+                if finishes_plan && let Some(result) = retry_empty_completion(ctx) {
+                    return Ok(result);
+                }
+
+                if finishes_plan && ctx.data.review_issues.is_some() {
+                    if ctx.data.last_report.is_some() {
+                        ctx.output = "CONTINUE".to_string();
+                    } else {
+                        // Keep findings for finalize's manual-review path, including last-task skip/advance.
+                        ctx.data.reply_text = synthesize_reply_text(None, &ctx.data.ledger);
+                        ctx.output = SDD_PIPELINE_COMPLETE_MARKER.to_string();
+                    }
+                    return Ok(StepResult::Success);
+                }
 
                 // 3. Apply the decision.
                 ctx.data.ledger.push(decision.ledger_line.clone());
@@ -1194,6 +1255,10 @@ pub(crate) fn run_or_resume_with_sender(
     // prompt built from those tasks inherits the framing.
     let item_description = crate::cli::work::wrap_if_external(item, &item_description);
 
+    let repo_root = mcp.worktree_repo_root();
+    let target_branch = mcp
+        .with_backend_db(|conn| crate::worktree::resolve_target_branch(conn, item, &repo_root))
+        .map_err(|e| e.to_string())?;
     let existing_metadata: serde_json::Value = serde_json::from_str(&item.metadata)
         .unwrap_or(serde_json::Value::Object(Default::default()));
     let existing_run_id = existing_metadata["workflow_run_id"]
@@ -1252,6 +1317,7 @@ pub(crate) fn run_or_resume_with_sender(
             tdd,
             verify_against_ci,
             worktree_path: worktree_path.clone(),
+            target_branch: target_branch.clone(),
             // A resumed run (the other arm below) keeps its own persisted
             // cursor instead of going through `fresh_data()`. A genuinely
             // fresh dispatch reads the item-level cursor `persist_comment_
@@ -1312,7 +1378,10 @@ pub(crate) fn run_or_resume_with_sender(
                 // still running in this same live process, or left behind
                 // by a process that died. Never start a second run against
                 // it — adopt it (see `adopt_existing_run`) and await it.
-                adopt_existing_run(eng, &mcp, &item.id, run_id, &state, &owner, &tasks).await?;
+                adopt_existing_run(
+                    eng, &mcp, &item.id, run_id, &state, &owner, (&tasks, &target_branch),
+                )
+                .await?;
                 run_id
             }
             _ => {
@@ -1502,12 +1571,14 @@ async fn adopt_existing_run(
     run_id: flare_workflow::WorkflowRunId,
     state: &flare_workflow::WorkflowState<WorkItemData>,
     owner: &str,
-    incoming_tasks: &[SddTask],
+    incoming_plan: (&[SddTask], &str),
 ) -> Result<(), String> {
+    let (incoming_tasks, target_branch) = incoming_plan;
     let repair_dispatch = latest_repair_dispatch_body(mcp, item_id);
     let owner_changed = state.context.data.owner != owner;
     let repair_redispatch = repair_dispatch.is_some();
-    if owner_changed || repair_redispatch {
+    let target_changed = state.context.data.target_branch != target_branch;
+    if owner_changed || repair_redispatch || target_changed {
         if owner_changed {
             eprintln!(
                 "work_item_pipeline: rebinding run {run_id}'s claim owner {:?} -> {owner:?}",
@@ -1520,8 +1591,10 @@ async fn adopt_existing_run(
             );
         }
         let new_owner = owner.to_string();
+        let target_branch = target_branch.to_string();
         eng.patch_run_data(run_id, move |data: &mut WorkItemData| {
             data.owner = new_owner.clone();
+            data.target_branch = target_branch.clone();
         })
         .await
         .map_err(|e| e.to_string())?;

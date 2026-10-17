@@ -130,9 +130,15 @@ fn adopt_existing_run_injects_repair_findings_into_task_prompt() {
                 run_id,
                 &state,
                 &next_owner,
-                &incoming_tasks,
+                (&incoming_tasks, "master"),
             ))
             .unwrap();
+
+        let mut stale_data = state.context.data.clone();
+        stale_data.target_branch = "stale-target".into();
+        eng.refresh_registered_data_patch(run_id, &mut stale_data);
+        assert_eq!(stale_data.owner, next_owner);
+        assert_eq!(stale_data.target_branch, "master");
 
         let (send, calls, owners) = mock_send_recording_owners(vec![
             "DONE: fixed",
@@ -213,7 +219,13 @@ fn repair_dispatch_comment_not_re_adopted_without_new_marker_comment() {
                 .unwrap();
             crate::workflow::blocking_runtime()
                 .block_on(adopt_existing_run(
-                    eng, &mcp, &item_id, run_id, &state, owner, &incoming,
+                    eng,
+                    &mcp,
+                    &item_id,
+                    run_id,
+                    &state,
+                    owner,
+                    (&incoming, "master"),
                 ))
                 .unwrap();
         };
@@ -288,7 +300,13 @@ fn newer_repair_dispatch_comment_is_adopted_on_redispatch() {
                 .unwrap();
             crate::workflow::blocking_runtime()
                 .block_on(adopt_existing_run(
-                    eng, &mcp, &item_id, run_id, &state, owner, &incoming,
+                    eng,
+                    &mcp,
+                    &item_id,
+                    run_id,
+                    &state,
+                    owner,
+                    (&incoming, "master"),
                 ))
                 .unwrap();
         };
