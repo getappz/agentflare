@@ -96,14 +96,15 @@ fn stderr(out: &Output) -> String {
 fn t45_cli_fire_enqueues_and_exits_without_running() {
     let f = fixture();
     let marker = f.repo.join("ran");
-    write_workflow(
-        &f.repo,
-        "delayed",
-        &format!(
-            r#"{{"name":"delayed","steps":[{{"name":"t","command":["/bin/sleep","30"]}},{{"name":"m","command":["/usr/bin/touch","{}"]}}]}}"#,
-            marker.display()
-        ),
-    );
+    // serde_json escapes Windows separators; a format string would emit `\U`.
+    let body = serde_json::json!({
+        "name": "delayed",
+        "steps": [
+            {"name": "t", "command": ["/bin/sleep", "30"]},
+            {"name": "m", "command": ["/usr/bin/touch", marker]},
+        ]
+    });
+    write_workflow(&f.repo, "delayed", &serde_json::to_string(&body).unwrap());
     let created = run(
         &f.home,
         &f.repo,
