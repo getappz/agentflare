@@ -20,14 +20,57 @@ pub(super) fn reconcile_orphaned_jobs(queue: &Queue) {
             return;
         }
     };
-    if orphaned.is_empty() {
+    release_claims_for_reconciled_jobs(
+        orphaned,
+        "left running by a previous daemon process",
+        "orphaned by daemon restart",
+    );
+}
+
+/// Periodic counterpart to `reconcile_orphaned_jobs` above, run every
+/// `dashboard::server::STALE_JOB_WATCHDOG_INTERVAL` for the life of the
+/// daemon rather than once at startup -- see `Queue::reconcile_stale_running`'s
+/// doc comment for why that's safe here despite the daemon never restarting.
+/// Without this, a job whose worker thread died mid-job (not the whole
+/// daemon process) left its item's claim stuck past its TTL indefinitely,
+/// with nothing periodically checking -- only a manual `item redispatch`
+/// call could unstick it (item #283: confirmed live, two items stuck ~16h
+/// while the rest of the daemon kept dispatching other items fine).
+pub(super) fn reconcile_stale_running_jobs(queue: &Queue, grace_secs: i64) {
+    let stale = match queue.reconcile_stale_running(grace_secs) {
+        Ok(jobs) => jobs,
+        Err(e) => {
+            eprintln!("agentflare-jobs: stale-running reconciliation failed: {e}");
+            return;
+        }
+    };
+    release_claims_for_reconciled_jobs(
+        stale,
+        "stuck running past their own timeout with no daemon restart",
+        "orphaned: worker thread died mid-job with no daemon restart",
+    );
+}
+
+/// Shared release-the-item-claim path for both reconciliation entry points
+/// above -- identical handling regardless of whether a job was orphaned by a
+/// full daemon restart or died mid-job on an otherwise-live daemon.
+/// `release_reason` is the operator-visible string posted on the item
+/// (`release_and_comment`'s `reason` arg) -- kept distinct per caller so it
+/// doesn't misattribute a mid-job thread death to a daemon restart that
+/// never happened.
+fn release_claims_for_reconciled_jobs(
+    jobs: Vec<(String, agentflare_jobs::AgentJob)>,
+    reason_label: &str,
+    release_reason: &str,
+) {
+    if jobs.is_empty() {
         return;
     }
     eprintln!(
-        "agentflare-jobs: reconciled {} job(s) left running by a previous daemon process",
-        orphaned.len()
+        "agentflare-jobs: reconciled {} job(s) {reason_label}",
+        jobs.len()
     );
-    for (job_id, job) in orphaned {
+    for (job_id, job) in jobs {
         // Only `WorkItemExecutor`-dispatched jobs (see `enqueue_work_job` in
         // `supervisor.rs`) hold an item claim at all -- a plain subprocess
         // job submitted via `POST /api/jobs` has no item to release.
@@ -78,7 +121,7 @@ pub(super) fn reconcile_orphaned_jobs(queue: &Queue) {
             crate::cli::work::release_and_comment_preserving_worktree(
                 &mcp,
                 item_id,
-                "orphaned by daemon restart",
+                release_reason,
                 None,
             );
         });
