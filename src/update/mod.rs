@@ -206,6 +206,24 @@ fn report_other_instances() {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn extracts_a_deflated_windows_release_zip() {
+        use std::io::Write;
+
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        writer.start_file(github::binary_name(), options).unwrap();
+        writer.write_all(b"release-binary").unwrap();
+        let archive = writer.finish().unwrap().into_inner();
+
+        let binary = extract_binary(&archive).unwrap();
+        assert_eq!(std::fs::read(&binary).unwrap(), b"release-binary");
+        std::fs::remove_file(&binary).unwrap();
+        std::fs::remove_dir(binary.parent().unwrap()).unwrap();
+    }
+
     // Regression (item 627): `update::run`'s swap path calls `swap::replace_binary`
     // then must call `swap::verify_installed` before declaring success, exactly
     // like `dev_install::run` does for item 624. This exercises the same two

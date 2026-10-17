@@ -31,7 +31,7 @@ streaming-iterator = "0.1"
 # extracted from PEP 561 `.pyi` stub files via tree-sitter, with a typeshed
 # (types-<package> on PyPI) fallback for packages that ship none. See
 # python::extract.
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 tree-sitter-python = "0.23"
 agentflare-workspace-hack = { version = "0.1", path = "../../agentflare-workspace-hack" }
 

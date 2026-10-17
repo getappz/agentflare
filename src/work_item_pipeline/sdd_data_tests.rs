@@ -13,6 +13,7 @@ fn work_item_data_roundtrips_sdd_fields() {
         fix_round: 0,
         ledger: vec!["Task 0: dispatched".to_string()],
         last_report: None,
+        target_branch: "parent-task".into(),
         ..Default::default()
     };
     let json = serde_json::to_string(&data).expect("serialize");
@@ -20,6 +21,7 @@ fn work_item_data_roundtrips_sdd_fields() {
     assert_eq!(back.tasks.len(), 1);
     assert_eq!(back.tasks[0].title, "Add config flag");
     assert_eq!(back.current_task_index, 0);
+    assert_eq!(back.target_branch, "parent-task");
     assert_eq!(back.ledger, vec!["Task 0: dispatched".to_string()]);
 }
 
@@ -47,4 +49,5 @@ fn deserializes_persisted_state_json_from_before_review_only_existed() {
     assert!(!data.review_only);
     assert!(data.review_findings.is_empty());
     assert!(!data.tdd);
+    assert!(data.target_branch.is_empty());
 }

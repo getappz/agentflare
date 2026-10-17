@@ -177,10 +177,11 @@ pub fn extract_pyi(wheel_zip: &[u8]) -> Result<Vec<PyiFile>, PythonFetchError> {
     let mut has_pyi = false;
     let mut has_marker = false;
     for name in archive.file_names() {
+        let name = name.map_err(|e| PythonFetchError::Wheel(e.to_string()))?;
         if name.ends_with(".pyi") {
             has_pyi = true;
         }
-        if is_py_typed_marker(name) {
+        if is_py_typed_marker(&name) {
             has_marker = true;
         }
     }
@@ -194,7 +195,10 @@ pub fn extract_pyi(wheel_zip: &[u8]) -> Result<Vec<PyiFile>, PythonFetchError> {
         let mut entry = archive
             .by_index(i)
             .map_err(|e| PythonFetchError::Wheel(e.to_string()))?;
-        let path = entry.name().to_string();
+        let path = entry
+            .name()
+            .map_err(|e| PythonFetchError::Wheel(e.to_string()))?
+            .into_owned();
         // `.pyi` stubs are authored specifically as an interface — smaller
         // and cleaner than the runtime source — so they win whenever both
         // exist for a file.
@@ -344,7 +348,7 @@ mod tests {
         {
             let cursor = std::io::Cursor::new(&mut buf);
             let mut writer = zip::ZipWriter::new(cursor);
-            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            let opts = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             for (path, body) in files {
                 writer.start_file(*path, opts).unwrap();

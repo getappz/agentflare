@@ -191,6 +191,13 @@ fn judge_prompt_notes_design_spec_deliverable_when_set() {
 }
 
 #[test]
+fn judge_prompt_includes_the_current_task_requirements() {
+    let prompt = build_judge_prompt(&[sample_task()], 0, &[], "Tests pass.", false, false);
+    assert!(prompt.contains("Add --verbose"));
+    assert!(prompt.contains("unchanged"));
+}
+
+#[test]
 fn judge_prompt_instructs_json_only_output() {
     let prompt = build_judge_prompt(
         &[sample_task()],

@@ -157,6 +157,7 @@ pub(crate) fn build_judge_prompt(
             )
         })
         .collect();
+    let task_body = tasks.get(current_task_index).map_or("", |task| task.body.as_str());
     let ledger_text: String = ledger.join("\n");
     let mode_note = if design_spec {
         "This is a design-spec task: no application code should be written, but the role's deliverable is a written spec/design document (e.g. under docs/superpowers/specs/) — completion requires that document to exist, not just a reply saying there's nothing to build.\n\n"
@@ -166,6 +167,6 @@ pub(crate) fn build_judge_prompt(
         ""
     };
     format!(
-        "You are the judge for an autonomous multi-task execution pipeline.\n\n{mode_note}Plan:\n{task_list}\n\nLedger so far:\n{ledger_text}\n\nLatest role reply:\n{role_reply}\n\nDecide what happens next. Reply with ONE JSON object and nothing else, matching exactly:\n{{\"action\": \"continue_task|fix_round|escalate|park_finding|rule_and_continue|insert_task|skip_task|advance_task|complete_pipeline\", \"rationale\": \"...\", \"ledger_line\": \"...\"}}\nDo not include task_model_tier unless action is insert_task. For insert_task, add task_model_tier: \"mechanical\" (localized edit), \"integration\" (cross-module wiring), or \"architecture\" (design or broad refactor).\n"
+        "You are the judge for an autonomous multi-task execution pipeline.\n\n{mode_note}Plan:\n{task_list}\n\nCurrent task requirements:\n{task_body}\n\nDo not finish an implementation task from passing checks on unchanged code; require the requested deliverable and review evidence.\n\nLedger so far:\n{ledger_text}\n\nLatest role reply:\n{role_reply}\n\nDecide what happens next. Reply with ONE JSON object and nothing else, matching exactly:\n{{\"action\": \"continue_task|fix_round|escalate|park_finding|rule_and_continue|insert_task|skip_task|advance_task|complete_pipeline\", \"rationale\": \"...\", \"ledger_line\": \"...\"}}\nDo not include task_model_tier unless action is insert_task. For insert_task, add task_model_tier: \"mechanical\" (localized edit), \"integration\" (cross-module wiring), or \"architecture\" (design or broad refactor).\n"
     )
 }
