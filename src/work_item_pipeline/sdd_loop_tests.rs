@@ -1,6 +1,72 @@
 use super::sdd_test_support::*;
 use super::*;
 
+#[test]
+fn empty_completion_preserves_existing_reviewer_findings() {
+    let (_mcp, _backend, _repo, _item, _project, worktree) =
+        crate::mcp_server::tests::mcp_with_claimed_item("Keep completion findings");
+    let mut data = one_task_data();
+    data.worktree_path = worktree.to_string_lossy().into_owned();
+    data.review_issues = Some("Missing required cancellation handling.".into());
+    let mut ctx = WorkflowContext::new(Default::default(), data);
+    assert!(retry_empty_completion(&mut ctx).is_some());
+    let findings = ctx.data.review_issues.as_deref().unwrap();
+    assert!(findings.contains("Missing required cancellation handling."));
+    assert!(findings.contains("no committed changes"));
+}
+
+#[test]
+fn target_patch_during_judging_is_applied_before_completion() {
+    crate::paths::test_support::with_temp_home(|| {
+        crate::workflow::blocking_runtime().block_on(async {
+            let (_mcp, _backend, _repo, _item, _project, worktree) =
+                crate::mcp_server::tests::mcp_with_claimed_item("Judge target adoption");
+            let mut data = one_task_data();
+            data.worktree_path = worktree.to_string_lossy().into_owned();
+            data.target_branch = "master".into();
+            std::fs::write(worktree.join("prior.txt"), "parent work").unwrap();
+            checkpoint_implementer_turn(&mut data, 0).unwrap();
+            assert!(flare_git_core::shell::run_in_ok(
+                &worktree,
+                &["branch", "parent-task", "HEAD"]
+            ));
+            data.last_report = Some("Prior implementation.".into());
+            let hang_send: flare_workflow::json::SendMessage =
+                std::sync::Arc::new(|_| Box::pin(std::future::pending()));
+            let eng = engine();
+            eng.register_workflow(
+                flare_workflow::WorkflowDefinition::new(WORKFLOW_ID, "judge adoption")
+                    .add_step(build_sdd_loop_step(hang_send)),
+            )
+            .unwrap();
+            let run_id = eng
+                .start_workflow(WorkflowId::new(WORKFLOW_ID), data, String::new())
+                .await
+                .unwrap();
+            let mut ctx = eng.get_status(run_id).await.unwrap().context;
+            let send: flare_workflow::json::SendMessage = std::sync::Arc::new(move |inv| {
+                Box::pin(async move {
+                    let reply = if inv.prompt.contains("You are the judge") {
+                        engine()
+                            .patch_run_data(run_id, |data: &mut WorkItemData| {
+                                data.target_branch = "parent-task".into();
+                            })
+                            .await
+                            .unwrap();
+                        r#"{"action":"complete_pipeline","rationale":"done","ledger_line":"done"}"#
+                    } else {
+                        "REVIEW_APPROVED"
+                    };
+                    Ok((reply.to_string(), 0, 0))
+                })
+            });
+            sdd_step(send).executor.execute(&mut ctx).await.unwrap();
+            assert_eq!(ctx.data.target_branch, "parent-task");
+            assert_eq!(ctx.output, "CONTINUE");
+        });
+    });
+}
+
 #[tokio::test]
 async fn no_change_completion_returns_to_implementer_instead_of_finalizing() {
     for action in ["complete_pipeline", "advance_task", "skip_task"] {
@@ -180,8 +246,22 @@ async fn design_spec_document_is_checkpointed_before_completion() {
 }
 
 #[tokio::test]
-async fn last_task_decisions_preserve_reviewer_findings_for_manual_review() {
-    for action in ["complete_pipeline", "advance_task", "skip_task"] {
+async fn terminal_findings_complete_pipeline() {
+    assert_terminal_findings_flow("complete_pipeline").await;
+}
+
+#[tokio::test]
+async fn terminal_findings_advance_task() {
+    assert_terminal_findings_flow("advance_task").await;
+}
+
+#[tokio::test]
+async fn terminal_findings_skip_task() {
+    assert_terminal_findings_flow("skip_task").await;
+}
+
+async fn assert_terminal_findings_flow(action: &str) {
+    for fix_round in [0, MAX_FIX_ROUNDS] {
         let (_mcp, _backend, _repo, _item, _project, worktree) =
             crate::mcp_server::tests::mcp_with_claimed_item("Unresolved completion review");
         let mut data = one_task_data();
@@ -189,7 +269,7 @@ async fn last_task_decisions_preserve_reviewer_findings_for_manual_review() {
         std::fs::write(worktree.join("work.txt"), "partial implementation").unwrap();
         checkpoint_implementer_turn(&mut data, 0).unwrap();
         data.last_report = Some("Implemented.".into());
-        data.fix_round = MAX_FIX_ROUNDS;
+        data.fix_round = fix_round;
         let decision = match action {
             "advance_task" => {
                 r#"{"action":"advance_task","rationale":"stop","ledger_line":"stop"}"#
@@ -197,15 +277,43 @@ async fn last_task_decisions_preserve_reviewer_findings_for_manual_review() {
             "skip_task" => r#"{"action":"skip_task","rationale":"stop","ledger_line":"stop"}"#,
             _ => r#"{"action":"complete_pipeline","rationale":"stop","ledger_line":"stop"}"#,
         };
-        let (send, _) = mock_send(vec!["REVIEW_ISSUES: missing required behavior", decision]);
+        let (send, calls) = mock_send(vec![
+            "REVIEW_ISSUES: missing required behavior",
+            decision,
+            "Fixed the required behavior.",
+            decision,
+            "REVIEW_APPROVED",
+            decision,
+        ]);
         let mut ctx = WorkflowContext::new(Default::default(), data);
-        sdd_step(send).executor.execute(&mut ctx).await.unwrap();
-        assert_eq!(ctx.output, "PIPELINE_COMPLETE");
+        let step = sdd_step(send);
+        step.executor.execute(&mut ctx).await.unwrap();
+        assert_eq!(
+            ctx.output == "PIPELINE_COMPLETE",
+            fix_round == MAX_FIX_ROUNDS
+        );
         assert_eq!(
             ctx.data.review_issues.as_deref(),
             Some("missing required behavior")
         );
         assert_eq!(ctx.data.current_task_index, 0);
+        if fix_round < MAX_FIX_ROUNDS {
+            assert_eq!(ctx.data.fix_round, fix_round + 1);
+            step.executor.execute(&mut ctx).await.unwrap();
+            assert_eq!(ctx.output, "CONTINUE", "the fix still needs review");
+            assert!(
+                calls.lock().unwrap()[2]
+                    .1
+                    .contains("missing required behavior")
+            );
+            step.executor.execute(&mut ctx).await.unwrap();
+            if action != "complete_pipeline" {
+                assert_eq!(ctx.output, "CONTINUE");
+                step.executor.execute(&mut ctx).await.unwrap();
+            }
+            assert_eq!(ctx.output, "PIPELINE_COMPLETE");
+            assert!(ctx.data.review_issues.is_none());
+        }
     }
 }
 

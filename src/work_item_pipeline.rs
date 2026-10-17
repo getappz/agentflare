@@ -459,7 +459,12 @@ fn retry_empty_completion(ctx: &mut WorkflowContext<WorkItemData>) -> Option<Ste
         return Some(StepResult::Failed(reason));
     }
     ctx.data.current_task_index = ctx.data.current_task_index.min(ctx.data.tasks.len() - 1);
-    ctx.data.review_issues = Some(reason.clone());
+    ctx.data.review_issues = Some(
+        ctx.data
+            .review_issues
+            .take()
+            .map_or_else(|| reason.clone(), |issues| format!("{issues}\n\n{reason}")),
+    );
     ctx.data.last_report = None;
     ctx.data.ledger.push(reason);
     ctx.output = "CONTINUE".to_string();
@@ -797,12 +802,21 @@ pub(crate) fn build_sdd_loop_step(
                         decision.action,
                         JudgeAction::AdvanceTask | JudgeAction::SkipTask
                     ) && ctx.data.current_task_index + 1 == ctx.data.tasks.len());
+                if finishes_plan {
+                    refresh_patched_run_data(ctx);
+                }
                 if finishes_plan && let Some(result) = retry_empty_completion(ctx) {
                     return Ok(result);
                 }
 
                 if finishes_plan && ctx.data.review_issues.is_some() {
-                    if ctx.data.last_report.is_some() {
+                    let awaiting_fix_review =
+                        ctx.data.last_report.is_some() && !matches!(role_kind, SddRole::Reviewer);
+                    if awaiting_fix_review {
+                        ctx.output = "CONTINUE".to_string();
+                    } else if ctx.data.fix_round < MAX_FIX_ROUNDS {
+                        ctx.data.fix_round += 1;
+                        ctx.data.last_report = None;
                         ctx.output = "CONTINUE".to_string();
                     } else {
                         // Keep findings for finalize's manual-review path, including last-task skip/advance.
