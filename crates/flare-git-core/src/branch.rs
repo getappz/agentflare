@@ -195,17 +195,46 @@ pub fn is_linked_worktree(repo_root: &Path) -> bool {
     }
 }
 
-/// The main/canonical checkout's root, even when `repo_root` is itself a
-/// linked worktree -- derived from `--git-common-dir`, which always points
-/// at the shared `.git` inside the main checkout no matter which worktree
-/// it's run from. `None` outside a git repo. `--git-common-dir` can return
-/// either an absolute path or one relative to `repo_root` depending on git
-/// version; `repo_root.join(..)` handles both (joining an absolute path
-/// onto any base just returns that absolute path unchanged).
+/// The main checkout's root when `repo_root` is a linked worktree, or the
+/// checkout itself. Derived from the absolute `--git-common-dir`.
+///
+/// `None` outside a git repo. Also `None` when the common dir's parent is
+/// not its own repo toplevel, or does not share this worktree's normalized
+/// common dir. A bare repo nested in another checkout must not resolve to
+/// that outer repo — the parent of the bare git dir is the wrong scope.
 #[must_use]
 pub fn main_worktree_root(repo_root: &Path) -> Option<PathBuf> {
-    let common_dir = run_in_opt(repo_root, &["rev-parse", "--git-common-dir"])?;
-    repo_root.join(common_dir).parent().map(Path::to_path_buf)
+    let source_common = normalized_git_common_dir(repo_root)?;
+    let candidate = source_common.parent()?.to_path_buf();
+    if !candidate.is_dir() {
+        return None;
+    }
+    let top = repo_toplevel(&candidate)?;
+    if !same_path(&top, &candidate) {
+        return None;
+    }
+    let candidate_common = normalized_git_common_dir(&candidate)?;
+    if candidate_common != source_common {
+        return None;
+    }
+    Some(candidate)
+}
+
+/// Absolute, symlink-resolved `--git-common-dir`.
+fn normalized_git_common_dir(start: &Path) -> Option<PathBuf> {
+    let raw = run_in_opt(
+        start,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let path = PathBuf::from(raw);
+    Some(std::fs::canonicalize(&path).unwrap_or(path))
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
 }
 
 #[cfg(test)]

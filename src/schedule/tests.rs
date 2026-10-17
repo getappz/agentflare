@@ -763,6 +763,64 @@ fn canonical_repo_root_maps_linked_worktree_to_main_checkout() {
     );
 }
 
+/// A linked worktree whose git-common-dir parent is another enclosing checkout
+/// must not be stored as that checkout. `repo_toplevel` succeeding is not
+/// enough: the candidate has to be its own toplevel and share the worktree's
+/// normalized `--git-common-dir`.
+#[test]
+fn canonical_repo_root_rejects_main_candidate_from_another_checkout() {
+    let parent = tempfile::tempdir().unwrap();
+    let outer = parent.path().join("outer");
+    std::fs::create_dir_all(&outer).unwrap();
+    let git = |dir: &Path, args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&outer, &["init", "-b", "master"]);
+    git(&outer, &["config", "user.email", "test@test.com"]);
+    git(&outer, &["config", "user.name", "Test"]);
+    git(&outer, &["commit", "--allow-empty", "-m", "outer"]);
+    let bare = outer.join("proj.git");
+    git(&outer, &["init", "--bare", bare.to_str().unwrap()]);
+    let seed = parent.path().join("seed");
+    git(
+        parent.path(),
+        &["clone", bare.to_str().unwrap(), seed.to_str().unwrap()],
+    );
+    git(&seed, &["config", "user.email", "test@test.com"]);
+    git(&seed, &["config", "user.name", "Test"]);
+    git(&seed, &["commit", "--allow-empty", "-m", "seed"]);
+    git(&seed, &["push", "origin", "HEAD:master"]);
+    let wt = parent.path().join("wt");
+    git(
+        &bare,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "wt-branch",
+            wt.to_str().unwrap(),
+            "master",
+        ],
+    );
+
+    let err = super::canonical_repo_root(wt.to_str().unwrap()).unwrap_err();
+    assert!(err.contains("cannot resolve a main checkout"), "{err}");
+    let outer_canon = std::fs::canonicalize(&outer).unwrap();
+    assert!(
+        !err.contains(outer_canon.to_str().unwrap()),
+        "must not accept the enclosing checkout: {err}"
+    );
+}
+
 /// T15: daemon-offline manual request survives delay+grace, executes at tick.
 #[tokio::test]
 async fn t15_offline_manual_survives_and_executes() {

@@ -116,8 +116,8 @@ impl AgentflareMcp {
         let invalid = |e: String| ErrorData::invalid_params(e, None);
         let now = db_kit::ids::now();
         let repo = || -> Result<String, ErrorData> {
-            crate::schedule::canonical_repo_root(&self.worktree_repo_root().to_string_lossy())
-                .map_err(invalid)
+            let root = schedule_repo_root(&self.worktree_repo_root()).map_err(invalid)?;
+            crate::schedule::canonical_repo_root(&root.to_string_lossy()).map_err(invalid)
         };
         match req.action.as_str() {
             "schedule_create" => {
@@ -253,6 +253,22 @@ pub(crate) fn resolve_workflow_db_path(requested: Option<&str>, production: bool
         return PathBuf::from(path);
     }
     crate::workflow::default_db_path()
+}
+
+/// `worktree_repo_root` returns `worktree_repo_root_override` unchanged.
+/// Schedule ops must map a linked-worktree override to the main checkout
+/// before `canonical_repo_root`, matching the CLI's repository scope.
+fn schedule_repo_root(root: &Path) -> Result<PathBuf, String> {
+    if flare_git_core::branch::is_linked_worktree(root) {
+        flare_git_core::branch::main_worktree_root(root).ok_or_else(|| {
+            format!(
+                "cannot resolve a main checkout for linked worktree '{}'",
+                root.display()
+            )
+        })
+    } else {
+        Ok(root.to_path_buf())
+    }
 }
 
 fn schedule_token(req: &WorkflowRequest) -> Result<&str, ErrorData> {
@@ -683,5 +699,47 @@ mod tests {
         reserved.params = Some(r#"{"schedule":1}"#.into());
         let err = mcp_a.workflow(Parameters(reserved)).await.unwrap_err();
         assert!(format!("{err}").contains("reserves top-level key `schedule`"));
+    }
+
+    #[tokio::test]
+    async fn schedule_create_normalizes_linked_worktree_override_to_main_checkout() {
+        let parent = tempfile::tempdir().unwrap();
+        let main = parent.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&main, &["init", "-b", "master"]);
+        git(&main, &["config", "user.email", "test@test.com"]);
+        git(&main, &["config", "user.name", "Test"]);
+        git(&main, &["commit", "--allow-empty", "-m", "initial"]);
+        let wt = parent.path().join("wt");
+        git(
+            &main,
+            &["worktree", "add", "-b", "wt-branch", wt.to_str().unwrap()],
+        );
+        write_workflow(&main, "echo");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("wf.db");
+        let mut create = req("schedule_create", &db);
+        create.schedule_name = Some("nightly".into());
+        create.workflow_name = Some("echo".into());
+        create.every = Some("1m".into());
+        let created: serde_json::Value =
+            serde_json::from_str(&mcp_at(&wt).workflow(Parameters(create)).await.unwrap()).unwrap();
+        let main_canon = std::fs::canonicalize(&main).unwrap();
+        let wt_canon = std::fs::canonicalize(&wt).unwrap();
+        assert_eq!(created["repo_root"], main_canon.to_str().unwrap());
+        assert_ne!(created["repo_root"], wt_canon.to_str().unwrap());
     }
 }
