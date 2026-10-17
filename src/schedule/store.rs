@@ -269,6 +269,27 @@ impl ScheduleStore {
         .await
     }
 
+    /// Every schedule, across repositories. `list --all` and MCP `all`.
+    pub async fn list_all(&self) -> Result<Vec<ScheduleRow>, String> {
+        let conn = Arc::clone(&self.conn);
+        blocking(move || {
+            let conn = conn_lock(&conn)?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id,name,repo_root,workflow_name,params,every_secs,grace_secs,overlap,\
+                            enabled,next_fire_at,last_fire_at,frozen_error,created_at,updated_at \
+                     FROM schedules ORDER BY repo_root, name",
+                )
+                .map_err(|e| format!("prepare list: {e}"))?;
+            let rows = stmt
+                .query_map([], row_to_schedule)
+                .map_err(|e| format!("list schedules: {e}"))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| format!("list schedules: {e}"))
+        })
+        .await
+    }
+
     pub async fn update_schedule(
         &self,
         id: &str,

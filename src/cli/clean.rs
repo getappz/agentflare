@@ -66,20 +66,7 @@ pub struct CleanArgs {
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
-    let bad = || format!("invalid duration '{s}' (use e.g. 12h, 7d, 2w, 3M)");
-    let split = s.len().checked_sub(1).filter(|i| s.is_char_boundary(*i));
-    let (num, unit) = s.split_at(split.ok_or_else(bad)?);
-    let unit_secs = match unit {
-        "h" => 3600,
-        "d" => 86_400,
-        "w" => 7 * 86_400,
-        "M" => 30 * 86_400,
-        _ => return Err(bad()),
-    };
-    let n: u64 = num.parse().map_err(|_| bad())?;
-    n.checked_mul(unit_secs)
-        .map(Duration::from_secs)
-        .ok_or_else(bad)
+    super::parse_duration(s)
 }
 
 fn parse_size(s: &str) -> Result<u64, String> {

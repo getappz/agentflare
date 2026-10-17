@@ -92,6 +92,44 @@ session's token bill, it's about multiple agents (or multiple sessions of the
 same agent, over time) staying out of each other's way and handing off work
 cleanly.
 
+## Workflow schedules
+
+`agentflare workflow schedule` registers an interval trigger for a project-local
+workflow at `<repo>/.agentflare/workflows/<name>.json`. Schedules and their
+occurrence history live in `~/.agentflare/workflows.db` (UTC epoch seconds,
+`every` at least 60s). The same actions are on the `workflow` MCP tool:
+`schedule_create`, `schedule_list`, `schedule_show`, `schedule_update`,
+`schedule_enable`, `schedule_disable`, `schedule_remove`, `schedule_fire`,
+`schedule_runs`.
+
+Manual `fire` (CLI or `schedule_fire`) only enqueues a durable occurrence and
+returns its id with status `queued`. It does not start a workflow run. The
+daemon claims that queue on its next tick — every 60 seconds, including the
+first tick after boot — and is the only process that executes it. Exiting or
+killing the client does not abandon a queued occurrence. While the daemon is
+down, fire still succeeds and reports `queued; waiting for daemon`.
+
+The schedule ticker starts next to the binary-staleness watchdog, outside
+work-item dispatch recovery. A failed work-item smoke test, registration, or
+recovery turns work dispatch off only; schedules keep firing.
+
+`disable` stops new scheduled admissions. It does not cancel a run the daemon
+already claimed, and a manual fire of a disabled schedule still enqueues.
+`remove` deletes the schedule and its occurrence history. It does not cancel
+a workflow that has already started. Start receipts in `workflow_start_receipts`
+stay behind so a later tick cannot launch that occurrence again.
+
+The driver writes the terminal outcome into `schedule_runs` when it finishes.
+The next tick copies the outcome if that write failed. A paused run stays
+`dispatched` and keeps blocking overlap until something resumes or cancels it.
+A committed start whose driver never launched is recorded as `interrupted`
+and is not replaced with a new run.
+
+Each schedule keeps the newest 100 non-skip terminal occurrences and,
+separately, the newest 100 skip rows (`skipped_missed`, `skipped_overlap`).
+Rows that are still queued, dispatching, or dispatched are never pruned to
+make room. Receipts are kept for the life of the database in this phase.
+
 **Why Rust, not Node:** Claude Code doesn't bundle or require Node.js — it's a
 standalone compiled binary. A plugin whose hooks shell out to `node` breaks on
 any machine that installed Claude Code without separately installing Node.

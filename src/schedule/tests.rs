@@ -723,6 +723,46 @@ async fn t14_manual_bypasses_checks_preserves_clock() {
     );
 }
 
+/// Linked-worktree paths store the main checkout, matching CLI scope.
+#[test]
+fn canonical_repo_root_maps_linked_worktree_to_main_checkout() {
+    let parent = tempfile::tempdir().unwrap();
+    let main = parent.path().join("main");
+    std::fs::create_dir_all(&main).unwrap();
+    let git = |dir: &Path, args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&main, &["init", "-b", "master"]);
+    git(&main, &["config", "user.email", "test@test.com"]);
+    git(&main, &["config", "user.name", "Test"]);
+    git(&main, &["commit", "--allow-empty", "-m", "initial"]);
+    let wt = parent.path().join("wt");
+    git(
+        &main,
+        &["worktree", "add", "-b", "wt-branch", wt.to_str().unwrap()],
+    );
+    let main_root = super::canonical_repo_root(main.to_str().unwrap()).unwrap();
+    let wt_root = super::canonical_repo_root(wt.to_str().unwrap()).unwrap();
+    assert_eq!(wt_root, main_root);
+    let plain = tempfile::tempdir().unwrap();
+    let plain_root = super::canonical_repo_root(plain.path().to_str().unwrap()).unwrap();
+    assert_eq!(
+        plain_root,
+        std::fs::canonicalize(plain.path())
+            .unwrap()
+            .to_string_lossy()
+    );
+}
+
 /// T15: daemon-offline manual request survives delay+grace, executes at tick.
 #[tokio::test]
 async fn t15_offline_manual_survives_and_executes() {
