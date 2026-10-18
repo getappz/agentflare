@@ -229,9 +229,11 @@ pub fn validate_params(params: &serde_json::Value) -> Result<(), String> {
 
 /// Canonicalize a repo root for storage/comparison; reject nonexistent roots.
 ///
-/// A linked worktree resolves to the main checkout first. CLI already does
-/// that from cwd; MCP `worktree_repo_root_override` does not, so the store
-/// boundary is what keeps both surfaces on one repository scope.
+/// A linked worktree resolves to the main checkout first. That candidate must
+/// be its own repo toplevel and share the worktree's normalized
+/// `--git-common-dir` (`main_worktree_root`). Falling back to the linked path,
+/// or to the parent of a bare git dir inside another checkout, would store a
+/// different scope than the CLI.
 pub fn canonical_repo_root(root: &str) -> Result<String, String> {
     let path = std::path::Path::new(root);
     if !path.is_dir() {
@@ -239,8 +241,7 @@ pub fn canonical_repo_root(root: &str) -> Result<String, String> {
     }
     let path = if flare_git_core::branch::is_linked_worktree(path) {
         flare_git_core::branch::main_worktree_root(path)
-            .filter(|main| main.is_dir())
-            .unwrap_or_else(|| path.to_path_buf())
+            .ok_or_else(|| format!("cannot resolve a main checkout for linked worktree '{root}'"))?
     } else {
         path.to_path_buf()
     };
