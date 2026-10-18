@@ -69,6 +69,12 @@ Call and elapsed-time limits work with supported headless agents. Optional
 per-invocation budget. Unknown or interrupted costs consume the reserved
 allowance; without a dollar ceiling, unknown dollar usage stays unknown.
 
+For Claude JSON output, a complete terminal result preserves the reply and
+reported usage even if background tools keep the CLI alive. The runner allows
+one second for normal exit, then stops the process tree. Cancellation, hard
+deadlines and observed nonzero exits remain failures. Acceptance checks still
+run separately before a solver result can count as successful.
+
 Resume validates saved request/executor identities and artifact hashes. An
 interrupted reservation is not silently executed again; a new, separately
 budgeted attempt may replace it. Missing budget records fail closed. A failed

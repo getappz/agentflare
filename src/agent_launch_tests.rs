@@ -401,6 +401,8 @@
         ]
     }
 
+    include!("agent_launch_completion_tests.rs");
+
     #[test]
     fn headless_argv_carries_no_prompt_element() {
         // The prompt is piped over stdin by `run_headless`, not appended to
@@ -706,6 +708,7 @@
             cancelled: false,
             stalled: false,
             exhausted: None,
+            terminal_result: None,
         };
         assert_eq!(diagnostic_suffix(&c, None), " (no output captured)");
     }
@@ -727,6 +730,7 @@
             cancelled: false,
             stalled: false,
             exhausted: None,
+            terminal_result: None,
         };
         let suffix = diagnostic_suffix(&c, None);
         assert!(suffix.contains("last stdout before kill"));
@@ -747,6 +751,7 @@
             cancelled: false,
             stalled: false,
             exhausted: None,
+            terminal_result: None,
         };
         let suffix = diagnostic_suffix(&c, None);
         assert!(suffix.contains("last stderr before kill"));
@@ -768,6 +773,7 @@
             cancelled: false,
             stalled: false,
             exhausted: None,
+            terminal_result: None,
         };
         let suffix = diagnostic_suffix(&c, Some("level=INFO message=\"tool call\" tool=lean_ctx"));
         assert!(suffix.contains("sandbox-side agent log tail"));
@@ -785,6 +791,7 @@
             cancelled: false,
             stalled: false,
             exhausted: None,
+            terminal_result: None,
         };
         let msg = match Ok::<_, std::io::Error>(captured) {
             Ok(c) if c.success => unreachable!(),
