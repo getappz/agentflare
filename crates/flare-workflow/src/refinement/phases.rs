@@ -315,14 +315,13 @@ async fn execute_phase(
                 jobs.push((label, s.tree.clone()));
             }
             probes(data, run, jobs, backend).await?;
-            if data.request.mode == RefinementMode::Sequential {
-                if let Some(t) = data
+            if data.request.mode == RefinementMode::Sequential
+                && let Some(t) = data
                     .trials
                     .last()
                     .filter(|t| t.label.starts_with("compose"))
-                {
-                    data.current = t.tree.clone();
-                }
+            {
+                data.current = t.tree.clone();
             }
         }
         Phase::Select => select(data, run, backend).await?,

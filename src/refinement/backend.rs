@@ -196,12 +196,11 @@ impl RefinementBackend for NativeBackend {
             Ok(())
             })();
             let receipt = settle_receipt(&ledger, &reservation, receipt, processing)?;
-            if let (Some(actual), Some(limit)) = (receipt.cost_usd, reservation.allowance_usd) {
-                if actual > limit {
+            if let (Some(actual), Some(limit)) = (receipt.cost_usd, reservation.allowance_usd)
+                && actual > limit {
                     return Err(RefinementError::Exhausted(
                         "executor exceeded its dollar allowance".into(),
                     ));
-                }
             }
             if agentflare_jobs::cancel::job_cancelled(&job) {
                 return Err(RefinementError::Cancelled);
@@ -256,18 +255,16 @@ fn attach_telemetry(receipt: &mut Receipt) {
     let Some(id) = receipt.session_id.as_deref() else {
         return;
     };
-    if path.exists() {
-        if let Ok(store) = flare_insights::InsightsStore::open(&path) {
-            if let Ok(turns) = store.get_turns(id) {
-                let tools = store.get_tool_calls(id).unwrap_or_default();
-                if !turns.is_empty() || !tools.is_empty() {
-                    let text = serde_json::json!({"session_id":id,"turns":turns,"tools":tools})
-                        .to_string();
-                    receipt.evidence.push_str("\nSESSION TELEMETRY\n");
-                    receipt.evidence.extend(text.chars().take(131072));
-                    return;
-                }
-            }
+    if path.exists()
+        && let Ok(store) = flare_insights::InsightsStore::open(&path)
+        && let Ok(turns) = store.get_turns(id)
+    {
+        let tools = store.get_tool_calls(id).unwrap_or_default();
+        if !turns.is_empty() || !tools.is_empty() {
+            let text = serde_json::json!({"session_id":id,"turns":turns,"tools":tools}).to_string();
+            receipt.evidence.push_str("\nSESSION TELEMETRY\n");
+            receipt.evidence.extend(text.chars().take(131072));
+            return;
         }
     }
     receipt.evidence.push_str("\nSession telemetry unavailable; evidence contains actual reply and artifact changes only.");
@@ -288,10 +285,11 @@ pub fn load_experiences_from(
     let mut entries = vec![];
     for row in rows {
         let content = row.map_err(|e| RefinementError::Persistence(e.to_string()))?;
-        if let Ok(e) = serde_json::from_str::<Experience>(&content) {
-            if e.project == project && e.domain == domain {
-                entries.push(e);
-            }
+        if let Ok(e) = serde_json::from_str::<Experience>(&content)
+            && e.project == project
+            && e.domain == domain
+        {
+            entries.push(e);
         }
     }
     Ok(entries)
