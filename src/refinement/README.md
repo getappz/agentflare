@@ -64,6 +64,22 @@ evidence excludes runner-supplied instruction changes. Task files are compared
 with the frozen snapshot; `AGENTS.md` and skills are compared with the supplied
 harness, so subsequent solver edits, additions, and deletions remain visible.
 
+For Claude and Codex structured output, solver-visible messages and tool
+observations are captured directly from the invocation stream. This avoids
+depending on delayed insights ingestion. Launch metadata and usage events are
+excluded. Other executors fall back to available insights telemetry, with an
+explicit warning when no trajectory is available. Captured trajectories are
+retained without a whole-trajectory cutoff; artifact text still has its
+existing size limits and marks omissions.
+
+Improvers receive an indexed JSON context with long strings split into ordered
+2000-character text files. They are instructed to read every part and recover
+truncated tool reads. Proposals must cite specific observations or artifact
+locations; self-reported test counts alone do not demonstrate a benefit. Like
+upstream Harness2, this is answer-free adaptation: private acceptance results
+remain in the report, and are never training feedback for the improver. Public
+task materials must supply enough information to discover and verify a fix.
+
 Call and elapsed-time limits work with supported headless agents. Optional
 `max_cost_usd` requires both roles to use `claude-code`, whose CLI supports a
 per-invocation budget. Unknown or interrupted costs consume the reserved

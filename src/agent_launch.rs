@@ -516,6 +516,8 @@ fn launch_command(binary: &Path, args: &[String]) -> (String, Vec<String>, bool)
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct HeadlessReply {
     pub text: String,
+    /// Solver-visible messages and tool observations, excluding launch/usage metadata.
+    pub trajectory: String,
     pub session_id: Option<String>,
     pub cost_usd: Option<f64>,
     /// `success`, `error_max_turns`, `error_max_budget_usd`,
@@ -614,7 +616,10 @@ fn parse_json_reply(stdout: &str) -> HeadlessReply {
 /// Keep the thread id from the first event and the last completed agent message.
 fn parse_codex_reply(stdout: &str) -> HeadlessReply {
     use serde_json::Value;
-    let mut reply = HeadlessReply::default();
+    let mut reply = HeadlessReply {
+        trajectory: public_trajectory(stdout),
+        ..HeadlessReply::default()
+    };
     let mut saw_event = false;
     for line in stdout.lines() {
         let Ok(event) = serde_json::from_str::<Value>(line) else {
@@ -707,6 +712,7 @@ fn reply_from_result_event(value: &serde_json::Value, raw: &str) -> HeadlessRepl
     };
     HeadlessReply {
         text,
+        trajectory: public_trajectory(raw),
         session_id: value
             .get("session_id")
             .and_then(Value::as_str)
@@ -728,6 +734,27 @@ fn reply_from_result_event(value: &serde_json::Value, raw: &str) -> HeadlessRepl
             .filter(|s| !s.is_null())
             .cloned(),
     }
+}
+
+fn public_trajectory(stdout: &str) -> String {
+    use serde_json::Value;
+    // Capture the stream directly; the asynchronously ingested insights DB can lag this call.
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let event: Value = serde_json::from_str(line).ok()?;
+            let body = match event.get("type")?.as_str()? {
+                "assistant" | "user" => event.pointer("/message/content")?,
+                "item.started" | "item.completed" => event.get("item")?,
+                _ => return None,
+            };
+            Some(format!(
+                "{}\n{}\n",
+                event["type"].as_str()?,
+                serde_json::to_string_pretty(body).ok()?
+            ))
+        })
+        .collect()
 }
 
 /// Turns a parsed structured reply into an outcome. A cap hit

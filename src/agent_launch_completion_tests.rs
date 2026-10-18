@@ -1,6 +1,37 @@
 const TERMINAL_EVENT: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"verified 🦀","session_id":"fixture-session","total_cost_usd":0.125,"usage":{"input_tokens":30,"output_tokens":7}}"#;
 
 #[test]
+fn solver_trajectory_retains_tool_observations_without_launch_metadata() {
+    let observation = format!("{} END_OF_OBSERVATION 🦀", "x".repeat(140_000));
+    let raw = [
+        serde_json::json!({"type":"system","subtype":"init","apiKey":"PRIVATE_INIT"}),
+        serde_json::json!({"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test"}}]}}),
+        serde_json::json!({"type":"user","message":{"content":[{"type":"tool_result","content":observation}]}}),
+        serde_json::json!({"type":"result","result":"done","total_cost_usd":0.1}),
+    ].iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+    let reply = parse_json_reply(&raw);
+    assert_eq!(reply.text, "done");
+    assert!(reply.trajectory.contains("cargo test"));
+    assert!(reply.trajectory.contains(&observation));
+    assert!(!reply.trajectory.contains("PRIVATE_INIT"));
+    assert!(!reply.trajectory.contains("total_cost_usd"));
+}
+
+#[test]
+fn codex_trajectory_retains_commands_and_observations() {
+    let raw = concat!(
+        "{\"type\":\"thread.started\",\"thread_id\":\"thread-1\"}\n",
+        "{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\",\"command\":\"cargo test\",\"aggregated_output\":\"FAILED escaped slash\",\"exit_code\":1}}\n",
+        "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"done\"}}\n",
+    );
+    let reply = parse_codex_reply(raw);
+    assert_eq!(reply.text, "done");
+    assert!(reply.trajectory.contains("FAILED escaped slash"));
+    assert!(reply.trajectory.contains("cargo test"));
+    assert!(!reply.trajectory.contains("thread-1"));
+}
+
+#[test]
 fn terminal_claude_detection_respects_explicit_output_format() {
     for (flags, expected) in [
         (vec!["--output-format", "json"], true),

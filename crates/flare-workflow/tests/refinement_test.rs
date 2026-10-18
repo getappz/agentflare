@@ -320,6 +320,29 @@ async fn sequential_carries_composition_and_history() {
 }
 
 #[tokio::test]
+async fn failed_probes_reach_improvers_without_private_verdicts() {
+    let backend = Arc::new(Scripted {
+        all_fail: true,
+        ..Default::default()
+    });
+    let data = run(request(), backend.clone()).await;
+    assert!(data.adoption.is_none());
+    let seen = backend.seen.lock().unwrap();
+    for role in [Role::General, Role::Domain, Role::Compose] {
+        let inv = seen.iter().find(|i| i.role == role).unwrap();
+        let prompt: serde_json::Value = serde_json::from_str(&inv.prompt).unwrap();
+        assert!(inv.prompt.contains("artifact from"));
+        assert!(!inv.prompt.contains("PRIVATE_CHECK_SENTINEL"));
+        assert!(!inv.prompt.contains("private_checks"));
+        assert!(!inv.prompt.contains("accepted"));
+        let instructions = prompt["instructions"].as_str().unwrap();
+        assert!(instructions.to_ascii_lowercase().contains("self-reported"));
+        assert!(instructions.contains("specific"));
+        assert!(instructions.contains("private"));
+    }
+}
+
+#[tokio::test]
 async fn invalid_proposal_gets_one_repair_then_inherits_current_tree() {
     let backend = Arc::new(Scripted {
         bad_proposal: true,

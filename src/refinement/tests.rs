@@ -1,6 +1,57 @@
 use super::receipts::*;
 use flare_workflow::{WorkflowRunId, refinement::*};
 
+#[test]
+fn proposer_context_preserves_large_unicode_evidence_and_repair_feedback() {
+    let root = tempfile::tempdir().unwrap();
+    let context = tempfile::Builder::new()
+        .prefix(".refinement-")
+        .tempdir_in(root.path())
+        .unwrap();
+    let evidence = format!("{} FINAL_TOOL_FAILURE", "observation 🦀\n".repeat(12_000));
+    let request = serde_json::json!({
+        "instructions":"Propose a harness; return JSON.",
+        "evidence":{"executions":[{"id":"base1","evidence":evidence}]}
+    })
+    .to_string();
+    let prompt = super::context::prepare_context(
+        root.path(),
+        context.path(),
+        &format!("{request}\nPrevious attempt rejected: invalid tree"),
+    )
+    .unwrap();
+    assert!(prompt.contains("Propose a harness; return JSON."));
+    assert!(prompt.contains("truncated"));
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(context.path().join("request.json")).unwrap())
+            .unwrap();
+    assert!(
+        manifest["repair_feedback"]
+            .as_str()
+            .unwrap()
+            .contains("invalid tree")
+    );
+    let parts = manifest["evidence"]["executions"][0]["evidence"]["text_parts"]
+        .as_array()
+        .unwrap();
+    assert!(parts.len() > 2);
+    let recovered: String = parts
+        .iter()
+        .map(|name| {
+            let body = std::fs::read_to_string(root.path().join(name.as_str().unwrap())).unwrap();
+            assert!(body.chars().count() <= 2000);
+            body
+        })
+        .collect();
+    assert_eq!(recovered, evidence);
+}
+
+#[test]
+fn malformed_context_is_rejected_before_launch() {
+    let root = tempfile::tempdir().unwrap();
+    assert!(super::context::prepare_context(root.path(), root.path(), "not JSON").is_err());
+}
+
 fn invocation(id: &str) -> Invocation {
     Invocation {
         id: id.into(),
