@@ -307,12 +307,10 @@ pub fn run_check(
     )?)
 }
 
-fn attach_telemetry(receipt: &mut Receipt) {
+pub(super) fn attach_telemetry(receipt: &mut Receipt) {
     let path = flare_insights::InsightsConfig::default().db_path;
-    let Some(id) = receipt.session_id.as_deref() else {
-        return;
-    };
-    if path.exists()
+    if let Some(id) = receipt.session_id.as_deref()
+        && path.exists()
         && let Ok(store) = flare_insights::InsightsStore::open(&path)
         && let Ok(turns) = store.get_turns(id)
     {

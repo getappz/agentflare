@@ -52,6 +52,13 @@ fn malformed_context_is_rejected_before_launch() {
     assert!(super::context::prepare_context(root.path(), root.path(), "not JSON").is_err());
 }
 
+#[test]
+fn missing_session_marks_trajectory_unavailable() {
+    let mut receipt = Receipt::default();
+    super::backend::attach_telemetry(&mut receipt);
+    assert!(receipt.evidence.contains("telemetry unavailable"));
+}
+
 fn invocation(id: &str) -> Invocation {
     Invocation {
         id: id.into(),
