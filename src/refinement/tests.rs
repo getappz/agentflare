@@ -112,7 +112,7 @@ fn every_trial_starts_from_same_dirty_snapshot() {
     run_in(one.path(), &["add", "input.txt"]).unwrap();
     run_in(one.path(), &["commit", "-m", "solver change"]).unwrap();
     assert!(
-        public_artifacts(one.path(), &frozen.snapshot)
+        public_artifacts(one.path(), &frozen.snapshot, &invocation("one").harness)
             .unwrap()
             .contains("mutated trial")
     );
@@ -128,6 +128,76 @@ fn every_trial_starts_from_same_dirty_snapshot() {
     );
     one.cleanup().unwrap();
     two.cleanup().unwrap();
+}
+
+#[test]
+fn supplied_harness_is_not_solver_evidence() {
+    use super::workspace::*;
+    use flare_git_core::shell::run_in;
+    let repo = tempfile::tempdir().unwrap();
+    run_in(repo.path(), &["init"]).unwrap();
+    run_in(repo.path(), &["config", "user.email", "test@example.test"]).unwrap();
+    run_in(repo.path(), &["config", "user.name", "Test"]).unwrap();
+    std::fs::write(repo.path().join("AGENTS.md"), "original instructions").unwrap();
+    std::fs::write(repo.path().join("input.txt"), "original task").unwrap();
+    std::fs::write(repo.path().join(".gitignore"), ".agents/\n").unwrap();
+    run_in(repo.path(), &["add", "."]).unwrap();
+    run_in(repo.path(), &["commit", "-m", "base"]).unwrap();
+    let frozen = FrozenInput::capture(repo.path()).unwrap();
+    let artifacts = tempfile::tempdir().unwrap();
+    let harness = HarnessTree::from([
+        (
+            "AGENTS.md".into(),
+            "Read .agents/skills/check/SKILL.md for Rust tasks.".into(),
+        ),
+        (
+            ".agents/skills/check/SKILL.md".into(),
+            "---\ndescription: Rust checks\n---\nVerify the result.\n".into(),
+        ),
+    ]);
+    let trial = TrialWorkspace::create(&frozen, artifacts.path(), "evidence", &harness).unwrap();
+    let evidence = public_artifacts(trial.path(), &frozen.snapshot, &harness).unwrap();
+    assert!(
+        evidence.is_empty(),
+        "runner setup appeared as solver work: {evidence}"
+    );
+
+    std::fs::write(trial.path().join("input.txt"), "solver task repair").unwrap();
+    let evidence = public_artifacts(trial.path(), &frozen.snapshot, &harness).unwrap();
+    assert!(evidence.contains("solver task repair"));
+    assert!(!evidence.contains("AGENTS.md"));
+    assert!(!evidence.contains("SKILL.md"));
+
+    std::fs::write(trial.path().join("AGENTS.md"), "solver instruction edit").unwrap();
+    std::fs::remove_file(trial.path().join(".agents/skills/check/SKILL.md")).unwrap();
+    std::fs::create_dir_all(trial.path().join(".agents/skills/extra")).unwrap();
+    std::fs::write(
+        trial.path().join(".agents/skills/extra/SKILL.md"),
+        "solver added skill",
+    )
+    .unwrap();
+    let evidence = public_artifacts(trial.path(), &frozen.snapshot, &harness).unwrap();
+    assert!(evidence.contains("solver instruction edit"));
+    assert!(evidence.contains(".agents/skills/check/SKILL.md"));
+    assert!(evidence.contains("\"after\":null"));
+    assert!(evidence.contains("solver added skill"));
+    let special = trial.path().join(".agents/skills/extra/SKILL.md");
+    std::fs::remove_file(&special).unwrap();
+    #[cfg(unix)]
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&special)
+            .status()
+            .unwrap()
+            .success()
+    );
+    #[cfg(not(unix))]
+    std::fs::create_dir(&special).unwrap();
+    assert!(matches!(
+        public_artifacts(trial.path(), &frozen.snapshot, &harness),
+        Err(RefinementError::Invalid(_))
+    ));
+    trial.cleanup().unwrap();
 }
 
 #[test]
@@ -272,7 +342,7 @@ fn active_artifact_collection_obeys_its_run_deadline() {
         job: None,
     };
     assert!(matches!(
-        public_artifacts_with_control(root.path(), "HEAD", &expired),
+        public_artifacts_with_control(root.path(), "HEAD", &HarnessTree::new(), &expired),
         Err(RefinementError::Exhausted(_))
     ));
     assert!(matches!(

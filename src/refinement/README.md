@@ -59,6 +59,11 @@ Acceptance commands are trusted user-supplied argv, executed directly and
 kept out of model prompts. Commands and fixtures already present in the task
 snapshot remain accessible according to the host's existing sandbox policy.
 
+Following upstream Harness2's separate harness and deliverable views, solver
+evidence excludes runner-supplied instruction changes. Task files are compared
+with the frozen snapshot; `AGENTS.md` and skills are compared with the supplied
+harness, so subsequent solver edits, additions, and deletions remain visible.
+
 Call and elapsed-time limits work with supported headless agents. Optional
 `max_cost_usd` requires both roles to use `claude-code`, whose CLI supports a
 per-invocation budget. Unknown or interrupted costs consume the reserved

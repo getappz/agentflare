@@ -4,6 +4,7 @@ use flare_workflow::refinement::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeSet,
     io::Read,
     path::{Path, PathBuf},
     time::Duration,
@@ -300,12 +301,17 @@ pub(super) fn hash_contents(
     }
 }
 #[cfg(test)]
-pub fn public_artifacts(root: &Path, snapshot: &str) -> Result<String, RefinementError> {
-    public_artifacts_with_control(root, snapshot, &GitControl::default())
+pub fn public_artifacts(
+    root: &Path,
+    snapshot: &str,
+    supplied: &HarnessTree,
+) -> Result<String, RefinementError> {
+    public_artifacts_with_control(root, snapshot, supplied, &GitControl::default())
 }
 pub fn public_artifacts_with_control(
     root: &Path,
     snapshot: &str,
+    supplied: &HarnessTree,
     control: &GitControl,
 ) -> Result<String, RefinementError> {
     let diff = control.git(
@@ -317,9 +323,24 @@ pub fn public_artifacts_with_control(
             "--binary",
             snapshot,
             "--",
+            ".",
+            ":(top,exclude)AGENTS.md",
+            ":(top,exclude,glob).agents/skills/*/SKILL.md",
         ],
     )?;
-    let new = control.git(root, &["ls-files", "-z", "--others", "--exclude-standard"])?;
+    let new = control.git(
+        root,
+        &[
+            "ls-files",
+            "-z",
+            "--others",
+            "--exclude-standard",
+            "--",
+            ".",
+            ":(top,exclude)AGENTS.md",
+            ":(top,exclude,glob).agents/skills/*/SKILL.md",
+        ],
+    )?;
     let mut evidence = diff;
     for name in new.split('\0').filter(|n| !n.is_empty()) {
         control.check_active()?;
@@ -331,6 +352,49 @@ pub fn public_artifacts_with_control(
             }
         } else {
             evidence.push_str(&format!("\nFILE {name}: exceeds text evidence limit\n"));
+        }
+        if evidence.len() > 262144 {
+            break;
+        }
+    }
+    // Like Harness2's separate harness/deliverable views, setup is not solver work.
+    let mut names: BTreeSet<_> = supplied.keys().cloned().collect();
+    for path in harness_paths(root)? {
+        names.insert(
+            path.strip_prefix(root)
+                .map_err(|e| RefinementError::Invalid(e.to_string()))?
+                .to_string_lossy()
+                .replace('\\', "/"),
+        );
+    }
+    for name in names {
+        control.check_active()?;
+        let path = root.join(&name);
+        ensure_plain(&path)?;
+        let after = if path.try_exists()? {
+            if !std::fs::metadata(&path)?.is_file() {
+                return Err(RefinementError::Invalid(format!(
+                    "non-file harness path: {name}"
+                )));
+            }
+            let mut bytes = Vec::new();
+            std::fs::File::open(&path)?
+                .take(262145)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > 262144 {
+                serde_json::json!({"omitted":"solver harness file exceeds 256 KiB"})
+            } else {
+                serde_json::json!(String::from_utf8_lossy(&bytes))
+            }
+        } else {
+            serde_json::Value::Null
+        };
+        let before = serde_json::json!(supplied.get(&name));
+        if before != after {
+            evidence.push_str(&format!(
+                "\nSOLVER HARNESS CHANGE {name}\n{}\n",
+                serde_json::json!({"before":before,"after":after})
+            ));
         }
         if evidence.len() > 262144 {
             break;

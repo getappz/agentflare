@@ -143,7 +143,7 @@ impl RefinementBackend for NativeBackend {
             let processing = (|| -> Result<(), RefinementError> {
             if inv.role == Role::Probe {
                 // Capture solver evidence before private acceptance commands can write logs.
-                receipt.evidence = public_artifacts_with_control(workspace.path(), &input.snapshot, &git_control)?;
+                receipt.evidence = public_artifacts_with_control(workspace.path(), &input.snapshot, &inv.harness, &git_control)?;
                 attach_telemetry(&mut receipt);
                 let evaluation = (|| -> Result<(), RefinementError> {
                 if receipt.error.is_none() {
