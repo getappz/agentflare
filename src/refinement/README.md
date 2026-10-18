@@ -65,7 +65,8 @@ with the frozen snapshot; `AGENTS.md` and skills are compared with the supplied
 harness, so subsequent solver edits, additions, and deletions remain visible.
 
 For Claude and Codex structured output, solver-visible messages and tool
-observations are captured directly from the invocation stream. This avoids
+observations are captured directly from the invocation stream, including
+nonzero exits and timeouts. This avoids
 depending on delayed insights ingestion. Launch metadata and usage events are
 excluded. Other executors fall back to available insights telemetry, with an
 explicit warning when no trajectory is available. Captured trajectories are
@@ -92,6 +93,9 @@ deadlines and observed nonzero exits remain failures. Acceptance checks still
 run separately before a solver result can count as successful.
 
 Resume validates saved request/executor identities and artifact hashes. An
+execution started before the current feedback method must start a new run;
+resume rejects it rather than mixing earlier evidence with changed semantics.
+An
 interrupted reservation is not silently executed again; a new, separately
 budgeted attempt may replace it. Missing budget records fail closed. A failed
 or cancelled workflow is terminal; start a new run to change its limits or

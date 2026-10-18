@@ -76,7 +76,7 @@ fn execution_identity(request: &RefinementRequest) -> Result<String, String> {
     .into_iter()
     .map(|key| (key, std::env::var(key).ok().map(|v| identity(v.as_bytes()))))
     .collect();
-    Ok(identity(&serde_json::to_vec(&serde_json::json!({"method":2,"executors":parts,"configuration":files,"environment":environment})).map_err(|e|e.to_string())?))
+    Ok(identity(&serde_json::to_vec(&serde_json::json!({"method":3,"executors":parts,"configuration":files,"environment":environment})).map_err(|e|e.to_string())?))
 }
 
 fn configuration_identity(home: &Path, codex: &Path, claude: &Path) -> Result<String, String> {

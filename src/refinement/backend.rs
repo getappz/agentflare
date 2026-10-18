@@ -127,7 +127,8 @@ impl RefinementBackend for NativeBackend {
             } else {
                 probe_prompt(&inv.prompt)
             };
-            let outcome = crate::agent_launch::run_headless_in_with_owner(
+            let mut trajectory = String::new();
+            let outcome = crate::agent_launch::run_headless_in_with_evidence(
                 Some(&owner),
                 workspace.path(),
                 agent_registry::REGISTRY,
@@ -137,9 +138,19 @@ impl RefinementBackend for NativeBackend {
                 hard_cap.min(Duration::from_secs(300)),
                 &args,
                 true,
+                if inv.role == Role::Probe {
+                    Some(&mut trajectory)
+                } else {
+                    None
+                },
             );
             let mut receipt = Receipt {
                 id: inv.id.clone(),
+                evidence: if trajectory.is_empty() {
+                    String::new()
+                } else {
+                    format!("\nSOLVER TRAJECTORY\n{trajectory}")
+                },
                 ..Receipt::default()
             };
             match outcome {
@@ -152,9 +163,6 @@ impl RefinementBackend for NativeBackend {
                     receipt.input_tokens = reply.input_tokens.unwrap_or(0);
                     receipt.output_tokens = reply.output_tokens.unwrap_or(0);
                     receipt.session_id = reply.session_id;
-                    if inv.role == Role::Probe && !reply.trajectory.is_empty() {
-                        receipt.evidence = format!("\nSOLVER TRAJECTORY\n{}", reply.trajectory);
-                    }
                 }
                 crate::agent_launch::HeadlessOutcome::UnknownAgent(e)
                 | crate::agent_launch::HeadlessOutcome::NotHeadless(e)

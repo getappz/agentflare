@@ -4,17 +4,18 @@ const TERMINAL_EVENT: &str = r#"{"type":"result","subtype":"success","is_error":
 fn solver_trajectory_retains_tool_observations_without_launch_metadata() {
     let observation = format!("{} END_OF_OBSERVATION 🦀", "x".repeat(140_000));
     let raw = [
-        serde_json::json!({"type":"system","subtype":"init","apiKey":"PRIVATE_INIT"}),
+        serde_json::json!({"type":"system","subtype":"init","launch_metadata":"PRIVATE_INIT"}),
         serde_json::json!({"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test"}}]}}),
         serde_json::json!({"type":"user","message":{"content":[{"type":"tool_result","content":observation}]}}),
         serde_json::json!({"type":"result","result":"done","total_cost_usd":0.1}),
     ].iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
     let reply = parse_json_reply(&raw);
+    let trajectory = public_trajectory(&raw);
     assert_eq!(reply.text, "done");
-    assert!(reply.trajectory.contains("cargo test"));
-    assert!(reply.trajectory.contains(&observation));
-    assert!(!reply.trajectory.contains("PRIVATE_INIT"));
-    assert!(!reply.trajectory.contains("total_cost_usd"));
+    assert!(trajectory.contains("cargo test"));
+    assert!(trajectory.contains(&observation));
+    assert!(!trajectory.contains("PRIVATE_INIT"));
+    assert!(!trajectory.contains("total_cost_usd"));
 }
 
 #[test]
@@ -25,10 +26,59 @@ fn codex_trajectory_retains_commands_and_observations() {
         "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"done\"}}\n",
     );
     let reply = parse_codex_reply(raw);
+    let trajectory = public_trajectory(raw);
     assert_eq!(reply.text, "done");
-    assert!(reply.trajectory.contains("FAILED escaped slash"));
-    assert!(reply.trajectory.contains("cargo test"));
-    assert!(!reply.trajectory.contains("thread-1"));
+    assert!(trajectory.contains("FAILED escaped slash"));
+    assert!(trajectory.contains("cargo test"));
+    assert!(!trajectory.contains("thread-1"));
+}
+
+#[test]
+fn solver_trajectory_survives_success_nonzero_exit_and_timeout() {
+    for mode in ["success", "nonzero", "timeout"] {
+        let root = tempfile::tempdir().unwrap();
+        let event = format!(
+            "{}\n{}",
+            serde_json::json!({"type":"user","message":{"content":[{"type":"tool_result","content":"EARLY_TOOL_FAILURE"}]}}),
+            if mode == "timeout" {
+                serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":"x".repeat(5000)}]}})
+            } else {
+                serde_json::json!({"type":"result","subtype":"success","is_error":false,"result":"x".repeat(5000)})
+            }
+        );
+        let registry = lingering_claude_registry(root.path(), &event);
+        if mode == "nonzero" {
+            let path = Path::new(registry[0].binary_names[0]);
+            let script = std::fs::read_to_string(path).unwrap();
+            std::fs::write(
+                path,
+                script
+                    .replace("Start-Sleep -Seconds 30", "exit 1")
+                    .replace("sleep 30", "exit 1"),
+            )
+            .unwrap();
+        }
+        let mut trajectory = String::new();
+        let outcome = run_headless_in_with_evidence(
+            None,
+            root.path(),
+            &registry,
+            "claude-code",
+            "task",
+            Duration::from_secs(if mode == "timeout" { 2 } else { 15 }),
+            Duration::from_secs(5),
+            &[],
+            true,
+            Some(&mut trajectory),
+        );
+        assert_eq!(
+            matches!(outcome, HeadlessOutcome::Failed(_)),
+            mode != "success",
+            "{mode}: {outcome:?}"
+        );
+        assert!(trajectory.contains("EARLY_TOOL_FAILURE"));
+        assert!(!trajectory.contains("subtype"));
+    }
 }
 
 #[test]
