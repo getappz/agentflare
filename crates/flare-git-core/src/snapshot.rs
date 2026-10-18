@@ -126,47 +126,80 @@ pub fn snapshot_worktree_before(
     worktree_path: &Path,
     reason: &str,
 ) -> Result<SnapshotId, String> {
+    snapshot_worktree_before_with_runner(repo_root, worktree_path, reason, |mut command| {
+        let out = command
+            .output()
+            .map_err(|e| format!("git not available: {e}"))?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    })
+}
+
+/// Capture the same snapshot with a caller-owned timeout/cancellation runner.
+pub fn snapshot_worktree_before_with_runner(
+    repo_root: &Path,
+    worktree_path: &Path,
+    reason: &str,
+    mut execute: impl FnMut(Command) -> Result<String, String>,
+) -> Result<SnapshotId, String> {
     if !worktree_path.exists() {
         return Err(format!(
             "worktree path does not exist: {}",
             worktree_path.display()
         ));
     }
-    let common_dir = resolve_common_dir(repo_root);
+    let common_dir = execute(crate::shell::command_in(
+        repo_root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    ))
+    .map(std::path::PathBuf::from)?;
     let tmp_index = common_dir.join(format!(
         "agentflare-worktree-snapshot-index-{}",
         unique_index_suffix()
     ));
     let git_dir = common_dir.to_string_lossy().to_string();
     let result = (|| {
-        let stage_args = ["--git-dir", &git_dir, "add", "-A", "."];
-        run_git_with_index(worktree_path, &tmp_index, &stage_args)?;
-        let tree = run_git_with_index(
+        let mut stage = crate::shell::command_in(
             worktree_path,
-            &tmp_index,
-            &["--git-dir", &git_dir, "write-tree"],
-        )?;
-        let sha = run_in(repo_root, &["commit-tree", &tree, "-m", reason])?;
+            &[
+                "-c",
+                "core.autocrlf=false",
+                "--git-dir",
+                &git_dir,
+                "add",
+                "-A",
+                ".",
+            ],
+        );
+        stage.env("GIT_INDEX_FILE", &tmp_index);
+        execute(stage)?;
+        let mut write_tree = crate::shell::command_in(
+            worktree_path,
+            &[
+                "-c",
+                "core.autocrlf=false",
+                "--git-dir",
+                &git_dir,
+                "write-tree",
+            ],
+        );
+        write_tree.env("GIT_INDEX_FILE", &tmp_index);
+        let tree = execute(write_tree)?;
+        let sha = execute(crate::shell::command_in(
+            repo_root,
+            &["commit-tree", &tree, "-m", reason],
+        ))?;
         let refname = format!("{SNAPSHOT_REF_PREFIX}{sha}");
-        run_in(repo_root, &["update-ref", &refname, &sha])?;
+        execute(crate::shell::command_in(
+            repo_root,
+            &["update-ref", &refname, &sha],
+        ))?;
         Ok(SnapshotId(sha))
     })();
     let _ = std::fs::remove_file(&tmp_index);
     result
-}
-
-/// Absolute path to the repo's common git dir — the shared `.git` of the
-/// main checkout, which is where linked worktrees' objects and admin
-/// entries actually live. Falls back to `<repo_root>/.git` when git can't
-/// answer, matching this module's best-effort style.
-fn resolve_common_dir(repo_root: &Path) -> std::path::PathBuf {
-    match run_in(
-        repo_root,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    ) {
-        Ok(p) if !p.trim().is_empty() => std::path::PathBuf::from(p.trim()),
-        _ => repo_root.join(".git"),
-    }
 }
 
 /// Checks out `commit_ish`'s tracked files into the current working tree and
