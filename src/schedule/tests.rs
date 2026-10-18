@@ -723,24 +723,19 @@ async fn t14_manual_bypasses_checks_preserves_clock() {
     );
 }
 
+/// Fixture git. `run_in` strips inherited repository-location variables
+/// (`GIT_DIR`, `GIT_WORK_TREE`, and the rest of `GIT_LOCATION_ENV`) so a
+/// hook-spawned test acts on `dir`, not the caller's checkout.
+fn git(dir: &Path, args: &[&str]) {
+    flare_git_core::shell::run_in(dir, args).unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+}
+
 /// Linked-worktree paths store the main checkout, matching CLI scope.
 #[test]
 fn canonical_repo_root_maps_linked_worktree_to_main_checkout() {
     let parent = tempfile::tempdir().unwrap();
     let main = parent.path().join("main");
     std::fs::create_dir_all(&main).unwrap();
-    let git = |dir: &Path, args: &[&str]| {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("git");
-        assert!(
-            out.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    };
     git(&main, &["init", "-b", "master"]);
     git(&main, &["config", "user.email", "test@test.com"]);
     git(&main, &["config", "user.name", "Test"]);
@@ -760,6 +755,52 @@ fn canonical_repo_root_maps_linked_worktree_to_main_checkout() {
         std::fs::canonicalize(plain.path())
             .unwrap()
             .to_string_lossy()
+    );
+}
+
+/// A linked worktree whose git-common-dir parent is another enclosing checkout
+/// must not be stored as that checkout. `repo_toplevel` succeeding is not
+/// enough: the candidate has to be its own toplevel and share the worktree's
+/// normalized `--git-common-dir`.
+#[test]
+fn canonical_repo_root_rejects_main_candidate_from_another_checkout() {
+    let parent = tempfile::tempdir().unwrap();
+    let outer = parent.path().join("outer");
+    std::fs::create_dir_all(&outer).unwrap();
+    git(&outer, &["init", "-b", "master"]);
+    git(&outer, &["config", "user.email", "test@test.com"]);
+    git(&outer, &["config", "user.name", "Test"]);
+    git(&outer, &["commit", "--allow-empty", "-m", "outer"]);
+    let bare = outer.join("proj.git");
+    git(&outer, &["init", "--bare", bare.to_str().unwrap()]);
+    let seed = parent.path().join("seed");
+    git(
+        parent.path(),
+        &["clone", bare.to_str().unwrap(), seed.to_str().unwrap()],
+    );
+    git(&seed, &["config", "user.email", "test@test.com"]);
+    git(&seed, &["config", "user.name", "Test"]);
+    git(&seed, &["commit", "--allow-empty", "-m", "seed"]);
+    git(&seed, &["push", "origin", "HEAD:master"]);
+    let wt = parent.path().join("wt");
+    git(
+        &bare,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "wt-branch",
+            wt.to_str().unwrap(),
+            "master",
+        ],
+    );
+
+    let err = super::canonical_repo_root(wt.to_str().unwrap()).unwrap_err();
+    assert!(err.contains("cannot resolve a main checkout"), "{err}");
+    let outer_canon = std::fs::canonicalize(&outer).unwrap();
+    assert!(
+        !err.contains(outer_canon.to_str().unwrap()),
+        "must not accept the enclosing checkout: {err}"
     );
 }
 
