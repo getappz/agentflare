@@ -272,7 +272,7 @@ impl AgentflareMcp {
             std::collections::BTreeMap::new();
 
         for obs in observations {
-            let entry = serde_json::json!({
+            let mut entry = serde_json::json!({
                 "id": obs.id,
                 "type": obs.r#type,
                 "title": obs.title,
@@ -284,6 +284,11 @@ impl AgentflareMcp {
                 "pinned": obs.pinned,
                 "topic_key": obs.topic_key,
             });
+            if obs.r#type.eq_ignore_ascii_case("lesson") {
+                let view = crate::memory::mcp::observation_view(&brain, &obs)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                entry["promotion"] = view["promotion"].clone();
+            }
             let key = if obs.r#type.is_empty() {
                 "unknown".into()
             } else {

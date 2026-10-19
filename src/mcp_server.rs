@@ -1480,10 +1480,13 @@ impl AgentflareMcp {
         }
     } // --- Memory tools ---
     #[tool(
-        description = "Memory operations — compact, context, curate, handoff, recall, relate, or remember observations. Single consolidated tool with `action` field (compact|context|curate|handoff|recall|relate|remember)."
+        description = "Memory operations — compact, context, curate, handoff, promote, recall, relate, or remember observations. Single consolidated tool with `action` field (compact|context|curate|handoff|promote|recall|relate|remember). Promote requires project observations, explicit confidence and a stored terminal workflow run from the same project."
     )]
-    fn memory(&self, Parameters(req): Parameters<MemoryRequest>) -> Result<String, ErrorData> {
-        self.memory_impl(req)
+    async fn memory(
+        &self,
+        Parameters(req): Parameters<MemoryRequest>,
+    ) -> Result<String, ErrorData> {
+        self.memory_impl(req).await
     }
 
     // --- docs tool ---

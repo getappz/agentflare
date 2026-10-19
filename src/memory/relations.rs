@@ -29,6 +29,11 @@ pub fn create(
     evidence: Option<&str>,
     confidence: Option<f64>,
 ) -> rusqlite::Result<i64> {
+    if relation.trim().eq_ignore_ascii_case("evidence_for") {
+        return Err(rusqlite::Error::InvalidParameterName(
+            "evidence_for is reserved for explicit promotion".into(),
+        ));
+    }
     let now = now_iso();
     // `last_insert_rowid()` only reflects a successful INSERT: when the
     // ON CONFLICT ... DO UPDATE arm fires instead, SQLite does not update
@@ -48,6 +53,36 @@ pub fn create(
         params![source_id, target_id, relation, reason, evidence, confidence, session_id, now],
         |r| r.get(0),
     )
+}
+
+/// Promotion receipts are append-only; reusing the same receipt is idempotent.
+pub(super) fn create_promotion_evidence(
+    conn: &Connection,
+    source_id: i64,
+    target_id: i64,
+    session_id: Option<&str>,
+    evidence: &str,
+    confidence: f64,
+) -> rusqlite::Result<i64> {
+    let existing = conn.query_row(
+        "SELECT id, evidence, confidence FROM memory_relations WHERE source_id=?1 AND target_id=?2 AND relation='evidence_for'",
+        params![source_id,target_id],
+        |row| Ok((row.get::<_,i64>(0)?,row.get::<_,Option<String>>(1)?,row.get::<_,Option<f64>>(2)?)),
+    ).optional()?;
+    if let Some((id, old_evidence, old_confidence)) = existing {
+        if old_evidence.as_deref() != Some(evidence) || old_confidence != Some(confidence) {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "promotion evidence is immutable; create a new lesson revision".into(),
+            ));
+        }
+        return Ok(id);
+    }
+    let now = now_iso();
+    conn.execute(
+        "INSERT INTO memory_relations(source_id,target_id,relation,judgment_status,reason,evidence,confidence,session_id,created_at,updated_at) VALUES (?1,?2,'evidence_for','judged','explicit promotion',?3,?4,?5,?6,?6)",
+        params![source_id,target_id,evidence,confidence,session_id,now],
+    )?;
+    Ok(conn.last_insert_rowid())
 }
 
 #[allow(dead_code)]

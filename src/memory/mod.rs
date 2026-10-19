@@ -2,6 +2,7 @@ pub mod embeddings;
 pub mod engine;
 pub mod mcp;
 pub mod observations;
+mod promotion;
 pub mod prompts;
 pub mod relations;
 pub mod schema;
