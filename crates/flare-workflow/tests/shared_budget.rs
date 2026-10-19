@@ -400,3 +400,79 @@ fn budgeted_native_runs_have_an_identity_older_executors_will_reject() {
     assert!(identity.as_deref().unwrap().contains("workflow-budget-v1"));
     assert_ne!(identity, budgeted.resume_identity);
 }
+
+#[tokio::test]
+async fn expired_budget_journals_each_skipped_rollback_and_still_cancels() {
+    use flare_workflow::{
+        EntryResult, FunctionStep, JournalEntry, StepDefinition, StepId, StepResult, StepStatus,
+        WorkflowContext, WorkflowDefinition,
+    };
+    let store = SqliteStore::<PipelineData>::open_memory().unwrap();
+    let run = seed(
+        &store,
+        BudgetLimits {
+            max_elapsed_secs: Some(1),
+            ..Default::default()
+        },
+    )
+    .await;
+    store
+        .update(run, |state| {
+            state.status = WorkflowStatus::Paused;
+            state.budget.as_mut().unwrap().started_at = Utc::now() - chrono::Duration::seconds(2);
+            for id in ["a", "b"] {
+                state.step_states.insert(
+                    StepId::new(id),
+                    StepState {
+                        status: StepStatus::Succeeded,
+                        ..Default::default()
+                    },
+                );
+            }
+        })
+        .await
+        .unwrap();
+    let context = store.load(run).await.unwrap().context;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut definition = WorkflowDefinition::new("test", "test");
+    for id in ["a", "b"] {
+        store
+            .append_journal(
+                run,
+                JournalEntry::StepRun {
+                    step_id: StepId::new(id),
+                    attempt: 1,
+                    result: Some(EntryResult::Success(serde_json::to_vec(&context).unwrap())),
+                },
+            )
+            .await
+            .unwrap();
+        let calls = calls.clone();
+        definition = definition.add_step(
+            StepDefinition::new(id, id, flare_workflow::executor::noop_executor()).with_rollback(
+                Arc::new(FunctionStep::new(
+                    move |_: &mut WorkflowContext<PipelineData>| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async { Ok(StepResult::Success) })
+                    },
+                )),
+                None,
+            ),
+        );
+    }
+    let engine = WorkflowEngine::with_store(store.clone());
+    engine.register_workflow(definition).unwrap();
+    engine.cancel_workflow_with_rollback(run).await.unwrap();
+    assert_eq!(
+        store.load(run).await.unwrap().status,
+        WorkflowStatus::Cancelled
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let journal = store.journal(run).await.unwrap();
+    for id in ["a", "b"] {
+        assert!(journal.iter().any(|entry| matches!(entry,
+            JournalEntry::Rollback { step_id, result: Some(EntryResult::Failure { message, .. }), .. }
+                if step_id == &StepId::new(id) && message.contains("elapsed allowance exhausted")
+        )), "missing rollback failure for {id}");
+    }
+}
