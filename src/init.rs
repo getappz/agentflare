@@ -828,42 +828,68 @@ pub fn wire_optimize_hooks(agent: &str) {
     }
 }
 
+/// Rewrites `statusLine` when it is absent or already an optimize statusline
+/// whose command is not `command`. A user-owned statusline is left alone,
+/// including one that exists but has no string `command`.
+fn refresh_optimize_statusline(obj: &mut Map<String, Value>, command: &str) -> bool {
+    let existing = obj
+        .get("statusLine")
+        .and_then(|s| s.get("command"))
+        .and_then(Value::as_str);
+    let owns = match obj.get("statusLine") {
+        None => true,
+        Some(_) => existing.is_some_and(|c| c.contains("optimize code hook statusline")),
+    };
+    if !owns || existing == Some(command) {
+        return false;
+    }
+    obj.insert(
+        "statusLine".to_string(),
+        json!({
+            "type": "command",
+            "command": command
+        }),
+    );
+    true
+}
+
 fn wire_optimize_claude_code() {
     let path = claude_settings_path();
     let mut settings = read_json_object(&path, || json!({}));
     let bin = agentflare_binary();
 
-    let already_wired = settings
-        .get("hooks")
-        .and_then(|h| h.get("SessionStart"))
-        .map(|v| v.to_string().contains("optimize"))
-        .unwrap_or(false);
-    if already_wired {
+    // Same in-place refresh as lifecycle hooks (`add_hook_entry`): an entry
+    // whose command still contains the marker is updated when the baked
+    // binary path (or timeout) differs, instead of treating any "optimize"
+    // substring as "already wired" and returning. That skip left a stale
+    // `~/.local/bin/agentflare` in place after upgrade (item #372).
+    let obj = settings.as_object_mut().unwrap();
+    let mut changed = false;
+    {
+        let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
+        let hooks_obj = hooks.as_object_mut().unwrap();
+        for (event, subcommand, timeout) in [
+            ("SessionStart", "session-start", 10u64),
+            ("SubagentStart", "subagent-start", 5),
+            ("UserPromptSubmit", "prompt-submit", 5),
+        ] {
+            changed |= add_hook_entry(
+                hooks_obj,
+                event,
+                &format!("optimize code hook {subcommand}"),
+                None,
+                format!("\"{bin}\" optimize code hook {subcommand}"),
+                timeout,
+            );
+        }
+    }
+    changed |=
+        refresh_optimize_statusline(obj, &format!("\"{bin}\" optimize code hook statusline"));
+
+    if !changed {
         ui::skip("optimize code hooks already wired in ~/.claude/settings.json");
         return;
     }
-
-    let obj = settings.as_object_mut().unwrap();
-    let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
-    let hooks_obj = hooks.as_object_mut().unwrap();
-
-    hooks_obj.entry("SessionStart").or_insert_with(|| json!([])).as_array_mut().unwrap().push(json!({
-        "hooks": [{ "type": "command", "command": format!("\"{bin}\" optimize code hook session-start"), "timeout": 10 }]
-    }));
-    hooks_obj.entry("SubagentStart").or_insert_with(|| json!([])).as_array_mut().unwrap().push(json!({
-        "hooks": [{ "type": "command", "command": format!("\"{bin}\" optimize code hook subagent-start"), "timeout": 5 }]
-    }));
-    hooks_obj.entry("UserPromptSubmit").or_insert_with(|| json!([])).as_array_mut().unwrap().push(json!({
-        "hooks": [{ "type": "command", "command": format!("\"{bin}\" optimize code hook prompt-submit"), "timeout": 5 }]
-    }));
-
-    obj.insert(
-        "statusLine".to_string(),
-        json!({
-            "type": "command",
-            "command": format!("\"{bin}\" optimize code hook statusline")
-        }),
-    );
 
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -1509,6 +1535,156 @@ mod tests {
 
             wire_optimize_cursor();
             assert_eq!(fs::read_to_string(&path).unwrap(), first);
+        });
+    }
+
+    /// Item #372: a SessionStart entry that already mentions "optimize" used
+    /// to skip the whole file, so a baked `~/.local/bin/agentflare` survived
+    /// an upgrade to `~/.cargo/bin/agentflare`.
+    #[test]
+    fn wire_optimize_claude_code_rewrites_stale_binary_path() {
+        with_temp_home(|| {
+            let path = home().join(".claude").join("settings.json");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let stale = "/old/1.7.0/agentflare";
+            fs::write(
+                &path,
+                serde_json::to_string_pretty(&json!({
+                    "theme": "dark",
+                    "hooks": {
+                        "SessionStart": [
+                            { "hooks": [{
+                                "type": "command",
+                                "command": "\"agentflare\" hook session-start --agent claude-code",
+                                "timeout": 10
+                            }] },
+                            { "hooks": [{
+                                "type": "command",
+                                "command": format!("\"{stale}\" optimize code hook session-start"),
+                                "timeout": 10
+                            }] }
+                        ],
+                        "SubagentStart": [{ "hooks": [{
+                            "type": "command",
+                            "command": format!("\"{stale}\" optimize code hook subagent-start"),
+                            "timeout": 5
+                        }] }],
+                        "UserPromptSubmit": [{ "hooks": [{
+                            "type": "command",
+                            "command": format!("\"{stale}\" optimize code hook prompt-submit"),
+                            "timeout": 5
+                        }] }]
+                    },
+                    "statusLine": {
+                        "type": "command",
+                        "command": format!("\"{stale}\" optimize code hook statusline")
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            wire_optimize_claude_code();
+
+            let content = fs::read_to_string(&path).unwrap();
+            let parsed: Value = serde_json::from_str(&content).unwrap();
+            let bin = agentflare_binary();
+            assert!(content.contains("dark"), "unrelated settings must survive");
+            assert!(
+                !content.contains(stale),
+                "stale binary path must be rewritten: {content}"
+            );
+            let session = parsed["hooks"]["SessionStart"].as_array().unwrap();
+            assert_eq!(
+                session.len(),
+                2,
+                "lifecycle co-tenant must not be duplicated"
+            );
+            assert_eq!(
+                session[0]["hooks"][0]["command"],
+                "\"agentflare\" hook session-start --agent claude-code"
+            );
+            for (event, sub, timeout) in [
+                ("SessionStart", "session-start", 10),
+                ("SubagentStart", "subagent-start", 5),
+                ("UserPromptSubmit", "prompt-submit", 5),
+            ] {
+                let entries = parsed["hooks"][event].as_array().unwrap();
+                let optimize: Vec<_> = entries
+                    .iter()
+                    .filter(|e| e.to_string().contains("optimize code hook"))
+                    .collect();
+                assert_eq!(optimize.len(), 1, "{event}");
+                assert_eq!(
+                    optimize[0]["hooks"][0]["command"],
+                    format!("\"{bin}\" optimize code hook {sub}")
+                );
+                assert_eq!(optimize[0]["hooks"][0]["timeout"], timeout);
+            }
+            assert_eq!(
+                parsed["statusLine"]["command"],
+                format!("\"{bin}\" optimize code hook statusline")
+            );
+
+            wire_optimize_claude_code();
+            assert_eq!(fs::read_to_string(&path).unwrap(), content);
+        });
+    }
+
+    #[test]
+    fn wire_optimize_claude_code_leaves_a_foreign_statusline() {
+        with_temp_home(|| {
+            let path = home().join(".claude").join("settings.json");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(
+                &path,
+                serde_json::to_string(&json!({
+                    "hooks": {
+                        "SessionStart": [{ "hooks": [{
+                            "type": "command",
+                            "command": "\"/old/1.7.0/agentflare\" optimize code hook session-start",
+                            "timeout": 10
+                        }] }]
+                    },
+                    "statusLine": { "type": "command", "command": "my-statusline" }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            wire_optimize_claude_code();
+
+            let parsed: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(parsed["statusLine"]["command"], "my-statusline");
+            assert_eq!(
+                parsed["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+                format!(
+                    "\"{}\" optimize code hook session-start",
+                    agentflare_binary()
+                )
+            );
+        });
+    }
+
+    #[test]
+    fn wire_optimize_claude_code_leaves_a_statusline_without_command() {
+        with_temp_home(|| {
+            let path = home().join(".claude").join("settings.json");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(
+                &path,
+                serde_json::to_string(&json!({
+                    "statusLine": { "type": "command" }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            wire_optimize_claude_code();
+
+            let parsed: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(parsed["statusLine"]["type"], "command");
+            assert!(parsed["statusLine"].get("command").is_none());
         });
     }
 
