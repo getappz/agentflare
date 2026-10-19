@@ -218,7 +218,7 @@ fn build_report(
             .zip(end)
             .map(|(s, e)| (e - s).num_milliseconds().max(0))
     );
-    // shortcut: session totals span runs; require per-invocation accounting before summing run cost.
+    // shortcut: session totals span runs; budget receipts are provider reports, not a verified total bill.
     // shortcut: file activity is not an artifact diff; require stored snapshot IDs before comparing artifacts.
     let mut report = json!({
         "schema_version":1,"generated_at":Utc::now(),"run":run,

@@ -20,6 +20,10 @@ use uuid::Uuid;
 pub trait WorkflowData: Serialize + DeserializeOwned + Send + Sync + Clone + 'static {
     /// Human-readable name for logging and identification.
     fn workflow_type() -> &'static str;
+
+    fn budget_limits(&self) -> Option<crate::budget::BudgetLimits> {
+        None
+    }
 }
 
 /// Unique identifier for a workflow definition.
@@ -408,6 +412,8 @@ pub struct WorkflowContext<D: WorkflowData> {
     /// Runtime metadata for the step currently executing. Not persisted.
     #[serde(skip)]
     pub step: StepExecutionMeta,
+    #[serde(skip)]
+    pub budget: Option<crate::budget::BudgetHandle>,
 }
 
 impl<D: WorkflowData> WorkflowContext<D> {
@@ -423,6 +429,7 @@ impl<D: WorkflowData> WorkflowContext<D> {
             params: serde_json::Value::Null,
             triggered_at: Utc::now(),
             step: StepExecutionMeta::default(),
+            budget: None,
         }
     }
 }
@@ -436,6 +443,8 @@ pub struct WorkflowState<D: WorkflowData> {
     /// Execution configuration captured at start; missing on legacy runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<crate::budget::BudgetState>,
     pub status: WorkflowStatus,
     pub current_step: Option<StepId>,
     pub step_states: HashMap<StepId, StepState>,
@@ -486,6 +495,7 @@ impl<D: WorkflowData> WorkflowState<D> {
             run_id,
             workflow_id,
             resume_identity: None,
+            budget: None,
             status: WorkflowStatus::Pending,
             current_step: None,
             step_states: HashMap::new(),
@@ -541,6 +551,8 @@ pub enum StepResult {
 /// Errors surfaced by the workflow engine.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum WorkflowError {
+    #[error("workflow budget: {0}")]
+    Budget(String),
     #[error("workflow run not found: {0}")]
     NotFound(WorkflowRunId),
 
