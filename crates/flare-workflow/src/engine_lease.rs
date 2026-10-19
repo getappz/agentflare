@@ -357,12 +357,16 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             tracing::info!(run_id = %run_id, holder = ?state.lease.as_ref().map(|l| &l.owner), "Run is held by another live executor; not resuming it here");
             return Ok(false);
         }
+        if state.resume_identity != definition.resume_identity {
+            return Err(WorkflowError::ResumeIdentityMismatch(run_id));
+        }
         let Some(driving) = self.claim_driving(run_id) else {
             return Ok(false);
         };
         // Re-check under the store's update (the listing above may be stale)
         // and claim the lease in the same write.
         let mut taken = true;
+        let mut incompatible = false;
         let result = self
             .state_store
             .update(run_id, |s| {
@@ -377,12 +381,19 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                     taken = false;
                     return;
                 }
+                if s.resume_identity != definition.resume_identity {
+                    incompatible = true;
+                    return;
+                }
                 s.status = WorkflowStatus::Running;
                 s.lease = Some(self.new_lease());
             })
             .await;
         // Dropping `driving` on either early return releases the claim.
         result?;
+        if incompatible {
+            return Err(WorkflowError::ResumeIdentityMismatch(run_id));
+        }
         if !taken {
             return Ok(false);
         }

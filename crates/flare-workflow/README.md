@@ -16,6 +16,7 @@ layer (items / claims / handoffs).
 | OpenFang | StepMode semantics, `{{input}}`/`{{var}}` templating, ErrorMode, JSON schema | MIT / Apache-2.0 |
 | Restate | journal durability (CompletableEntry), durable timers/promises | BSL — design only, no code |
 | DBOS | step outputs checkpointed with user state ⇒ exactly-once | MIT |
+| Google Research Harness² | configuration identity checked before resume | Apache-2.0 — design adapted |
 
 ## Usage
 
@@ -68,6 +69,21 @@ Each step also accepts `model`, `args` (extra CLI flags), `hard_cap_secs`, and
 `idle_timeout_secs` — all optional, all forwarded to the `SendMessage` hook
 via `StepInvocation` so a workflow author can tune agent/model/flags/timeouts
 per step as plain JSON, with no crate rebuild.
+
+JSON workflows persist their typed definition and absolute execution directory as
+a resume identity in the existing workflow state. `resume_run`, `resume_workflow`
+and boot recovery refuse mismatched identities before replay or agent calls.
+Recovery skips incompatible runs and continues recovering compatible ones; saved
+state and journals remain available for inspection. JSON formatting and key order
+do not change identity. An implicit working directory is captured at compilation.
+
+Legacy JSON runs have no identity and cannot be resumed by a newly compiled JSON
+definition; start a new run. Rust-defined workflows retain their existing behavior
+unless they opt in with `.with_resume_identity("my-workflow:v1")`. Change that
+revision when the executor's replay contract changes. Neither mode fingerprints
+repository contents, executables, inherited environment, agent defaults, or persona
+file contents; callers must include external configuration in an explicit identity
+when it affects compatibility. No additional completion markers or store are used.
 
 A project can commit its own workflows to `<repo_root>/.agentflare/workflows/
 <name>.json` (JSONC — comments and trailing commas allowed) and run them by

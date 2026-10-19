@@ -433,6 +433,9 @@ impl<D: WorkflowData> WorkflowContext<D> {
 pub struct WorkflowState<D: WorkflowData> {
     pub run_id: WorkflowRunId,
     pub workflow_id: WorkflowId,
+    /// Execution configuration captured at start; missing on legacy runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_identity: Option<String>,
     pub status: WorkflowStatus,
     pub current_step: Option<StepId>,
     pub step_states: HashMap<StepId, StepState>,
@@ -482,6 +485,7 @@ impl<D: WorkflowData> WorkflowState<D> {
         Self {
             run_id,
             workflow_id,
+            resume_identity: None,
             status: WorkflowStatus::Pending,
             current_step: None,
             step_states: HashMap::new(),
@@ -542,6 +546,11 @@ pub enum WorkflowError {
 
     #[error("workflow definition not found: {0}")]
     DefinitionNotFound(WorkflowId),
+
+    #[error(
+        "workflow run {0} has an incompatible or missing resume identity; restore the original definition or start a new run"
+    )]
+    ResumeIdentityMismatch(WorkflowRunId),
 
     #[error("step failed: {step_id} - {message}")]
     StepFailed { step_id: StepId, message: String },
