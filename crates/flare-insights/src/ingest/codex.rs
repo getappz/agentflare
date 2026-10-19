@@ -78,6 +78,7 @@ fn parse_codex_jsonl(path: &std::path::Path) -> Option<(Session, Vec<Turn>, Vec<
     let mut cwd: Option<String> = None;
     let mut turns: Vec<Turn> = Vec::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
+    let mut tool_indices = std::collections::HashMap::new();
     let mut seq: u32 = 0;
 
     for v in &vals {
@@ -165,6 +166,11 @@ fn parse_codex_jsonl(path: &std::path::Path) -> Option<(Session, Vec<Turn>, Vec<
                 .and_then(|p| p.get("arguments"))
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
+            let input = input
+                .as_str()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or(input);
+            tool_indices.insert(call_id.clone(), tool_calls.len());
             tool_calls.push(ToolCall {
                 id: call_id,
                 session_id: id.clone(),
@@ -172,10 +178,25 @@ fn parse_codex_jsonl(path: &std::path::Path) -> Option<(Session, Vec<Turn>, Vec<
                 name,
                 input,
                 output: None,
-                status: "completed".into(),
+                status: "pending".into(),
                 duration_ms: None,
                 created_at: v.get("timestamp").and_then(parse_timestamp),
             });
+        }
+        if payload_type == "function_call_output" {
+            if let Some(index) = v["payload"]["call_id"]
+                .as_str()
+                .and_then(|id| tool_indices.get(id))
+                .copied()
+            {
+                let tool: &mut ToolCall = &mut tool_calls[index];
+                tool.output = v["payload"].get("output").map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| v.to_string())
+                });
+                tool.status = "completed".into();
+            }
         }
     }
 
@@ -189,7 +210,7 @@ fn parse_codex_jsonl(path: &std::path::Path) -> Option<(Session, Vec<Turn>, Vec<
         id: id.clone(),
         source: SessionSource::Codex,
         project,
-        project_path: cwd,
+        project_path: cwd.clone(),
         title: None,
         model,
         status: SessionStatus::Completed,
@@ -206,7 +227,7 @@ fn parse_codex_jsonl(path: &std::path::Path) -> Option<(Session, Vec<Turn>, Vec<
         tags: vec![],
         starred: false,
         pid: None,
-        cwd: None,
+        cwd,
     };
 
     Some((session, turns, tool_calls))
@@ -236,4 +257,37 @@ fn extract_codex_text(payload: Option<&serde_json::Value>, v: &serde_json::Value
         .and_then(|c| c.as_str())
         .unwrap_or("")
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_outputs_join_by_call_id_and_arguments_are_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let records = [
+            serde_json::json!({"payload":{"type":"function_call","call_id":"a","name":"exec_command","arguments":"{\"cmd\":\"cargo test\"}"}}),
+            serde_json::json!({"payload":{"type":"function_call","call_id":"b","name":"exec_command","arguments":"{\"cmd\":\"cargo fmt --check\"}"}}),
+            serde_json::json!({"payload":{"type":"function_call_output","call_id":"a","output":"Process exited with code 1\nOutput:\ntest failed"}}),
+        ];
+        std::fs::write(
+            &path,
+            records
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let (_, _, tools) = parse_codex_jsonl(&path).unwrap();
+        assert_eq!(tools[0].input["cmd"], "cargo test");
+        assert_eq!(
+            tools[0].output.as_deref(),
+            Some("Process exited with code 1\nOutput:\ntest failed")
+        );
+        assert_eq!(tools[0].status, "completed");
+        assert_eq!(tools[1].status, "pending");
+    }
 }

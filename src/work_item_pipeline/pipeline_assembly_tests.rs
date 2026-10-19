@@ -81,7 +81,7 @@ async fn sdd_loop_resumes_the_implementer_session_on_the_next_fix_round() {
         r#"{"action":"continue_task","rationale":"reviewing","ledger_line":"Task 0: review issues found","task_model_tier":null}"#,
         // Iteration 3: implementer (claude-code) fixes it -- this call
         // must resume iteration 1's session.
-        "did the fix",
+        "did the fix\u{0}AGENTFLARE_SESSION:sess-2",
         r#"{"action":"advance_task","rationale":"fixed","ledger_line":"Task 0: fixed","task_model_tier":null}"#,
     ]);
     let pipeline =
@@ -100,9 +100,13 @@ async fn sdd_loop_resumes_the_implementer_session_on_the_next_fix_round() {
 
     assert_eq!(
         ctx.data.agent_sessions.get("claude-code"),
-        Some(&"sess-1".to_string())
+        Some(&"sess-2".to_string())
     );
-    assert_eq!(ctx.data.session_id.as_deref(), Some("sess-1"));
+    assert_eq!(ctx.data.session_id.as_deref(), Some("sess-2"));
+    assert_eq!(
+        ctx.data.session_ids,
+        ["sess-1".to_string(), "sess-2".to_string()].into()
+    );
 
     let recorded = calls.lock().unwrap();
     let (agent, _prompt, args) = recorded[4].clone();

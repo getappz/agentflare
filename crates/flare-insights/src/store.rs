@@ -20,6 +20,13 @@ pub struct InsightsStore {
 }
 
 impl InsightsStore {
+    /// Inspect an existing index without creating it or running migrations.
+    pub fn open_read_only(path: &Path) -> Result<Self, StoreError> {
+        Ok(Self {
+            conn: Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?,
+        })
+    }
+
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -178,6 +185,29 @@ impl InsightsStore {
         let mut stmt = self.conn.prepare("SELECT * FROM sessions WHERE id=?1")?;
         let row = stmt.query_row(params![id], row_to_session).optional()?;
         Ok(row)
+    }
+
+    /// Codex indexes historically used rollout filenames instead of provider UUIDs.
+    pub fn get_session_by_provider_id(&self, id: &str) -> Result<Option<Session>, StoreError> {
+        if let Some(session) = self.get_session(id)? {
+            return Ok(Some(session));
+        }
+        if uuid::Uuid::parse_str(id).is_err() {
+            return Ok(None);
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM sessions WHERE source = ?1 AND id GLOB ?2 LIMIT 2")?;
+        let mut sessions = stmt.query_map(
+            params!["\"codex\"", format!("rollout-*-{id}")],
+            row_to_session,
+        )?;
+        let first = sessions.next().transpose()?;
+        // An ambiguous native ID must not attach another session's evidence.
+        if sessions.next().transpose()?.is_some() {
+            return Ok(None);
+        }
+        Ok(first)
     }
 
     pub fn list_sessions(&self, limit: usize, offset: usize) -> Result<Vec<Session>, StoreError> {
@@ -341,7 +371,7 @@ impl InsightsStore {
             tx.execute(
                 r#"INSERT INTO tool_calls(id, session_id, turn_seq, name, input, output, status, duration_ms, created_at)
                    VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
-                   ON CONFLICT(id) DO UPDATE SET output=excluded.output, status=excluded.status, duration_ms=excluded.duration_ms"#,
+                    ON CONFLICT(id) DO UPDATE SET session_id=excluded.session_id, turn_seq=excluded.turn_seq, name=excluded.name, input=excluded.input, output=excluded.output, status=excluded.status, duration_ms=excluded.duration_ms, created_at=excluded.created_at"#,
                 params![
                     tc.id,
                     tc.session_id,

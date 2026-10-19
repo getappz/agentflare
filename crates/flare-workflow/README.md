@@ -99,6 +99,32 @@ what's available. See `agentflare::workflow::resolve_named_definition`.
   tables `workflow_runs` (authoritative JSON state), `journal` (append-only),
   `step_state`, `run_vars` (queryable projections).
 
+## Execution evidence reports
+
+Use `agentflare workflow report <run-id>` (or the workflow MCP tool with
+`action="report", run_id="..."`) for a JSON evidence report. It reads a consistent
+snapshot of existing workflow state and journal, then joins explicitly recorded
+provider session IDs to the existing insights index. It does not launch agents,
+run checks, publish artifacts, or modify either database. `--db-path` works as it
+does for `workflow status`; the MCP database remains fixed in production.
+
+Reports preserve journal attempt failures, observed verification commands and
+their known exit outcomes, time-scoped conversation/tool/file activity, recorded
+PR links and agent claims. Replaced provider session IDs are retained for new
+work-item runs. Missing/ambiguous sessions, unrecorded timestamps and unknown
+outcomes remain explicit; unrelated worktree sessions are excluded. Text uses the
+existing handoff redactor and 4,000-character field cap, with a truncation count.
+Use source session/tool IDs to inspect the indexed originals.
+
+Session costs may be estimates covering an entire resumed session; they are not
+reported as total run spending. Acceptance stays `unknown`: successful execution
+does not prove every required check passed against the final source. File activity
+records tool requests, not an immutable Git/artifact diff. Legacy runs may lack
+session history and failed-call usage. Claude/Codex importers now retain returned
+tool output; refresh previously indexed files with `agentflare insights sync
+--force` (read-only for source logs). Existing `insights show` and artifact export
+tools remain available for deeper inspection and publication.
+
 ## License
 
 Apache-2.0. Restate ideas are adopted as design only (BSL 1.1); no Restate

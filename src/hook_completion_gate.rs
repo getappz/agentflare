@@ -6,13 +6,13 @@
 use crate::hook::read_stdin_or_skip;
 use serde_json::Value;
 
-struct PostToolUseInput {
+pub(crate) struct PostToolUseInput {
     session_id: String,
     tool_name: String,
-    command: Option<String>,
-    exit_code: Option<i32>,
-    is_error: bool,
-    is_running: bool,
+    pub(crate) command: Option<String>,
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) is_error: bool,
+    pub(crate) is_running: bool,
     output_text: String,
     item_action: Option<String>,
     /// Whether the `item` call's own response says the action actually took
@@ -56,9 +56,8 @@ fn response_as_json(response: &Value) -> Option<Value> {
 /// Codex's shell response puts `Process exited with code N` in its header,
 /// while apply_patch uses `Exit code: N`. Inspect only header lines so test
 /// output mentioning an exit code cannot change the command's result.
-fn exit_code_from_text(response: &Value) -> Option<i32> {
+fn exit_code_from_text(response: &str) -> Option<i32> {
     response
-        .as_str()?
         .lines()
         .take_while(|line| line.trim() != "Output:")
         .take(6)
@@ -102,7 +101,7 @@ fn item_action_succeeded(action: &str, response: Option<&Value>) -> Option<bool>
 /// enough as an unrelated field on non-Bash tool responses (e.g. an HTTP
 /// status code) that trusting it risked misreading an unrelated field as a
 /// process exit code.
-fn parse_post_tool_use(input: &str) -> Option<PostToolUseInput> {
+pub(crate) fn parse_post_tool_use(input: &str) -> Option<PostToolUseInput> {
     let v: serde_json::Value = serde_json::from_str(input).ok()?;
     let session_id = v
         .get("session_id")
@@ -132,16 +131,27 @@ fn parse_post_tool_use(input: &str) -> Option<PostToolUseInput> {
         .and_then(|ti| ti.get("action"))
         .and_then(Value::as_str)
         .map(String::from);
-    let response = v.get("tool_response");
+    // Imported Claude MCP results can be content arrays without an envelope.
+    let array_response = v
+        .get("tool_response")
+        .filter(|r| r.is_array())
+        .map(|r| serde_json::json!({"content":r}));
+    let response = array_response.as_ref().or_else(|| v.get("tool_response"));
+    let decoded_response = response.and_then(response_as_json);
     let exit_code = response
-        .and_then(|r| {
+        .into_iter()
+        .chain(decoded_response.as_ref())
+        .find_map(|r| {
             ["exit_code", "exitCode", "returncode", "return_code"]
                 .iter()
-                .find_map(|key| r.get(key))
+                .find_map(|key| r.get(key).and_then(Value::as_i64))
         })
-        .and_then(Value::as_i64)
         .and_then(|n| i32::try_from(n).ok())
-        .or_else(|| response.and_then(exit_code_from_text));
+        .or_else(|| {
+            response
+                .and_then(Value::as_str)
+                .and_then(exit_code_from_text)
+        });
     let is_error = response
         .and_then(|r| r.get("isError"))
         .and_then(Value::as_bool)
@@ -172,20 +182,27 @@ fn parse_post_tool_use(input: &str) -> Option<PostToolUseInput> {
                 .to_string()
         })
         .unwrap_or_default();
-    let exit_code = exit_code.or_else(|| {
-        tool_name
-            .ends_with("__ctx_shell")
-            .then(|| ctx_shell_exit_code(&output_text))
-            .flatten()
-    });
-    let is_running = output_text.contains("Process running with session ID")
-        || output_text.starts_with("[background:")
-        || output_text.starts_with("[auto-background:")
-        || response
-            .and_then(|r| r.get("structuredContent"))
-            .and_then(|r| r.get("state"))
-            .and_then(Value::as_str)
-            == Some("running");
+    let exit_code = exit_code
+        .or_else(|| exit_code_from_text(&output_text))
+        .or_else(|| {
+            tool_name
+                .ends_with("__ctx_shell")
+                .then(|| ctx_shell_exit_code(&output_text))
+                .flatten()
+        });
+    let result_state = decoded_response
+        .as_ref()
+        .and_then(|r| r.get("state"))
+        .and_then(Value::as_str);
+    let is_running = match result_state {
+        Some("running") => true,
+        Some("completed" | "failed") => false,
+        _ => {
+            output_text.contains("Process running with session ID")
+                || output_text.starts_with("[background:")
+                || output_text.starts_with("[auto-background:")
+        }
+    };
     let item_success = item_action
         .as_deref()
         .and_then(|action| item_action_succeeded(action, response));
@@ -513,7 +530,10 @@ mod tests {
         let mentioned_in_output = serde_json::json!(
             "Wall time: 0.1 seconds\nProcess exited with code 0\nOutput:\nExit code: 1"
         );
-        assert_eq!(exit_code_from_text(&mentioned_in_output), Some(0));
+        assert_eq!(
+            exit_code_from_text(mentioned_in_output.as_str().unwrap()),
+            Some(0)
+        );
     }
 
     #[test]

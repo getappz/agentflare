@@ -408,7 +408,7 @@ fn mask_secret_words(input: &str) -> String {
 /// True for `key=value` words whose key is a known secret name
 /// (`password=hunter2`, `--api-key=sk-...`). Bare prose words never match:
 /// without an `=` there is no assignment to mask.
-fn has_sensitive_name(word: &str) -> bool {
+pub(crate) fn has_sensitive_name(word: &str) -> bool {
     let Some((name, _)) = word.split_once('=') else {
         return false;
     };

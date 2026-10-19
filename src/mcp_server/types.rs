@@ -1459,7 +1459,7 @@ pub(crate) struct SearchRequest {
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct WorkflowRequest {
     #[schemars(
-        description = "Action: run|status|complete_event|cancel|list|list_definitions|metrics|schedule_create|schedule_list|schedule_show|schedule_update|schedule_enable|schedule_disable|schedule_remove|schedule_fire|schedule_runs"
+        description = "Action: run|status|report|complete_event|cancel|list|list_definitions|metrics|schedule_create|schedule_list|schedule_show|schedule_update|schedule_enable|schedule_disable|schedule_remove|schedule_fire|schedule_runs"
     )]
     pub(crate) action: String,
     #[schemars(
@@ -1480,7 +1480,7 @@ pub(crate) struct WorkflowRequest {
     )]
     #[serde(default)]
     pub(crate) params: Option<String>,
-    #[schemars(description = "Run UUID (status, complete_event, cancel)")]
+    #[schemars(description = "Run UUID (status, report, complete_event, cancel)")]
     #[serde(default)]
     pub(crate) run_id: Option<String>,
     #[schemars(description = "WaitEvent name to resolve (complete_event)")]
