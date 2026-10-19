@@ -244,15 +244,17 @@ impl ConsensusEngine {
             if is_cancelled(&opts.cancellation) {
                 stop_reason = StopReason::Aborted;
             } else {
+                // Shuffle so judge-side position bias can't favour a fixed
+                // participant; the seeded rng makes the order reproducible.
+                let shuffled = shuffle(&last_round_responses, &mut rng);
                 synthesis = Some(
                     self.run_judge(
                         judge,
-                        &last_round_responses,
+                        &shuffled,
                         &opts.participants,
                         &opts.question,
                         last_round_num,
                         opts.cancellation.clone(),
-                        &mut rng,
                     )
                     .await,
                 );
@@ -479,7 +481,6 @@ impl ConsensusEngine {
         question: &str,
         last_round_number: u32,
         cancellation: Option<CancellationToken>,
-        rng: &mut StdRng,
     ) -> SynthesisResult {
         self.events
             .publish(ConsensusEvent::SynthesisStart {
@@ -492,10 +493,7 @@ impl ConsensusEngine {
             .clone()
             .unwrap_or_else(|| judge_persona().system_prompt);
         let system = build_judge_system_prompt(&judge_system_prompt, question);
-        // Shuffle so judge-side position bias can't favour a fixed participant;
-        // the seeded rng makes the order reproducible.
-        let shuffled = shuffle(final_responses, rng);
-        let candidate_order: Vec<JudgeCandidate> = shuffled
+        let candidate_order: Vec<JudgeCandidate> = final_responses
             .iter()
             .enumerate()
             .map(|(i, r)| JudgeCandidate {
@@ -504,7 +502,7 @@ impl ConsensusEngine {
                 model_id: r.model_id.clone(),
             })
             .collect();
-        let user = build_judge_user_prompt(&shuffled, participants);
+        let user = build_judge_user_prompt(final_responses, participants);
 
         let caller: &Arc<dyn ModelCaller> = judge.caller.as_ref().unwrap_or(&self.caller);
         let temperature = judge
