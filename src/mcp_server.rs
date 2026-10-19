@@ -26,6 +26,7 @@ mod project_resolution;
 mod resume;
 mod review;
 pub(crate) mod search;
+mod search_fuse;
 pub(crate) mod secret_scan;
 mod skill;
 pub(crate) mod types;

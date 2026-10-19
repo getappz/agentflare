@@ -300,3 +300,140 @@ fn search_store_includes_artifact_matches() {
         );
     });
 }
+
+fn all_req(query: &str) -> SearchRequest {
+    SearchRequest {
+        query: query.into(),
+        r#type: Some("all".into()),
+        limit: Some(20),
+        meta: None,
+        path_glob: None,
+        min_score: None,
+        rerank: None,
+    }
+}
+
+fn arm(refs: &[&str]) -> Vec<super::search_fuse::ArmHit> {
+    refs.iter()
+        .map(|r| super::search_fuse::ArmHit {
+            r#ref: (*r).into(),
+            title: (*r).into(),
+            excerpt: String::new(),
+        })
+        .collect()
+}
+
+#[test]
+fn fuse_rrf_orders_by_summed_reciprocal_rank_and_dedups() {
+    use super::search_fuse::fuse_rrf;
+    let hits = fuse_rrf(
+        vec![
+            ("store", arm(&["a", "shared", "b"])),
+            ("memory", arm(&["shared", "c"])),
+            ("code", arm(&["c", "a"])),
+        ],
+        10,
+    );
+    let refs: Vec<&str> = hits.iter().map(|h| h.r#ref.as_str()).collect();
+    // shared = 1/62 + 1/61; a = 1/61 + 1/62 (tie, a seen first); c = 1/62 + 1/61 (tie)
+    // b = 1/63 only.
+    assert_eq!(refs.len(), 4, "shared ref must be one hit: {refs:?}");
+    assert_eq!(refs.last(), Some(&"b"));
+    let shared = hits.iter().find(|h| h.r#ref == "shared").unwrap();
+    assert!((shared.score - (1.0 / 62.0 + 1.0 / 61.0)).abs() < 1e-12);
+    // memory ranked it #1, store #2 -> memory's source wins
+    assert_eq!(shared.source, "memory");
+    let a = hits.iter().find(|h| h.r#ref == "a").unwrap();
+    assert_eq!(a.source, "store");
+    let c = hits.iter().find(|h| h.r#ref == "c").unwrap();
+    assert_eq!(c.source, "code");
+    assert_eq!(fuse_rrf(vec![("store", arm(&["a", "b", "c"]))], 2).len(), 2);
+}
+
+#[test]
+fn opaque_hits_extracts_rank_order_from_text_and_json() {
+    use super::search_fuse::opaque_hits;
+    let text = serde_json::json!("src/a.rs:10: fn x\nsrc/b.rs:3: fn y");
+    let refs: Vec<String> = opaque_hits(&text).into_iter().map(|h| h.r#ref).collect();
+    assert_eq!(refs, ["src/a.rs:10", "src/b.rs:3"]);
+    let wrapped = serde_json::json!({"content": [{"type": "text", "text": "[{\"url\":\"https://x\",\"title\":\"X\"},{\"url\":\"https://y\"}]"}]});
+    let hits = opaque_hits(&wrapped);
+    assert_eq!(hits[0].r#ref, "https://x");
+    assert_eq!(hits[0].title, "X");
+    assert_eq!(hits[1].r#ref, "https://y");
+}
+
+#[test]
+fn search_all_fuses_store_and_memory_and_skips_failing_arm() {
+    crate::paths::test_support::with_temp_home(|| {
+        let conn = crate::memory::store::open().unwrap();
+        crate::memory::observations::save(
+            &conn,
+            None,
+            "decision",
+            "zebrafish decision",
+            "zebrafish memory observation",
+            None,
+            Some("test-project"),
+            None,
+            None,
+        )
+        .unwrap();
+        drop(conn);
+
+        let (_tmp, s) = harness();
+        let wid = ws_id(&s);
+        seed_doc(
+            &s,
+            &wid,
+            "docs/zebrafish.md",
+            "zebrafish store document",
+            "note",
+        );
+
+        let result = search_sync(&s, all_req("zebrafish")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["source"], "all");
+        let hits = parsed["hits"].as_array().unwrap();
+        let sources: Vec<&str> = hits.iter().map(|h| h["source"].as_str().unwrap()).collect();
+        assert!(sources.contains(&"store"), "{result}");
+        assert!(sources.contains(&"memory"), "{result}");
+        // best-first, scores descending, and the doc carries the store ref
+        let scores: Vec<f64> = hits.iter().map(|h| h["score"].as_f64().unwrap()).collect();
+        assert!(scores.windows(2).all(|w| w[0] >= w[1]), "{scores:?}");
+        assert!(
+            hits.iter().any(|h| h["ref"] == "docs/zebrafish.md"),
+            "{result}"
+        );
+        // web is off unless asked for
+        assert!(!sources.contains(&"web"));
+        assert!(
+            !parsed["skipped"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a == "web")
+        );
+    });
+}
+
+#[test]
+fn search_all_requires_non_empty_query() {
+    let (_tmp, s) = harness();
+    let err = search_sync(&s, all_req("")).unwrap_err();
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+}
+
+#[test]
+fn failing_delegated_arm_is_skipped_and_others_still_fuse() {
+    use super::search_fuse::{delegated_arm, fuse_rrf};
+    let failed = r#"{"source":"code","error":"leanctx ctx_search failed: down","results":[]}"#;
+    assert!(delegated_arm(failed).is_none());
+    let ok = delegated_arm(r#"{"source":"web","results":[{"url":"https://x"}]}"#).unwrap();
+    let mut arms = vec![("store", arm(&["a"]))];
+    arms.extend(delegated_arm(failed).map(|h| ("code", h)));
+    arms.push(("web", ok));
+    let hits = fuse_rrf(arms, 10);
+    assert_eq!(hits.len(), 2);
+    assert!(hits.iter().all(|h| h.source != "code"));
+}
