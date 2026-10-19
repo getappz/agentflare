@@ -1,0 +1,21 @@
+name: macos-probe
+on:
+  push:
+    branches: [task/762-fix-ci-master-macos-build-fails-on-agent]
+jobs:
+  probe:
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: raw script (old vs new)
+        shell: bash
+        run: |
+          echo "locale: LANG=$LANG LC_ALL=$LC_ALL"
+          echo "--- old (no LC_ALL) ---"
+          time (for i in 1 2 3; do echo "step $(tr -dc a-z </dev/urandom | head -c 12)"; done) 2>&1
+          echo "--- new (LC_ALL=C) ---"
+          time (for i in 1 2 3; do echo "step $(LC_ALL=C tr -dc a-z </dev/urandom | head -c 12)"; done) 2>&1
+      - uses: dtolnay/rust-toolchain@stable
+      - name: the failing test
+        run: cargo test --bin agentflare run_captured_leaves_varied_output_running -- --nocapture --test-threads=1
