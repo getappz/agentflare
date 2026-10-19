@@ -342,3 +342,45 @@ async fn report_reads_foreign_workflow_data_without_writing_or_creating_database
     assert!(read_report(run, &missing, &insights).is_err());
     assert!(!missing.exists());
 }
+
+#[tokio::test]
+async fn budget_report_reads_the_live_ledger_instead_of_the_initial_snapshot() {
+    use flare_workflow::budget::{BudgetLimits, BudgetOperation, BudgetState};
+    use flare_workflow::{PipelineData, StateStore, WorkflowId, WorkflowState, WorkflowStatus};
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("workflow.db");
+    let insights = dir.path().join("missing-insights.db");
+    let store = flare_workflow::SqliteStore::open_file(&db).unwrap();
+    let run = WorkflowRunId::new();
+    let mut state = WorkflowState::new(run, WorkflowId::new("fixture"), PipelineData);
+    state.status = WorkflowStatus::Running;
+    state.budget = Some(
+        BudgetState::new(
+            BudgetLimits {
+                max_cost_usd: Some(1.0),
+                reserve_per_call_usd: Some(0.5),
+                ..Default::default()
+            },
+            Utc::now(),
+        )
+        .unwrap(),
+    );
+    store.save(state).await.unwrap();
+    store
+        .budget_operation(
+            run,
+            BudgetOperation::Reserve {
+                step_id: "solve".into(),
+                agent: "fixture".into(),
+                logical_attempt: 1,
+            },
+        )
+        .await
+        .unwrap();
+    let before = std::fs::read(&db).unwrap();
+    let report = read_report(run, &db, &insights).unwrap();
+    assert_eq!(report["run"]["budget"]["held_cost_usd"], 0.5);
+    assert_eq!(report["run"]["budget"]["unknown_usage_count"], 1);
+    assert_eq!(report["run_cost_usd"], Value::Null);
+    assert_eq!(std::fs::read(&db).unwrap(), before);
+}

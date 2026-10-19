@@ -106,7 +106,13 @@ impl<D: WorkflowData> WorkflowEngine<D, SqliteStore<D>> {
 
         let run_id = WorkflowRunId::new();
         let mut state = WorkflowState::new(run_id, definition_id.clone(), data);
-        state.resume_identity = definition.resume_identity.clone();
+        state.resume_identity = definition.run_identity(&state.context.data)?;
+        state.budget = definition
+            .budget
+            .clone()
+            .or_else(|| state.context.data.budget_limits())
+            .map(|limits| crate::budget::BudgetState::new(limits, state.created_at))
+            .transpose()?;
         state.status = WorkflowStatus::Running;
         state.lease = Some(self.new_lease());
         state.input = input.clone();

@@ -1729,6 +1729,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "flare-process",
+ "libc",
  "parking_lot",
  "rand 0.8.6",
  "rusqlite",
