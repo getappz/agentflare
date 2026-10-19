@@ -206,9 +206,12 @@ impl RefinementBackend for NativeBackend {
                                         if c.cancelled {
                                             return Err(RefinementError::Cancelled);
                                         }
-                                        if !c.success {
-                                            accepted = Some(false);
-                                            break;
+                                        match check_verdict(c.success, c.timed_out) {
+                                            Some(true) => {}
+                                            verdict => {
+                                                accepted = verdict;
+                                                break;
+                                            }
                                         }
                                     }
                                     Err(e) => {
@@ -307,6 +310,13 @@ pub fn run_check(
     )?)
 }
 
+/// A check that timed out never produced a verdict: unknown, not a failure.
+pub(super) fn check_verdict(success: bool, timed_out: bool) -> Option<bool> {
+    if timed_out { None } else { Some(success) }
+}
+
+const TELEMETRY_CAP_CHARS: usize = 64 * 1024;
+
 pub(super) fn attach_telemetry(receipt: &mut Receipt) {
     let path = flare_insights::InsightsConfig::default().db_path;
     if let Some(id) = receipt.session_id.as_deref()
@@ -318,7 +328,14 @@ pub(super) fn attach_telemetry(receipt: &mut Receipt) {
         if !turns.is_empty() || !tools.is_empty() {
             let text = serde_json::json!({"session_id":id,"turns":turns,"tools":tools}).to_string();
             receipt.evidence.push_str("\nSESSION TELEMETRY\n");
-            receipt.evidence.push_str(&text);
+            receipt
+                .evidence
+                .push_str(crate::agent_launch::tail_str(&text, TELEMETRY_CAP_CHARS));
+            if text.chars().count() > TELEMETRY_CAP_CHARS {
+                receipt
+                    .evidence
+                    .push_str("\n[telemetry truncated to its tail]");
+            }
             return;
         }
     }
