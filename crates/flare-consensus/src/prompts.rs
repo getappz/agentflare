@@ -1,6 +1,6 @@
-//! Faithful port of the CVP prompt templates (`ai-consensus-core`'s
-//! `prompts.ts`). The exact strings here shape model behavior — keep edits
-//! deliberate.
+//! CVP prompt templates ported from `ai-consensus-core`'s `prompts.ts`, with
+//! anonymous judge headings inspired by Harness² (`google-research/harness2`,
+//! Google LLC, Apache-2.0, `core/selection.py`).
 
 use crate::parser::strip_confidence_line;
 use crate::types::{Participant, ParticipantResponse, Phase};
@@ -149,30 +149,96 @@ pub fn build_judge_system_prompt(judge_system_prompt: &str, question: &str) -> S
     }
 }
 
-/// Build the judge's user content: the final-round responses, labelled with
-/// persona name and model id, with the trailing `CONFIDENCE: N` line
-/// stripped from each body (participant confidence is surfaced in the heading).
+/// Build the judge's user content without identity or confidence metadata.
+/// Numbers follow the final-round response order recorded in the result.
+/// Response bodies are preserved apart from the trailing confidence line;
+/// this does not redact identities mentioned in the arguments themselves.
 pub fn build_judge_user_prompt(
     final_responses: &[ParticipantResponse],
-    participants: &[Participant],
+    _participants: &[Participant],
 ) -> String {
     let blocks: Vec<String> = final_responses
         .iter()
-        .map(|r| {
-            let label = participants
-                .iter()
-                .find(|p| p.id == r.participant_id)
-                .map(|p| format!("{} ({})", p.persona.name, p.model_id))
-                .unwrap_or_else(|| r.participant_id.clone());
+        .enumerate()
+        .map(|(index, r)| {
             let body = strip_confidence_line(&r.content);
-            format!(
-                "### {label} — self-reported confidence {}%\n{body}",
-                r.confidence
-            )
+            format!("### Participant {}\n{body}", index + 1)
         })
         .collect();
     format!(
         "Below are the final-round responses from every participant. Synthesize them per your instructions.\n\n{}",
         blocks.join("\n\n---\n\n")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn response(id: &str, content: &str) -> ParticipantResponse {
+        ParticipantResponse {
+            participant_id: id.into(),
+            model_id: "private-model".into(),
+            persona_id: "private-persona".into(),
+            round: 1,
+            phase: Phase::InitialAnalysis,
+            content: content.into(),
+            confidence: 99,
+            error: None,
+            usage: None,
+            started_at: 0,
+            completed_at: 0,
+            duration_ms: 0,
+        }
+    }
+
+    #[test]
+    fn judge_compares_arguments_without_identity_or_confidence_metadata() {
+        let participants = [Participant {
+            id: "private-id".into(),
+            model_id: "private-model".into(),
+            label: None,
+            persona: crate::types::Persona {
+                id: "private-persona".into(),
+                name: "Famous Expert".into(),
+                emoji: None,
+                color: None,
+                description: String::new(),
+                system_prompt: String::new(),
+            },
+        }];
+        let responses = [
+            response("private-id", "Keep the baseline.\nCONFIDENCE: 99"),
+            response("unregistered-id", "Try the candidate.\nCONFIDENCE: 10"),
+        ];
+        let prompt = build_judge_user_prompt(&responses, &participants);
+        assert!(prompt.contains("### Participant 1\nKeep the baseline."));
+        assert!(prompt.contains("### Participant 2\nTry the candidate."));
+        for hidden in [
+            "private-",
+            "unregistered-id",
+            "Famous Expert",
+            "99",
+            "CONFIDENCE",
+        ] {
+            assert!(
+                !prompt.contains(hidden),
+                "judge received metadata: {hidden}"
+            );
+        }
+        assert_eq!(responses[0].participant_id, "private-id");
+        assert_eq!(responses[0].confidence, 99);
+    }
+
+    #[test]
+    fn judge_preserves_numbers_in_arguments_and_handles_an_empty_round() {
+        let responses = [response(
+            "id",
+            "The measured pass rate is 99%.\nCONFIDENCE: 99",
+        )];
+        let prompt = build_judge_user_prompt(&responses, &[]);
+        assert!(prompt.contains("The measured pass rate is 99%."));
+        assert!(!prompt.contains("CONFIDENCE:"));
+        assert!(!build_judge_user_prompt(&[], &[]).contains("### Participant"));
+    }
 }
