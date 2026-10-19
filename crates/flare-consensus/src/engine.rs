@@ -23,8 +23,9 @@ use crate::prompts::{
 };
 use crate::stats::{average, consensus_score, detect_disagreements, shuffle, stddev};
 use crate::types::{
-    ConsensusOptions, ConsensusResult, EarlyStop, JudgeOptions, ModelCallRequest, ModelCaller,
-    Participant, ParticipantResponse, Phase, RoundResult, StopReason, SynthesisResult, TokenSink,
+    ConsensusOptions, ConsensusResult, EarlyStop, JudgeCandidate, JudgeOptions, ModelCallRequest,
+    ModelCaller, Participant, ParticipantResponse, Phase, RoundResult, StopReason, SynthesisResult,
+    TokenSink,
 };
 
 // ── Defaults ────────────────────────────────────────────────────
@@ -251,6 +252,7 @@ impl ConsensusEngine {
                         &opts.question,
                         last_round_num,
                         opts.cancellation.clone(),
+                        &mut rng,
                     )
                     .await,
                 );
@@ -477,6 +479,7 @@ impl ConsensusEngine {
         question: &str,
         last_round_number: u32,
         cancellation: Option<CancellationToken>,
+        rng: &mut StdRng,
     ) -> SynthesisResult {
         self.events
             .publish(ConsensusEvent::SynthesisStart {
@@ -489,7 +492,19 @@ impl ConsensusEngine {
             .clone()
             .unwrap_or_else(|| judge_persona().system_prompt);
         let system = build_judge_system_prompt(&judge_system_prompt, question);
-        let user = build_judge_user_prompt(final_responses, participants);
+        // Shuffle so judge-side position bias can't favour a fixed participant;
+        // the seeded rng makes the order reproducible.
+        let shuffled = shuffle(final_responses, rng);
+        let candidate_order: Vec<JudgeCandidate> = shuffled
+            .iter()
+            .enumerate()
+            .map(|(i, r)| JudgeCandidate {
+                label: format!("Participant {}", i + 1),
+                participant_id: r.participant_id.clone(),
+                model_id: r.model_id.clone(),
+            })
+            .collect();
+        let user = build_judge_user_prompt(&shuffled, participants);
 
         let caller: &Arc<dyn ModelCaller> = judge.caller.as_ref().unwrap_or(&self.caller);
         let temperature = judge
@@ -534,6 +549,7 @@ impl ConsensusEngine {
             minority_positions: extract_judge_section(&content, "Minority Positions"),
             unresolved_disputes: extract_judge_section(&content, "Unresolved Disputes"),
             judge_confidence: extract_judge_confidence(&content),
+            candidate_order,
             content,
             usage,
             started_at,
@@ -845,6 +861,65 @@ mod tests {
         let synthesis = result.synthesis.expect("judge should have run");
         assert_eq!(synthesis.model_id, "judge-model");
         assert_eq!(synthesis.judge_confidence, 50);
+    }
+
+    #[tokio::test]
+    async fn judge_order_is_seeded_and_mapped() {
+        async fn run(seed: u64) -> Vec<JudgeCandidate> {
+            let ps: Vec<Participant> = ["a", "b", "c", "d", "e", "f"]
+                .iter()
+                .map(|id| participant(id, id, 70).0)
+                .collect();
+            let engine = ConsensusEngine::new(Arc::new(FixedConfidenceCaller {
+                confidences: std::collections::HashMap::new(),
+                call_count: AtomicUsize::new(0),
+            }));
+            engine
+                .run(ConsensusOptions {
+                    question: "q".to_string(),
+                    participants: ps,
+                    max_rounds: Some(1),
+                    early_stop: Some(false),
+                    convergence_delta: None,
+                    disagreement_threshold: None,
+                    blind_first_round: Some(true),
+                    randomize_order: Some(false),
+                    participant_temperature: None,
+                    max_output_tokens: None,
+                    judge: Some(JudgeOptions {
+                        model_id: "j".to_string(),
+                        caller: None,
+                        temperature: None,
+                        max_output_tokens: None,
+                        system_prompt: None,
+                    }),
+                    random_seed: Some(seed),
+                    cancellation: None,
+                })
+                .await
+                .unwrap()
+                .synthesis
+                .unwrap()
+                .candidate_order
+        }
+        let a = run(11).await;
+        assert_eq!(a, run(11).await);
+        assert_eq!(a[0].label, "Participant 1");
+        assert_eq!(a[0].model_id, format!("model-{}", a[0].participant_id));
+        let mut ids: Vec<_> = a.iter().map(|c| c.participant_id.clone()).collect();
+        ids.sort();
+        assert_eq!(ids, ["a", "b", "c", "d", "e", "f"]);
+        let natural = ids.clone();
+        let mut differs = false;
+        for seed in 0..20u64 {
+            let o = run(seed).await;
+            differs |= o
+                .iter()
+                .map(|c| c.participant_id.clone())
+                .collect::<Vec<_>>()
+                != natural;
+        }
+        assert!(differs);
     }
 
     #[tokio::test]
