@@ -388,12 +388,13 @@ async fn probes(
     }
     let mut fatal = None;
     for (_, (label, tree, receipts, result)) in results {
+        let last_receipt = receipts.last().cloned();
         data.receipts.extend(receipts);
         match result {
             Ok(r) => data.trials.push(Trial {
                 label,
                 tree,
-                receipt: r.unwrap_or_else(|| Receipt {
+                receipt: r.or(last_receipt).unwrap_or_else(|| Receipt {
                     error: Some("transport attempts exhausted".into()),
                     ..Receipt::default()
                 }),

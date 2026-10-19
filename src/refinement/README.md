@@ -80,6 +80,9 @@ locations; self-reported test counts alone do not demonstrate a benefit. Like
 upstream Harness2, this is answer-free adaptation: private acceptance results
 remain in the report, and are never training feedback for the improver. Public
 task materials must supply enough information to discover and verify a fix.
+When probe retries are exhausted, the last failed receipt remains the trial's
+record, including its partial observations and reported usage. It remains
+ineligible for adoption, and private acceptance output stays out of prompts.
 
 Call and elapsed-time limits work with supported headless agents. Optional
 `max_cost_usd` requires both roles to use `claude-code`, whose CLI supports a

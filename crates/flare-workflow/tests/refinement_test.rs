@@ -110,6 +110,7 @@ struct Scripted {
     saved: Mutex<Vec<Experience>>,
     bad_proposal: bool,
     all_fail: bool,
+    probe_errors: bool,
     finals_fail: bool,
     bad_selection: bool,
     choose_final: bool,
@@ -146,6 +147,12 @@ impl RefinementBackend for Scripted {
                 r.accepted = Some(!self.all_fail && !(self.finals_fail && inv.id.starts_with("compose")));
                 r.artifact_identity = Some("artifact".into());
                 r.private_checks = "PRIVATE_CHECK_SENTINEL".into();
+                if self.probe_errors {
+                    r.accepted = None;
+                    r.error = Some("bounded probe failure".into());
+                    r.input_tokens = 7;
+                    r.output_tokens = 3;
+                }
             }
             Role::Select => r.reply = if self.bad_selection { "not json".into() } else if self.choose_final {
                 let prompt: serde_json::Value = serde_json::from_str(&inv.prompt).unwrap();
@@ -339,6 +346,39 @@ async fn failed_probes_reach_improvers_without_private_verdicts() {
         assert!(instructions.to_ascii_lowercase().contains("self-reported"));
         assert!(instructions.contains("specific"));
         assert!(instructions.contains("private"));
+    }
+}
+
+#[tokio::test]
+async fn exhausted_probe_retries_preserve_public_failure_evidence() {
+    for mode in [RefinementMode::Parallel, RefinementMode::Sequential] {
+        let mut req = request();
+        req.mode = mode;
+        let backend = Arc::new(Scripted {
+            probe_errors: true,
+            ..Default::default()
+        });
+        let data = run(req, backend.clone()).await;
+        assert!(data.adoption.is_none());
+        assert_eq!(data.trials.len(), 4);
+        assert_eq!(data.receipts.len(), 11);
+        for trial in &data.trials {
+            let receipt = &trial.receipt;
+            assert_eq!(receipt.id, format!("{}.probe.t2", trial.label));
+            assert_eq!(receipt.evidence, format!("artifact from {}", receipt.id));
+            assert_eq!(receipt.error.as_deref(), Some("bounded probe failure"));
+            assert_eq!(receipt.cost_usd, Some(0.01));
+            assert_eq!((receipt.input_tokens, receipt.output_tokens), (7, 3));
+            assert!(!receipt.successful());
+            assert_eq!(receipt.private_checks, "PRIVATE_CHECK_SENTINEL");
+        }
+        let seen = backend.seen.lock().unwrap();
+        for role in [Role::General, Role::Domain, Role::Compose] {
+            let inv = seen.iter().find(|i| i.role == role).unwrap();
+            assert!(inv.prompt.contains("artifact from base1.probe.t2"));
+            assert!(inv.prompt.contains("bounded probe failure"));
+            assert!(!inv.prompt.contains("PRIVATE_CHECK_SENTINEL"));
+        }
     }
 }
 
