@@ -106,6 +106,8 @@ impl From<&Observation> for SyncEntry {
 pub fn export_all(conn: &Connection) -> rusqlite::Result<Vec<SyncEntry>> {
     Ok(observations::list_all(conn)?
         .iter()
+        // Run receipts are local and are not included in the sync format.
+        .filter(|o| !observations::is_lesson(&o.r#type))
         .map(SyncEntry::from)
         .collect())
 }
@@ -148,7 +150,19 @@ pub fn merge(remote: Vec<SyncEntry>, local: Vec<SyncEntry>) -> Vec<SyncEntry> {
 /// a row (excludes ones already current locally).
 pub fn import_entries(conn: &Connection, entries: &[SyncEntry]) -> rusqlite::Result<usize> {
     let mut changed = 0;
+    let skipped = entries
+        .iter()
+        .filter(|e| observations::is_lesson(&e.r#type))
+        .count();
+    if skipped > 0 {
+        eprintln!(
+            "[memory] skipped {skipped} lesson(s) without local promotion receipts; remote records are preserved"
+        );
+    }
     for e in entries {
+        if observations::is_lesson(&e.r#type) {
+            continue;
+        }
         let outcome = observations::upsert_synced(
             conn,
             &e.r#type,
@@ -433,6 +447,28 @@ mod tests {
         conn.pragma_update(None, "foreign_keys", true).unwrap();
         schema::migrate(&mut conn).unwrap();
         conn
+    }
+
+    #[test]
+    fn unverified_remote_lessons_do_not_block_notes_or_disappear_from_the_log() {
+        let conn = new_db();
+        let mut lesson = entry("p", "lesson", "remote lesson", "2026-01-01T00:00:00.000Z");
+        lesson.r#type = "LeSsOn".into();
+        let note = entry("p", "note", "remote note", "2026-01-01T00:00:00.000Z");
+        let merged = merge(vec![lesson.clone(), note], export_all(&conn).unwrap());
+        assert_eq!(import_entries(&conn, &merged).unwrap(), 1);
+        let local = export_all(&conn).unwrap();
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0].title, "remote note");
+        assert!(parse_jsonl(&to_jsonl(&merged)).unwrap().contains(&lesson));
+        let lessons: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM observations WHERE lower(type) = 'lesson'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(lessons, 0);
     }
 
     fn config() -> MemorySyncConfig {
