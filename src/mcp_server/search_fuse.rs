@@ -244,29 +244,50 @@ impl AgentflareMcp {
                 None
             }
         });
-        let mut arms: Vec<(&str, Vec<ArmHit>)> = Vec::new();
-        let mut skipped: Vec<&str> = Vec::new();
-        let mut push = |name: &'static str, hits: Option<Vec<ArmHit>>| match hits {
-            Some(h) => arms.push((name, h)),
-            None => skipped.push(name),
-        };
-        push(
-            "store",
-            self.search_store(req).ok().and_then(|s| store_arm(&s)),
-        );
-        push("memory", Self::memory_arm(q, limit));
-        push("code", code.ok().and_then(|s| delegated_arm(&s)));
-        if let Some(web) = web {
-            push("web", web.ok().and_then(|s| delegated_arm(&s)));
-        }
-        let hits = fuse_rrf(arms, limit);
-        Ok(serde_json::json!({
-            "query": q,
-            "source": "all",
-            "total": hits.len(),
-            "hits": hits,
-            "skipped": skipped,
-        })
-        .to_string())
+        let store = self.search_store(req).ok();
+        let code = code.ok();
+        let web = web.map(|w| w.ok());
+        Ok(fuse_envelopes(
+            q,
+            limit,
+            store.as_deref(),
+            Self::memory_arm(q, limit),
+            code.as_deref(),
+            web.as_ref().map(|w| w.as_deref()),
+        ))
     }
+}
+
+/// Assembles the fused response from each arm's raw output. `None` (or an
+/// unparseable / error envelope) marks the arm as skipped; `web` is `None`
+/// when the web arm was not requested.
+pub(super) fn fuse_envelopes(
+    q: &str,
+    limit: usize,
+    store: Option<&str>,
+    memory: Option<Vec<ArmHit>>,
+    code: Option<&str>,
+    web: Option<Option<&str>>,
+) -> String {
+    let mut arms: Vec<(&str, Vec<ArmHit>)> = Vec::new();
+    let mut skipped: Vec<&str> = Vec::new();
+    let mut push = |name: &'static str, hits: Option<Vec<ArmHit>>| match hits {
+        Some(h) => arms.push((name, h)),
+        None => skipped.push(name),
+    };
+    push("store", store.and_then(store_arm));
+    push("memory", memory);
+    push("code", code.and_then(delegated_arm));
+    if let Some(web) = web {
+        push("web", web.and_then(delegated_arm));
+    }
+    let hits = fuse_rrf(arms, limit);
+    serde_json::json!({
+        "query": q,
+        "source": "all",
+        "total": hits.len(),
+        "hits": hits,
+        "skipped": skipped,
+    })
+    .to_string()
 }

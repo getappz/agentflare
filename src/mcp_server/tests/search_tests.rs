@@ -437,3 +437,41 @@ fn failing_delegated_arm_is_skipped_and_others_still_fuse() {
     assert_eq!(hits.len(), 2);
     assert!(hits.iter().all(|h| h.source != "code"));
 }
+
+#[test]
+fn fuse_envelopes_dedups_real_store_arm_and_skips_failing_arms() {
+    crate::paths::test_support::with_temp_home(|| {
+        let (_tmp, s) = harness();
+        let wid = ws_id(&s);
+        seed_doc(&s, &wid, "shared/doc.md", "quokka store document", "note");
+        let store = search_sync(
+            &s,
+            SearchRequest {
+                r#type: Some("store".into()),
+                ..all_req("quokka")
+            },
+        )
+        .unwrap();
+        // code arm also ranks the same ref; memory arm is down; web errors
+        let code = r#"{"source":"code","results":[{"path":"other.rs"},{"path":"shared/doc.md"}]}"#;
+        let web = r#"{"source":"web","error":"rivalsearch web_search failed","results":[]}"#;
+        let out = super::search_fuse::fuse_envelopes(
+            "quokka",
+            20,
+            Some(&store),
+            None,
+            Some(code),
+            Some(Some(web)),
+        );
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["skipped"], serde_json::json!(["memory", "web"]));
+        let hits = v["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 2, "shared ref must be one hit: {out}");
+        // store rank 1 + code rank 2 beats code rank 1 alone
+        assert_eq!(hits[0]["ref"], "shared/doc.md");
+        assert_eq!(hits[0]["source"], "store");
+        let want = 1.0 / 61.0 + 1.0 / 62.0;
+        assert!((hits[0]["score"].as_f64().unwrap() - want).abs() < 1e-12);
+        assert_eq!(hits[1]["ref"], "other.rs");
+    });
+}
