@@ -216,7 +216,9 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             let _driving = driving;
             let renewer =
                 AbortOnDrop(engine.spawn(engine.clone_for_execution().renew_lease_loop(run_id)));
-            let result = engine.execute_workflow(run_id, definition).await;
+            let result = engine
+                .execute_with_budget_deadline(run_id, definition)
+                .await;
             drop(renewer);
             engine.release_lease(run_id).await;
             if let Err(e) = result {
@@ -357,7 +359,14 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             tracing::info!(run_id = %run_id, holder = ?state.lease.as_ref().map(|l| &l.owner), "Run is held by another live executor; not resuming it here");
             return Ok(false);
         }
-        if state.resume_identity != definition.resume_identity {
+        let expected_identity = definition.run_identity(&state.context.data)?;
+        if state.resume_identity != expected_identity
+            || state.budget.as_ref().map(|budget| budget.limits.clone())
+                != definition
+                    .budget
+                    .clone()
+                    .or_else(|| state.context.data.budget_limits())
+        {
             return Err(WorkflowError::ResumeIdentityMismatch(run_id));
         }
         let Some(driving) = self.claim_driving(run_id) else {
@@ -381,7 +390,13 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                     taken = false;
                     return;
                 }
-                if s.resume_identity != definition.resume_identity {
+                if s.resume_identity != expected_identity
+                    || s.budget.as_ref().map(|budget| budget.limits.clone())
+                        != definition
+                            .budget
+                            .clone()
+                            .or_else(|| s.context.data.budget_limits())
+                {
                     incompatible = true;
                     return;
                 }

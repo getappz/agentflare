@@ -125,6 +125,64 @@ tool output; refresh previously indexed files with `agentflare insights sync
 --force` (read-only for source logs). Existing `insights show` and artifact export
 tools remain available for deeper inspection and publication.
 
+## Shared workflow budgets
+
+Workflows can opt into one durable allowance shared by agent dispatches:
+
+```json
+"budget": {
+  "max_cost_usd": 5.0,
+  "reserve_per_call_usd": 0.5,
+  "max_invocations": 12,
+  "max_elapsed_secs": 900
+}
+```
+
+The dollar fields must appear together; invocation and elapsed limits can be used
+independently. Native work-item runs accept the same object in item metadata as
+`workflow_budget`. Rust definitions can use `with_budget`; per-run typed data can
+provide `WorkflowData::budget_limits`. Existing definitions without a budget keep
+their current behavior. A policy is captured at run creation and cannot change on
+resume; changing it requires a new run.
+Budgeted runs also carry a versioned resume identity, so older executors cannot
+silently recover them without budget enforcement.
+For budgeted work items, automatic job retries cannot replace failed/cancelled or
+missing runs with a fresh allowance. Explicitly clear the item's `workflow_run_id`
+when authorizing a new run; ordinary resume keeps the existing ledger.
+
+Before each send, including fan-out branches, retries, loop roles and stale-session
+fallbacks, reserve an invocation and up to `reserve_per_call_usd` from the remaining
+allowance. Reservations and reported usage share the existing workflow SQLite
+database in a separate transactional ledger, so context replay cannot refill it.
+Known unused cost is released after reconciliation; missing, failed or interrupted
+usage retains its reservation. Counts are dispatch reservations, not proof that a
+provider started. Original step/agent IDs and logical attempts remain recorded.
+Claude resumed-session totals include earlier calls, so those invocations retain
+their reservations rather than treating the cumulative estimate as per-call usage.
+Zero-cost error results are also treated as unknown. Cost fields are client-side
+estimates; see [Claude's cost tracking documentation](https://code.claude.com/docs/en/agent-sdk/cost-tracking).
+
+Dollar-limited headless launches currently require Claude Code's existing
+`--max-budget-usd` support. The allocated cap cannot override a stricter caller
+cap; unsupported providers and positional argument delimiters are rejected.
+Provider-reported overruns block subsequent sends. Invocation/time limits work
+without a dollar limit. Custom Rust send hooks must honor `StepInvocation::allocation`
+and record available cost through its usage receipt; the engine cannot enforce a
+third-party provider's billing behavior. Command steps and tools are not separately
+priced or counted as provider sends.
+Optional fire-and-forget judge shadow calls are skipped for budgeted work items
+because that API has no enforceable per-call allowance.
+
+The elapsed limit is wall-clock time from run creation, including waits and pauses.
+It clamps executor/subprocess timeouts and cancels the run when exhausted; resumed
+runs keep the original deadline. Existing subprocess cleanup applies. A dropped
+future keeps its reservation, including when a blocking launch completes later.
+
+`workflow status` and `workflow report` expose limits, invocation reservations,
+reported cost, held cost, unknown usage and overruns. These are budget records,
+not a verified bill. The report remains read-only. No paid agent is launched to
+inspect a budget.
+
 ## License
 
 Apache-2.0. Restate ideas are adopted as design only (BSL 1.1); no Restate
