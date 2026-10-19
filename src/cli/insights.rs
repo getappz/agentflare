@@ -36,8 +36,25 @@ pub enum InsightsCommands {
 
 #[derive(Parser, Debug)]
 pub struct SyncArgs {
+    /// Re-read unchanged session files to refresh previously omitted evidence.
+    #[arg(long)]
+    pub force: bool,
     #[arg(long, default_value = "0")]
     pub prune_days: u32,
+}
+
+#[cfg(test)]
+mod evidence_tests {
+    use super::*;
+
+    #[test]
+    fn historical_tool_evidence_can_be_refreshed_without_editing_source_logs() {
+        let cli = InsightsArgs::try_parse_from(["insights", "sync", "--force"]).unwrap();
+        let Some(InsightsCommands::Sync(args)) = cli.command else {
+            panic!("expected sync")
+        };
+        assert!(args.force);
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -157,11 +174,23 @@ fn run_sync(db: PathBuf, args: SyncArgs) {
     let mut total_files = 0;
     let mut total_subs = 0;
     let mut printed_progress = false;
-    let results = mgr.scan_all(&config, &store, |source, done, total| {
-        printed_progress = true;
-        eprint!("\r  {source}: {done}/{total} files scanned\x1b[K");
-        let _ = std::io::stderr().flush();
-    });
+    let empty_cursors = args
+        .force
+        .then(flare_insights::store::InsightsStore::open_in_memory)
+        .transpose()
+        .unwrap_or_else(|e| {
+            crate::ui::error(&format!("cannot initialize forced sync: {e}"));
+            std::process::exit(1);
+        });
+    let results = mgr.scan_all(
+        &config,
+        empty_cursors.as_ref().unwrap_or(&store),
+        |source, done, total| {
+            printed_progress = true;
+            eprint!("\r  {source}: {done}/{total} files scanned\x1b[K");
+            let _ = std::io::stderr().flush();
+        },
+    );
     if printed_progress {
         eprintln!();
     }

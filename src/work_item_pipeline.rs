@@ -163,6 +163,9 @@ pub(crate) struct WorkItemData {
     /// session.
     #[serde(default)]
     pub agent_sessions: std::collections::HashMap<String, String>,
+    /// All observed provider session IDs, including replaced/stale sessions.
+    #[serde(default)]
+    pub session_ids: std::collections::BTreeSet<String>,
     /// The item's claimed worktree, captured once at dispatch time and
     /// threaded through every `sdd_loop` agent call as `StepInvocation::cwd`
     /// (item #191) — a run resumed by `engine().recover()` after a daemon
@@ -688,6 +691,7 @@ pub(crate) fn build_sdd_loop_step(
 
                 let (role_reply, role_session_id) = strip_session_marker(&raw_role_reply);
                 if let Some(id) = role_session_id {
+                    ctx.data.session_ids.insert(id.clone());
                     ctx.data
                         .agent_sessions
                         .insert(role_agent.clone(), id.clone());
@@ -763,6 +767,7 @@ pub(crate) fn build_sdd_loop_step(
 
                 let (judge_reply, judge_session_id) = strip_session_marker(&raw_judge_reply);
                 if let Some(id) = judge_session_id {
+                    ctx.data.session_ids.insert(id.clone());
                     ctx.data.agent_sessions.insert(judge_agent_name.clone(), id);
                 }
 

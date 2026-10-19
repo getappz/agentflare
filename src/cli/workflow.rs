@@ -20,6 +20,8 @@ pub enum WorkflowCommand {
     Run(RunArgs),
     /// Show a run's state, per-step results, and journal tail.
     Status(StatusArgs),
+    /// Report journal failures, attempts and linked session evidence as JSON.
+    Report(StatusArgs),
     /// Resolve a human-in-the-loop WaitEvent.
     CompleteEvent(CompleteEventArgs),
     /// Cancel a running/waiting workflow. Already-succeeded steps are left
@@ -171,6 +173,18 @@ impl WorkflowArgs {
                     }
                 }
             }
+            WorkflowCommand::Report(args) => {
+                match crate::workflow::workflow_report(&args.run_id, &db_path(&args.db_path)) {
+                    Ok(report) => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&report).unwrap_or_default()
+                    ),
+                    Err(e) => {
+                        ui::error(&e);
+                        std::process::exit(1);
+                    }
+                }
+            }
             WorkflowCommand::CompleteEvent(args) => {
                 match crate::workflow::complete_workflow_event(
                     &args.run_id,
@@ -231,5 +245,28 @@ impl WorkflowArgs {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        workflow: WorkflowArgs,
+    }
+
+    #[test]
+    fn report_uses_existing_run_id_and_database_arguments() {
+        let cli = TestCli::try_parse_from(["test", "report", "run-1", "--db-path", "fixture.db"])
+            .unwrap();
+        let WorkflowCommand::Report(args) = cli.workflow.command else {
+            panic!("expected report")
+        };
+        assert_eq!(args.run_id, "run-1");
+        assert_eq!(args.db_path, Some(PathBuf::from("fixture.db")));
     }
 }

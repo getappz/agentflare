@@ -93,8 +93,10 @@ fn parse_claude_jsonl(path: &Path) -> Option<IngestBundle> {
         .unwrap_or("unknown")
         .to_string();
     let mut title: Option<String> = None;
+    let mut cwd = None;
     let mut turns: Vec<Turn> = Vec::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
+    let mut tool_indices = std::collections::HashMap::new();
     let mut file_events: Vec<FileEvent> = Vec::new();
     let mut subagents: Vec<Subagent> = Vec::new();
     let mut seq: u32 = 0;
@@ -106,6 +108,9 @@ fn parse_claude_jsonl(path: &Path) -> Option<IngestBundle> {
                     project = last.to_string();
                 }
             }
+        }
+        if let Some(value) = v.get("cwd").and_then(|c| c.as_str()) {
+            cwd = Some(value.to_string());
         }
         if let Some(ts) = v.get("timestamp").and_then(parse_timestamp) {
             updated_at = Some(updated_at.map_or(ts, |prev| prev.max(ts)));
@@ -189,6 +194,28 @@ fn parse_claude_jsonl(path: &Path) -> Option<IngestBundle> {
             let content_val = msg.and_then(|m| m.get("content"));
             if let Some(arr) = content_val.and_then(|c| c.as_array()) {
                 for c in arr {
+                    if c.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
+                        if let Some(index) = c
+                            .get("tool_use_id")
+                            .and_then(|id| id.as_str())
+                            .and_then(|id| tool_indices.get(id))
+                            .copied()
+                        {
+                            let tool: &mut ToolCall = &mut tool_calls[index];
+                            tool.output = c.get("content").map(|v| {
+                                v.as_str()
+                                    .map(str::to_string)
+                                    .unwrap_or_else(|| v.to_string())
+                            });
+                            tool.status =
+                                if c.get("is_error").and_then(|v| v.as_bool()) == Some(true) {
+                                    "failed"
+                                } else {
+                                    "completed"
+                                }
+                                .into();
+                        }
+                    }
                     if c.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
                         tool_call_count += 1;
                         let call_id = c
@@ -228,6 +255,7 @@ fn parse_claude_jsonl(path: &Path) -> Option<IngestBundle> {
                                     .map(|s| s.to_string()),
                             });
                         }
+                        tool_indices.insert(call_id.clone(), tool_calls.len());
                         tool_calls.push(ToolCall {
                             id: call_id,
                             session_id: id.clone(),
@@ -235,7 +263,7 @@ fn parse_claude_jsonl(path: &Path) -> Option<IngestBundle> {
                             name,
                             input,
                             output: None,
-                            status: "completed".into(),
+                            status: "pending".into(),
                             duration_ms: None,
                             created_at: started_at,
                         });
@@ -275,7 +303,7 @@ fn parse_claude_jsonl(path: &Path) -> Option<IngestBundle> {
         tags: vec![],
         starred: false,
         pid: None,
-        cwd: None,
+        cwd,
     };
 
     Some(IngestBundle {
@@ -314,6 +342,43 @@ fn extract_text_from_message(msg: Option<&serde_json::Value>) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    #[test]
+    fn tool_results_preserve_output_errors_and_unfinished_calls() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let records = [
+            serde_json::json!({"type":"assistant","message":{"content":[
+                {"type":"tool_use","id":"a","name":"Bash","input":{"command":"cargo test"}},
+                {"type":"tool_use","id":"b","name":"Read","input":{"file_path":"a.rs"}},
+                {"type":"tool_use","id":"c","name":"Bash","input":{"command":"cargo fmt --check"}}
+            ]}}),
+            serde_json::json!({"type":"user","message":{"content":[
+                {"type":"tool_result","tool_use_id":"b","content":"file contents"},
+                {"type":"tool_result","tool_use_id":"a","content":"test failed: expected 2, got 1","is_error":true}
+            ]}}),
+        ];
+        std::fs::write(
+            &path,
+            records
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let bundle = parse_claude_jsonl(&path).unwrap();
+        assert_eq!(
+            bundle.tool_calls[0].output.as_deref(),
+            Some("test failed: expected 2, got 1")
+        );
+        assert_eq!(bundle.tool_calls[0].status, "failed");
+        assert_eq!(
+            bundle.tool_calls[1].output.as_deref(),
+            Some("file contents")
+        );
+        assert_eq!(bundle.tool_calls[1].status, "completed");
+        assert_eq!(bundle.tool_calls[2].status, "pending");
+    }
     #[test]
     fn empty_dir_returns_empty() {
         let dir = TempDir::new().unwrap();

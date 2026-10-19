@@ -11,10 +11,14 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use flare_workflow::StateStore;
+
+mod report;
 use flare_workflow::engine::WorkflowEngine;
 use flare_workflow::json::{JsonWorkflow, PipelineData, SendMessage, compile_workflow};
 use flare_workflow::sqlite_store::SqliteStore;
 use flare_workflow::types::{EntryResult, WorkflowId, WorkflowRunId, WorkflowStatus};
+pub use report::workflow_report;
+pub(crate) use report::workflow_report_async;
 
 /// Shared multi-thread runtime for the async engine. Must live for the
 /// process lifetime: `start_workflow` spawns execution tasks that outlive the
@@ -534,6 +538,13 @@ pub(crate) async fn workflow_status_async(
         .journal(run_id)
         .await
         .map_err(|e| e.to_string())?;
+    Ok(status_view(&state, &journal))
+}
+
+fn status_view(
+    state: &serde_json::Value,
+    journal: &[flare_workflow::JournalEntry],
+) -> serde_json::Value {
     let journal_tail: Vec<serde_json::Value> = journal
         .iter()
         .rev()
@@ -566,7 +577,7 @@ pub(crate) async fn workflow_status_async(
         })
         .unwrap_or_default();
 
-    Ok(serde_json::json!({
+    serde_json::json!({
         "run_id": state["run_id"],
         "workflow_id": state["workflow_id"],
         "status": state["status"],
@@ -577,7 +588,7 @@ pub(crate) async fn workflow_status_async(
         "steps": steps,
         "variables": state["variables"],
         "journal_tail": journal_tail,
-    }))
+    })
 }
 
 /// Reads a run's raw `state_json` and parses it as a generic
@@ -589,6 +600,13 @@ fn load_state_generic_blocking(
     db_path: &Path,
 ) -> Result<serde_json::Value, String> {
     let conn = open_conn_blocking(db_path)?;
+    load_state_from_conn(run_id, &conn)
+}
+
+fn load_state_from_conn(
+    run_id: &WorkflowRunId,
+    conn: &rusqlite::Connection,
+) -> Result<serde_json::Value, String> {
     let state_json: String = conn
         .query_row(
             "SELECT state_json FROM workflow_runs WHERE id = ?",
