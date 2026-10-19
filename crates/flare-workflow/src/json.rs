@@ -213,14 +213,25 @@ pub fn compile_workflow(
 /// step runs in `cwd`, and every agent step carries it as
 /// `StepInvocation::cwd`, so a workflow belonging to one repository executes
 /// there even when the driving process (e.g. the daemon) has some other
-/// ambient cwd. `None` keeps the ambient-cwd behavior. The process-wide cwd
-/// is never changed.
+/// ambient cwd. `None` captures the current directory at compilation. The
+/// process-wide cwd is never changed.
 pub fn compile_workflow_in(
     json: &JsonWorkflow,
     send: SendMessage,
     cwd: Option<PathBuf>,
 ) -> Result<WorkflowDefinition<PipelineData>, String> {
-    let mut wf = WorkflowDefinition::new(json.name.clone(), json.name.clone());
+    let cwd = Some(
+        std::path::absolute(match cwd {
+            Some(cwd) => cwd,
+            None => std::env::current_dir().map_err(|e| format!("workflow cwd: {e}"))?,
+        })
+        .map_err(|e| format!("workflow cwd: {e}"))?,
+    );
+    // Compare typed configuration, so JSON formatting and key order do not matter.
+    let identity = serde_json::to_string(&(1, json, &cwd))
+        .map_err(|e| format!("workflow resume identity: {e}"))?;
+    let mut wf = WorkflowDefinition::new(json.name.clone(), json.name.clone())
+        .with_resume_identity(identity);
 
     // Previous step that produced the input channel, per OpenFang chaining.
     let mut prev: Option<String> = None;
@@ -993,10 +1004,9 @@ mod tests {
         );
     }
 
-    /// Spec T34: the compiled cwd reaches the agent invocation; the legacy
-    /// `compile_workflow` entry point keeps `cwd: None`.
+    /// The compiled cwd reaches the agent invocation; implicit cwd is frozen too.
     #[tokio::test]
-    async fn compiled_cwd_reaches_the_agent_invocation_and_legacy_compile_gives_none() {
+    async fn compiled_cwd_reaches_the_agent_invocation_and_implicit_cwd_is_captured() {
         async fn captured_cwd(
             wf: WorkflowDefinition<PipelineData>,
             captured: &std::sync::Mutex<Option<StepInvocation>>,
@@ -1040,10 +1050,16 @@ mod tests {
 
         let repo = PathBuf::from("/srv/repos/b");
         let wf = compile_workflow_in(&json, Arc::clone(&send), Some(repo.clone())).unwrap();
-        assert_eq!(captured_cwd(wf, &captured).await, Some(repo));
+        assert_eq!(
+            captured_cwd(wf, &captured).await,
+            Some(std::path::absolute(repo).unwrap())
+        );
 
         let wf = compile_workflow(&json, send).unwrap();
-        assert_eq!(captured_cwd(wf, &captured).await, None);
+        assert_eq!(
+            captured_cwd(wf, &captured).await,
+            Some(std::env::current_dir().unwrap())
+        );
     }
 
     #[tokio::test]
