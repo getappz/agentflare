@@ -64,7 +64,7 @@ const BUILTIN_TOOLS: &[(&str, &str)] = &[
     ),
     (
         "memory",
-        "Memory operations — compact, context, curate, handoff, recall, relate, or remember observations. Single consolidated tool with `action` field (compact|context|curate|handoff|recall|relate|remember).",
+        "Memory operations — compact, context, curate, handoff, promote, recall, relate, or remember observations. Single consolidated tool with `action` field (compact|context|curate|handoff|promote|recall|relate|remember). Promotion requires project-scoped evidence_ids, confidence and a stored terminal run_id from the same project. Lessons and evidence receipts are immutable; raw observations are not promoted instructions.",
     ),
     (
         "docs",

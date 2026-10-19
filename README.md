@@ -92,6 +92,28 @@ session's token bill, it's about multiple agents (or multiple sessions of the
 same agent, over time) staying out of each other's way and handing off work
 cleanly.
 
+## Evidence-backed project lessons
+
+Raw observations stay observations until an explicit `memory` MCP promotion:
+
+```json
+{"action":"promote","title":"Prefer the bounded launch path","content":"Why this applies here","project":"my-project","evidence_ids":[12],"confidence":0.8,"run_id":"<workflow-run-uuid>"}
+```
+
+The run must exist in the workflow database, be terminal, contain a recorded
+execution outcome, and belong to a work item in the requested project. Supporting
+observations must be live and project-scoped. Promotion records the run/journal
+link and observation hashes in the existing relations table. Execution provenance
+does not prove a lesson correct; confidence remains an explicit estimate.
+
+Recall, context, memory search and observation listings include lesson provenance
+and the minimum confidence across its evidence receipts. Lesson contents and
+receipts are immutable: create a new lesson for a revision, optionally relating it
+with `supersedes`. Ordinary remember/curate writes cannot create or rewrite lessons.
+Memory sync excludes local lessons and skips remote lesson imports while preserving
+remote records, because its format does not carry locally verified run receipts.
+Generic workflows without work-item project provenance cannot back promotion yet.
+
 ## Workflow schedules
 
 `agentflare workflow schedule` registers an interval trigger for a project-local

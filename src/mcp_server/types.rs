@@ -453,7 +453,9 @@ pub(crate) struct VentFileRequest {
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct MemoryRequest {
-    #[schemars(description = "Action: compact|context|curate|handoff|recall|relate|remember")]
+    #[schemars(
+        description = "Action: compact|context|curate|handoff|promote|recall|relate|remember"
+    )]
     pub(crate) action: String,
     #[schemars(description = "Title of the observation (remember)")]
     #[serde(default)]
@@ -528,7 +530,15 @@ pub(crate) struct MemoryRequest {
     #[schemars(description = "Reason for the relation (relate)")]
     #[serde(default)]
     pub(crate) reason: Option<String>,
-    #[schemars(description = "Confidence score 0.0..1.0 (relate)")]
+    #[schemars(description = "Supporting observation IDs, at least one (promote)")]
+    #[serde(default)]
+    pub(crate) evidence_ids: Option<Vec<i64>>,
+    #[schemars(
+        description = "Stored terminal workflow run UUID backing this promotion; must belong to the requested project (promote)"
+    )]
+    #[serde(default)]
+    pub(crate) run_id: Option<String>,
+    #[schemars(description = "Confidence score 0.0..1.0 (relate; required for promote)")]
     #[serde(default)]
     pub(crate) confidence: Option<f64>,
     #[schemars(description = "Pin status (curate pin/unpin actions)")]

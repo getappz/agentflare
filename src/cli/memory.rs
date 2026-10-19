@@ -105,7 +105,17 @@ impl MemoryArgs {
                     limit,
                 ) {
                     Ok(obs) => {
-                        println!("{}", serde_json::to_string_pretty(&obs).unwrap_or_default())
+                        let views = obs
+                            .iter()
+                            .map(|o| crate::memory::mcp::observation_view(&conn, o))
+                            .collect::<rusqlite::Result<Vec<_>>>();
+                        match views {
+                            Ok(views) => println!(
+                                "{}",
+                                serde_json::to_string_pretty(&views).unwrap_or_default()
+                            ),
+                            Err(e) => crate::ui::error(&e.to_string()),
+                        }
                     }
                     Err(e) => crate::ui::error(&e.to_string()),
                 },

@@ -30,8 +30,59 @@ pub enum SaveOutcome {
     Duplicate(i64),
 }
 
+pub(super) fn is_lesson(kind: &str) -> bool {
+    kind.trim().eq_ignore_ascii_case("lesson")
+}
+
+fn lesson_write_error() -> rusqlite::Error {
+    rusqlite::Error::InvalidParameterName(
+        "lessons are immutable; use explicit evidence-backed promotion".into(),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn save(
+    conn: &Connection,
+    session_id: Option<&str>,
+    r#type: &str,
+    title: &str,
+    content: &str,
+    tool_name: Option<&str>,
+    project: Option<&str>,
+    scope: Option<&str>,
+    topic_key: Option<&str>,
+) -> rusqlite::Result<SaveOutcome> {
+    if is_lesson(r#type) {
+        return Err(lesson_write_error());
+    }
+    save_inner(
+        conn, session_id, r#type, title, content, tool_name, project, scope, topic_key,
+    )
+}
+
+pub(super) fn save_lesson(
+    conn: &Connection,
+    session_id: Option<&str>,
+    title: &str,
+    content: &str,
+    project: &str,
+    topic_key: Option<&str>,
+) -> rusqlite::Result<SaveOutcome> {
+    save_inner(
+        conn,
+        session_id,
+        "lesson",
+        title,
+        content,
+        None,
+        Some(project),
+        Some("project"),
+        topic_key,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn save_inner(
     conn: &Connection,
     session_id: Option<&str>,
     r#type: &str,
@@ -65,6 +116,9 @@ pub fn save(
             .optional()?
         {
             let (id, rev) = existing;
+            if is_lesson(r#type) || get(conn, id)?.is_some_and(|o| is_lesson(&o.r#type)) {
+                return Err(lesson_write_error());
+            }
             conn.execute(
                 "UPDATE observations SET content = ?2, title = ?3, revision_count = ?4, normalized_hash = ?5, updated_at = ?6, last_seen_at = ?6 WHERE id = ?1",
                 params![id, content, title, rev + 1, &hash, now],
@@ -106,6 +160,10 @@ pub fn upsert_synced(
     created_at: &str,
     updated_at: &str,
 ) -> rusqlite::Result<SaveOutcome> {
+    // Sync does not carry verified run receipts, so it cannot promote lessons.
+    if is_lesson(r#type) {
+        return Err(lesson_write_error());
+    }
     if let Some(tk) = topic_key.filter(|t| !t.is_empty()) {
         if let Some((id, existing_updated_at, existing_content, existing_title)) = conn
             .query_row(
@@ -123,6 +181,9 @@ pub fn upsert_synced(
             )
             .optional()?
         {
+            if get(conn, id)?.is_some_and(|o| is_lesson(&o.r#type)) {
+                return Err(lesson_write_error());
+            }
             // A tie on `updated_at` with identical content is a true no-op
             // (skip it rather than bump revision_count for nothing); a tie
             // with different content must still converge to whichever entry
@@ -205,6 +266,12 @@ pub fn update(
     r#type: Option<&str>,
     pinned: Option<bool>,
 ) -> rusqlite::Result<bool> {
+    if r#type.is_some_and(is_lesson)
+        || ((title.is_some() || content.is_some() || r#type.is_some())
+            && get(conn, id)?.is_some_and(|o| is_lesson(&o.r#type)))
+    {
+        return Err(lesson_write_error());
+    }
     let now = now_iso();
     let mut parts = Vec::new();
     let mut vals: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -365,6 +432,78 @@ mod tests {
         conn.pragma_update(None, "foreign_keys", true).unwrap();
         schema::migrate(&mut conn).unwrap();
         conn
+    }
+
+    #[test]
+    fn generic_writes_cannot_create_or_rewrite_promoted_lessons() {
+        let conn = new_db();
+        assert!(save(&conn, None, "LeSsOn", "t", "c", None, Some("p"), None, None).is_err());
+        conn.execute("INSERT INTO observations(type,title,content,project,scope,topic_key,created_at,updated_at) VALUES ('lesson','verified','original','p','project','topic','2000','2000')", []).unwrap();
+        let lesson = conn.last_insert_rowid();
+        assert!(update(&conn, lesson, None, Some("unsupported"), None, None).is_err());
+        assert!(
+            save(
+                &conn,
+                None,
+                "note",
+                "new",
+                "unsupported",
+                None,
+                Some("p"),
+                None,
+                Some("topic")
+            )
+            .is_err()
+        );
+        assert!(
+            upsert_synced(
+                &conn,
+                "note",
+                "new",
+                "unsupported",
+                Some("p"),
+                "project",
+                Some("topic"),
+                "hash",
+                "2000",
+                "2099"
+            )
+            .is_err()
+        );
+        assert!(
+            upsert_synced(
+                &conn,
+                "lesson",
+                "new",
+                "unsupported",
+                Some("p"),
+                "project",
+                None,
+                "hash",
+                "2000",
+                "2099"
+            )
+            .is_err()
+        );
+        assert_eq!(get(&conn, lesson).unwrap().unwrap().content, "original");
+        let ordinary = match save(
+            &conn,
+            None,
+            "note",
+            "raw",
+            "claim",
+            None,
+            Some("p"),
+            None,
+            None,
+        )
+        .unwrap()
+        {
+            SaveOutcome::Created(id) => id,
+            other => panic!("{other:?}"),
+        };
+        assert!(update(&conn, ordinary, None, None, Some("lesson"), None).is_err());
+        assert!(pin(&conn, lesson, true).unwrap());
     }
 
     // Regression test: identical title/content in two different projects
