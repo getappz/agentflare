@@ -239,6 +239,8 @@ pub struct WorkflowDefinition<D: WorkflowData> {
     pub steps: Vec<StepDefinition<D>>,
     pub default_retry_policy: RetryPolicy,
     pub default_timeout: Duration,
+    /// Stable execution configuration/revision required for compatible replay.
+    pub resume_identity: Option<String>,
     /// Pre-computed reverse dependencies: step_id -> indices of steps that depend on it.
     reverse_deps: HashMap<StepId, Vec<usize>>,
     /// Pre-computed indices of steps with no dependencies (can start immediately).
@@ -253,6 +255,7 @@ impl<D: WorkflowData> Clone for WorkflowDefinition<D> {
             steps: self.steps.clone(),
             default_retry_policy: self.default_retry_policy.clone(),
             default_timeout: self.default_timeout,
+            resume_identity: self.resume_identity.clone(),
             reverse_deps: self.reverse_deps.clone(),
             initial_step_indices: self.initial_step_indices.clone(),
         }
@@ -279,6 +282,7 @@ impl<D: WorkflowData> WorkflowDefinition<D> {
             steps: Vec::new(),
             default_retry_policy: RetryPolicy::default(),
             default_timeout: Duration::from_secs(300),
+            resume_identity: None,
             reverse_deps: HashMap::new(),
             initial_step_indices: Vec::new(),
         }
@@ -286,6 +290,14 @@ impl<D: WorkflowData> WorkflowDefinition<D> {
 
     pub fn add_step(mut self, step: StepDefinition<D>) -> Self {
         self.steps.push(step);
+        self
+    }
+
+    /// Require the same identity on resume, including when loading legacy runs.
+    /// Rust executors must change this revision when their replay contract changes;
+    /// closure code and external configuration cannot be inferred by the engine.
+    pub fn with_resume_identity(mut self, identity: impl Into<String>) -> Self {
+        self.resume_identity = Some(identity.into());
         self
     }
 
