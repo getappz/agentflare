@@ -170,6 +170,15 @@ pub struct RoundResult {
 
 // ── Synthesis (judge) result ───────────────────────────────────
 
+/// Maps an anonymous judge candidate label (e.g. `Participant 2`) back to the
+/// real participant/model, so the shuffled judge input stays auditable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JudgeCandidate {
+    pub label: String,
+    pub participant_id: String,
+    pub model_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SynthesisResult {
     pub model_id: String,
@@ -179,6 +188,9 @@ pub struct SynthesisResult {
     pub unresolved_disputes: String,
     /// 0-100, from the `JUDGE_CONFIDENCE: N` trailing line. Defaults to 50 if absent.
     pub judge_confidence: u8,
+    /// Candidate-label → identity mapping, in the (shuffled) order shown to the judge.
+    #[serde(default)]
+    pub candidate_order: Vec<JudgeCandidate>,
     #[serde(default)]
     pub usage: Option<TokenUsage>,
     pub started_at: i64,
