@@ -33,18 +33,18 @@ pub(super) fn process_executor_id() -> Arc<str> {
 
 /// Whether a process with `pid` currently exists on this host.
 pub(super) fn pid_exists(pid: u32) -> bool {
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
-        std::path::Path::new(&format!("/proc/{pid}")).exists()
-    }
-    #[cfg(all(unix, not(target_os = "linux")))]
-    {
-        flare_process::command("kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return true;
+        };
+        if pid <= 0 {
+            return true;
+        }
+        // SAFETY: signal zero probes a positive PID without sending a signal.
+        let result = unsafe { libc::kill(pid, 0) };
+        // Permission denial and unknown errors cannot prove the holder is dead.
+        result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
     #[cfg(windows)]
     {
