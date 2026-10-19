@@ -829,13 +829,17 @@ pub fn wire_optimize_hooks(agent: &str) {
 }
 
 /// Rewrites `statusLine` when it is absent or already an optimize statusline
-/// whose command is not `command`. A user-owned statusline is left alone.
+/// whose command is not `command`. A user-owned statusline is left alone,
+/// including one that exists but has no string `command`.
 fn refresh_optimize_statusline(obj: &mut Map<String, Value>, command: &str) -> bool {
     let existing = obj
         .get("statusLine")
         .and_then(|s| s.get("command"))
         .and_then(Value::as_str);
-    let owns = existing.is_none_or(|cmd| cmd.contains("optimize code hook statusline"));
+    let owns = match obj.get("statusLine") {
+        None => true,
+        Some(_) => existing.is_some_and(|c| c.contains("optimize code hook statusline")),
+    };
     if !owns || existing == Some(command) {
         return false;
     }
@@ -1659,6 +1663,28 @@ mod tests {
                     agentflare_binary()
                 )
             );
+        });
+    }
+
+    #[test]
+    fn wire_optimize_claude_code_leaves_a_statusline_without_command() {
+        with_temp_home(|| {
+            let path = home().join(".claude").join("settings.json");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(
+                &path,
+                serde_json::to_string(&json!({
+                    "statusLine": { "type": "command" }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            wire_optimize_claude_code();
+
+            let parsed: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(parsed["statusLine"]["type"], "command");
+            assert!(parsed["statusLine"].get("command").is_none());
         });
     }
 

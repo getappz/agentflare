@@ -251,7 +251,7 @@ pub(crate) fn stale_hooks_in(
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+    let Ok(value) = crate::jsonc::parse_jsonc(&text) else {
         return Vec::new();
     };
     let mut commands = Vec::new();
@@ -282,9 +282,14 @@ fn hook_config_files() -> Vec<(&'static str, PathBuf)> {
 }
 
 /// Wired hook commands whose binary path is not `current_exe`.
-pub(crate) fn stale_hook_binaries(current_exe: &std::path::Path) -> Vec<StaleHook> {
+/// When `agent` is set, only that host's config is scanned.
+pub(crate) fn stale_hook_binaries(
+    current_exe: &std::path::Path,
+    agent: Option<&str>,
+) -> Vec<StaleHook> {
     hook_config_files()
         .into_iter()
+        .filter(|(host, _)| agent.is_none_or(|a| a == *host))
         .flat_map(|(host, path)| stale_hooks_in(host, &path, current_exe))
         .collect()
 }
@@ -333,7 +338,7 @@ pub fn run(agent: Option<&str>, json: bool) {
         stale.extend(stale_rules_for_host(host));
     }
     let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("agentflare"));
-    let stale_hooks = stale_hook_binaries(&current_exe);
+    let stale_hooks = stale_hook_binaries(&current_exe, agent);
 
     // Not a coding-agent host like the others in `hosts` -- appended after
     // so the per-agent loop above (which calls `get_components`/
@@ -573,6 +578,94 @@ mod tests {
             std::os::unix::fs::symlink(&current, &link).unwrap();
             let command = format!("\"{}\" optimize code hook prompt-submit", link.display());
             assert!(!hook_binary_is_stale(&command, &current));
+        });
+    }
+
+    #[test]
+    fn stale_hooks_in_reads_jsonc_comments_and_trailing_commas() {
+        with_temp_home(|| {
+            let path = crate::paths::claude_settings_path();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let current = std::env::current_exe().unwrap();
+            std::fs::write(
+                &path,
+                r#"{
+                    // claude settings are JSONC
+                    "hooks": {
+                        "UserPromptSubmit": [{
+                            "hooks": [{
+                                "command": "\"/old/1.7.0/agentflare\" optimize code hook prompt-submit",
+                            }],
+                        }],
+                    },
+                }"#,
+            )
+            .unwrap();
+
+            let stale = stale_hooks_in("claude-code", &path, &current);
+            assert_eq!(stale.len(), 1, "{stale:?}");
+            assert!(stale[0].command.contains("/old/1.7.0/agentflare"));
+        });
+    }
+
+    #[test]
+    fn stale_hook_binaries_limits_the_scan_to_the_requested_agent() {
+        with_temp_home(|| {
+            let home = crate::paths::home();
+            let original = std::env::current_dir().unwrap();
+            std::env::set_current_dir(&home).unwrap();
+            struct RestoreCwd(std::path::PathBuf);
+            impl Drop for RestoreCwd {
+                fn drop(&mut self) {
+                    let _ = std::env::set_current_dir(&self.0);
+                }
+            }
+            let _restore = RestoreCwd(original);
+
+            let current = std::env::current_exe().unwrap();
+            let stale_cmd = "\"/old/1.7.0/agentflare\" optimize code hook prompt-submit";
+            let claude = crate::paths::claude_settings_path();
+            std::fs::create_dir_all(claude.parent().unwrap()).unwrap();
+            std::fs::write(
+                &claude,
+                serde_json::json!({
+                    "hooks": { "UserPromptSubmit": [{ "hooks": [{ "command": stale_cmd }] }] }
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let codex = home.join(".codex").join("hooks.json");
+            std::fs::create_dir_all(codex.parent().unwrap()).unwrap();
+            std::fs::write(
+                &codex,
+                serde_json::json!({
+                    "hooks": { "PreToolUse": [{ "hooks": [{ "command": stale_cmd }] }] }
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let cursor = home.join(".cursor").join("hooks.json");
+            std::fs::create_dir_all(cursor.parent().unwrap()).unwrap();
+            std::fs::write(
+                &cursor,
+                serde_json::json!({
+                    "hooks": { "beforeSubmitPrompt": [{ "command": stale_cmd }] }
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+            let scoped = stale_hook_binaries(&current, Some("claude-code"));
+            assert_eq!(scoped.len(), 1, "{scoped:?}");
+            assert_eq!(scoped[0].host, "claude-code");
+
+            let hosts: Vec<_> = stale_hook_binaries(&current, None)
+                .into_iter()
+                .map(|h| h.host)
+                .collect();
+            assert!(hosts.contains(&"claude-code".to_string()), "{hosts:?}");
+            assert!(hosts.contains(&"codex".to_string()), "{hosts:?}");
+            assert!(hosts.contains(&"cursor".to_string()), "{hosts:?}");
         });
     }
 }
