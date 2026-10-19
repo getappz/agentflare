@@ -24,6 +24,32 @@ pub struct RememberInput {
     pub scope: Option<String>,
 }
 
+/// Best-effort semantic index of one observation; failure never fails the write.
+/// `updated` rows may hold a vector for stale content, so it is dropped when it
+/// can't be refreshed (`missing` re-surfaces it for backfill).
+fn index_embedding(
+    conn: &rusqlite::Connection,
+    id: i64,
+    title: &str,
+    content: &str,
+    updated: bool,
+) {
+    let text = format!("{title}\n{content}");
+    match super::engine::embed_doc(&text) {
+        Some(vec) => {
+            let model = super::engine::model_name().unwrap_or_default();
+            if let Err(e) = super::embeddings::upsert(conn, id, &vec, &model) {
+                eprintln!("[memory] embedding upsert failed for obs {id}: {e}");
+                let _ = super::embeddings::delete(conn, id);
+            }
+        }
+        None if updated => {
+            let _ = super::embeddings::delete(conn, id);
+        }
+        None => {}
+    }
+}
+
 pub fn handle_remember(input: RememberInput) -> Result<String, String> {
     if input.title.trim().is_empty() || input.content.trim().is_empty() {
         return Err("title and content are required".into());
@@ -59,25 +85,7 @@ pub fn handle_remember(input: RememberInput) -> Result<String, String> {
     // Best-effort semantic index; failure must never fail the remember.
     // Duplicates keep their existing vector — content is unchanged by definition.
     if status != "duplicate" {
-        let text = format!("{}\n{}", input.title, input.content);
-        match super::engine::embed_doc(&text) {
-            Some(vec) => {
-                let model = super::engine::model_name().unwrap_or_default();
-                if let Err(e) = super::embeddings::upsert(&conn, id, &vec, &model) {
-                    eprintln!("[memory] embedding upsert failed for obs {id}: {e}");
-                    // Refresh failed — drop any stale vector so recall never ranks
-                    // on outdated content; `missing` re-surfaces it for backfill.
-                    let _ = super::embeddings::delete(&conn, id);
-                }
-            }
-            // No embedder available. A prior vector (from when a model was present)
-            // would now point at stale content on an update — remove it. Created
-            // rows have no vector yet, so this is a no-op for them.
-            None if status == "updated" => {
-                let _ = super::embeddings::delete(&conn, id);
-            }
-            None => {}
-        }
+        index_embedding(&conn, id, &input.title, &input.content, status == "updated");
     }
     Ok(json!({"status": status, "id": id}).to_string())
 }
@@ -471,16 +479,20 @@ pub struct PromoteInput {
 
 pub fn handle_promote(input: PromoteInput) -> Result<String, String> {
     let conn = open_db()?;
+    let project = input.project.clone();
     let out = promote_with_conn(&conn, input)?;
     if let Ok(mut cache) = recall_cache().lock() {
-        cache.entries.clear();
+        cache.invalidate_project(project.as_deref());
     }
     Ok(out)
 }
 
 /// Promote a project lesson: saved as a project-scoped `lesson` observation
 /// and linked by an `evidence_for` relation (carrying `confidence`) from each
-/// supporting observation. Evidence must be live and in the same project.
+/// supporting observation. Evidence must be live, project-scoped and in the
+/// same project. A lesson's effective confidence is the minimum confidence over
+/// its `evidence_for` relations; re-promoting restates the confidence of the
+/// evidence supplied (existing relations for it are overwritten).
 fn promote_with_conn(conn: &rusqlite::Connection, input: PromoteInput) -> Result<String, String> {
     if input.title.trim().is_empty() || input.content.trim().is_empty() {
         return Err("title and content are required".into());
@@ -514,6 +526,12 @@ fn promote_with_conn(conn: &rusqlite::Connection, input: PromoteInput) -> Result
             .map_err(|e| format!("evidence lookup: {e}"))?
             .filter(|o| o.deleted_at.is_none())
             .ok_or_else(|| format!("evidence observation {id} not found"))?;
+        if obs.scope != "project" {
+            return Err(format!(
+                "evidence observation {id} has scope '{}'; only project-scoped evidence can back a lesson",
+                obs.scope
+            ));
+        }
         if obs.project.as_deref().map(str::to_lowercase) != Some(project.to_lowercase()) {
             return Err(format!(
                 "evidence observation {id} belongs to a different project"
@@ -541,6 +559,17 @@ fn promote_with_conn(conn: &rusqlite::Connection, input: PromoteInput) -> Result
         observations::SaveOutcome::Updated(id) => ("updated", id),
         observations::SaveOutcome::Duplicate(id) => ("duplicate", id),
     };
+    // save() dedups by content hash and topic_key across types; never attach
+    // evidence to (or rewrite) an observation that is not already a lesson.
+    let saved = observations::get(&tx, id)
+        .map_err(|e| format!("lesson lookup: {e}"))?
+        .ok_or("lesson vanished after save")?;
+    if saved.r#type != LESSON_TYPE {
+        return Err(format!(
+            "an existing '{}' observation (id {id}) has the same content or topic_key; refusing to promote over it",
+            saved.r#type
+        ));
+    }
     for ev in &evidence {
         if *ev == id {
             return Err("a lesson cannot be evidence for itself".into());
@@ -557,9 +586,19 @@ fn promote_with_conn(conn: &rusqlite::Connection, input: PromoteInput) -> Result
         )
         .map_err(|e| format!("create relation: {e}"))?;
     }
+    let effective: f64 = tx
+        .query_row(
+            "SELECT MIN(confidence) FROM memory_relations WHERE target_id = ?1 AND relation = ?2",
+            rusqlite::params![id, EVIDENCE_RELATION],
+            |r| r.get(0),
+        )
+        .map_err(|e| format!("confidence lookup: {e}"))?;
     tx.commit().map_err(|e| format!("commit promote: {e}"))?;
+    if status != "duplicate" {
+        index_embedding(conn, id, &input.title, &input.content, status == "updated");
+    }
     Ok(
-        json!({"status": status, "id": id, "evidence_ids": evidence, "confidence": confidence})
+        json!({"status": status, "id": id, "evidence_ids": evidence, "confidence": effective})
             .to_string(),
     )
 }
@@ -669,6 +708,16 @@ pub struct CurateInput {
 }
 
 pub fn handle_curate(input: CurateInput) -> Result<String, String> {
+    if input.action == "update"
+        && input
+            .r#type
+            .as_deref()
+            .is_some_and(|t| t.eq_ignore_ascii_case(LESSON_TYPE))
+    {
+        return Err(
+            "type 'lesson' is reserved: use action=promote with evidence_ids and confidence".into(),
+        );
+    }
     let conn = open_db()?;
     match input.action.as_str() {
         "update" => {
@@ -808,6 +857,151 @@ mod tests {
             project: None,
             topic_key: None,
             scope: None,
+        })
+        .unwrap_err();
+        assert!(err.contains("promote"));
+    }
+
+    fn scoped_obs(conn: &Connection, title: &str, scope: &str) -> i64 {
+        match observations::save(
+            conn,
+            None,
+            "discovery",
+            title,
+            "body",
+            None,
+            Some("p"),
+            Some(scope),
+            None,
+        )
+        .unwrap()
+        {
+            observations::SaveOutcome::Created(id) => id,
+            o => panic!("{o:?}"),
+        }
+    }
+
+    fn lesson_count(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM observations WHERE type='lesson'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn promote_rejects_personal_scope_and_soft_deleted_evidence() {
+        let conn = new_db();
+        let personal = scoped_obs(&conn, "mine", "personal");
+        assert!(promote_with_conn(&conn, promote_input(vec![personal], Some(0.5))).is_err());
+        let gone = obs(&conn, "gone", "p");
+        observations::soft_delete(&conn, gone).unwrap();
+        assert!(promote_with_conn(&conn, promote_input(vec![gone], Some(0.5))).is_err());
+        assert_eq!(lesson_count(&conn), 0);
+    }
+
+    #[test]
+    fn promote_refuses_to_collide_with_non_lesson_and_rolls_back() {
+        let conn = new_db();
+        let a = obs(&conn, "a", "p");
+        // Same title+content hash as an existing non-lesson observation.
+        let existing = match observations::save(
+            &conn,
+            None,
+            "decision",
+            "Always X",
+            "because Y",
+            None,
+            Some("p"),
+            None,
+            Some("tk"),
+        )
+        .unwrap()
+        {
+            observations::SaveOutcome::Created(id) => id,
+            o => panic!("{o:?}"),
+        };
+        let err = promote_with_conn(&conn, promote_input(vec![a], Some(0.7))).unwrap_err();
+        assert!(err.contains("decision"));
+        let rels: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_relations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rels, 0);
+        let dup: i64 = conn
+            .query_row(
+                "SELECT duplicate_count FROM observations WHERE id=?1",
+                [existing],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dup, 0, "rolled back: no duplicate bump");
+
+        // topic_key collision must not rewrite the non-lesson row either.
+        let mut input = promote_input(vec![a], Some(0.7));
+        input.title = "Different".into();
+        input.content = "text".into();
+        input.topic_key = Some("tk".into());
+        assert!(promote_with_conn(&conn, input).is_err());
+        let title: String = conn
+            .query_row(
+                "SELECT title FROM observations WHERE id=?1",
+                [existing],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(title, "Always X");
+    }
+
+    #[test]
+    fn promote_duplicate_and_topic_update_and_self_evidence() {
+        let conn = new_db();
+        let a = obs(&conn, "a", "p");
+        let first = promote_with_conn(&conn, promote_input(vec![a], Some(0.9))).unwrap();
+        let lesson: i64 = serde_json::from_str::<serde_json::Value>(&first).unwrap()["id"]
+            .as_i64()
+            .unwrap();
+
+        // Same content again -> duplicate of the same lesson; lower confidence
+        // on new evidence lowers the effective (minimum) confidence.
+        let b = obs(&conn, "b", "p");
+        let again = promote_with_conn(&conn, promote_input(vec![b], Some(0.4))).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&again).unwrap();
+        assert_eq!(v["status"], "duplicate");
+        assert_eq!(v["id"].as_i64().unwrap(), lesson);
+        assert_eq!(v["confidence"].as_f64().unwrap(), 0.4);
+
+        // The lesson cannot be its own evidence.
+        assert!(promote_with_conn(&conn, promote_input(vec![lesson], Some(0.9))).is_err());
+
+        // topic_key update of an existing lesson revises it in place.
+        let mut t1 = promote_input(vec![a], Some(0.8));
+        t1.title = "T".into();
+        t1.content = "v1".into();
+        t1.topic_key = Some("topic".into());
+        let id1 = serde_json::from_str::<serde_json::Value>(&promote_with_conn(&conn, t1).unwrap())
+            .unwrap()["id"]
+            .as_i64()
+            .unwrap();
+        let mut t2 = promote_input(vec![a], Some(0.8));
+        t2.title = "T".into();
+        t2.content = "v2".into();
+        t2.topic_key = Some("topic".into());
+        let r2: serde_json::Value =
+            serde_json::from_str(&promote_with_conn(&conn, t2).unwrap()).unwrap();
+        assert_eq!(r2["status"], "updated");
+        assert_eq!(r2["id"].as_i64().unwrap(), id1);
+    }
+
+    #[test]
+    fn curate_rejects_retyping_to_lesson() {
+        let err = handle_curate(CurateInput {
+            action: "update".into(),
+            id: 1,
+            title: None,
+            content: None,
+            r#type: Some("Lesson".into()),
+            pinned: None,
         })
         .unwrap_err();
         assert!(err.contains("promote"));
