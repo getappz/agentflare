@@ -28,6 +28,11 @@ pub fn handle_remember(input: RememberInput) -> Result<String, String> {
     if input.title.trim().is_empty() || input.content.trim().is_empty() {
         return Err("title and content are required".into());
     }
+    if input.r#type.eq_ignore_ascii_case(LESSON_TYPE) {
+        return Err(
+            "type 'lesson' is reserved: use action=promote with evidence_ids and confidence".into(),
+        );
+    }
     let conn = open_db()?;
     let outcome = observations::save(
         &conn,
@@ -448,6 +453,117 @@ pub fn handle_relate(input: RelateInput) -> Result<String, String> {
     Ok(json!({"status": "created", "id": id}).to_string())
 }
 
+/// Observation type reserved for promoted project lessons.
+const LESSON_TYPE: &str = "lesson";
+/// Relation from a supporting observation to the lesson it justifies.
+const EVIDENCE_RELATION: &str = "evidence_for";
+
+#[derive(Debug, Deserialize)]
+pub struct PromoteInput {
+    pub title: String,
+    pub content: String,
+    pub project: Option<String>,
+    pub evidence_ids: Vec<i64>,
+    pub confidence: Option<f64>,
+    pub session_id: Option<String>,
+    pub topic_key: Option<String>,
+}
+
+pub fn handle_promote(input: PromoteInput) -> Result<String, String> {
+    let conn = open_db()?;
+    let out = promote_with_conn(&conn, input)?;
+    if let Ok(mut cache) = recall_cache().lock() {
+        cache.entries.clear();
+    }
+    Ok(out)
+}
+
+/// Promote a project lesson: saved as a project-scoped `lesson` observation
+/// and linked by an `evidence_for` relation (carrying `confidence`) from each
+/// supporting observation. Evidence must be live and in the same project.
+fn promote_with_conn(conn: &rusqlite::Connection, input: PromoteInput) -> Result<String, String> {
+    if input.title.trim().is_empty() || input.content.trim().is_empty() {
+        return Err("title and content are required".into());
+    }
+    let project = input
+        .project
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .ok_or("project is required: lessons are project-scoped")?;
+    let confidence = input
+        .confidence
+        .ok_or("confidence is required (0.0..1.0)")?;
+    if !(confidence > 0.0 && confidence <= 1.0) {
+        return Err("confidence must be in (0.0, 1.0]".into());
+    }
+    let evidence: Vec<i64> = input
+        .evidence_ids
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if evidence.is_empty() {
+        return Err(
+            "evidence_ids is required: a lesson needs at least one supporting observation".into(),
+        );
+    }
+    for id in &evidence {
+        let obs = observations::get(conn, *id)
+            .map_err(|e| format!("evidence lookup: {e}"))?
+            .filter(|o| o.deleted_at.is_none())
+            .ok_or_else(|| format!("evidence observation {id} not found"))?;
+        if obs.project.as_deref().map(str::to_lowercase) != Some(project.to_lowercase()) {
+            return Err(format!(
+                "evidence observation {id} belongs to a different project"
+            ));
+        }
+    }
+
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("begin transaction: {e}"))?;
+    let outcome = observations::save(
+        &tx,
+        input.session_id.as_deref(),
+        LESSON_TYPE,
+        &input.title,
+        &input.content,
+        None,
+        Some(project),
+        Some("project"),
+        input.topic_key.as_deref(),
+    )
+    .map_err(|e| format!("save failed: {e}"))?;
+    let (status, id) = match outcome {
+        observations::SaveOutcome::Created(id) => ("promoted", id),
+        observations::SaveOutcome::Updated(id) => ("updated", id),
+        observations::SaveOutcome::Duplicate(id) => ("duplicate", id),
+    };
+    for ev in &evidence {
+        if *ev == id {
+            return Err("a lesson cannot be evidence for itself".into());
+        }
+        relations::create(
+            &tx,
+            *ev,
+            id,
+            EVIDENCE_RELATION,
+            input.session_id.as_deref(),
+            Some("promoted lesson evidence"),
+            None,
+            Some(confidence),
+        )
+        .map_err(|e| format!("create relation: {e}"))?;
+    }
+    tx.commit().map_err(|e| format!("commit promote: {e}"))?;
+    Ok(
+        json!({"status": status, "id": id, "evidence_ids": evidence, "confidence": confidence})
+            .to_string(),
+    )
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CompactInput {
     pub lines: String,
@@ -610,6 +726,91 @@ mod tests {
         conn.pragma_update(None, "foreign_keys", true).unwrap();
         super::super::schema::migrate(&mut conn).unwrap();
         conn
+    }
+
+    fn obs(conn: &Connection, title: &str, project: &str) -> i64 {
+        match observations::save(
+            conn,
+            None,
+            "discovery",
+            title,
+            "body",
+            None,
+            Some(project),
+            None,
+            None,
+        )
+        .unwrap()
+        {
+            observations::SaveOutcome::Created(id) => id,
+            o => panic!("{o:?}"),
+        }
+    }
+
+    fn promote_input(ev: Vec<i64>, conf: Option<f64>) -> PromoteInput {
+        PromoteInput {
+            title: "Always X".into(),
+            content: "because Y".into(),
+            project: Some("p".into()),
+            evidence_ids: ev,
+            confidence: conf,
+            session_id: None,
+            topic_key: None,
+        }
+    }
+
+    #[test]
+    fn promote_links_evidence_and_requires_it() {
+        let conn = new_db();
+        let a = obs(&conn, "a", "p");
+        let b = obs(&conn, "b", "p");
+        assert!(promote_with_conn(&conn, promote_input(vec![], Some(0.8))).is_err());
+        assert!(promote_with_conn(&conn, promote_input(vec![a], None)).is_err());
+        assert!(promote_with_conn(&conn, promote_input(vec![a], Some(1.5))).is_err());
+        assert!(promote_with_conn(&conn, promote_input(vec![a, 9999], Some(0.8))).is_err());
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM observations WHERE type='lesson'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "failed promotions must not leave a lesson behind");
+
+        let out = promote_with_conn(&conn, promote_input(vec![a, b, a], Some(0.8))).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["status"], "promoted");
+        let id = v["id"].as_i64().unwrap();
+        let rels: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_relations WHERE target_id=?1 AND relation='evidence_for' AND confidence=0.8",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rels, 2);
+    }
+
+    #[test]
+    fn promote_rejects_cross_project_evidence() {
+        let conn = new_db();
+        let other = obs(&conn, "other", "q");
+        assert!(promote_with_conn(&conn, promote_input(vec![other], Some(0.5))).is_err());
+    }
+
+    #[test]
+    fn remember_rejects_reserved_lesson_type() {
+        let err = handle_remember(RememberInput {
+            title: "t".into(),
+            content: "c".into(),
+            r#type: "lesson".into(),
+            session_id: None,
+            project: None,
+            topic_key: None,
+            scope: None,
+        })
+        .unwrap_err();
+        assert!(err.contains("promote"));
     }
 
     // Regression test for item 10: sessions::create was never called from

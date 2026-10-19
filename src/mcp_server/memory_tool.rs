@@ -99,6 +99,25 @@ impl AgentflareMcp {
                 crate::memory::mcp::handle_relate(input)
                     .map_err(|e| ErrorData::internal_error(e, None))
             }
+            "promote" => {
+                let title = req
+                    .title
+                    .ok_or_else(|| ErrorData::invalid_params("title is required", None))?;
+                let content = req
+                    .content
+                    .ok_or_else(|| ErrorData::invalid_params("content is required", None))?;
+                let input = crate::memory::mcp::PromoteInput {
+                    title,
+                    content,
+                    project: req.project,
+                    evidence_ids: req.evidence_ids.unwrap_or_default(),
+                    confidence: req.confidence,
+                    session_id: req.session_id,
+                    topic_key: req.topic_key,
+                };
+                crate::memory::mcp::handle_promote(input)
+                    .map_err(|e| ErrorData::invalid_params(e, None))
+            }
             "curate" => {
                 let id = req
                     .id
