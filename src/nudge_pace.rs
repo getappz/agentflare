@@ -33,12 +33,12 @@ fn lock_path() -> PathBuf {
 /// process already holds it. Without this, two hook processes racing on
 /// `mark_fired` — even for different keys — can each `load()` before the
 /// other's `save()` lands, silently dropping one process's fired-timestamp.
-struct PaceLock {
+pub(crate) struct PaceLock {
     path: PathBuf,
 }
 
 impl PaceLock {
-    fn acquire() -> std::io::Result<Self> {
+    pub(crate) fn acquire() -> std::io::Result<Self> {
         let path = lock_path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;

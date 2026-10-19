@@ -19,6 +19,7 @@ const SESSION_START_STDIN_TIMEOUT_MS: u64 = 300;
 const BRAND: &str = "\x1b[1;35m";
 const HEADING: &str = "\x1b[2;36m";
 const RESET: &str = "\x1b[0m";
+use crate::memory_nudge::{pre_edit_nudge, with_failure_recall};
 
 fn colorize(code: &str, s: &str) -> String {
     if std::env::var_os("NO_COLOR").is_some() {
@@ -355,12 +356,13 @@ pub fn post_tool_failure(agent: &str) {
     let Some(parsed) = parse_post_tool_failure(&input) else {
         return;
     };
-    if let Some(out) = failure_nudge(
+    let out = failure_nudge(
         agent,
         &parsed.tool_name,
         &parsed.failure_text,
         parsed.is_interrupt,
-    ) {
+    );
+    if let Some(out) = with_failure_recall(agent, &input, &parsed.failure_text, out) {
         println!("{out}");
     }
 }
@@ -599,7 +601,11 @@ pub fn pre_tool_use(agent: &str) {
     }
 
     nudges.extend(crate::coaching::rule_bodies_for_tool(&parsed.tool_name));
-
+    nudges.extend(pre_edit_nudge(
+        &parsed.tool_name,
+        parsed.tool_input.as_ref(),
+        &parsed.session_id,
+    ));
     if parsed.tool_name == "ScheduleWakeup"
         && let Some(delay) = parsed.delay_seconds
         && let Some(nudge) = crate::optimize::schedule_wakeup_nudge(delay)

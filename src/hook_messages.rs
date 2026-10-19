@@ -348,6 +348,19 @@ pub fn stop(agent: &str) {
     );
     if let Some(out) = stop_output(agent, &msgs) {
         println!("{out}");
+        return;
+    }
+    // One reminder per session to record durable learnings; the ledger gate
+    // also keeps the resulting continuation turn from looping on Stop.
+    if let Some(sid) = parse_session(&input).session_id
+        && crate::memory_nudge::first_time(&sid, "stop")
+    {
+        let out = if agent == "cursor" {
+            json!({ "followup_message": crate::memory_nudge::STOP_INSTRUCTION })
+        } else {
+            json!({ "decision": "block", "reason": crate::memory_nudge::STOP_INSTRUCTION })
+        };
+        println!("{out}");
     }
 }
 
