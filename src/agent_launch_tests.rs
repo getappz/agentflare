@@ -1279,7 +1279,7 @@
         let dir = tempfile::tempdir().unwrap();
         let mut cmd = Command::new("sh");
         cmd.current_dir(dir.path()).arg("-c").arg(
-            "for i in $(seq 1 80); do echo \"step $(tr -dc a-z </dev/urandom | head -c 12)\"; sleep 0.05; done",
+            "for i in $(seq 1 80); do echo \"step $(LC_ALL=C tr -dc a-z </dev/urandom | head -c 12)\"; sleep 0.05; done",
         );
         let out = run_captured_with_stall(
             cmd,
