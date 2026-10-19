@@ -158,6 +158,23 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             let mut attempt = 1u32;
 
             let outcome = loop {
+                let step_timeout = match state
+                    .budget
+                    .as_ref()
+                    .map(|budget| budget.cap_timeout(step_timeout))
+                    .transpose()
+                {
+                    Ok(capped) => capped.unwrap_or(step_timeout),
+                    Err(error) => break Err(error.to_string()),
+                };
+                context.budget = state.budget.as_ref().map(|_| {
+                    crate::budget::BudgetHandle::new(
+                        self.state_store.clone(),
+                        run_id,
+                        step.id.to_string(),
+                        attempt,
+                    )
+                });
                 let result =
                     tokio::time::timeout(step_timeout, rollback_executor.execute(&mut context))
                         .await;

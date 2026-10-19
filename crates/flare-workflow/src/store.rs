@@ -20,6 +20,26 @@ use crate::types::{
 /// engine only ever talks to this trait.
 #[async_trait]
 pub trait StateStore<D: WorkflowData>: Send + Sync + Clone {
+    /// SQLite overrides this with a separate transactional ledger, isolated from step snapshots.
+    async fn budget_operation(
+        &self,
+        run_id: WorkflowRunId,
+        operation: crate::budget::BudgetOperation,
+    ) -> WorkflowResult<crate::budget::BudgetUpdate> {
+        let mut result = Err(crate::budget::error("run has no budget"));
+        self.update(run_id, |state| {
+            if matches!(&operation, crate::budget::BudgetOperation::Reserve { .. })
+                && (state.status.is_terminal() || state.status == WorkflowStatus::Paused)
+            {
+                result = Err(crate::budget::error("run is no longer dispatchable"));
+            } else if let Some(budget) = state.budget.as_mut() {
+                result = budget.apply(operation);
+            }
+        })
+        .await?;
+        result
+    }
+
     /// Save workflow state.
     async fn save(&self, state: WorkflowState<D>) -> WorkflowResult<()>;
 
@@ -141,7 +161,8 @@ impl<D: WorkflowData> Default for InMemoryStore<D> {
 
 #[async_trait]
 impl<D: WorkflowData> StateStore<D> for InMemoryStore<D> {
-    async fn save(&self, state: WorkflowState<D>) -> WorkflowResult<()> {
+    async fn save(&self, mut state: WorkflowState<D>) -> WorkflowResult<()> {
+        state.context.budget = None;
         self.states.write().insert(state.run_id, state);
         Ok(())
     }
@@ -163,6 +184,7 @@ impl<D: WorkflowData> StateStore<D> for InMemoryStore<D> {
             .get_mut(&run_id)
             .ok_or(WorkflowError::NotFound(run_id))?;
         f(state);
+        state.context.budget = None;
         state.updated_at = chrono::Utc::now();
         Ok(())
     }

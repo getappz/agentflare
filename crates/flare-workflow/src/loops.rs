@@ -106,6 +106,20 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             let mut backoff = Backoff::from_strategy(&retry_policy.backoff);
             let mut retry_attempt = 1;
             let result = loop {
+                let step_timeout = state
+                    .budget
+                    .as_ref()
+                    .map(|budget| budget.cap_timeout(step_timeout))
+                    .transpose()?
+                    .unwrap_or(step_timeout);
+                context.budget = state.budget.as_ref().map(|_| {
+                    crate::budget::BudgetHandle::new(
+                        self.state_store.clone(),
+                        run_id,
+                        step.id.to_string(),
+                        retry_attempt,
+                    )
+                });
                 let attempt_result =
                     timeout(step_timeout, step.executor.execute(&mut context)).await;
                 let is_failure = matches!(

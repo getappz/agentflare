@@ -163,6 +163,8 @@ pub(crate) struct WorkItemData {
     /// session.
     #[serde(default)]
     pub agent_sessions: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub workflow_budget: Option<flare_workflow::budget::BudgetLimits>,
     /// All observed provider session IDs, including replaced/stale sessions.
     #[serde(default)]
     pub session_ids: std::collections::BTreeSet<String>,
@@ -217,6 +219,9 @@ pub(crate) struct WorkItemData {
 }
 
 impl flare_workflow::WorkflowData for WorkItemData {
+    fn budget_limits(&self) -> Option<flare_workflow::budget::BudgetLimits> {
+        self.workflow_budget.clone()
+    }
     fn workflow_type() -> &'static str {
         WORKFLOW_ID
     }
@@ -477,6 +482,7 @@ fn retry_empty_completion(ctx: &mut WorkflowContext<WorkItemData>) -> Option<Ste
 pub(crate) fn build_sdd_loop_step(
     send: flare_workflow::json::SendMessage,
 ) -> StepDefinition<WorkItemData> {
+    let send = flare_workflow::budget_send::budgeted_sender(send);
     let executor = std::sync::Arc::new(FunctionStep::new(
         move |ctx: &mut WorkflowContext<WorkItemData>| {
             let send = send.clone();
@@ -637,6 +643,7 @@ pub(crate) fn build_sdd_loop_step(
                     .then(|| std::path::PathBuf::from(&ctx.data.worktree_path));
                 refresh_patched_run_data(ctx);
                 let role_invocation = flare_workflow::json::StepInvocation {
+                    budget: ctx.budget.clone(),
                     args: role_invocation_args,
                     cwd: cwd.clone(),
                     owner: Some(ctx.data.owner.clone()),
@@ -666,6 +673,7 @@ pub(crate) fn build_sdd_loop_step(
                         // same: retrying would just be refused again.
                         if crate::auth_runner::skips_step_retry(&message)
                             || message == agentflare_jobs::cancel::CANCELLED_MESSAGE
+                            || message.starts_with(flare_workflow::budget::ERROR_PREFIX)
                         {
                             return Ok(StepResult::Failed(message));
                         }
@@ -729,6 +737,7 @@ pub(crate) fn build_sdd_loop_step(
                 judge_invocation_args.extend(judge_args);
                 refresh_patched_run_data(ctx);
                 let judge_invocation = flare_workflow::json::StepInvocation {
+                    budget: ctx.budget.clone(),
                     args: judge_invocation_args,
                     cwd,
                     owner: Some(ctx.data.owner.clone()),
@@ -753,6 +762,7 @@ pub(crate) fn build_sdd_loop_step(
                         // same: retrying would just be refused again.
                         if crate::auth_runner::skips_step_retry(&message)
                             || message == agentflare_jobs::cancel::CANCELLED_MESSAGE
+                            || message.starts_with(flare_workflow::budget::ERROR_PREFIX)
                         {
                             return Ok(StepResult::Failed(message));
                         }
@@ -791,15 +801,18 @@ pub(crate) fn build_sdd_loop_step(
 
                 // Shadow-only (item #705): log what Jev would have decided next to
                 // this decision. Never alters the decision applied below.
-                spawn_judge_shadow(
-                    &ctx.data.tasks,
-                    ctx.data.current_task_index,
-                    &ctx.data.ledger,
-                    &role_reply,
-                    ctx.data.review_only,
-                    ctx.data.design_spec,
-                    decision.action,
-                );
+                // The optional shadow API has no enforceable per-call allowance.
+                if ctx.budget.is_none() {
+                    spawn_judge_shadow(
+                        &ctx.data.tasks,
+                        ctx.data.current_task_index,
+                        &ctx.data.ledger,
+                        &role_reply,
+                        ctx.data.review_only,
+                        ctx.data.design_spec,
+                        decision.action,
+                    );
+                }
 
                 // A judge's prose cannot override the same Git evidence finalize requires.
                 let finishes_plan = decision.action == JudgeAction::CompletePipeline
@@ -972,13 +985,18 @@ fn real_agent_send_hook(
             prompt,
             cwd,
             owner,
+            allocation,
             ..
         } = inv;
         Box::pin(async move {
+            let mut timeout = timeout;
             // Refuse to start another agent turn for a cancelled job (item
             // #607). A turn already running is stopped by `run_captured_for_job`,
             // which finds the job via `owner` on its own blocking thread.
             let agent_for_reply = agent.clone();
+            let launch_allocation = allocation.clone();
+            let cumulative_usage =
+                crate::workflow::budget_launch::usage_is_cumulative(&agent, &all_args);
             let outcome = tokio::task::spawn_blocking(move || {
                 // The check reads SQLite, so it runs here on the blocking
                 // pool, not on the shared workflow runtime's worker threads.
@@ -997,6 +1015,14 @@ fn real_agent_send_hook(
                 let mut all_args = all_args;
                 if let Some(agent_enum) = agent_registry::agent_by_name(&agent) {
                     all_args.extend(crate::claude_job_config::job_scoped_args(agent_enum));
+                }
+                if let Err(error) = crate::workflow::budget_launch::prepare(
+                    &agent,
+                    &mut all_args,
+                    &mut timeout,
+                    launch_allocation.as_ref(),
+                ) {
+                    return crate::agent_launch::HeadlessOutcome::Failed(error);
                 }
                 match &cwd {
                     // Explicit cwd (the item's own worktree, threaded through
@@ -1031,6 +1057,11 @@ fn real_agent_send_hook(
             .map_err(|e| format!("agent task panicked: {e}"))?;
             match outcome {
                 crate::agent_launch::HeadlessOutcome::Ok(reply) => {
+                    crate::workflow::budget_launch::record_reply(
+                        allocation.as_ref(),
+                        cumulative_usage,
+                        &reply,
+                    );
                     let session_id = reply.session_id.clone();
                     let (text, in_tok, out_tok) = crate::agent_launch::reply_payload(reply);
                     Ok((
@@ -1280,6 +1311,15 @@ pub(crate) fn run_or_resume_with_sender(
         .map_err(|e| e.to_string())?;
     let existing_metadata: serde_json::Value = serde_json::from_str(&item.metadata)
         .unwrap_or(serde_json::Value::Object(Default::default()));
+    let workflow_budget: Option<flare_workflow::budget::BudgetLimits> = existing_metadata
+        .get("workflow_budget")
+        .filter(|value| !value.is_null())
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()
+        .map_err(|e| format!("invalid workflow_budget: {e}"))?;
+    if let Some(budget) = &workflow_budget {
+        budget.validate().map_err(|e| e.to_string())?;
+    }
     let existing_run_id = existing_metadata["workflow_run_id"]
         .as_str()
         .and_then(|s| flare_workflow::WorkflowRunId::from_str(s).ok());
@@ -1324,6 +1364,7 @@ pub(crate) fn run_or_resume_with_sender(
         // whose registration (the boot-time sweep in `dashboard/server.rs`)
         // never sees this item/agent at all.
         let fresh_data = || WorkItemData {
+            workflow_budget: workflow_budget.clone(),
             item_id: item.id.clone(),
             agent_name: agent_name.clone(),
             judge_agent_name: judge_agent_name.clone(),
@@ -1371,6 +1412,9 @@ pub(crate) fn run_or_resume_with_sender(
         let resumable_state = match existing_run_id {
             Some(run_id) => match eng.get_status(run_id).await {
                 Ok(state) if state.context.data.item_id != item.id => {
+                    if workflow_budget.is_some() {
+                        return Err(flare_workflow::budget::error("linked run belongs to another item; clear workflow_run_id to start a new run").to_string());
+                    }
                     eprintln!(
                         "work_item_pipeline: item {}'s stored workflow_run_id {run_id} \
                          actually belongs to item {} -- discarding it and starting a fresh \
@@ -1380,11 +1424,23 @@ pub(crate) fn run_or_resume_with_sender(
                     None
                 }
                 Ok(state) => Some((run_id, state)),
+                Err(WorkflowError::NotFound(_)) if workflow_budget.is_some() => {
+                    return Err(flare_workflow::budget::error("persisted run is unavailable; clear workflow_run_id to authorize a new allowance").to_string());
+                }
                 Err(WorkflowError::NotFound(_)) => None,
                 Err(e) => return Err(e.to_string()),
             },
             None => None,
         };
+        if let Some((_, state)) = &resumable_state {
+            if state.budget.as_ref().map(|budget| &budget.limits) != workflow_budget.as_ref() {
+                return Err(flare_workflow::budget::error("requested policy differs from the persisted run; restore it or start a new run").to_string());
+            }
+            if state.budget.is_some() && state.status.is_terminal() {
+                if state.status == WorkflowStatus::Completed { return Ok(()); }
+                return Err(flare_workflow::budget::error("persisted budgeted run is terminal; clear workflow_run_id to authorize a new allowance").to_string());
+            }
+        }
         let run_id = match resumable_state {
             Some((run_id, state))
                 if !matches!(

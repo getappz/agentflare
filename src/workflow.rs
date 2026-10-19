@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use flare_workflow::StateStore;
 
+pub(crate) mod budget_launch;
 mod report;
 use flare_workflow::engine::WorkflowEngine;
 use flare_workflow::json::{JsonWorkflow, PipelineData, SendMessage, compile_workflow};
@@ -75,6 +76,8 @@ pub(crate) fn agent_send_hook() -> SendMessage {
                 cwd,
                 owner: _,
                 persona,
+                allocation,
+                budget: _,
             } = inv;
             // `--model` ahead of any caller-supplied flags, mirroring
             // `run_launch_env`'s existing `--model` placement for the
@@ -97,7 +100,7 @@ pub(crate) fn agent_send_hook() -> SendMessage {
                 &mut extra_args,
                 prompt,
             );
-            let hard_cap = Duration::from_secs(hard_cap_secs.unwrap_or(DEFAULT_HARD_CAP_SECS));
+            let mut hard_cap = Duration::from_secs(hard_cap_secs.unwrap_or(DEFAULT_HARD_CAP_SECS));
             let idle_timeout =
                 Duration::from_secs(idle_timeout_secs.unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS));
             // `run_headless` blocks synchronously (subprocess, up to 900s) —
@@ -105,30 +108,43 @@ pub(crate) fn agent_send_hook() -> SendMessage {
             // before it, or the call already happened on whatever thread
             // invoked this closure before the returned future was ever
             // polled/awaited.
-            let outcome = tokio::task::spawn_blocking(move || match &cwd {
-                // Explicit cwd (a workflow compiled with
-                // `compile_workflow_in`, e.g. a schedule's repo root) instead
-                // of the ambient process cwd, which is the daemon's own when
-                // the run is driven there. Never a process-wide chdir.
-                Some(cwd) => crate::agent_launch::run_headless_in(
-                    cwd,
-                    agent_registry::REGISTRY,
+            let launch_allocation = allocation.clone();
+            let cumulative_usage = budget_launch::usage_is_cumulative(&agent, &extra_args);
+            let outcome = tokio::task::spawn_blocking(move || {
+                // Blocking-pool queue time must not permit a launch after the deadline.
+                if let Err(error) = budget_launch::prepare(
                     &agent,
-                    &prompt,
-                    hard_cap,
-                    idle_timeout,
-                    &extra_args,
-                    request_json,
-                ),
-                None => crate::agent_launch::run_headless(
-                    agent_registry::REGISTRY,
-                    &agent,
-                    &prompt,
-                    hard_cap,
-                    idle_timeout,
-                    &extra_args,
-                    request_json,
-                ),
+                    &mut extra_args,
+                    &mut hard_cap,
+                    launch_allocation.as_ref(),
+                ) {
+                    return crate::agent_launch::HeadlessOutcome::Failed(error);
+                }
+                match &cwd {
+                    // Explicit cwd (a workflow compiled with
+                    // `compile_workflow_in`, e.g. a schedule's repo root) instead
+                    // of the ambient process cwd, which is the daemon's own when
+                    // the run is driven there. Never a process-wide chdir.
+                    Some(cwd) => crate::agent_launch::run_headless_in(
+                        cwd,
+                        agent_registry::REGISTRY,
+                        &agent,
+                        &prompt,
+                        hard_cap,
+                        idle_timeout,
+                        &extra_args,
+                        request_json,
+                    ),
+                    None => crate::agent_launch::run_headless(
+                        agent_registry::REGISTRY,
+                        &agent,
+                        &prompt,
+                        hard_cap,
+                        idle_timeout,
+                        &extra_args,
+                        request_json,
+                    ),
+                }
             })
             .await
             .map_err(|e| format!("agent task panicked: {e}"))?;
@@ -137,6 +153,7 @@ pub(crate) fn agent_send_hook() -> SendMessage {
                 // reports them; 0 otherwise keeps accounting honest (unknown
                 // rather than fabricated).
                 crate::agent_launch::HeadlessOutcome::Ok(reply) => {
+                    budget_launch::record_reply(allocation.as_ref(), cumulative_usage, &reply);
                     Ok(crate::agent_launch::reply_payload(reply))
                 }
                 crate::agent_launch::HeadlessOutcome::UnknownAgent(e)
@@ -282,6 +299,8 @@ pub(crate) fn app_send_hook(
                 cwd: _,
                 owner: _,
                 persona,
+                allocation,
+                budget: _,
             } = inv;
             let mut extra_args = Vec::with_capacity(args.len() + 8);
             if let Some(m) = model {
@@ -301,7 +320,7 @@ pub(crate) fn app_send_hook(
                 &mut extra_args,
                 prompt,
             );
-            let hard_cap = Duration::from_secs(hard_cap_secs.unwrap_or(DEFAULT_HARD_CAP_SECS));
+            let mut hard_cap = Duration::from_secs(hard_cap_secs.unwrap_or(DEFAULT_HARD_CAP_SECS));
             let idle_timeout =
                 Duration::from_secs(idle_timeout_secs.unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS));
             let scratch_path = scratch.path().to_path_buf();
@@ -319,8 +338,18 @@ pub(crate) fn app_send_hook(
             // started (it keeps running on its own thread regardless), so a
             // `scratch` owned by the *outer* future would be deleted out
             // from under a still-running `run_headless_in` call.
+            let launch_allocation = allocation.clone();
+            let cumulative_usage = budget_launch::usage_is_cumulative(&agent, &extra_args);
             let outcome = tokio::task::spawn_blocking(move || {
                 let _scratch = scratch;
+                if let Err(error) = budget_launch::prepare(
+                    &agent,
+                    &mut extra_args,
+                    &mut hard_cap,
+                    launch_allocation.as_ref(),
+                ) {
+                    return crate::agent_launch::HeadlessOutcome::Failed(error);
+                }
                 crate::agent_launch::run_headless_in(
                     &scratch_path,
                     agent_registry::REGISTRY,
@@ -337,6 +366,7 @@ pub(crate) fn app_send_hook(
 
             match outcome {
                 crate::agent_launch::HeadlessOutcome::Ok(reply) => {
+                    budget_launch::record_reply(allocation.as_ref(), cumulative_usage, &reply);
                     Ok(crate::agent_launch::reply_payload(reply))
                 }
                 crate::agent_launch::HeadlessOutcome::UnknownAgent(e)
@@ -588,6 +618,7 @@ fn status_view(
         "steps": steps,
         "variables": state["variables"],
         "journal_tail": journal_tail,
+        "budget": state["budget"],
     })
 }
 
@@ -614,7 +645,19 @@ fn load_state_from_conn(
             |row| row.get(0),
         )
         .map_err(|e| format!("run '{run_id}' not found: {e}"))?;
-    serde_json::from_str(&state_json).map_err(|e| format!("corrupt state for run '{run_id}': {e}"))
+    let mut state: serde_json::Value = serde_json::from_str(&state_json)
+        .map_err(|e| format!("corrupt state for run '{run_id}': {e}"))?;
+    let seed = state
+        .get("budget")
+        .filter(|value| !value.is_null())
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()
+        .map_err(|e| format!("corrupt budget for run '{run_id}': {e}"))?;
+    state["budget"] = flare_workflow::sqlite_store::read_budget(conn, *run_id, seed)
+        .map_err(|e| e.to_string())?
+        .map(|budget| budget.summary())
+        .unwrap_or(serde_json::Value::Null);
+    Ok(state)
 }
 
 /// List run summaries. Sync wrapper — see [`list_workflows_async`].

@@ -62,6 +62,8 @@ pub struct StepInvocation {
     /// send hook folds the definition's body into the prompt for agents
     /// without an equivalent.
     pub persona: Option<String>,
+    pub budget: Option<crate::budget::BudgetHandle>,
+    pub allocation: Option<crate::budget::BudgetAllocation>,
 }
 
 impl StepInvocation {
@@ -94,6 +96,8 @@ pub struct JsonWorkflow {
     #[serde(default)]
     pub description: String,
     pub steps: Vec<JsonStep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<crate::budget::BudgetLimits>,
 }
 
 /// A single JSON step.
@@ -232,6 +236,11 @@ pub fn compile_workflow_in(
         .map_err(|e| format!("workflow resume identity: {e}"))?;
     let mut wf = WorkflowDefinition::new(json.name.clone(), json.name.clone())
         .with_resume_identity(identity);
+    if let Some(limits) = &json.budget {
+        limits.validate().map_err(|e| e.to_string())?;
+        wf = wf.with_budget(limits.clone());
+    }
+    let send = crate::budget_send::budgeted_sender(send);
 
     // Previous step that produced the input channel, per OpenFang chaining.
     let mut prev: Option<String> = None;
@@ -419,14 +428,21 @@ impl StepExecutor<PipelineData> for PromptExecutor {
             cwd: self.cwd.clone(),
             owner: None,
             persona: self.persona.clone(),
+            budget: ctx.budget.clone(),
+            allocation: None,
         };
-        let (output, input_tokens, output_tokens) =
-            (self.send)(invocation)
-                .await
-                .map_err(|e| WorkflowError::StepFailed {
+        let (output, input_tokens, output_tokens) = match (self.send)(invocation).await {
+            Ok(reply) => reply,
+            Err(message) if message.starts_with(crate::budget::ERROR_PREFIX) => {
+                return Ok(StepResult::Failed(message));
+            }
+            Err(message) => {
+                return Err(WorkflowError::StepFailed {
                     step_id: StepId::new(&self.agent),
-                    message: e,
-                })?;
+                    message,
+                });
+            }
+        };
         ctx.output = output;
         ctx.input_tokens = input_tokens;
         ctx.output_tokens = output_tokens;
