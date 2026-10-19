@@ -59,6 +59,7 @@ fn terminal_fixture_command(mode: &str) -> Command {
         "--exact",
         "agent_launch::tests::terminal_claude_fixture",
         "--nocapture",
+        "--test-threads=2",
     ])
     .env("AGENTFLARE_TEST_RESULT_MODE", mode)
     .env("RUST_TEST_THREADS", "1");
@@ -111,6 +112,7 @@ fn terminal_claude_result_never_overrides_failure_or_cancellation() {
 
 #[test]
 fn terminal_claude_detection_is_opt_in_and_ignores_stderr_and_partial_json() {
+    assert!(claude_result(format!("{TERMINAL_EVENT} \t\r\n").as_bytes()).is_some());
     for (mode, enabled) in [("success", false), ("stderr", true), ("partial", true)] {
         let c = terminal_capture(mode, enabled, Duration::from_secs(10), None);
         assert!(

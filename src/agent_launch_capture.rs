@@ -27,6 +27,9 @@ fn claude_json_output(args: &[String]) -> bool {
 }
 
 fn claude_result(bytes: &[u8]) -> Option<serde_json::Value> {
+    if bytes.trim_ascii_end().last() != Some(&b'}') {
+        return None;
+    }
     let event: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     (event.get("type")?.as_str()? == "result"
         && event.get("subtype")?.is_string()
