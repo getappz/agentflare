@@ -60,7 +60,8 @@ fn terminal_fixture_command(mode: &str) -> Command {
         "agent_launch::tests::terminal_claude_fixture",
         "--nocapture",
     ])
-    .env("AGENTFLARE_TEST_RESULT_MODE", mode);
+    .env("AGENTFLARE_TEST_RESULT_MODE", mode)
+    .env("RUST_TEST_THREADS", "1");
     cmd
 }
 
