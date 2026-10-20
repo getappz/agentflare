@@ -449,6 +449,14 @@ fn acceptance_argv_does_not_invoke_a_shell() {
 }
 
 #[test]
+fn timed_out_check_is_unknown_not_failed() {
+    use super::backend::check_verdict;
+    assert_eq!(check_verdict(true, false), Some(true));
+    assert_eq!(check_verdict(false, false), Some(false));
+    assert_eq!(check_verdict(false, true), None);
+}
+
+#[test]
 fn experiences_do_not_cross_project_or_domain() {
     let mut conn = rusqlite::Connection::open_in_memory().unwrap();
     crate::memory::schema::migrations()
