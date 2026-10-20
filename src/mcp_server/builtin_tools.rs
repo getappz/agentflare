@@ -56,7 +56,7 @@ const BUILTIN_TOOLS: &[(&str, &str)] = &[
     ),
     (
         "review",
-        "Review operations — submit findings, run consensus, list/clear/record rounds, check scores. Single consolidated tool with `action` field (clear|consensus|list|record|scores|submit).",
+        "Review operations — submit findings, run consensus, list/clear/record rounds, check scores. Single consolidated tool with `action` field (clear|consensus|list|record|scores|submit|verify).",
     ),
     (
         "tool",

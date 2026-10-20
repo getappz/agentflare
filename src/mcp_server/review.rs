@@ -88,6 +88,7 @@ impl AgentflareMcp {
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                 Ok(serde_json::json!({ "recorded_agents": n, "repo": repo, "pr": pr }).to_string())
             }
+            "verify" => self.verify_criteria_action(req),
             "scores" => {
                 let conn = Self::claim_db()?;
                 let repo = req.repo;
@@ -106,5 +107,47 @@ impl AgentflareMcp {
                 None,
             )),
         }
+    }
+
+    fn verify_criteria_action(&self, req: ReviewRequest) -> Result<String, ErrorData> {
+        let item_id = req
+            .item_id
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| ErrorData::invalid_params("item_id is required", None))?;
+        let criteria = req
+            .criteria
+            .ok_or_else(|| ErrorData::invalid_params("criteria is required", None))?;
+        let submitted: Vec<crate::review::verify::SubmittedCriterion> = criteria
+            .into_iter()
+            .map(|c| crate::review::verify::SubmittedCriterion {
+                id: c.id,
+                verdict: c.verdict,
+                evidence: c.evidence,
+            })
+            .collect();
+        let agent = req
+            .agent
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(crate::review::submitter_name);
+        let result = self.with_backend_db(|conn| {
+            let id = self.resolve_item_id(conn, &item_id)?;
+            crate::review::verify::apply_item_verify(
+                conn,
+                &id,
+                &submitted,
+                &agent,
+                crate::claims::now(),
+            )
+            .map_err(|e| match e {
+                crate::review::verify::VerifyFailure::Rejected(m) => {
+                    ErrorData::invalid_params(m, None)
+                }
+                crate::review::verify::VerifyFailure::Store(m) => {
+                    ErrorData::internal_error(m, None)
+                }
+            })
+        })??;
+        serde_json::to_string_pretty(&result)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
     }
 }
