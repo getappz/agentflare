@@ -901,14 +901,24 @@ pub(super) fn note_review_stall(
         }
         return;
     }
-    let ticks = meta
-        .get(REVIEW_STALL_TICKS_KEY)
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0)
-        + 1;
-    let notify = ticks >= REVIEW_STALL_TICK_LIMIT && !meta.contains_key(REVIEW_STALL_NOTIFIED_KEY);
+    // Notified before but the needs-human label is gone (a human dismissed it
+    // or the add never landed) while the stall persists: start a fresh count
+    // and re-escalate after another `REVIEW_STALL_TICK_LIMIT` ticks.
+    let dismissed = meta.contains_key(REVIEW_STALL_NOTIFIED_KEY);
+    let ticks = if dismissed {
+        1
+    } else {
+        meta.get(REVIEW_STALL_TICKS_KEY)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            + 1
+    };
+    let notify = ticks >= REVIEW_STALL_TICK_LIMIT;
     update_metadata(mcp, &item.id, |m| {
         m.insert(REVIEW_STALL_TICKS_KEY.into(), ticks.into());
+        if dismissed {
+            m.remove(REVIEW_STALL_NOTIFIED_KEY);
+        }
     });
     if !notify {
         return;

@@ -265,8 +265,16 @@ fn approved_green_pr_stalled_on_threads_is_surfaced_once() {
     // Unapproved ticks do not count: the count resets.
     tick(&mcp, &queue, &item_id, &held, &[]);
     assert!(!get_meta().contains("review_stall"), "{}", get_meta());
-    for _ in 0..REVIEW_STALL_TICK_LIMIT + 3 {
+    for _ in 0..REVIEW_STALL_TICK_LIMIT {
         tick(&mcp, &queue, &item_id, &held, &approved);
+    }
+    // The escalation put needs-human on the PR; later sweeps see it.
+    let flagged = vec![
+        PR_APPROVAL_LABEL.to_string(),
+        NEEDS_HUMAN_PR_LABEL.to_string(),
+    ];
+    for _ in 0..3 {
+        tick(&mcp, &queue, &item_id, &held, &flagged);
     }
     assert!(get_meta().contains("review_stall_notified"));
     let cards = take_pr_stage_comments_for_test();
@@ -279,6 +287,80 @@ fn approved_green_pr_stalled_on_threads_is_surfaced_once() {
     };
     tick(&mcp, &queue, &item_id, &waiting, &approved);
     assert!(!get_meta().contains("review_stall"));
+}
+
+fn stall_item(mcp: &AgentflareMcp, item_id: &str) -> agentflare_backend::item::Item {
+    mcp.with_backend_db(|conn| agentflare_backend::item::get(conn, item_id).unwrap())
+        .unwrap()
+}
+
+fn held_state() -> ReviewBotState {
+    ReviewBotState {
+        blocking: 1,
+        escalated: 1,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn notified_stall_keeps_its_label_and_does_not_renotify() {
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
+    let approved = vec![PR_APPROVAL_LABEL.to_string()];
+    let _ = take_pr_stage_comments_for_test();
+    for _ in 0..REVIEW_STALL_TICK_LIMIT {
+        tick(&mcp, &queue, &item_id, &held_state(), &approved);
+    }
+    assert_eq!(take_pr_stage_comments_for_test().len(), 1);
+    // Label now on the PR: further stalled ticks are a quiet no-op that keeps
+    // the notified state, and handle_ci_green must not revert the label.
+    let flagged = vec![
+        PR_APPROVAL_LABEL.to_string(),
+        NEEDS_HUMAN_PR_LABEL.to_string(),
+    ];
+    for _ in 0..REVIEW_STALL_TICK_LIMIT * 2 {
+        tick(&mcp, &queue, &item_id, &held_state(), &flagged);
+    }
+    assert!(take_pr_stage_comments_for_test().is_empty());
+    let item = stall_item(&mcp, &item_id);
+    assert!(review_stall_notified(&mcp, &item));
+    assert!(keeps_needs_human_label(&mcp, &item, &flagged));
+    // Without a stall notification the label is still reverted as before.
+    let other = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
+    assert!(!keeps_needs_human_label(
+        &mcp,
+        &stall_item(&mcp, &other),
+        &flagged
+    ));
+}
+
+#[test]
+fn failed_label_add_is_retried_and_dismissed_label_re_escalates() {
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
+    let approved = vec![PR_APPROVAL_LABEL.to_string()];
+    let _ = take_pr_stage_comments_for_test();
+    // The label add fails: the marker must not be recorded, so it retries.
+    set_pr_stage_label_add_fails_for_test(true);
+    for _ in 0..REVIEW_STALL_TICK_LIMIT {
+        tick(&mcp, &queue, &item_id, &held_state(), &approved);
+    }
+    assert!(!review_stall_notified(&mcp, &stall_item(&mcp, &item_id)));
+    set_pr_stage_label_add_fails_for_test(false);
+    tick(&mcp, &queue, &item_id, &held_state(), &approved);
+    assert!(review_stall_notified(&mcp, &stall_item(&mcp, &item_id)));
+    // A human removes the label while the stall persists: quiet for a fresh
+    // window, then escalated again (not silently stalled forever).
+    let _ = take_pr_stage_comments_for_test();
+    for _ in 0..REVIEW_STALL_TICK_LIMIT - 1 {
+        tick(&mcp, &queue, &item_id, &held_state(), &approved);
+    }
+    assert!(take_pr_stage_comments_for_test().is_empty());
+    tick(&mcp, &queue, &item_id, &held_state(), &approved);
+    assert_eq!(take_pr_stage_comments_for_test().len(), 1);
+    assert!(review_stall_notified(&mcp, &stall_item(&mcp, &item_id)));
 }
 
 #[test]

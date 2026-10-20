@@ -77,6 +77,9 @@ const CODERABBIT_REPAIR_PR_LABEL: &str = "agentflare:review-repair";
 thread_local! {
     static PR_STAGE_COMMENTS_FOR_TEST: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Makes `update_pr_stage` report a failed label add (test seam).
+    static PR_STAGE_LABEL_ADD_FAILS_FOR_TEST: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// Drains PR-stage comment bodies recorded by `update_pr_stage` during tests
@@ -84,6 +87,11 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn take_pr_stage_comments_for_test() -> Vec<String> {
     PR_STAGE_COMMENTS_FOR_TEST.with(|v| v.borrow_mut().drain(..).collect())
+}
+
+#[cfg(test)]
+pub(crate) fn set_pr_stage_label_add_fails_for_test(fails: bool) {
+    PR_STAGE_LABEL_ADD_FAILS_FOR_TEST.with(|c| c.set(fails));
 }
 
 #[cfg(test)]
@@ -110,6 +118,10 @@ fn update_pr_stage(
     if !comment.is_empty() {
         #[cfg(test)]
         record_pr_stage_comment_for_test(comment);
+    }
+    #[cfg(test)]
+    if PR_STAGE_LABEL_ADD_FAILS_FOR_TEST.with(std::cell::Cell::get) {
+        return false;
     }
     let Some(repo) = crate::github::RepoId::resolve_from_remote(std::path::Path::new(folder_path))
     else {

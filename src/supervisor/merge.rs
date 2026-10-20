@@ -29,6 +29,17 @@ pub(super) fn ci_green_stale_stage_label(
         .find(|l| labels.iter().any(|have| have == l))
 }
 
+/// A needs-human label that a CodeRabbit repair cap or a review-stall
+/// escalation put on the PR must survive `handle_ci_green`'s stage revert.
+pub(super) fn keeps_needs_human_label(
+    mcp: &AgentflareMcp,
+    item: &agentflare_backend::item::Item,
+    labels: &[String],
+) -> bool {
+    labels.iter().any(|l| l == NEEDS_HUMAN_PR_LABEL)
+        && (coderabbit_repair_capped_unresolved(mcp, item) || review_stall_notified(mcp, item))
+}
+
 /// Whether a CI-green PR may be merged this tick, and at which head. Both
 /// arms carry the head the green verdict was made on and the PR's
 /// auto-merge handle (`worktree::AutoMergeRef`): once approved, either arm
@@ -109,8 +120,7 @@ pub(super) fn handle_ci_green(
     // when there's actually something to revert.
     // The cap only matters to a PR carrying `NEEDS_HUMAN_PR_LABEL`: skip its
     // item/comment lookups on every other green PR.
-    let coderabbit_capped = labels.iter().any(|l| l == NEEDS_HUMAN_PR_LABEL)
-        && (coderabbit_repair_capped_unresolved(mcp, item) || review_stall_notified(mcp, item));
+    let coderabbit_capped = keeps_needs_human_label(mcp, item, labels);
     if let Some(stale) = ci_green_stale_stage_label(labels, coderabbit_capped) {
         update_pr_stage(
             folder_path,
