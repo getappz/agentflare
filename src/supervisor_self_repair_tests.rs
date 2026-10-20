@@ -976,3 +976,86 @@ fn repair_agent_is_none_when_nothing_resolves() {
     });
     assert_eq!(agent, None);
 }
+
+fn claim_comment_count(mcp: &AgentflareMcp, item_id: &str) -> usize {
+    mcp.with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, item_id).unwrap())
+        .unwrap()
+        .iter()
+        .filter(|c| c.body.starts_with(CI_SELF_REPAIR_MARKER))
+        .count()
+}
+
+#[test]
+fn unassigned_item_dispatches_repair_when_one_agent_resolves() {
+    crate::paths::test_support::with_temp_home(|| {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        let item_id = seed_in_review_item_with_claim_age(&mcp, None, 1_900);
+        let mut item = current_item(&mcp, &item_id);
+        item.assignee_agent = None;
+        // Models: no prior job, empty router, exactly one installed agent.
+        TEST_FALLBACK_AGENT.with(|c| c.set(Some(Some(agent_registry::Agent::Opencode))));
+        let outcome = self_repair_or_gate(
+            &mcp,
+            &queue,
+            &test_auth_conn(),
+            agentflare_resource_gate::Policy::Normal,
+            &item,
+            1,
+            RepairTrigger::FailingChecks(&["clippy".to_string()]),
+            &[],
+            &seed_gate_label(&mcp),
+            "/repo",
+        );
+        TEST_FALLBACK_AGENT.with(|c| c.set(None));
+        assert!(matches!(outcome, SelfRepairOutcome::Dispatched));
+        assert_eq!(claim_comment_count(&mcp, &item_id), 1);
+        let jobs = queue.list(None).unwrap();
+        assert!(jobs.iter().any(|j| j.command == "agentflare-work"
+            && j.args.first() == Some(&item_id)
+            && j.args.get(1).map(String::as_str) == Some("opencode")));
+    });
+}
+
+#[test]
+fn unresolvable_agent_skips_without_a_claim_comment_or_job() {
+    crate::paths::test_support::with_temp_home(|| {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        let item_id = seed_in_review_item_with_claim_age(&mcp, None, 1_900);
+        let mut item = current_item(&mcp, &item_id);
+        item.assignee_agent = None;
+        TEST_FALLBACK_AGENT.with(|c| c.set(Some(None)));
+        let label_id_by_name = seed_gate_label(&mcp);
+        let auth_conn = test_auth_conn();
+        let outcome = self_repair_or_gate(
+            &mcp,
+            &queue,
+            &auth_conn,
+            agentflare_resource_gate::Policy::Normal,
+            &item,
+            1,
+            RepairTrigger::FailingChecks(&["clippy".to_string()]),
+            &[],
+            &label_id_by_name,
+            "/repo",
+        );
+        let cr_outcome = crate::supervisor::review_bots::coderabbit_repair_or_gate(
+            &mcp,
+            &queue,
+            &auth_conn,
+            agentflare_resource_gate::Policy::Normal,
+            &item,
+            1,
+            &[coderabbit_finding(1, "coderabbitai[bot]")],
+            &[],
+            &label_id_by_name,
+            "/repo",
+        );
+        TEST_FALLBACK_AGENT.with(|c| c.set(None));
+        assert!(matches!(outcome, SelfRepairOutcome::Skipped));
+        assert!(matches!(cr_outcome, SelfRepairOutcome::Skipped));
+        assert_eq!(claim_comment_count(&mcp, &item_id), 0);
+        assert!(queue.list(None).unwrap().is_empty());
+    });
+}

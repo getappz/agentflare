@@ -272,7 +272,8 @@ fn route_unassigned_with(
 /// Agent for a repair dispatch. A finished work job clears the item's
 /// `assignee_agent`, so fall back, in order, to the agent on the item's most
 /// recent `agentflare-work` job, the only installed autonomous agent, then
-/// `[router]` rules. Logs one line when nothing resolves.
+/// `[router]` rules. (The PR's beacon stamp names an instance, not an agent,
+/// so it adds nothing here.) Logs one line when nothing resolves.
 fn resolve_repair_agent(
     queue: &agentflare_jobs::Queue,
     item: &agentflare_backend::item::Item,
@@ -280,6 +281,10 @@ fn resolve_repair_agent(
 ) -> Option<agent_registry::Agent> {
     let jobs = queue.list(None).unwrap_or_default();
     let agent = resolve_repair_agent_with(item, &jobs, || {
+        #[cfg(test)]
+        if let Some(forced) = TEST_FALLBACK_AGENT.with(|c| c.get()) {
+            return forced;
+        }
         let mut state = crate::state::load();
         let installed: Vec<agent_registry::Agent> = agent_registry::detect_all_with(
             agent_registry::REGISTRY,
@@ -302,6 +307,14 @@ fn resolve_repair_agent(
         );
     }
     agent
+}
+
+// Stands in for the machine-specific installed-agent / `[router]` fallback so
+// gate-level tests are hermetic.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_FALLBACK_AGENT: std::cell::Cell<Option<Option<agent_registry::Agent>>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Pure core of `resolve_repair_agent`; `fallback` covers the installed-agent
