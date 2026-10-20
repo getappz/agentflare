@@ -689,3 +689,62 @@ fn needs_input_group_without_enforce_errors_cleanly_and_lists_empty() {
     .unwrap();
     assert_eq!(listed["total"], 0);
 }
+
+/// `[verify] enforce = true`: the project gets a needs_input state, an item
+/// moves into it via `update_state`, `list` finds it there, `claim` refuses
+/// it, and it moves back to started.
+#[test]
+fn needs_input_round_trip_with_enforce_on() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(repo.join(".agentflare")).unwrap();
+    std::fs::write(
+        repo.join(".agentflare").join("config.toml"),
+        "[verify]\nenforce = true\n",
+    )
+    .unwrap();
+    let s = AgentflareMcp {
+        backend_db_override: Some(tmp.path().join("backend.db")),
+        backend_project_link_override: Some(tmp.path().join("project.json")),
+        worktree_repo_root_override: Some(repo),
+        agent: Some("claude-code".into()),
+        ..Default::default()
+    };
+    let a: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("NI on"))).unwrap()).unwrap();
+    let id = a["id"].as_str().unwrap().to_string();
+    let set = |group: &str| {
+        s.item(Parameters(ItemRequest {
+            action: "update_state".into(),
+            id: Some(id.clone()),
+            state_group: Some(group.into()),
+            ..Default::default()
+        }))
+    };
+    let listed = |group: &str| -> serde_json::Value {
+        serde_json::from_str(
+            &s.item(Parameters(ItemRequest {
+                action: "list".into(),
+                state_group: Some(group.into()),
+                ..Default::default()
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+    };
+    set("needs_input").unwrap();
+    assert_eq!(listed("needs_input")["total"], 1);
+    let claim: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "claim".into(),
+            id: Some(id.clone()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(claim["status"], "blocked", "{claim}");
+    set("started").unwrap();
+    assert_eq!(listed("needs_input")["total"], 0);
+    assert_eq!(listed("started")["total"], 1);
+}
