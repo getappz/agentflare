@@ -950,13 +950,22 @@ fn repair_agent_prefers_the_agent_the_executor_failed_over_to() {
         .args(vec![item_id.clone(), "claude-code".to_string()])
         .in_process();
     let job_id = queue.enqueue(&job).unwrap().id;
-    // The worker wires this sink; the executor calls `record_effective_agent`
-    // once failover settles on `opencode`.
+    // The worker wires this sink; the executor's pre-launch failover from
+    // `claude-code` to `opencode` goes through `settle_execution_agent`.
     let sink_queue = queue.clone();
     let sink_id = job_id.clone();
     let _guard = agentflare_jobs::cancel::register(&job_id, || false)
         .with_agent_sink(move |a| sink_queue.set_effective_agent(&sink_id, a).unwrap());
-    agentflare_jobs::cancel::record_effective_agent(&job_id, "opencode");
+    let (ran, model) = crate::cli::work::settle_execution_agent(
+        &job_id,
+        "claude-code".to_string(),
+        Some("pinned".to_string()),
+        |from| {
+            assert_eq!(from, "claude-code");
+            Some("opencode".to_string())
+        },
+    );
+    assert_eq!((ran.as_str(), model), ("opencode", None));
 
     let last = queue
         .last_agent_for_item("agentflare-work", &item_id)

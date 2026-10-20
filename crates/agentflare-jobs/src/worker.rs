@@ -241,8 +241,11 @@ fn run_in_process(
         abandoned_check.load(Ordering::SeqCst) || cancel_queue.is_cancelled(&cancel_id)
     })
     .with_agent_sink(move |agent| {
+        // Best-effort: a failed write leaves repair on the enqueue-time agent.
         if let Err(e) = agent_queue.set_effective_agent(&agent_job_id, agent) {
-            eprintln!("agentflare-jobs: recording effective agent for {agent_job_id}: {e}");
+            eprintln!(
+                "agentflare-jobs: recording effective agent {agent} for {agent_job_id} failed                  (repair falls back to the enqueue-time agent): {e}"
+            );
         }
     });
     std::thread::spawn(move || {
@@ -405,6 +408,54 @@ mod tests {
                 .contains("abandoned"),
             "the watchdog's own reason is what gets recorded, got: {:?}",
             final_info.error
+        );
+    }
+
+    /// Reports the agent it settled on, as `WorkItemExecutor` does after a
+    /// pre-launch failover.
+    struct ReportsAgentExecutor;
+
+    impl InProcessExecutor for ReportsAgentExecutor {
+        fn execute(
+            &self,
+            job_id: &str,
+            _args: &[String],
+            _log: &mut dyn std::io::Write,
+        ) -> Result<(), JobFailure> {
+            crate::cancel::record_effective_agent(job_id, "opencode");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn executor_reported_agent_is_persisted_and_preferred_over_enqueue_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::open_memory(dir.path().join("logs")).unwrap();
+        let mut pool = WorkerPool::new(q.clone()).with_executor(Arc::new(ReportsAgentExecutor));
+        pool.start(1);
+        let info = q
+            .enqueue(
+                &AgentJob::new("agentflare-work")
+                    .args(vec!["item-1".to_string(), "claude-code".to_string()])
+                    .in_process()
+                    .max_retries(0),
+            )
+            .unwrap();
+        let mut state = q.get(&info.id).unwrap().state;
+        for _ in 0..400 {
+            if state == JobState::Exited {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            state = q.get(&info.id).unwrap().state;
+        }
+        pool.shutdown();
+        assert_eq!(state, JobState::Exited);
+        assert_eq!(
+            q.last_agent_for_item("agentflare-work", "item-1")
+                .unwrap()
+                .as_deref(),
+            Some("opencode")
         );
     }
 
