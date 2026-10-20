@@ -331,10 +331,17 @@ pub(super) fn fuse_envelopes(
     if let Some(web) = web {
         push("web", web.and_then(delegated_arm));
     }
-    let hits = fuse_rrf(arms, limit);
+    // Budgeted: pack from the whole fused pool, then cap at `limit`, so a
+    // too-big top hit can't empty the pack while a lower-ranked one would fit.
+    let hits = fuse_rrf(arms, if budget.is_some() { usize::MAX } else { limit });
     if let Some(budget) = budget {
         let found = hits.len();
-        let (kept, used) = pack_hits(hits, budget);
+        let (mut kept, _) = pack_hits(hits, budget);
+        kept.truncate(limit);
+        let used: usize = kept
+            .iter()
+            .map(|h| h["tokens"].as_u64().unwrap_or(0) as usize)
+            .sum();
         return serde_json::json!({
             "query": q,
             "source": "all",

@@ -537,3 +537,22 @@ fn budget_packs_by_score_with_citations_and_truncates_in_order() {
     assert_eq!(refs, ["a.rs"]);
     assert_eq!(run(Some(0))["total"], 0);
 }
+
+#[test]
+fn budget_packs_before_capping_at_limit() {
+    // the top-ranked hit is over budget; with limit=1 the pack must still
+    // reach the lower-ranked hit that fits instead of coming back empty
+    let code = r#"{"source":"code","results":[
+        {"path":"huge.rs","snippet":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+        {"path":"c.rs","snippet":"cc"}]}"#;
+    let out = super::search_fuse::fuse_envelopes("q", 1, Some(8), None, None, Some(code), None);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let refs: Vec<_> = v["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["ref"].as_str().unwrap())
+        .collect();
+    assert_eq!(refs, ["c.rs"], "{v}");
+    assert_eq!(v["total"], 1);
+}
