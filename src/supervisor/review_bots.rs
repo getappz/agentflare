@@ -46,6 +46,12 @@ pub(super) const CODERABBIT_REPAIR_CAP_MARKER: &str =
 
 /// Item-metadata key recording which findings fingerprint already received a
 /// cap-reached announcement (PR #829 idempotency).
+const REVIEW_STALL_TICKS_KEY: &str = "review_stall_ticks";
+const REVIEW_STALL_NOTIFIED_KEY: &str = "review_stall_notified";
+/// Sweep ticks an approved, CI-green PR may sit held on review-bot threads
+/// with no repair job running before it is surfaced to a human.
+pub(super) const REVIEW_STALL_TICK_LIMIT: u64 = 10;
+
 pub(super) const CODERABBIT_REPAIR_CAP_KEY: &str = "coderabbit_repair_cap_for";
 
 /// Item-metadata keys tracking review-repair announcements (item #633
@@ -855,6 +861,66 @@ pub(super) fn clear_stale_coderabbit_repair_label(
     }
 }
 
+/// Escape hatch for an approved, CI-green PR held only by review-bot threads
+/// nobody is working on (lost repair claim, job exited, fix pushed out of
+/// band): counts consecutive such ticks on the item and, past
+/// `REVIEW_STALL_TICK_LIMIT`, comments, labels the PR needs-human and pings
+/// once instead of skipping silently. `held` is "the review holds the merge
+/// and this tick dispatched nothing"; any other tick resets the count.
+pub(super) fn note_review_stall(
+    mcp: &AgentflareMcp,
+    queue: &agentflare_jobs::Queue,
+    item: &agentflare_backend::item::Item,
+    pr_number: u64,
+    labels: &[String],
+    folder_path: &str,
+    held: bool,
+) {
+    let stalled =
+        held && labels.iter().any(|l| l == PR_APPROVAL_LABEL) && !job_in_flight(queue, &item.id);
+    let meta = current_metadata(mcp, item);
+    if !stalled {
+        if meta.contains_key(REVIEW_STALL_TICKS_KEY) {
+            update_metadata(mcp, &item.id, |m| {
+                m.remove(REVIEW_STALL_TICKS_KEY);
+                m.remove(REVIEW_STALL_NOTIFIED_KEY);
+            });
+        }
+        return;
+    }
+    let ticks = meta
+        .get(REVIEW_STALL_TICKS_KEY)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        + 1;
+    let notify = ticks >= REVIEW_STALL_TICK_LIMIT && !meta.contains_key(REVIEW_STALL_NOTIFIED_KEY);
+    update_metadata(mcp, &item.id, |m| {
+        m.insert(REVIEW_STALL_TICKS_KEY.into(), ticks.into());
+        if notify {
+            m.insert(REVIEW_STALL_NOTIFIED_KEY.into(), true.into());
+        }
+    });
+    if !notify {
+        return;
+    }
+    let message = format!(
+        "## supervisor — approved PR stalled on review threads
+
+This PR is approved and          CI-green but unresolved review-bot threads have held the merge for {ticks} sweeps with          no repair job running. Fix and push (then record the result with `review_result`), or          resolve the threads, to unblock it."
+    );
+    update_pr_stage(
+        folder_path,
+        pr_number,
+        stale_stage_label(labels),
+        NEEDS_HUMAN_PR_LABEL,
+        &message,
+    );
+    notify_human_gate(
+        item,
+        &format!("PR #{pr_number} is approved and green but stalled on unresolved review threads"),
+    );
+}
+
 /// Dispatches a review-repair job for a CI-green PR whose bot review still
 /// has unresolved findings, or -- once `quota::decide::SELF_REPAIR_CAP`
 /// prior attempts have been made -- gates it for a human instead of
@@ -914,14 +980,11 @@ pub(super) fn coderabbit_repair_or_gate(
         return SelfRepairOutcome::Skipped;
     }
 
-    let meta = current_metadata(mcp, item);
-    if findings
-        .iter()
-        .all(|f| thread_record(&meta, &f.thread_id).round >= f.round())
-    {
-        return SelfRepairOutcome::Skipped;
-    }
-
+    // No "this round was already dispatched" early-return here: the sweep only
+    // hands back a finding for a recorded round once its job is over without
+    // an answer (not in flight, no result, head not newer than the review),
+    // i.e. the attempt was lost. Skipping it would stall the PR forever
+    // (GitHub PR 931); the retry is bounded by `SELF_REPAIR_CAP` below.
     let (announced_for, _, _) = repair_track(
         item,
         CODERABBIT_REPAIR_ANNOUNCED_KEY,

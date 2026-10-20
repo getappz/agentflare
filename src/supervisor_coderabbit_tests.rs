@@ -97,7 +97,7 @@ fn coderabbit_findings_fingerprint_ignores_order_but_not_content() {
 }
 
 #[test]
-fn coderabbit_repair_or_gate_skips_an_already_dispatched_round() {
+fn coderabbit_repair_or_gate_redispatches_a_round_whose_job_was_lost() {
     let mcp = test_mcp();
     let queue = test_queue();
     let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
@@ -147,60 +147,44 @@ fn coderabbit_repair_or_gate_skips_an_already_dispatched_round() {
     );
 
     assert!(
-        matches!(outcome, SelfRepairOutcome::Skipped),
-        "an unresolved thread must not restart the same repair round"
+        matches!(outcome, SelfRepairOutcome::Dispatched),
+        "a recorded round whose job exited without an answer must be retried, not skipped forever"
     );
     assert_eq!(
         queue
             .list(Some(agentflare_jobs::JobState::Queued))
             .unwrap()
             .len(),
-        0,
-        "the cancelled prior attempt must not be queued again"
-    );
-    let comments = mcp
-        .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &item_id).unwrap())
-        .unwrap();
-    assert_eq!(
-        comments
-            .iter()
-            .filter(|c| c.body.starts_with(CODERABBIT_REPAIR_MARKER))
-            .count(),
         1,
-        "identical findings must not post the announcement twice"
+        "the retry must be queued"
     );
+    // Retries are bounded: the claimed-then-lost attempts count toward the cap.
+}
 
-    // New findings are a new announcement, not a silent retry.
-    let mut evolved = findings.clone();
-    evolved.push(coderabbit_finding(9, "coderabbitai[bot]"));
-    queue.cancel_for_item(&item_id, |_| false).unwrap();
-    let item = mcp
-        .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
-        .unwrap();
-    let outcome = coderabbit_repair_or_gate(
-        &mcp,
-        &queue,
-        &auth_conn,
-        agentflare_resource_gate::Policy::Normal,
-        &item,
-        1,
-        &evolved,
-        &[],
-        &label_id_by_name,
-        "/repo",
+#[test]
+fn approved_green_pr_stalled_on_threads_is_surfaced_once() {
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
+    let labels = vec![PR_APPROVAL_LABEL.to_string()];
+    let get = || {
+        mcp.with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
+            .unwrap()
+    };
+    for _ in 0..REVIEW_STALL_TICK_LIMIT {
+        note_review_stall(&mcp, &queue, &get(), 42, &labels, "/repo", true);
+    }
+    let meta = get().metadata;
+    assert!(meta.contains("review_stall_notified"), "{meta}");
+    // A tick that dispatched (or a PR without the approval label) resets it.
+    note_review_stall(&mcp, &queue, &get(), 42, &labels, "/repo", false);
+    assert!(
+        !get().metadata.contains("review_stall"),
+        "{}",
+        get().metadata
     );
-    assert!(matches!(outcome, SelfRepairOutcome::Dispatched));
-    let comments = mcp
-        .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &item_id).unwrap())
-        .unwrap();
-    assert_eq!(
-        comments
-            .iter()
-            .filter(|c| c.body.starts_with(CODERABBIT_REPAIR_MARKER))
-            .count(),
-        2,
-        "changed findings must announce again"
-    );
+    note_review_stall(&mcp, &queue, &get(), 42, &[], "/repo", true);
+    assert!(!get().metadata.contains("review_stall"));
 }
 
 #[test]

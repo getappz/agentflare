@@ -488,7 +488,7 @@ pub(super) fn merge_or_repair_findings(
         );
     }
     if review.dispatch_needed() {
-        return PassingPrOutcome::Repair(coderabbit_repair_or_gate(
+        let outcome = coderabbit_repair_or_gate(
             mcp,
             queue,
             auth_conn,
@@ -499,11 +499,24 @@ pub(super) fn merge_or_repair_findings(
             labels,
             label_id_by_name,
             folder_path,
-        ));
+        );
+        let held = !matches!(outcome, SelfRepairOutcome::Dispatched);
+        note_review_stall(mcp, queue, item, number, labels, folder_path, held);
+        return PassingPrOutcome::Repair(outcome);
     }
     if review.blocks_merge() {
+        note_review_stall(
+            mcp,
+            queue,
+            item,
+            number,
+            labels,
+            folder_path,
+            !review.unknown,
+        );
         return PassingPrOutcome::NotMerged;
     }
+    note_review_stall(mcp, queue, item, number, labels, folder_path, false);
     let summary = maybe_post_repair_complete_summary(
         mcp,
         item,
