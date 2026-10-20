@@ -58,6 +58,7 @@ mod mbx;
 mod mcp_prompts;
 mod mcp_server;
 mod memory;
+mod memory_nudge;
 mod mentions;
 mod messages;
 mod nudge_pace;

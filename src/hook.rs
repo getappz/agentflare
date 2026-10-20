@@ -3,8 +3,7 @@
 // Codex, the plugin manifest) wired into the target agent's hook config.
 // No install/consent logic lives here: `init` is the explicit, one-shot
 // consent; these just reinforce rules and report drift each session/turn.
-use crate::components::get_components;
-use crate::state;
+use crate::{components::get_components, memory_nudge, state};
 use serde_json::json;
 use std::io::Read;
 use std::time::Duration;
@@ -355,12 +354,13 @@ pub fn post_tool_failure(agent: &str) {
     let Some(parsed) = parse_post_tool_failure(&input) else {
         return;
     };
-    if let Some(out) = failure_nudge(
+    let out = failure_nudge(
         agent,
         &parsed.tool_name,
         &parsed.failure_text,
         parsed.is_interrupt,
-    ) {
+    );
+    if let Some(out) = memory_nudge::with_failure_recall(agent, &input, &parsed.failure_text, out) {
         println!("{out}");
     }
 }
@@ -599,7 +599,12 @@ pub fn pre_tool_use(agent: &str) {
     }
 
     nudges.extend(crate::coaching::rule_bodies_for_tool(&parsed.tool_name));
-
+    nudges.extend(memory_nudge::pre_edit_nudge(
+        agent,
+        &parsed.tool_name,
+        parsed.tool_input.as_ref(),
+        &parsed.session_id,
+    ));
     if parsed.tool_name == "ScheduleWakeup"
         && let Some(delay) = parsed.delay_seconds
         && let Some(nudge) = crate::optimize::schedule_wakeup_nudge(delay)
