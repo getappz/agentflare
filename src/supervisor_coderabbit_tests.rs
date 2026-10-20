@@ -161,30 +161,124 @@ fn coderabbit_repair_or_gate_redispatches_a_round_whose_job_was_lost() {
     // Retries are bounded: the claimed-then-lost attempts count toward the cap.
 }
 
+fn tick(
+    mcp: &AgentflareMcp,
+    queue: &agentflare_jobs::Queue,
+    item_id: &str,
+    review: &ReviewBotState,
+    labels: &[String],
+) -> PassingPrOutcome {
+    let item = mcp
+        .with_backend_db(|conn| agentflare_backend::item::get(conn, item_id).unwrap())
+        .unwrap();
+    let auto = crate::worktree::AutoMergeRef::default();
+    merge_or_repair_findings(
+        mcp,
+        queue,
+        &test_auth_conn(),
+        agentflare_resource_gate::Policy::Normal,
+        &item,
+        std::path::Path::new("/repo"),
+        42,
+        review,
+        labels,
+        &seed_gate_label(mcp),
+        "/repo",
+        CiGreenMerge::Allowed {
+            head_sha: None,
+            auto_merge: &auto,
+        },
+    )
+}
+
+fn queued(queue: &agentflare_jobs::Queue) -> usize {
+    queue
+        .list(Some(agentflare_jobs::JobState::Queued))
+        .unwrap()
+        .len()
+}
+
+#[test]
+fn approved_green_pr_with_lost_repair_job_is_redispatched_within_the_cap() {
+    // "claimed, job exited, threads open, label on", through the real entry.
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
+    let labels = vec![PR_APPROVAL_LABEL.to_string()];
+    let review = ReviewBotState::for_dispatch(vec![coderabbit_finding(1, "coderabbitai[bot]")]);
+
+    let first = tick(&mcp, &queue, &item_id, &review, &labels);
+    assert!(matches!(
+        first,
+        PassingPrOutcome::Repair(SelfRepairOutcome::Dispatched)
+    ));
+    // A live (queued) repair job: no behaviour change, nothing new queued.
+    let live = tick(&mcp, &queue, &item_id, &review, &labels);
+    assert!(matches!(
+        live,
+        PassingPrOutcome::Repair(SelfRepairOutcome::Skipped)
+    ));
+    assert_eq!(queued(&queue), 1, "a live job must not be duplicated");
+
+    // The job exits without a fix, repeatedly: retried, but bounded by the cap.
+    let mut dispatched = 1;
+    for _ in 0..10 {
+        queue.cancel_for_item(&item_id, |_| false).unwrap();
+        if matches!(
+            tick(&mcp, &queue, &item_id, &review, &labels),
+            PassingPrOutcome::Repair(SelfRepairOutcome::Dispatched)
+        ) {
+            dispatched += 1;
+        }
+    }
+    assert!(dispatched >= 2, "a lost job must be redispatched");
+    assert_eq!(
+        dispatched,
+        crate::quota::decide::SELF_REPAIR_CAP,
+        "retries stop at SELF_REPAIR_CAP"
+    );
+}
+
 #[test]
 fn approved_green_pr_stalled_on_threads_is_surfaced_once() {
     let mcp = test_mcp();
     let queue = test_queue();
     let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
-    let labels = vec![PR_APPROVAL_LABEL.to_string()];
-    let get = || {
+    let approved = vec![PR_APPROVAL_LABEL.to_string()];
+    let get_meta = || {
         mcp.with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
             .unwrap()
+            .metadata
     };
-    for _ in 0..REVIEW_STALL_TICK_LIMIT {
-        note_review_stall(&mcp, &queue, &get(), 42, &labels, "/repo", true);
+    // Escalated threads hold the merge and no job will ever come.
+    let held = ReviewBotState {
+        blocking: 1,
+        escalated: 1,
+        ..Default::default()
+    };
+    let _ = take_pr_stage_comments_for_test();
+    for _ in 0..REVIEW_STALL_TICK_LIMIT - 1 {
+        tick(&mcp, &queue, &item_id, &held, &approved);
     }
-    let meta = get().metadata;
-    assert!(meta.contains("review_stall_notified"), "{meta}");
-    // A tick that dispatched (or a PR without the approval label) resets it.
-    note_review_stall(&mcp, &queue, &get(), 42, &labels, "/repo", false);
-    assert!(
-        !get().metadata.contains("review_stall"),
-        "{}",
-        get().metadata
-    );
-    note_review_stall(&mcp, &queue, &get(), 42, &[], "/repo", true);
-    assert!(!get().metadata.contains("review_stall"));
+    assert!(!get_meta().contains("review_stall_notified"));
+    assert!(take_pr_stage_comments_for_test().is_empty());
+    // Unapproved ticks do not count: the count resets.
+    tick(&mcp, &queue, &item_id, &held, &[]);
+    assert!(!get_meta().contains("review_stall"), "{}", get_meta());
+    for _ in 0..REVIEW_STALL_TICK_LIMIT + 3 {
+        tick(&mcp, &queue, &item_id, &held, &approved);
+    }
+    assert!(get_meta().contains("review_stall_notified"));
+    let cards = take_pr_stage_comments_for_test();
+    assert_eq!(cards.len(), 1, "surfaced exactly once: {cards:?}");
+    assert!(cards[0].contains("stalled on review threads"));
+    // Merely waiting on the bot is not a stall.
+    let waiting = ReviewBotState {
+        blocking: 1,
+        ..Default::default()
+    };
+    tick(&mcp, &queue, &item_id, &waiting, &approved);
+    assert!(!get_meta().contains("review_stall"));
 }
 
 #[test]

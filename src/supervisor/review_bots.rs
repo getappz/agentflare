@@ -866,7 +866,10 @@ pub(super) fn clear_stale_coderabbit_repair_label(
 /// band): counts consecutive such ticks on the item and, past
 /// `REVIEW_STALL_TICK_LIMIT`, comments, labels the PR needs-human and pings
 /// once instead of skipping silently. `held` is "the review holds the merge
-/// and this tick dispatched nothing"; any other tick resets the count.
+/// and this tick dispatched nothing"; any other tick resets the count, except
+/// a `transient` deferral (cooldown, host pressure), which leaves it as is.
+/// A PR already carrying the needs-human label is already surfaced.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn note_review_stall(
     mcp: &AgentflareMcp,
     queue: &agentflare_jobs::Queue,
@@ -875,9 +878,15 @@ pub(super) fn note_review_stall(
     labels: &[String],
     folder_path: &str,
     held: bool,
+    transient: bool,
 ) {
-    let stalled =
-        held && labels.iter().any(|l| l == PR_APPROVAL_LABEL) && !job_in_flight(queue, &item.id);
+    if transient {
+        return;
+    }
+    let stalled = held
+        && !labels.iter().any(|l| l == NEEDS_HUMAN_PR_LABEL)
+        && labels.iter().any(|l| l == PR_APPROVAL_LABEL)
+        && !job_in_flight(queue, &item.id);
     let meta = current_metadata(mcp, item);
     if !stalled {
         if meta.contains_key(REVIEW_STALL_TICKS_KEY) {

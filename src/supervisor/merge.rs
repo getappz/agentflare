@@ -500,11 +500,10 @@ pub(super) fn merge_or_repair_findings(
             label_id_by_name,
             folder_path,
         );
-        let held = !matches!(outcome, SelfRepairOutcome::Dispatched);
-        note_review_stall(mcp, queue, item, number, labels, folder_path, held);
-        return PassingPrOutcome::Repair(outcome);
-    }
-    if review.blocks_merge() {
+        // Only a plain `Skipped` is a lost repair; `Deferred` (cooldown, host
+        // pressure, live claim, foreign worktree) is transient and self-clears.
+        let held = matches!(outcome, SelfRepairOutcome::Skipped);
+        let transient = matches!(outcome, SelfRepairOutcome::Deferred);
         note_review_stall(
             mcp,
             queue,
@@ -512,11 +511,19 @@ pub(super) fn merge_or_repair_findings(
             number,
             labels,
             folder_path,
-            !review.unknown,
+            held,
+            transient,
         );
+        return PassingPrOutcome::Repair(outcome);
+    }
+    if review.blocks_merge() {
+        // Threads escalated past `max_rounds` hold the merge with no job ever
+        // coming; threads merely waiting on the bot or a push are not stalls.
+        let held = !review.unknown && review.escalated > 0;
+        note_review_stall(mcp, queue, item, number, labels, folder_path, held, false);
         return PassingPrOutcome::NotMerged;
     }
-    note_review_stall(mcp, queue, item, number, labels, folder_path, false);
+    note_review_stall(mcp, queue, item, number, labels, folder_path, false, false);
     let summary = maybe_post_repair_complete_summary(
         mcp,
         item,
