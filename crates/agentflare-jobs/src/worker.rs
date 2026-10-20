@@ -235,8 +235,15 @@ fn run_in_process(
     // attempt, so its run winds down instead of running on unobserved.
     let abandoned = Arc::new(AtomicBool::new(false));
     let abandoned_check = abandoned.clone();
+    let agent_queue = queue.clone();
+    let agent_job_id = job_id.clone();
     let cancel_registration = crate::cancel::register(&job_id, move || {
         abandoned_check.load(Ordering::SeqCst) || cancel_queue.is_cancelled(&cancel_id)
+    })
+    .with_agent_sink(move |agent| {
+        if let Err(e) = agent_queue.set_effective_agent(&agent_job_id, agent) {
+            eprintln!("agentflare-jobs: recording effective agent for {agent_job_id}: {e}");
+        }
     });
     std::thread::spawn(move || {
         let _cancel = cancel_registration;

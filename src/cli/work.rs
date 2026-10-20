@@ -1196,6 +1196,7 @@ impl agentflare_jobs::InProcessExecutor for WorkItemExecutor {
             Some(to) => (to, None),
             None => (agent, model),
         };
+        agentflare_jobs::cancel::record_effective_agent(job_id, &agent);
         let work_args = WorkArgs {
             target: item_id.clone(),
             agent: Some(agent.clone()),

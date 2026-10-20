@@ -19,6 +19,10 @@ pub const CANCELLED_MESSAGE: &str =
 type Check = Arc<dyn Fn() -> bool + Send + Sync>;
 
 static CHECKS: LazyLock<Mutex<HashMap<String, (u64, Check)>>> = LazyLock::new(Default::default);
+type AgentSink = Arc<dyn Fn(&str) + Send + Sync>;
+
+static AGENT_SINKS: LazyLock<Mutex<HashMap<String, (u64, AgentSink)>>> =
+    LazyLock::new(Default::default);
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(0);
 
 /// Unregisters the job's check on drop.
@@ -40,6 +44,14 @@ impl Drop for Registration {
         {
             checks.remove(&self.id);
         }
+        drop(checks);
+        let mut sinks = AGENT_SINKS.lock();
+        if sinks
+            .get(&self.id)
+            .is_some_and(|(token, _)| *token == self.token)
+        {
+            sinks.remove(&self.id);
+        }
     }
 }
 
@@ -53,6 +65,27 @@ pub fn register(id: &str, check: impl Fn() -> bool + Send + Sync + 'static) -> R
     Registration {
         id: id.to_string(),
         token,
+    }
+}
+
+impl Registration {
+    /// Also registers `sink` to receive the agent the job actually runs
+    /// (see `record_effective_agent`), until this guard drops.
+    #[must_use]
+    pub fn with_agent_sink(self, sink: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        AGENT_SINKS
+            .lock()
+            .insert(self.id.clone(), (self.token, Arc::new(sink)));
+        self
+    }
+}
+
+/// Reports the agent job `id` settled on after any execution-time re-resolve
+/// or failover; a no-op for an unregistered job.
+pub fn record_effective_agent(id: &str, agent: &str) {
+    let sink = AGENT_SINKS.lock().get(id).map(|(_, sink)| sink.clone());
+    if let Some(sink) = sink {
+        sink(agent);
     }
 }
 

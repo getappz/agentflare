@@ -939,6 +939,34 @@ fn repair_agent_falls_back_to_the_last_work_job_even_behind_100_newer_jobs() {
 }
 
 #[test]
+fn repair_agent_prefers_the_agent_the_executor_failed_over_to() {
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let item_id = seed_in_review_item_with_claim_age(&mcp, None, 1_900);
+    let mut item = current_item(&mcp, &item_id);
+    item.assignee_agent = None;
+
+    let job = agentflare_jobs::AgentJob::new("agentflare-work")
+        .args(vec![item_id.clone(), "claude-code".to_string()])
+        .in_process();
+    let job_id = queue.enqueue(&job).unwrap().id;
+    // The worker wires this sink; the executor calls `record_effective_agent`
+    // once failover settles on `opencode`.
+    let sink_queue = queue.clone();
+    let sink_id = job_id.clone();
+    let _guard = agentflare_jobs::cancel::register(&job_id, || false)
+        .with_agent_sink(move |a| sink_queue.set_effective_agent(&sink_id, a).unwrap());
+    agentflare_jobs::cancel::record_effective_agent(&job_id, "opencode");
+
+    let last = queue
+        .last_agent_for_item("agentflare-work", &item_id)
+        .unwrap();
+    assert_eq!(last.as_deref(), Some("opencode"));
+    let agent = resolve_repair_agent_with(&item, last.as_deref(), || None);
+    assert_eq!(agent, Some(agent_registry::Agent::Opencode));
+}
+
+#[test]
 fn repair_agent_uses_the_sole_installed_agent_with_an_empty_router() {
     let mcp = test_mcp();
     let item_id = seed_in_review_item_with_claim_age(&mcp, None, 1_900);
