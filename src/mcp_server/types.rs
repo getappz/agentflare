@@ -182,7 +182,7 @@ pub(crate) struct ChannelSendRequest {
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ReviewRequest {
     #[schemars(
-        description = "Action: clear|consensus|list|record|scores|submit|scan (advisory Jev diff screening)"
+        description = "Action: clear|consensus|list|record|scores|submit|scan (advisory Jev diff screening)|verify (per-criterion acceptance verdicts)"
     )]
     pub(crate) action: String,
     #[schemars(
@@ -214,6 +214,27 @@ pub(crate) struct ReviewRequest {
     pub(crate) max_requests: Option<usize>,
     #[schemars(description = "Lower the scan input byte budget (default and maximum 512000)")]
     pub(crate) max_input_bytes: Option<usize>,
+    #[schemars(description = "Item id or sequence_id (verify)")]
+    #[serde(default)]
+    pub(crate) item_id: Option<String>,
+    #[schemars(
+        description = "Per-criterion verdicts [{id, verdict, evidence}] (verify). verdict is pass|fail|uncertain. evidence must cite a file:line, a test name, or a command with its output; empty evidence demotes pass to uncertain."
+    )]
+    #[serde(default)]
+    pub(crate) criteria: Option<Vec<VerifyCriterionInput>>,
+}
+
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub(crate) struct VerifyCriterionInput {
+    #[schemars(description = "Acceptance criterion id")]
+    pub(crate) id: String,
+    #[schemars(description = "pass | fail | uncertain")]
+    pub(crate) verdict: String,
+    #[schemars(
+        description = "Checkable citation: file:line (src/foo.rs:42), test name (`test_foo` or module::test_name), or a command with its output (`cargo test` → ok). Empty demotes pass to uncertain."
+    )]
+    #[serde(default)]
+    pub(crate) evidence: String,
 }
 
 /// A handoff assigns an item to another agent and attaches the work product
