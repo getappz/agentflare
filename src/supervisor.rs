@@ -279,8 +279,10 @@ fn resolve_repair_agent(
     item: &agentflare_backend::item::Item,
     pr_number: u64,
 ) -> Option<agent_registry::Agent> {
-    let jobs = queue.list(None).unwrap_or_default();
-    let agent = resolve_repair_agent_with(item, &jobs, || {
+    let last = queue
+        .last_agent_for_item("agentflare-work", &item.id)
+        .unwrap_or_default();
+    let agent = resolve_repair_agent_with(item, last.as_deref(), || {
         #[cfg(test)]
         if let Some(forced) = TEST_FALLBACK_AGENT.with(|c| c.get()) {
             return forced;
@@ -324,18 +326,13 @@ thread_local! {
 /// and router steps so a test can skip real detection.
 fn resolve_repair_agent_with(
     item: &agentflare_backend::item::Item,
-    jobs: &[agentflare_jobs::JobInfo],
+    last_work_agent: Option<&str>,
     fallback: impl FnOnce() -> Option<agent_registry::Agent>,
 ) -> Option<agent_registry::Agent> {
     item.assignee_agent
         .as_deref()
         .and_then(resolve_confirmed_agent)
-        // `list` is newest-first; args are `[item_id, agent, ..]`.
-        .or_else(|| {
-            jobs.iter()
-                .filter(|j| j.command == "agentflare-work" && j.args.first() == Some(&item.id))
-                .find_map(|j| j.args.get(1).and_then(|a| resolve_confirmed_agent(a)))
-        })
+        .or_else(|| last_work_agent.and_then(resolve_confirmed_agent))
         .or_else(fallback)
 }
 
