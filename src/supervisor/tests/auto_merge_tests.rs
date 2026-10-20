@@ -814,6 +814,53 @@ fn merge_or_repair_findings_never_merges_a_ci_green_approved_pr_with_unresolved_
 }
 
 #[test]
+fn merge_or_repair_findings_enqueues_no_repair_for_a_thread_with_an_out_of_scope_result() {
+    // Item #766: an out_of_scope reply leaves nothing for an agent to fix, so
+    // it must neither hold the merge nor redispatch a repair job.
+    let repo = throwaway_repo();
+    let mcp = test_mcp_with_repo(repo.path().to_path_buf());
+    let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
+    let item = mcp
+        .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
+        .unwrap();
+    let queue = test_queue();
+    let mut settled = coderabbit_finding(1, "coderabbitai[bot]");
+    settled.status = ThreadStatus::Waiting {
+        outcome: ReviewOutcome::OutOfScope,
+    };
+    assert!(!settled.blocks_merge());
+    let state = ReviewBotState {
+        blocking: usize::from(settled.blocks_merge()),
+        ..Default::default()
+    };
+    assert!(!state.blocks_merge());
+
+    let outcome = merge_or_repair_findings(
+        &mcp,
+        &queue,
+        &test_auth_conn(),
+        agentflare_resource_gate::Policy::Normal,
+        &item,
+        repo.path(),
+        42,
+        &state,
+        &[],
+        &seed_gate_label(&mcp),
+        "/repo",
+        allowed(None, &AutoMergeRef::default()),
+    );
+    assert!(!matches!(outcome, PassingPrOutcome::Repair(_)));
+    assert!(
+        queue.list(None).unwrap().is_empty(),
+        "no repair job enqueued"
+    );
+
+    // The same thread with no recorded result still blocks and repairs.
+    let unrecorded = coderabbit_finding(1, "coderabbitai[bot]");
+    assert!(unrecorded.blocks_merge());
+}
+
+#[test]
 fn armed_auto_merge_with_green_checks_still_repairs_unresolved_findings() {
     let repo = throwaway_repo();
     let mcp = test_mcp_with_repo(repo.path().to_path_buf());

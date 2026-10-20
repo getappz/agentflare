@@ -519,7 +519,20 @@ pub(crate) fn sweep_review_threads(
         state.to_dispatch.push(f.clone());
     }
 
-    state.blocking = findings.iter().filter(|f| f.blocks_merge()).count();
+    // A recorded not_valid/out_of_scope result is as settled as its reply.
+    state.blocking = findings
+        .iter()
+        .filter(|f| f.blocks_merge())
+        .filter(|f| {
+            !thread_result(&meta, &f.thread_id).is_some_and(|r| {
+                r.round.max(1) == f.round()
+                    && matches!(
+                        r.outcome,
+                        ReviewOutcome::NotValid | ReviewOutcome::OutOfScope
+                    )
+            })
+        })
+        .count();
     let detached_fixes: Vec<(String, ReviewResult)> = detached_results(&meta, &by_id)
         .filter(|(_, r)| r.outcome == ReviewOutcome::Fixed)
         .collect();
