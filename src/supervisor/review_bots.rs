@@ -526,7 +526,10 @@ pub(crate) fn sweep_review_threads(
         .filter(|f| {
             !thread_result(&meta, &f.thread_id).is_some_and(|r| {
                 r.round.max(1) == f.round()
-                    && matches!(r.outcome, ReviewOutcome::NotValid | ReviewOutcome::OutOfScope)
+                    && matches!(
+                        r.outcome,
+                        ReviewOutcome::NotValid | ReviewOutcome::OutOfScope
+                    )
             })
         })
         .count();

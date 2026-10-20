@@ -993,7 +993,10 @@ fn sweep_replies_without_resolving_for_a_not_valid_result() {
             .unwrap()
             .starts_with("Not changing this: the slice is never empty")
     );
-    assert!(!state.blocks_merge(), "a not_valid result leaves nothing to fix");
+    assert!(
+        !state.blocks_merge(),
+        "a not_valid result leaves nothing to fix"
+    );
 }
 
 #[test]
