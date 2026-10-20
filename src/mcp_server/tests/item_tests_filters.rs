@@ -734,6 +734,21 @@ fn needs_input_round_trip_with_enforce_on() {
     };
     set("needs_input").unwrap();
     assert_eq!(listed("needs_input")["total"], 1);
+    // Open but non-dispatchable: search still finds it, the default groom
+    // shortlist (backlog,unstarted) and the dispatch-facing reports do not
+    // offer it, and standup/health handle it without error.
+    let run = |action: &str, query: Option<&str>| {
+        s.item(Parameters(ItemRequest {
+            action: action.into(),
+            query: query.map(Into::into),
+            ..Default::default()
+        }))
+        .unwrap()
+    };
+    assert!(run("search", Some("NI on")).contains(&id));
+    assert!(!run("groom", None).contains(&id));
+    run("standup", None);
+    run("health", None);
     let claim: serde_json::Value = serde_json::from_str(
         &s.item(Parameters(ItemRequest {
             action: "claim".into(),

@@ -1,6 +1,7 @@
 //! `[verify]` config (`.agentflare/config.toml`): opt-in completion
-//! verification. `enforce` defaults to false; `metadata.require_verify`
-//! forces it on for a single item.
+//! verification. `enforce` defaults to false. The per-item
+//! `metadata.require_verify = true` override is read by the completion gate
+//! (follow-on item), not here.
 
 use std::path::Path;
 
@@ -23,18 +24,6 @@ fn enforce_from(repo_root: &Path, home: &Path) -> bool {
     .filter_map(|doc| doc.get("verify")?.get("enforce")?.as_bool())
     .last()
     .unwrap_or(false)
-}
-
-/// Whether verification applies to an item: project default or the item's
-/// `metadata.require_verify = true`. No caller yet — the completion gate
-/// (follow-on item) consumes it.
-#[allow(dead_code)]
-pub fn required_for(repo_root: &Path, item_metadata: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(item_metadata)
-        .ok()
-        .and_then(|m| m.get("require_verify")?.as_bool())
-        .unwrap_or(false)
-        || enforce_enabled(repo_root)
 }
 
 #[cfg(test)]
@@ -71,13 +60,5 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         write_cfg(repo.path(), "[verify\nenforce");
         assert!(!enforce_from(repo.path(), home.path()));
-    }
-
-    #[test]
-    fn metadata_override_forces_on() {
-        let dir = std::env::temp_dir().join("verify-test-no-config");
-        assert!(required_for(&dir, r#"{"require_verify":true}"#));
-        assert!(!required_for(&dir, "{}"));
-        assert!(!required_for(&dir, "not json"));
     }
 }
