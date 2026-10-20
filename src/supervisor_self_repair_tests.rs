@@ -1059,3 +1059,12 @@ fn unresolvable_agent_skips_without_a_claim_comment_or_job() {
         assert!(queue.list(None).unwrap().is_empty());
     });
 }
+
+#[test]
+fn no_repair_agent_message_names_the_pr_and_item() {
+    let msg = no_repair_agent_message(931, "item-248");
+    assert!(
+        msg.starts_with("agentflare-supervisor: no agent for repair of PR #931 (item item-248): "),
+        "{msg}"
+    );
+}

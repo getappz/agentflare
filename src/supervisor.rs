@@ -300,13 +300,16 @@ fn resolve_repair_agent(
         agent
     });
     if agent.is_none() {
-        eprintln!(
-            "agentflare-supervisor: no agent for repair of PR #{pr_number} (item {}): \
-             no assignee, no prior work job, no sole installed agent, no matching [router] rule",
-            item.id
-        );
+        eprintln!("{}", no_repair_agent_message(pr_number, &item.id));
     }
     agent
+}
+
+fn no_repair_agent_message(pr_number: u64, item_id: &str) -> String {
+    format!(
+        "agentflare-supervisor: no agent for repair of PR #{pr_number} (item {item_id}): \
+         no assignee, no prior work job, no sole installed agent, no matching [router] rule"
+    )
 }
 
 // Stands in for the machine-specific installed-agent / `[router]` fallback so
