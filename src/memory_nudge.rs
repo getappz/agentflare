@@ -40,6 +40,9 @@ fn load() -> Ledger {
 
 fn save(map: &Ledger) {
     let path = ledger_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     if let Ok(json) = serde_json::to_string(map) {
         let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
         if std::fs::write(&tmp, json).is_ok() && std::fs::rename(&tmp, &path).is_err() {
@@ -51,12 +54,18 @@ fn save(map: &Ledger) {
 /// Atomically (under the shared pace lock) drops keys already injected in
 /// `session`, records the survivors, and returns them. `None` on lock failure
 /// so a broken ledger injects nothing rather than repeating itself.
-fn claim_fresh(session: &str, keys: Vec<String>) -> Option<Vec<String>> {
+fn claim_fresh(session: &str, keys: Vec<String>, limit: usize) -> Option<Vec<String>> {
     let _lock = crate::nudge_pace::PaceLock::acquire().ok()?;
     let mut map = load();
     let now = chrono::Utc::now().to_rfc3339();
     let entry = map.entry(session.to_string()).or_default();
-    let fresh: Vec<String> = keys.into_iter().filter(|k| !entry.1.contains(k)).collect();
+    // Only the first `limit` unseen keys are claimed: a key is recorded iff it
+    // is actually emitted, so lower-ranked hits can surface on a later call.
+    let fresh: Vec<String> = keys
+        .into_iter()
+        .filter(|k| !entry.1.contains(k))
+        .take(limit)
+        .collect();
     entry.1.extend(fresh.iter().cloned());
     if entry.1.len() > MAX_KEYS {
         let drop = entry.1.len() - MAX_KEYS;
@@ -76,7 +85,7 @@ fn claim_fresh(session: &str, keys: Vec<String>) -> Option<Vec<String>> {
 
 /// True the first time it is called for `session` (Stop instruction gate).
 pub(crate) fn first_time(session: &str, key: &str) -> bool {
-    claim_fresh(session, vec![key.to_string()]).is_some_and(|f| !f.is_empty())
+    claim_fresh(session, vec![key.to_string()], 1).is_some_and(|f| !f.is_empty())
 }
 
 fn clip(s: &str, n: usize) -> String {
@@ -152,11 +161,10 @@ fn recall_with(
         return None;
     }
     let keys: Vec<String> = hits.iter().map(|o| format!("obs:{}", o.id)).collect();
-    let fresh = claim_fresh(session, keys)?;
+    let fresh = claim_fresh(session, keys, TOP_K)?;
     let picked: Vec<&Observation> = hits
         .iter()
         .filter(|o| fresh.contains(&format!("obs:{}", o.id)))
-        .take(TOP_K)
         .collect();
     (!picked.is_empty()).then(|| format_block(event, subject, &picked))
 }
@@ -312,6 +320,41 @@ mod tests {
             assert!(first_time("s1", "stop"));
             assert!(!first_time("s1", "stop"));
             assert!(first_time("s2", "stop"));
+        });
+    }
+
+    #[test]
+    fn overflow_hits_surface_on_later_calls_and_bad_ledger_fails_safe() {
+        with_temp_home(|| {
+            let conn = crate::memory::store::open().unwrap();
+            for i in 0..5 {
+                crate::memory::observations::save(
+                    &conn,
+                    None,
+                    "gotcha",
+                    &format!("widget note {i}"),
+                    &format!("widget quirk number {i}"),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+            }
+            let mut seen = std::collections::HashSet::new();
+            for _ in 0..3 {
+                if let Some(b) = recall_for(Event::PreEdit, "s1", "widget", "src/widget") {
+                    for l in b.lines().filter(|l| l.starts_with("- [obs#")) {
+                        assert!(seen.insert(l.to_string()), "repeated: {l}");
+                    }
+                }
+            }
+            assert_eq!(seen.len(), 5);
+            // Corrupt ledger: load() falls back to empty; never panics/errs.
+            std::fs::write(ledger_path(), "{not json").unwrap();
+            let _ = recall_for(Event::PreEdit, "s2", "widget", "src/widget");
+            // Unusable DB path: silent.
+            assert!(recall_for(Event::TestFailed, "", "", "error x").is_none());
         });
     }
 }
