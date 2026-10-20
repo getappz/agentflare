@@ -77,6 +77,9 @@ const CODERABBIT_REPAIR_PR_LABEL: &str = "agentflare:review-repair";
 thread_local! {
     static PR_STAGE_COMMENTS_FOR_TEST: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Makes `update_pr_stage` report a failed label add (test seam).
+    static PR_STAGE_LABEL_ADD_FAILS_FOR_TEST: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// Drains PR-stage comment bodies recorded by `update_pr_stage` during tests
@@ -84,6 +87,11 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn take_pr_stage_comments_for_test() -> Vec<String> {
     PR_STAGE_COMMENTS_FOR_TEST.with(|v| v.borrow_mut().drain(..).collect())
+}
+
+#[cfg(test)]
+pub(crate) fn set_pr_stage_label_add_fails_for_test(fails: bool) {
+    PR_STAGE_LABEL_ADD_FAILS_FOR_TEST.with(|c| c.set(fails));
 }
 
 #[cfg(test)]
@@ -98,23 +106,39 @@ fn record_pr_stage_comment_for_test(comment: &str) {
 /// mutation, which has already happened by the time this runs -- same
 /// fail-open contract `relabel_pr_completed` and `merge_approved_pr` use for
 /// their own GitHub calls.
-fn update_pr_stage(folder_path: &str, number: u64, from: Option<&str>, to: &str, comment: &str) {
+/// Returns whether the `to` label was added (always true under test, where
+/// there is no GitHub to talk to).
+fn update_pr_stage(
+    folder_path: &str,
+    number: u64,
+    from: Option<&str>,
+    to: &str,
+    comment: &str,
+) -> bool {
     if !comment.is_empty() {
         #[cfg(test)]
         record_pr_stage_comment_for_test(comment);
     }
+    #[cfg(test)]
+    if PR_STAGE_LABEL_ADD_FAILS_FOR_TEST.with(std::cell::Cell::get) {
+        return false;
+    }
     let Some(repo) = crate::github::RepoId::resolve_from_remote(std::path::Path::new(folder_path))
     else {
-        return;
+        return cfg!(test);
     };
     let Ok(client) = crate::github::Client::new() else {
-        return;
+        return cfg!(test);
     };
+    // Stop the whole transition if the destination label can't land: removing
+    // `from` / commenting anyway would leave a half-applied stage that the
+    // caller then retries (re-posting the comment) every sweep.
     if let Err(e) = crate::github::issues::add_labels(&client, &repo, number, &[to.to_string()]) {
         eprintln!(
             "agentflare-supervisor: could not add {to} to PR #{number}: {}",
             e.log_safe()
         );
+        return false;
     }
     if let Some(from) = from
         && let Err(e) = crate::github::issues::remove_label(&client, &repo, number, from)
@@ -134,6 +158,7 @@ fn update_pr_stage(folder_path: &str, number: u64, from: Option<&str>, to: &str,
             e.log_safe()
         );
     }
+    true
 }
 
 /// Whether `run_review_sweep` should dispatch an agent to rebase/resolve a
