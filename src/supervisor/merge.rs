@@ -502,7 +502,11 @@ pub(super) fn merge_or_repair_findings(
         );
         // Only a plain `Skipped` is a lost repair; `Deferred` (cooldown, host
         // pressure, live claim, foreign worktree) is transient and self-clears.
-        let held = matches!(outcome, SelfRepairOutcome::Skipped);
+        // And only when nothing else holds the PR: an unknown review state or a
+        // fix still waiting on its push is not a lost repair.
+        let held = matches!(outcome, SelfRepairOutcome::Skipped)
+            && !review.unknown
+            && review.waiting_push == 0;
         let transient = matches!(outcome, SelfRepairOutcome::Deferred);
         note_review_stall(
             mcp,

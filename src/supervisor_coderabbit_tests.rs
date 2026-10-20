@@ -3,8 +3,8 @@
 //! grow that file; add repair-cycle tests here instead.
 
 use super::tests::{
-    coderabbit_finding, seed_gate_label, seed_in_review_item_with_claim_age, test_auth_conn,
-    test_mcp, test_queue,
+    claim_marker, coderabbit_finding, comment_json, seed_gate_label,
+    seed_in_review_item_with_claim_age, test_auth_conn, test_mcp, test_queue,
 };
 use super::*;
 
@@ -353,4 +353,25 @@ fn coderabbit_repair_posts_a_completion_summary_exactly_once() {
         "summary must quote what the repair run reported: {}",
         summaries[0].body
     );
+}
+
+#[test]
+fn claim_self_repair_does_not_block_redispatch_after_its_own_job_exited() {
+    // PR 931: our own "Claiming self-repair" marker is still live (job exited
+    // without a fix). Redispatch must proceed -- true, with no second marker
+    // posted -- rather than deferring on the owner's own stale claim.
+    let me = crate::github::bridge::config::machine_label();
+    let server = crate::github::test_support::MockServer::start(vec![
+        crate::github::test_support::MockResponse::json(
+            200,
+            &comment_json(1, &claim_marker(&me, 1_000)),
+        ),
+    ]);
+    let client = server.client(Some("tok"));
+    let repo = crate::github::RepoId {
+        owner: "o".into(),
+        repo: "r".into(),
+    };
+    assert!(claim_self_repair(&client, &repo, 931, "i1", 1_050));
+    assert_eq!(server.requests().len(), 1, "no extra claim posted");
 }
