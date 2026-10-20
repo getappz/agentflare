@@ -44,14 +44,14 @@ pub(super) const CODERABBIT_REPAIR_COMPLETE_MARKER: &str =
 pub(super) const CODERABBIT_REPAIR_CAP_MARKER: &str =
     "## supervisor — CodeRabbit review repair cap reached";
 
-/// Item-metadata key recording which findings fingerprint already received a
-/// cap-reached announcement (PR #829 idempotency).
 const REVIEW_STALL_TICKS_KEY: &str = "review_stall_ticks";
 const REVIEW_STALL_NOTIFIED_KEY: &str = "review_stall_notified";
 /// Sweep ticks an approved, CI-green PR may sit held on review-bot threads
 /// with no repair job running before it is surfaced to a human.
 pub(super) const REVIEW_STALL_TICK_LIMIT: u64 = 10;
 
+/// Item-metadata key recording which findings fingerprint already received a
+/// cap-reached announcement (PR #829 idempotency).
 pub(super) const CODERABBIT_REPAIR_CAP_KEY: &str = "coderabbit_repair_cap_for";
 
 /// Item-metadata keys tracking review-repair announcements (item #633
@@ -926,7 +926,7 @@ pub(super) fn note_review_stall(
     let message = format!(
         "## supervisor — approved PR stalled on review threads
 
-This PR is approved and          CI-green but unresolved review-bot threads have held the merge for {ticks} sweeps with          no repair job running. Fix and push (then record the result with `review_result`), or          resolve the threads, to unblock it."
+This PR is approved and CI-green but unresolved review-bot threads have held the merge for {ticks} sweeps with no repair job running. Fix and push (then record the result with `review_result`), or resolve the threads, to unblock it."
     );
     // Record the notification only once the label landed, so a failed label
     // add is retried next sweep instead of being skipped for good.
