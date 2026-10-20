@@ -101,17 +101,26 @@ fn review_verify_unchanged_content_hash_does_not_rewrite() {
     let first = verify(
         &s,
         &item_id,
-        vec![criterion("ac1", "pass", "src/review.rs:10")],
+        vec![
+            criterion("ac1", "pass", "src/review.rs:10"),
+            criterion("ac2", "fail", ""),
+            criterion("ac3", "uncertain", ""),
+        ],
     )
     .unwrap();
     let second = verify(
         &s,
         &item_id,
-        vec![criterion("ac1", "fail", "src/review.rs:99")],
+        vec![
+            criterion("ac1", "fail", "src/review.rs:99"),
+            criterion("ac2", "pass", "src/review.rs:11"),
+            criterion("ac3", "pass", "src/review.rs:12"),
+        ],
     )
     .unwrap();
     assert_eq!(second["unchanged"], true);
     assert_eq!(second["criteria"][0]["verdict"], "pass");
+    assert_eq!(second["criteria"][1]["verdict"], "fail");
     assert_eq!(second["content_hash"], first["content_hash"]);
     let meta = metadata_of(&s, &item_id);
     assert_eq!(meta["verify"]["criteria"][0]["verdict"], "pass");
@@ -128,7 +137,11 @@ fn review_verify_rejects_evidence_without_a_checkable_citation() {
     let err = verify(
         &s,
         &item_id,
-        vec![criterion("ac1", "pass", "the implementation looks correct")],
+        vec![
+            criterion("ac1", "pass", "the implementation looks correct"),
+            criterion("ac2", "fail", ""),
+            criterion("ac3", "fail", ""),
+        ],
     )
     .unwrap_err();
     let msg = err.to_string();

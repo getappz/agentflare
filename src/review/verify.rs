@@ -85,6 +85,8 @@ pub fn verify_criteria(criteria: &[SubmittedCriterion]) -> Result<Vec<VerifiedCr
 /// description and acceptance criteria still hash to the stored latch.
 /// The hash check runs before citation checks, so a re-submit against
 /// unchanged content does not rewrite and does not reject.
+/// A new write must name each acceptance-criterion id once: unknown,
+/// duplicate, and missing ids are rejected and nothing is stored.
 pub fn apply_item_verify(
     conn: &rusqlite::Connection,
     item_id: &str,
@@ -112,6 +114,8 @@ pub fn apply_item_verify(
             unchanged: true,
         });
     }
+    let known = known_criterion_ids(&acceptance).map_err(VerifyFailure::Rejected)?;
+    require_complete_ids(criteria, &known).map_err(VerifyFailure::Rejected)?;
     let verified = verify_criteria(criteria).map_err(VerifyFailure::Rejected)?;
     let patch = serde_json::json!({
         "verify": {
@@ -165,31 +169,98 @@ fn canonical_acceptance_criteria(value: &serde_json::Value) -> String {
     let Some(arr) = value.as_array() else {
         return format!("raw\0{value}");
     };
-    let mut rows: Vec<(String, String)> = arr
-        .iter()
-        .map(|c| {
-            let id = c
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let text = c
-                .get("text")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            (id, text)
-        })
-        .collect();
+    let mut rows: Vec<String> = arr.iter().map(canonical_criterion).collect();
     rows.sort();
     let mut out = String::new();
-    for (id, text) in rows {
-        out.push_str(&id);
-        out.push('\0');
-        out.push_str(&text);
+    for row in rows {
+        out.push_str(&row);
         out.push('\0');
     }
     out
+}
+
+/// `c\0id\0text` only for an object whose fields are exactly string `id` and
+/// `text`. Every other element is its JSON, so a field the normalized form
+/// would drop still moves the latch.
+fn canonical_criterion(value: &serde_json::Value) -> String {
+    let Some(obj) = value.as_object() else {
+        return format!("r\0{value}");
+    };
+    match (
+        obj.len() == 2,
+        obj.get("id").and_then(|v| v.as_str()),
+        obj.get("text").and_then(|v| v.as_str()),
+    ) {
+        (true, Some(id), Some(text)) => format!("c\0{id}\0{text}"),
+        _ => format!("r\0{value}"),
+    }
+}
+
+fn known_criterion_ids(
+    acceptance: &serde_json::Value,
+) -> Result<std::collections::BTreeSet<String>, String> {
+    if acceptance.is_null() {
+        return Err("item has no acceptance_criteria".to_string());
+    }
+    let Some(arr) = acceptance.as_array() else {
+        return Err("acceptance_criteria must be an array of {id, text}".to_string());
+    };
+    if arr.is_empty() {
+        return Err("item has no acceptance_criteria".to_string());
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    for c in arr {
+        let Some(id) = c
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return Err("acceptance_criteria entry is missing a string id".to_string());
+        };
+        if !ids.insert(id.to_string()) {
+            return Err(format!("acceptance_criteria contains duplicate id '{id}'"));
+        }
+    }
+    Ok(ids)
+}
+
+fn require_complete_ids(
+    criteria: &[SubmittedCriterion],
+    known: &std::collections::BTreeSet<String>,
+) -> Result<(), String> {
+    let mut seen = std::collections::BTreeSet::new();
+    for c in criteria {
+        let id = c.id.trim();
+        if id.is_empty() {
+            return Err("criterion id is required".to_string());
+        }
+        if !known.contains(id) {
+            let known_ids = known
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "unknown criterion id '{id}'; known ids are {known_ids}"
+            ));
+        }
+        if !seen.insert(id.to_string()) {
+            return Err(format!("duplicate criterion id '{id}'"));
+        }
+    }
+    let missing: Vec<&str> = known
+        .iter()
+        .filter(|id| !seen.contains(id.as_str()))
+        .map(String::as_str)
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "missing verdict for criterion '{}'",
+            missing.join("', '")
+        ));
+    }
+    Ok(())
 }
 
 fn normalize_one(c: &SubmittedCriterion) -> Result<VerifiedCriterion, String> {
@@ -510,7 +581,11 @@ mod tests {
     #[test]
     fn rejected_evidence_does_not_persist() {
         let conn = agentflare_backend::open_in_memory().unwrap();
-        let id = seed(&conn, "ship it", serde_json::json!([]));
+        let id = seed(
+            &conn,
+            "ship it",
+            serde_json::json!([{"id": "ac1", "text": "persists"}]),
+        );
         let err = apply_item_verify(
             &conn,
             &id,
@@ -523,5 +598,121 @@ mod tests {
         let item = agentflare_backend::item::get(&conn, &id).unwrap();
         let meta: serde_json::Value = serde_json::from_str(&item.metadata).unwrap();
         assert!(meta.get("verify").is_none());
+    }
+
+    #[test]
+    fn content_hash_changes_when_a_criterion_is_not_exactly_id_and_text() {
+        let plain = serde_json::json!([{"id": "a", "text": "one"}]);
+        let reordered_keys = serde_json::json!([{"text": "one", "id": "a"}]);
+        let extra = serde_json::json!([{"id": "a", "text": "one", "note": "x"}]);
+        let other_extra = serde_json::json!([{"id": "a", "text": "one", "note": "y"}]);
+        let base = verify_content_hash("body", &plain);
+        assert_eq!(base, verify_content_hash("body", &reordered_keys));
+        assert_ne!(base, verify_content_hash("body", &extra));
+        assert_ne!(
+            verify_content_hash("body", &extra),
+            verify_content_hash("body", &other_extra)
+        );
+        assert_ne!(
+            verify_content_hash("body", &serde_json::json!([{"id": "", "text": ""}])),
+            verify_content_hash("body", &serde_json::json!(["not-an-object"]))
+        );
+        assert_ne!(
+            verify_content_hash("body", &serde_json::json!([{"nope": 1}])),
+            verify_content_hash("body", &serde_json::json!([{"nope": 2}]))
+        );
+    }
+
+    #[test]
+    fn unknown_duplicate_and_partial_ids_are_rejected_without_persisting() {
+        let conn = agentflare_backend::open_in_memory().unwrap();
+        let id = seed(
+            &conn,
+            "ship it",
+            serde_json::json!([
+                {"id": "ac1", "text": "one"},
+                {"id": "ac2", "text": "two"}
+            ]),
+        );
+        let cited = "src/review.rs:10";
+        let unknown = apply_item_verify(
+            &conn,
+            &id,
+            &[sub("ac9", "pass", cited), sub("ac1", "fail", "")],
+            "agent-a",
+            100,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(unknown, VerifyFailure::Rejected(ref m) if m.contains("unknown criterion id 'ac9'")),
+            "{unknown:?}"
+        );
+        let duplicate = apply_item_verify(
+            &conn,
+            &id,
+            &[
+                sub("ac1", "pass", cited),
+                sub("ac1", "fail", ""),
+                sub("ac2", "fail", ""),
+            ],
+            "agent-a",
+            100,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(duplicate, VerifyFailure::Rejected(ref m) if m.contains("duplicate criterion id 'ac1'")),
+            "{duplicate:?}"
+        );
+        let partial = apply_item_verify(&conn, &id, &[sub("ac1", "pass", cited)], "agent-a", 100)
+            .unwrap_err();
+        assert!(
+            matches!(partial, VerifyFailure::Rejected(ref m) if m.contains("missing verdict") && m.contains("ac2")),
+            "{partial:?}"
+        );
+        let item = agentflare_backend::item::get(&conn, &id).unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&item.metadata).unwrap();
+        assert!(meta.get("verify").is_none());
+    }
+
+    #[test]
+    fn extra_criterion_field_invalidates_the_stored_latch() {
+        let conn = agentflare_backend::open_in_memory().unwrap();
+        let id = seed(
+            &conn,
+            "ship it",
+            serde_json::json!([{"id": "ac1", "text": "persists"}]),
+        );
+        let first = apply_item_verify(
+            &conn,
+            &id,
+            &[sub("ac1", "pass", "src/review.rs:10")],
+            "agent-a",
+            100,
+        )
+        .unwrap();
+        assert!(!first.unchanged);
+        let item = agentflare_backend::item::get(&conn, &id).unwrap();
+        let mut meta: serde_json::Value = serde_json::from_str(&item.metadata).unwrap();
+        meta["acceptance_criteria"][0]["note"] = serde_json::json!("revised");
+        agentflare_backend::item::update(
+            &conn,
+            &id,
+            agentflare_backend::item::UpdateItem {
+                metadata: Some(meta.to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let second = apply_item_verify(
+            &conn,
+            &id,
+            &[sub("ac1", "fail", "src/review.rs:11")],
+            "agent-b",
+            200,
+        )
+        .unwrap();
+        assert!(!second.unchanged);
+        assert_eq!(second.criteria[0].verdict, "fail");
+        assert_ne!(second.content_hash, first.content_hash);
     }
 }
