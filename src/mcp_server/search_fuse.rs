@@ -91,6 +91,52 @@ pub(super) fn fuse_rrf(arms: Vec<(&str, Vec<ArmHit>)>, limit: usize) -> Vec<Sear
     out
 }
 
+/// Rough token cost of a hit (~4 chars/token over what the agent receives).
+fn estimate_tokens(h: &SearchHit) -> usize {
+    (h.r#ref.len() + h.title.len() + h.excerpt.len())
+        .div_ceil(4)
+        .max(1)
+}
+
+/// Resolvable citation for a fused hit: what kind of ref it is and the ref itself.
+fn citation(r: &str) -> serde_json::Value {
+    let is_file_line = r.rsplit_once(':').is_some_and(|(p, n)| {
+        !p.is_empty() && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+    });
+    let kind = if r.starts_with("memory:") {
+        "observation"
+    } else if r.starts_with("http://") || r.starts_with("https://") {
+        "url"
+    } else if is_file_line {
+        "file_line"
+    } else {
+        "doc"
+    };
+    serde_json::json!({ "kind": kind, "ref": r })
+}
+
+/// Greedy context-pack: walk hits best-score first, keep each one whose token
+/// estimate still fits the remaining budget (a too-big hit is skipped, smaller
+/// lower-ranked ones may still fill the gap). Returns `(kept, used_tokens)`;
+/// `used_tokens <= budget` always.
+fn pack_hits(hits: Vec<SearchHit>, budget: usize) -> (Vec<serde_json::Value>, usize) {
+    let mut used = 0;
+    let mut kept = Vec::new();
+    for h in hits {
+        let tokens = estimate_tokens(&h);
+        if used + tokens > budget {
+            continue;
+        }
+        used += tokens;
+        let citation = citation(&h.r#ref);
+        let mut v = serde_json::to_value(&h).unwrap_or_default();
+        v["tokens"] = tokens.into();
+        v["citation"] = citation;
+        kept.push(v);
+    }
+    (kept, used)
+}
+
 fn str_field<'a>(v: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
     keys.iter()
         .find_map(|k| v.get(*k).and_then(|x| x.as_str()))
@@ -251,6 +297,7 @@ impl AgentflareMcp {
         Ok(fuse_envelopes(
             q,
             limit,
+            req.budget,
             store.as_deref(),
             Self::memory_arm(q, limit),
             code.as_deref(),
@@ -259,12 +306,14 @@ impl AgentflareMcp {
     }
 }
 
-/// Assembles the fused response from each arm's raw output. `None` (or an
+/// Assembles the fused response from each arm's raw output; `budget` switches to
+/// a token-budgeted context pack. `None` (or an
 /// unparseable / error envelope) marks the arm as skipped; `web` is `None`
 /// when the web arm was not requested.
 pub(super) fn fuse_envelopes(
     q: &str,
     limit: usize,
+    budget: Option<usize>,
     store: Option<&str>,
     memory: Option<Vec<ArmHit>>,
     code: Option<&str>,
@@ -283,6 +332,21 @@ pub(super) fn fuse_envelopes(
         push("web", web.and_then(delegated_arm));
     }
     let hits = fuse_rrf(arms, limit);
+    if let Some(budget) = budget {
+        let found = hits.len();
+        let (kept, used) = pack_hits(hits, budget);
+        return serde_json::json!({
+            "query": q,
+            "source": "all",
+            "budget": budget,
+            "used_tokens": used,
+            "total": kept.len(),
+            "dropped": found - kept.len(),
+            "hits": kept,
+            "skipped": skipped,
+        })
+        .to_string();
+    }
     serde_json::json!({
         "query": q,
         "source": "all",

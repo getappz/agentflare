@@ -46,6 +46,7 @@ fn search_store_requires_non_empty_query() {
             path_glob: None,
             min_score: None,
             rerank: None,
+            budget: None,
         },
     )
     .unwrap_err();
@@ -83,6 +84,7 @@ fn search_store_returns_grouped_results() {
                 path_glob: None,
                 min_score: None,
                 rerank: None,
+                budget: None,
             },
         )
         .unwrap();
@@ -113,6 +115,7 @@ fn search_memory_requires_non_empty_query() {
             path_glob: None,
             min_score: None,
             rerank: None,
+            budget: None,
         },
     )
     .unwrap_err();
@@ -149,6 +152,7 @@ fn search_memory_returns_grouped_observations() {
                 path_glob: None,
                 min_score: None,
                 rerank: None,
+                budget: None,
             },
         )
         .unwrap();
@@ -179,6 +183,7 @@ fn search_code_requires_non_empty_query() {
             path_glob: None,
             min_score: None,
             rerank: None,
+            budget: None,
         },
     )
     .unwrap_err();
@@ -199,6 +204,7 @@ fn search_code_returns_graceful_payload_via_gateway() {
                 path_glob: None,
                 min_score: None,
                 rerank: None,
+                budget: None,
             },
         )
         .unwrap();
@@ -227,6 +233,7 @@ fn search_rejects_unknown_type() {
             path_glob: None,
             min_score: None,
             rerank: None,
+            budget: None,
         },
     )
     .unwrap_err();
@@ -251,6 +258,7 @@ fn search_store_defaults_to_store_type() {
                 path_glob: None,
                 min_score: None,
                 rerank: None,
+                budget: None,
             },
         )
         .unwrap();
@@ -289,6 +297,7 @@ fn search_store_includes_artifact_matches() {
                 path_glob: None,
                 min_score: None,
                 rerank: None,
+                budget: None,
             },
         )
         .unwrap();
@@ -310,6 +319,7 @@ fn all_req(query: &str) -> SearchRequest {
         path_glob: None,
         min_score: None,
         rerank: None,
+        budget: None,
     }
 }
 
@@ -458,6 +468,7 @@ fn fuse_envelopes_dedups_real_store_arm_and_skips_failing_arms() {
         let out = super::search_fuse::fuse_envelopes(
             "quokka",
             20,
+            None,
             Some(&store),
             None,
             Some(code),
@@ -480,9 +491,49 @@ fn fuse_envelopes_dedups_real_store_arm_and_skips_failing_arms() {
 fn store_arm_orders_by_rank_not_raw_score() {
     // two doc types, so grouping loses order; the higher raw score is ranked second
     let store = r#"{"groups":{"a":[{"path":"first.md","score":0.1,"rank":0}],"b":[{"path":"second.md","score":9.0,"rank":1}]}}"#;
-    let out = super::search_fuse::fuse_envelopes("q", 20, Some(store), None, None, None);
+    let out = super::search_fuse::fuse_envelopes("q", 20, None, Some(store), None, None, None);
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     let hits = v["hits"].as_array().unwrap();
     assert_eq!(hits[0]["ref"], "first.md", "{out}");
     assert_eq!(hits[1]["ref"], "second.md", "{out}");
+}
+
+#[test]
+fn budget_packs_by_score_with_citations_and_truncates_in_order() {
+    // refs are 5 chars, no title/excerpt-less: cost = ceil((ref+title+excerpt)/4)
+    let code = r#"{"source":"code","results":[
+        {"path":"a.rs","snippet":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+        {"path":"huge.rs","snippet":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+        {"path":"c.rs","snippet":"cc"}]}"#;
+    let run = |budget| {
+        let out = super::search_fuse::fuse_envelopes("q", 20, budget, None, None, Some(code), None);
+        serde_json::from_str::<serde_json::Value>(&out).unwrap()
+    };
+    // no budget: unchanged shape, all 3 hits, no citations
+    let full = run(None);
+    assert_eq!(full["hits"].as_array().unwrap().len(), 3);
+    assert!(full.get("used_tokens").is_none());
+    // a.rs = (4+4+40)/4 = 12 tokens, c.rs = (4+4+2)/4 = 3, huge.rs far larger
+    let v = run(Some(16));
+    let hits = v["hits"].as_array().unwrap();
+    let refs: Vec<_> = hits.iter().map(|h| h["ref"].as_str().unwrap()).collect();
+    assert_eq!(
+        refs,
+        ["a.rs", "c.rs"],
+        "best first; oversized hit skipped: {v}"
+    );
+    assert!(v["used_tokens"].as_u64().unwrap() <= 16);
+    assert_eq!(v["dropped"], 1);
+    assert_eq!(hits[0]["citation"]["ref"], "a.rs");
+    assert!(hits[0]["score"].as_f64().unwrap() > hits[1]["score"].as_f64().unwrap());
+    // tinier budget: only the top-ranked hit survives
+    let tiny = run(Some(12));
+    let refs: Vec<_> = tiny["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["ref"].as_str().unwrap())
+        .collect();
+    assert_eq!(refs, ["a.rs"]);
+    assert_eq!(run(Some(0))["total"], 0);
 }
