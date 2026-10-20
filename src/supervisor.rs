@@ -585,6 +585,12 @@ pub(crate) fn run_discovery_tick(
             0
         };
         for item in items {
+            // Parked awaiting human input: never dispatched, even if it still
+            // carries the ready label (leave the label for when it returns).
+            if in_needs_input(mcp, &item) {
+                result.waiting += 1;
+                continue;
+            }
             if let Some(paused_id) = label_id_by_name.get(PAUSED_LABEL) {
                 let paused = mcp
                     .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item.id))
@@ -2062,6 +2068,17 @@ fn item_gated(
                 .zip(item_label_ids.as_ref())
                 .is_some_and(|(gate_id, ids)| ids.contains(gate_id))
         })
+}
+
+/// True when the item's state group is `needs_input` (non-dispatchable).
+fn in_needs_input(
+    mcp: &crate::mcp_server::AgentflareMcp,
+    item: &agentflare_backend::item::Item,
+) -> bool {
+    mcp.with_backend_db(|conn| agentflare_backend::state::get(conn, &item.state_id))
+        .ok()
+        .and_then(Result::ok)
+        .is_some_and(|s| s.group_name == agentflare_backend::state::NEEDS_INPUT_GROUP)
 }
 
 fn already_gated_or_in_flight(

@@ -248,6 +248,35 @@ fn confirmed_agent_gets_dispatched_and_relabeled() {
 }
 
 #[test]
+fn needs_input_item_with_ready_label_is_never_dispatched() {
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let item_id = seed_ready_item(&mcp, Some("claude-code"));
+    mcp.with_backend_db(|conn| {
+        let item = agentflare_backend::item::get(conn, &item_id).unwrap();
+        let ni = agentflare_backend::state::ensure_needs_input(conn, &item.project_id).unwrap();
+        agentflare_backend::item::update_state(conn, &item_id, &ni.id).unwrap();
+    })
+    .unwrap();
+
+    let auth_conn = test_auth_conn();
+    let result = run_discovery_tick(
+        &mcp,
+        &queue,
+        &auth_conn,
+        agentflare_resource_gate::Policy::Normal,
+    );
+
+    assert_eq!(result.dispatched, 0);
+    assert_eq!(result.waiting, 1);
+    assert!(queue.list(None).unwrap().is_empty());
+    let labels = mcp
+        .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id).unwrap())
+        .unwrap();
+    assert!(labels_contain_name(&mcp, &labels, "ready-for-work"));
+}
+
+#[test]
 fn item_model_override_reads_metadata_model_key() {
     assert_eq!(
         item_model_override(r#"{"model": "anthropic/claude-sonnet-5"}"#),
