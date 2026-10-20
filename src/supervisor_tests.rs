@@ -1410,11 +1410,11 @@ mod auto_merge_tests;
 /// Wraps a marker comment body the way `MockResponse::json`'s callers need
 /// it -- serialized as a single JSON array entry with `id`/`user`/`body`,
 /// matching `github::models::Comment`'s shape.
-fn comment_json(id: u64, body: &str) -> String {
+pub(crate) fn comment_json(id: u64, body: &str) -> String {
     serde_json::json!([{"id": id, "user": {"login": "claude-code"}, "body": body}]).to_string()
 }
 
-fn claim_marker(owner: &str, ts: i64) -> String {
+pub(crate) fn claim_marker(owner: &str, ts: i64) -> String {
     crate::github::bridge::marker::Marker {
         action: crate::github::bridge::marker::Action::Claim,
         owner: owner.to_string(),
