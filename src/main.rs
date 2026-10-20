@@ -37,6 +37,7 @@ mod db;
 mod decide;
 mod dev_install;
 mod dev_vars;
+mod verify;
 use agentflare_bin_lib::{dispatch_failure_ceiling, errors, mise_install, paths, state, store};
 mod doctor;
 mod gateway_integrations;
