@@ -175,12 +175,13 @@ pub(super) fn delegated_arm(envelope: &str) -> Option<Vec<ArmHit>> {
 }
 
 /// Ranked hits from the store arm's grouped envelope. Grouping by doc type
-/// loses the order, so docs are re-ranked by their score (higher is better);
-/// artifact matches (unscored) follow.
+/// loses the order, so docs are put back in `search_store`'s fused/reranked
+/// order via their `rank` (raw scores mix BM25 and hybrid scales); artifact
+/// matches (unranked) follow.
 fn store_arm(envelope: &str) -> Option<Vec<ArmHit>> {
     let v: serde_json::Value = serde_json::from_str(envelope).ok()?;
     let groups = v.get("groups")?.as_object()?;
-    let mut docs: Vec<(f64, ArmHit)> = Vec::new();
+    let mut docs: Vec<(u64, ArmHit)> = Vec::new();
     let mut artifacts: Vec<ArmHit> = Vec::new();
     for (name, entries) in groups {
         for e in entries.as_array().into_iter().flatten() {
@@ -195,7 +196,7 @@ fn store_arm(envelope: &str) -> Option<Vec<ArmHit>> {
                 });
             } else if let Some(r) = str_field(e, &["path", "id"]) {
                 docs.push((
-                    e.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0),
+                    e.get("rank").and_then(|s| s.as_u64()).unwrap_or(u64::MAX),
                     ArmHit {
                         r#ref: r.to_string(),
                         title: str_field(e, &["title"]).unwrap_or(r).to_string(),
@@ -205,7 +206,7 @@ fn store_arm(envelope: &str) -> Option<Vec<ArmHit>> {
             }
         }
     }
-    docs.sort_by(|a, b| b.0.total_cmp(&a.0));
+    docs.sort_by_key(|(rank, _)| *rank); // stable
     Some(docs.into_iter().map(|(_, h)| h).chain(artifacts).collect())
 }
 

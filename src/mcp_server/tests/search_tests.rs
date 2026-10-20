@@ -364,7 +364,7 @@ fn opaque_hits_extracts_rank_order_from_text_and_json() {
 }
 
 #[test]
-fn search_all_fuses_store_and_memory_and_skips_failing_arm() {
+fn search_all_fuses_store_and_memory() {
     crate::paths::test_support::with_temp_home(|| {
         let conn = crate::memory::store::open().unwrap();
         crate::memory::observations::save(
@@ -474,4 +474,15 @@ fn fuse_envelopes_dedups_real_store_arm_and_skips_failing_arms() {
         assert!((hits[0]["score"].as_f64().unwrap() - want).abs() < 1e-12);
         assert_eq!(hits[1]["ref"], "other.rs");
     });
+}
+
+#[test]
+fn store_arm_orders_by_rank_not_raw_score() {
+    // two doc types, so grouping loses order; the higher raw score is ranked second
+    let store = r#"{"groups":{"a":[{"path":"first.md","score":0.1,"rank":0}],"b":[{"path":"second.md","score":9.0,"rank":1}]}}"#;
+    let out = super::search_fuse::fuse_envelopes("q", 20, Some(store), None, None, None);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let hits = v["hits"].as_array().unwrap();
+    assert_eq!(hits[0]["ref"], "first.md", "{out}");
+    assert_eq!(hits[1]["ref"], "second.md", "{out}");
 }

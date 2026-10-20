@@ -81,11 +81,11 @@ impl AgentflareMcp {
             {
                 let mut grouped: std::collections::BTreeMap<String, Vec<serde_json::Value>> =
                     std::collections::BTreeMap::new();
-                for m in cached.iter().take(limit) {
+                for (rank, m) in cached.iter().take(limit).enumerate() {
                     if let Some(doc) = store.doc_get(&m.id).ok().flatten() {
                         let entry = serde_json::json!({
                             "id": doc.id, "path": doc.path, "title": doc.title,
-                            "doc_type": doc.doc_type, "snippet": m.snippet, "score": m.score,
+                            "doc_type": doc.doc_type, "snippet": m.snippet, "score": m.score, "rank": rank,
                             "source": doc.source, "mime": doc.mime, "size": doc.size,
                             "created_at": doc.created_at, "updated_at": doc.updated_at,
                         });
@@ -189,7 +189,7 @@ impl AgentflareMcp {
             let mut grouped: std::collections::BTreeMap<String, Vec<serde_json::Value>> =
                 std::collections::BTreeMap::new();
 
-            for m in matches {
+            for (rank, m) in matches.into_iter().enumerate() {
                 let Some(doc) = store
                     .doc_get(&m.id)
                     .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
@@ -204,6 +204,7 @@ impl AgentflareMcp {
                     "doc_type": doc.doc_type,
                     "snippet": m.snippet,
                     "score": m.score,
+                    "rank": rank,
                     "source": doc.source,
                     "mime": doc.mime,
                     "size": doc.size,
