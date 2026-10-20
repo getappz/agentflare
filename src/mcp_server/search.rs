@@ -9,6 +9,8 @@ impl AgentflareMcp {
             "memory" => self.search_memory(&req),
             "web" => self.search_web(&req).await,
             "store" => self.search_store(&req),
+            "all" => self.search_all(&req, false).await,
+            "all+web" => self.search_all(&req, true).await,
             "social" => self.search_social(&req).await,
             "news" => self.search_news(&req).await,
             "github" => self.search_github(&req).await,
@@ -24,7 +26,7 @@ impl AgentflareMcp {
             "bluesky" => self.search_bluesky(&req).await,
             other => Err(ErrorData::invalid_params(
                 format!(
-                    "unknown type '{other}' — use store|memory|code|web|social|news|github|academic|datasets|websites|weather|financial|crypto|fx|indicators|youtube|bluesky"
+                    "unknown type '{other}' — use store|memory|code|web|all|all+web|social|news|github|academic|datasets|websites|weather|financial|crypto|fx|indicators|youtube|bluesky"
                 ),
                 None,
             )),
@@ -47,7 +49,7 @@ impl AgentflareMcp {
             .map_err(|e| gateway_registry::redact_error_for_llm(&e.to_string()))
     }
 
-    fn search_store(&self, req: &SearchRequest) -> Result<String, ErrorData> {
+    pub(super) fn search_store(&self, req: &SearchRequest) -> Result<String, ErrorData> {
         let q = req.query.trim();
         if q.is_empty() {
             return Err(ErrorData::invalid_params("query must not be empty", None));
@@ -79,11 +81,11 @@ impl AgentflareMcp {
             {
                 let mut grouped: std::collections::BTreeMap<String, Vec<serde_json::Value>> =
                     std::collections::BTreeMap::new();
-                for m in cached.iter().take(limit) {
+                for (rank, m) in cached.iter().take(limit).enumerate() {
                     if let Some(doc) = store.doc_get(&m.id).ok().flatten() {
                         let entry = serde_json::json!({
                             "id": doc.id, "path": doc.path, "title": doc.title,
-                            "doc_type": doc.doc_type, "snippet": m.snippet, "score": m.score,
+                            "doc_type": doc.doc_type, "snippet": m.snippet, "score": m.score, "rank": rank,
                             "source": doc.source, "mime": doc.mime, "size": doc.size,
                             "created_at": doc.created_at, "updated_at": doc.updated_at,
                         });
@@ -187,7 +189,7 @@ impl AgentflareMcp {
             let mut grouped: std::collections::BTreeMap<String, Vec<serde_json::Value>> =
                 std::collections::BTreeMap::new();
 
-            for m in matches {
+            for (rank, m) in matches.into_iter().enumerate() {
                 let Some(doc) = store
                     .doc_get(&m.id)
                     .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
@@ -202,6 +204,7 @@ impl AgentflareMcp {
                     "doc_type": doc.doc_type,
                     "snippet": m.snippet,
                     "score": m.score,
+                    "rank": rank,
                     "source": doc.source,
                     "mime": doc.mime,
                     "size": doc.size,
@@ -306,7 +309,7 @@ impl AgentflareMcp {
         .to_string())
     }
 
-    async fn search_code(&self, req: &SearchRequest) -> Result<String, ErrorData> {
+    pub(super) async fn search_code(&self, req: &SearchRequest) -> Result<String, ErrorData> {
         let q = req.query.trim();
         if q.is_empty() {
             return Err(ErrorData::invalid_params("query must not be empty", None));
@@ -326,7 +329,7 @@ impl AgentflareMcp {
         }
     }
 
-    async fn search_web(&self, req: &SearchRequest) -> Result<String, ErrorData> {
+    pub(super) async fn search_web(&self, req: &SearchRequest) -> Result<String, ErrorData> {
         let q = req.query.trim();
         if q.is_empty() {
             return Err(ErrorData::invalid_params("query must not be empty", None));
