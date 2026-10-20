@@ -908,3 +908,71 @@ fn coderabbit_cap_announced_requires_exact_fingerprint_not_substring() {
         );
     });
 }
+
+fn work_job(item_id: &str, agent: &str) -> agentflare_jobs::JobInfo {
+    agentflare_jobs::JobInfo {
+        id: "job".into(),
+        command: "agentflare-work".into(),
+        args: vec![item_id.into(), agent.into()],
+        state: agentflare_jobs::JobState::Exited,
+        retries: 0,
+        max_retries: 0,
+        error: None,
+        created_at: 0,
+        started_at: None,
+        finished_at: None,
+        output: None,
+        in_process: true,
+        dispatch_reason: None,
+    }
+}
+
+#[test]
+fn repair_agent_falls_back_to_the_last_work_job_when_assignee_is_cleared() {
+    let mcp = test_mcp();
+    let item_id = seed_in_review_item_with_claim_age(&mcp, None, 1_900);
+    let mut item = current_item(&mcp, &item_id);
+    item.assignee_agent = None;
+
+    let jobs = [
+        work_job("other-item", "opencode"),
+        work_job(&item_id, "claude-code"),
+    ];
+    let agent = resolve_repair_agent_with(&item, &jobs, || panic!("job must win over fallback"));
+    assert_eq!(agent, Some(agent_registry::Agent::ClaudeCode));
+}
+
+#[test]
+fn repair_agent_uses_the_sole_installed_agent_with_an_empty_router() {
+    let mcp = test_mcp();
+    let item_id = seed_in_review_item_with_claim_age(&mcp, None, 1_900);
+    let mut item = current_item(&mcp, &item_id);
+    item.assignee_agent = None;
+    let config = agent_registry::RouterConfig::default();
+    let installed = [agent_registry::Agent::Opencode];
+    let mut rotation = std::collections::HashMap::new();
+
+    let agent = resolve_repair_agent_with(&item, &[], || {
+        sole_or_routed_agent(&item, &config, &installed, &mut rotation)
+    });
+    assert_eq!(agent, Some(agent_registry::Agent::Opencode));
+}
+
+#[test]
+fn repair_agent_is_none_when_nothing_resolves() {
+    let mcp = test_mcp();
+    let item_id = seed_in_review_item_with_claim_age(&mcp, None, 1_900);
+    let mut item = current_item(&mcp, &item_id);
+    item.assignee_agent = None;
+    let config = agent_registry::RouterConfig::default();
+    let installed = [
+        agent_registry::Agent::Opencode,
+        agent_registry::Agent::ClaudeCode,
+    ];
+    let mut rotation = std::collections::HashMap::new();
+
+    let agent = resolve_repair_agent_with(&item, &[], || {
+        sole_or_routed_agent(&item, &config, &installed, &mut rotation)
+    });
+    assert_eq!(agent, None);
+}
