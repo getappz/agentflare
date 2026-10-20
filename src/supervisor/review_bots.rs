@@ -1113,6 +1113,18 @@ pub(super) fn coderabbit_repair_or_gate(
         return SelfRepairOutcome::Deferred;
     }
 
+    // Resolved before the claim comment so a skipped repair never leaves a
+    // claim marker behind to be re-posted on every TTL expiry.
+    let Some(agent) = resolve_repair_agent(queue, item, pr_number) else {
+        return SelfRepairOutcome::Skipped;
+    };
+    if crate::auth_db::is_cooling_down(auth_conn, agent.as_str()) {
+        return SelfRepairOutcome::Deferred;
+    }
+    if host_policy.blocks_dispatch() {
+        return SelfRepairOutcome::Deferred;
+    }
+
     // Same item #261 rationale as `self_repair_or_gate`: arbitrate across
     // workstations via a claim marker comment on the PR itself, since a
     // per-workstation backend db can't see another workstation's dispatch.
@@ -1123,21 +1135,6 @@ pub(super) fn coderabbit_repair_or_gate(
     if let Some((repo, client)) = repo_and_client
         && !claim_self_repair(&client, &repo, pr_number, &item.id, crate::claims::now())
     {
-        return SelfRepairOutcome::Deferred;
-    }
-
-    let Some(agent) = item
-        .assignee_agent
-        .as_deref()
-        .and_then(resolve_confirmed_agent)
-        .or_else(|| route_unassigned(item))
-    else {
-        return SelfRepairOutcome::Skipped;
-    };
-    if crate::auth_db::is_cooling_down(auth_conn, agent.as_str()) {
-        return SelfRepairOutcome::Deferred;
-    }
-    if host_policy.blocks_dispatch() {
         return SelfRepairOutcome::Deferred;
     }
 
