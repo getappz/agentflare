@@ -2468,6 +2468,10 @@ mod coderabbit_tests;
 mod review_bots_tests;
 
 #[cfg(test)]
+#[path = "supervisor/tests/review_bots_out_of_scope_tests.rs"]
+mod review_bots_out_of_scope_tests;
+
+#[cfg(test)]
 #[path = "supervisor_self_repair_tests.rs"]
 mod self_repair_tests;
 
