@@ -511,6 +511,28 @@ impl Queue {
         Ok(jobs)
     }
 
+    /// Target agent (`args[1]`) of the newest `command` job for `item_id`
+    /// (`args[0]`), in any state. Unlike `list`, not capped at 100 rows, so an
+    /// old job is still found behind a long run of newer unrelated ones.
+    pub fn last_agent_for_item(
+        &self,
+        command: &str,
+        item_id: &str,
+    ) -> Result<Option<String>, Error> {
+        let conn = self.conn.lock();
+        let agent = conn
+            .query_row(
+                "SELECT json_extract(payload, '$.args[1]') FROM agent_jobs
+                 WHERE json_extract(payload, '$.command') = ?1
+                   AND json_extract(payload, '$.args[0]') = ?2
+                 ORDER BY created_at DESC LIMIT 1",
+                params![command, item_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(agent.flatten())
+    }
+
     /// Number of queued or running jobs whose `args` carry `value` -- at
     /// position `index` when given, anywhere in `args` otherwise. Unlike
     /// `list`, which only returns the 100 newest rows, this counts every
