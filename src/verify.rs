@@ -1,7 +1,7 @@
 //! `[verify]` config (`.agentflare/config.toml`): opt-in completion
 //! verification. `enforce` defaults to false. The per-item
-//! `metadata.require_verify = true` override is read by the completion gate
-//! (follow-on item), not here.
+//! `metadata.require_verify = true` override is resolved by [`required`]; the
+//! completion gate (follow-on item) consumes both.
 
 use std::path::Path;
 
@@ -9,6 +9,17 @@ use std::path::Path;
 /// when unset or the config can't be read.
 pub fn enforce_enabled(repo_root: &Path) -> bool {
     enforce_from(repo_root, &crate::paths::home())
+}
+
+/// Whether verification applies to one item: the project default, or a
+/// per-item `metadata.require_verify = true` forcing it on.
+#[allow(dead_code)] // consumed by the completion gate (follow-on item)
+pub fn required(enforce: bool, metadata: &serde_json::Value) -> bool {
+    enforce
+        || metadata
+            .get("require_verify")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
 }
 
 fn enforce_from(repo_root: &Path, home: &Path) -> bool {
@@ -22,7 +33,7 @@ fn enforce_from(repo_root: &Path, home: &Path) -> bool {
     .into_iter()
     .flatten()
     .filter_map(|doc| doc.get("verify")?.get("enforce")?.as_bool())
-    .last()
+    .next_back()
     .unwrap_or(false)
 }
 
@@ -52,6 +63,17 @@ mod tests {
         assert!(enforce_from(repo.path(), home.path()));
         write_cfg(repo.path(), "[verify]\nenforce = false\n");
         assert!(!enforce_from(repo.path(), home.path()));
+    }
+
+    #[test]
+    fn require_verify_overrides_default_off() {
+        let on = serde_json::json!({"require_verify": true});
+        let off = serde_json::json!({"require_verify": false});
+        assert!(required(false, &on));
+        assert!(!required(false, &off));
+        assert!(!required(false, &serde_json::json!({})));
+        assert!(!required(false, &serde_json::Value::Null));
+        assert!(required(true, &off));
     }
 
     #[test]
