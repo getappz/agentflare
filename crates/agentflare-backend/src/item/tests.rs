@@ -1183,6 +1183,21 @@ fn claim_of_a_needs_input_item_is_blocked_and_leaves_it_untouched() {
 }
 
 #[test]
+fn item_can_leave_needs_input_and_then_be_claimed() {
+    let conn = db::open_in_memory().unwrap();
+    let (pid, sid) = seed_project(&conn, "");
+    let item = make_item(&conn, &pid, &sid);
+    let ni = crate::state::ensure_needs_input(&conn, &pid).unwrap();
+    update_state(&conn, &item.id, &ni.id).unwrap();
+    let started = crate::state::first_in_group(&conn, &pid, "started").unwrap();
+    update_state(&conn, &item.id, &started.id).unwrap();
+    assert_eq!(
+        claim(&conn, &item.id, "claude-code:1", 1000, TTL).unwrap(),
+        ClaimOutcome::Acquired
+    );
+}
+
+#[test]
 fn claim_by_the_handoff_assignee_itself_succeeds() {
     let conn = db::open_in_memory().unwrap();
     let (pid, sid) = seed_project(&conn, "");

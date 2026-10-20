@@ -650,3 +650,42 @@ fn item_list_returns_open_dependency_chain_with_blocked_by() {
     assert!(!unblocked_ids.contains(&b_id.as_str()));
     assert!(!unblocked_ids.contains(&c_id.as_str()));
 }
+
+/// With enforcement off, `needs_input` is not provisioned: `update_state`
+/// to it (and to any bogus group) errors cleanly, and `list` on it is empty.
+#[test]
+fn needs_input_group_without_enforce_errors_cleanly_and_lists_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let s = AgentflareMcp {
+        backend_db_override: Some(tmp.path().join("backend.db")),
+        backend_project_link_override: Some(tmp.path().join("project.json")),
+        agent: Some("claude-code".into()),
+        ..Default::default()
+    };
+    let a: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("NI"))).unwrap()).unwrap();
+    for group in ["needs_input", "no_such_group"] {
+        let err = s
+            .item(Parameters(ItemRequest {
+                action: "update_state".into(),
+                id: Some(a["id"].as_str().unwrap().into()),
+                state_group: Some(group.into()),
+                ..Default::default()
+            }))
+            .unwrap_err();
+        assert!(
+            err.message.contains("no state in group"),
+            "{group}: {err:?}"
+        );
+    }
+    let listed: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "list".into(),
+            state_group: Some("needs_input".into()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(listed["total"], 0);
+}
