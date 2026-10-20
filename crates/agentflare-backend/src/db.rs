@@ -37,6 +37,21 @@ pub fn open_in_memory() -> Result<Connection, db_kit::open::Error> {
     Ok(conn)
 }
 
+/// Splits `ids` into slices that fit one statement's bound-variable budget
+/// (`SQLITE_LIMIT_VARIABLE_NUMBER`) when each id binds `per_id` times, so an
+/// `IN (...)` query over a large project never exceeds the cap.
+pub fn id_batches<'a>(
+    conn: &Connection,
+    ids: &'a [String],
+    per_id: usize,
+) -> std::slice::Chunks<'a, String> {
+    let limit = conn
+        .limit(rusqlite::limits::Limit::SQLITE_LIMIT_VARIABLE_NUMBER)
+        .unwrap_or(999);
+    let n = (usize::try_from(limit).unwrap_or(1) / per_id.max(1)).max(1);
+    ids.chunks(n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
