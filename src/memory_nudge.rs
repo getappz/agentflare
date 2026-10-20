@@ -38,17 +38,22 @@ fn load() -> Ledger {
         .unwrap_or_default()
 }
 
-fn save(map: &Ledger) {
+/// True only when the ledger reached disk, so a caller never emits (and
+/// thereby "claims") keys the ledger failed to record.
+fn save(map: &Ledger) -> bool {
     let path = ledger_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(json) = serde_json::to_string(map) {
-        let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-        if std::fs::write(&tmp, json).is_ok() && std::fs::rename(&tmp, &path).is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
+    let Ok(json) = serde_json::to_string(map) else {
+        return false;
+    };
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    if std::fs::write(&tmp, json).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+        return true;
     }
+    let _ = std::fs::remove_file(&tmp);
+    false
 }
 
 /// Atomically (under the shared pace lock) drops keys already injected in
@@ -79,13 +84,19 @@ fn claim_fresh(session: &str, keys: Vec<String>, limit: usize) -> Option<Vec<Str
             map.remove(&k);
         }
     }
-    save(&map);
-    Some(fresh)
+    save(&map).then_some(fresh)
+}
+
+/// Ledger session key: agent-scoped, since agents can share a raw
+/// `session_id` (same keying as the runtime session tracking).
+fn ledger_key(agent: &str, session: &str) -> String {
+    crate::messages::identity::hook_key(agent, session)
 }
 
 /// True the first time it is called for `session` (Stop instruction gate).
-pub(crate) fn first_time(session: &str, key: &str) -> bool {
-    claim_fresh(session, vec![key.to_string()], 1).is_some_and(|f| !f.is_empty())
+pub(crate) fn first_time(agent: &str, session: &str, key: &str) -> bool {
+    claim_fresh(&ledger_key(agent, session), vec![key.to_string()], 1)
+        .is_some_and(|f| !f.is_empty())
 }
 
 fn clip(s: &str, n: usize) -> String {
@@ -135,6 +146,7 @@ fn recall_with(
     conn: &Connection,
     event: Event,
     session: &str,
+    project: &str,
     subject: &str,
     query: &str,
 ) -> Option<String> {
@@ -157,6 +169,13 @@ fn recall_with(
         crate::memory::engine::embed_query,
     )
     .ok()?;
+    // Scope policy: this project's observations plus unscoped (global) ones;
+    // never another project's. Filtered here because the search's own project
+    // filter would drop the global ones.
+    let hits: Vec<Observation> = hits
+        .into_iter()
+        .filter(|o| o.project.as_deref().is_none_or(|p| p == project))
+        .collect();
     if hits.is_empty() {
         return None;
     }
@@ -172,6 +191,7 @@ fn recall_with(
 /// Recall for a hook event. Never panics, never errors; `None` = stay silent.
 pub(crate) fn recall_for(
     event: Event,
+    agent: &str,
     session: &str,
     subject: &str,
     query: &str,
@@ -181,7 +201,15 @@ pub(crate) fn recall_for(
     }
     std::panic::catch_unwind(|| {
         let conn = crate::memory::store::open().ok()?;
-        recall_with(&conn, event, session, subject, query)
+        let project = crate::mcp_server::AgentflareMcp::resolve_project_name();
+        recall_with(
+            &conn,
+            event,
+            &ledger_key(agent, session),
+            &project,
+            subject,
+            query,
+        )
     })
     .ok()
     .flatten()
@@ -200,7 +228,7 @@ pub(crate) fn with_failure_recall(
     let block = crate::hook_messages::parse_session(input)
         .session_id
         .filter(|_| !interrupt)
-        .and_then(|sid| recall_for(Event::TestFailed, &sid, "", failure_text));
+        .and_then(|sid| recall_for(Event::TestFailed, agent, &sid, "", failure_text));
     let Some(block) = block else {
         return out;
     };
@@ -221,6 +249,7 @@ pub(crate) fn with_failure_recall(
 
 /// Recall for a mutating tool call's target file.
 pub(crate) fn pre_edit_nudge(
+    agent: &str,
     tool_name: &str,
     tool_input: Option<&serde_json::Value>,
     session: &str,
@@ -229,7 +258,7 @@ pub(crate) fn pre_edit_nudge(
         return None;
     }
     let path = edit_path(tool_input)?;
-    recall_for(Event::PreEdit, session, &path, &path)
+    recall_for(Event::PreEdit, agent, session, &path, &path)
 }
 
 /// File path a mutating tool call targets.
@@ -277,6 +306,7 @@ mod tests {
             .unwrap();
             let first = recall_for(
                 Event::PreEdit,
+                "claude",
                 "s1",
                 "src/parser.rs",
                 "src/parser.rs parser",
@@ -288,6 +318,7 @@ mod tests {
             assert!(
                 recall_for(
                     Event::PreEdit,
+                    "claude",
                     "s1",
                     "src/parser.rs",
                     "src/parser.rs parser"
@@ -296,6 +327,7 @@ mod tests {
             );
             let f = recall_for(
                 Event::TestFailed,
+                "claude",
                 "s1",
                 "",
                 "error[E0502] cannot borrow as mutable",
@@ -307,19 +339,56 @@ mod tests {
     #[test]
     fn silent_when_memory_empty_or_session_missing() {
         with_temp_home(|| {
-            assert!(recall_for(Event::PreEdit, "s1", "f", "anything").is_none());
+            assert!(recall_for(Event::PreEdit, "claude", "s1", "f", "anything").is_none());
             let _ = crate::memory::store::open().unwrap();
-            assert!(recall_for(Event::PreEdit, "s1", "f", "anything").is_none());
-            assert!(recall_for(Event::PreEdit, "", "f", "anything").is_none());
+            assert!(recall_for(Event::PreEdit, "claude", "s1", "f", "anything").is_none());
+            assert!(recall_for(Event::PreEdit, "claude", "", "f", "anything").is_none());
         });
     }
 
     #[test]
     fn stop_instruction_fires_once_per_session() {
         with_temp_home(|| {
-            assert!(first_time("s1", "stop"));
-            assert!(!first_time("s1", "stop"));
-            assert!(first_time("s2", "stop"));
+            assert!(first_time("claude", "s1", "stop"));
+            assert!(!first_time("claude", "s1", "stop"));
+            assert!(first_time("claude", "s2", "stop"));
+            // Agents sharing a raw session id keep separate ledgers.
+            assert!(first_time("codex", "s1", "stop"));
+        });
+    }
+
+    #[test]
+    fn recall_skips_other_projects_but_keeps_unscoped() {
+        with_temp_home(|| {
+            let conn = crate::memory::store::open().unwrap();
+            for (project, title) in [(Some("other"), "gizmo other"), (None, "gizmo global")] {
+                crate::memory::observations::save(
+                    &conn,
+                    None,
+                    "gotcha",
+                    title,
+                    "gizmo quirk",
+                    None,
+                    project,
+                    None,
+                    None,
+                )
+                .unwrap();
+            }
+            let b = recall_with(&conn, Event::PreEdit, "k", "mine", "gizmo", "src/gizmo").unwrap();
+            assert!(
+                b.contains("gizmo global") && !b.contains("gizmo other"),
+                "{b}"
+            );
+        });
+    }
+
+    #[test]
+    fn unwritable_ledger_claims_nothing() {
+        with_temp_home(|| {
+            std::fs::create_dir_all(ledger_path()).unwrap(); // rename onto a dir fails
+            assert!(claim_fresh("k", vec!["a".into()], 1).is_none());
+            assert!(!first_time("claude", "s1", "stop"));
         });
     }
 
@@ -343,7 +412,8 @@ mod tests {
             }
             let mut seen = std::collections::HashSet::new();
             for _ in 0..3 {
-                if let Some(b) = recall_for(Event::PreEdit, "s1", "widget", "src/widget") {
+                if let Some(b) = recall_for(Event::PreEdit, "claude", "s1", "widget", "src/widget")
+                {
                     for l in b.lines().filter(|l| l.starts_with("- [obs#")) {
                         assert!(seen.insert(l.to_string()), "repeated: {l}");
                     }
@@ -352,9 +422,9 @@ mod tests {
             assert_eq!(seen.len(), 5);
             // Corrupt ledger: load() falls back to empty; never panics/errs.
             std::fs::write(ledger_path(), "{not json").unwrap();
-            let _ = recall_for(Event::PreEdit, "s2", "widget", "src/widget");
+            let _ = recall_for(Event::PreEdit, "claude", "s2", "widget", "src/widget");
             // Unusable DB path: silent.
-            assert!(recall_for(Event::TestFailed, "", "", "error x").is_none());
+            assert!(recall_for(Event::TestFailed, "claude", "", "", "error x").is_none());
         });
     }
 }

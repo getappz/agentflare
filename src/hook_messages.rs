@@ -353,8 +353,13 @@ pub fn stop(agent: &str) {
     // One reminder per session to record durable learnings; the ledger gate
     // also keeps the resulting continuation turn from looping on Stop.
     if let Some(sid) = parse_session(&input).session_id
-        && crate::memory_nudge::first_time(&sid, "stop")
+        && crate::memory_nudge::first_time(agent, &sid, "stop")
     {
+        // The block continues the turn, but `sync` above already marked the
+        // session idle for an empty Stop: put it back to busy.
+        if let Some(conn) = messages::open_fast() {
+            let _ = crate::sessions::set_busy(&conn, &identity::hook_key(agent, &sid), true, now());
+        }
         let out = if agent == "cursor" {
             json!({ "followup_message": crate::memory_nudge::STOP_INSTRUCTION })
         } else {

@@ -3,8 +3,7 @@
 // Codex, the plugin manifest) wired into the target agent's hook config.
 // No install/consent logic lives here: `init` is the explicit, one-shot
 // consent; these just reinforce rules and report drift each session/turn.
-use crate::components::get_components;
-use crate::state;
+use crate::{components::get_components, memory_nudge, state};
 use serde_json::json;
 use std::io::Read;
 use std::time::Duration;
@@ -19,7 +18,6 @@ const SESSION_START_STDIN_TIMEOUT_MS: u64 = 300;
 const BRAND: &str = "\x1b[1;35m";
 const HEADING: &str = "\x1b[2;36m";
 const RESET: &str = "\x1b[0m";
-use crate::memory_nudge::{pre_edit_nudge, with_failure_recall};
 
 fn colorize(code: &str, s: &str) -> String {
     if std::env::var_os("NO_COLOR").is_some() {
@@ -362,7 +360,7 @@ pub fn post_tool_failure(agent: &str) {
         &parsed.failure_text,
         parsed.is_interrupt,
     );
-    if let Some(out) = with_failure_recall(agent, &input, &parsed.failure_text, out) {
+    if let Some(out) = memory_nudge::with_failure_recall(agent, &input, &parsed.failure_text, out) {
         println!("{out}");
     }
 }
@@ -601,7 +599,8 @@ pub fn pre_tool_use(agent: &str) {
     }
 
     nudges.extend(crate::coaching::rule_bodies_for_tool(&parsed.tool_name));
-    nudges.extend(pre_edit_nudge(
+    nudges.extend(memory_nudge::pre_edit_nudge(
+        agent,
         &parsed.tool_name,
         parsed.tool_input.as_ref(),
         &parsed.session_id,
