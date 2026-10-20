@@ -993,7 +993,7 @@ fn sweep_replies_without_resolving_for_a_not_valid_result() {
             .unwrap()
             .starts_with("Not changing this: the slice is never empty")
     );
-    assert!(state.blocks_merge(), "still open until the bot accepts");
+    assert!(!state.blocks_merge(), "a not_valid result leaves nothing to fix");
 }
 
 #[test]
@@ -1350,15 +1350,15 @@ fn merge_gate_ignores_optional_threads_and_accepted_replies_only() {
         "an optional finding alone neither starts a repair nor holds the merge"
     );
     let findings = classify_threads(&[nit, accepted, pending], &cfg, &meta);
-    let blocking: Vec<_> = findings
-        .iter()
-        .filter(|f| f.blocks_merge())
-        .map(|f| f.thread_id.as_str())
-        .collect();
-    assert_eq!(
-        blocking,
-        vec!["PRRT_pending"],
-        "unacknowledged reply still holds it"
+    assert!(
+        findings.iter().all(|f| !f.blocks_merge()),
+        "an out-of-scope reply awaiting the bot leaves nothing to fix"
+    );
+    let unrecorded = thread("PRRT_new", false, vec![comment(7, BOT, MAJOR_BODY, "t1")]);
+    let findings = classify_threads(&[unrecorded], &cfg, &meta);
+    assert!(
+        findings[0].blocks_merge(),
+        "a thread with no recorded result still blocks"
     );
     let state = ReviewBotState {
         blocking: 1,

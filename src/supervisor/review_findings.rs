@@ -531,9 +531,17 @@ impl BotFinding {
     }
 
     /// Whether this thread must hold the merge: unresolved, not optional,
-    /// and not an out-of-scope/not-valid reply the bot accepted.
+    /// and not an out-of-scope/not-valid reply (accepted by the bot, or
+    /// awaiting its word: there is nothing left for an agent to fix).
     pub fn blocks_merge(&self) -> bool {
-        !self.optional() && self.status != ThreadStatus::Accepted
+        !self.optional()
+            && !matches!(
+                self.status,
+                ThreadStatus::Accepted
+                    | ThreadStatus::Waiting {
+                        outcome: ReviewOutcome::NotValid | ReviewOutcome::OutOfScope
+                    }
+            )
     }
 
     /// One-line summary for the item's dispatch comment.
