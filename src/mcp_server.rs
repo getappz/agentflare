@@ -26,6 +26,7 @@ mod project_resolution;
 mod resume;
 mod review;
 pub(crate) mod search;
+mod search_fuse;
 pub(crate) mod secret_scan;
 mod skill;
 pub(crate) mod types;
@@ -1480,10 +1481,13 @@ impl AgentflareMcp {
         }
     } // --- Memory tools ---
     #[tool(
-        description = "Memory operations — compact, context, curate, handoff, recall, relate, or remember observations. Single consolidated tool with `action` field (compact|context|curate|handoff|recall|relate|remember)."
+        description = "Memory operations — compact, context, curate, handoff, promote, recall, relate, or remember observations. Single consolidated tool with `action` field (compact|context|curate|handoff|promote|recall|relate|remember). Promote requires project observations, explicit confidence and a stored terminal workflow run from the same project."
     )]
-    fn memory(&self, Parameters(req): Parameters<MemoryRequest>) -> Result<String, ErrorData> {
-        self.memory_impl(req)
+    async fn memory(
+        &self,
+        Parameters(req): Parameters<MemoryRequest>,
+    ) -> Result<String, ErrorData> {
+        self.memory_impl(req).await
     }
 
     // --- docs tool ---
@@ -1907,7 +1911,7 @@ impl AgentflareMcp {
     }
 
     #[tool(
-        description = "Workflow operations — durable agent pipelines. Single consolidated tool with `action` field: run (start a workflow from an inline `definition` JSON string OR a project-local `workflow_name`, resolved from <repo_root>/.agentflare/workflows/<name>.json), status (run state + per-step results + journal tail), complete_event (resolve a human-in-the-loop WaitEvent), cancel (stop a running/waiting workflow; already-succeeded steps are left uncompensated), list (run summaries), list_definitions (names of this project's .agentflare/workflows/*.json files)."
+        description = "Workflow operations — durable agent pipelines. Single consolidated tool with `action` field: run (start a workflow from an inline `definition` JSON string OR a project-local `workflow_name`, resolved from <repo_root>/.agentflare/workflows/<name>.json), status (run state + per-step results + journal tail), report (read-only journal failures, attempts and linked session evidence; unknown acceptance and missing usage remain explicit), complete_event (resolve a human-in-the-loop WaitEvent), cancel (stop a running/waiting workflow; already-succeeded steps are left uncompensated), list (run summaries), list_definitions (names of this project's .agentflare/workflows/*.json files)."
     )]
     async fn workflow(
         &self,

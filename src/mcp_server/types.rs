@@ -453,7 +453,9 @@ pub(crate) struct VentFileRequest {
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct MemoryRequest {
-    #[schemars(description = "Action: compact|context|curate|handoff|recall|relate|remember")]
+    #[schemars(
+        description = "Action: compact|context|curate|handoff|promote|recall|relate|remember"
+    )]
     pub(crate) action: String,
     #[schemars(description = "Title of the observation (remember)")]
     #[serde(default)]
@@ -528,7 +530,15 @@ pub(crate) struct MemoryRequest {
     #[schemars(description = "Reason for the relation (relate)")]
     #[serde(default)]
     pub(crate) reason: Option<String>,
-    #[schemars(description = "Confidence score 0.0..1.0 (relate)")]
+    #[schemars(description = "Supporting observation IDs, at least one (promote)")]
+    #[serde(default)]
+    pub(crate) evidence_ids: Option<Vec<i64>>,
+    #[schemars(
+        description = "Stored terminal workflow run UUID backing this promotion; must belong to the requested project (promote)"
+    )]
+    #[serde(default)]
+    pub(crate) run_id: Option<String>,
+    #[schemars(description = "Confidence score 0.0..1.0 (relate; required for promote)")]
     #[serde(default)]
     pub(crate) confidence: Option<f64>,
     #[schemars(description = "Pin status (curate pin/unpin actions)")]
@@ -1425,7 +1435,7 @@ pub(crate) struct SearchRequest {
     #[schemars(description = "Search query")]
     pub(crate) query: String,
     #[schemars(
-        description = "Search type: 'store' (default, FTS across store docs), 'memory' (brain.db observations), 'code' (leanctx ctx_search), 'web' (rivalsearch internet), 'social' (9 platforms), 'news' (5 sources), 'github' (repos), 'academic' (papers), 'datasets' (hubs), 'websites' (crawl), 'weather' (Open-Meteo), 'financial' (SEC), 'crypto' (CoinGecko), 'fx' (ECB rates), 'indicators' (World Bank), 'youtube' (transcripts), 'bluesky' (profiles)"
+        description = "Search type: 'store' (default, FTS across store docs), 'memory' (brain.db observations), 'code' (leanctx ctx_search), 'web' (rivalsearch internet), 'social' (9 platforms), 'news' (5 sources), 'github' (repos), 'academic' (papers), 'datasets' (hubs), 'websites' (crawl), 'weather' (Open-Meteo), 'financial' (SEC), 'crypto' (CoinGecko), 'fx' (ECB rates), 'indicators' (World Bank), 'youtube' (transcripts), 'bluesky' (profiles), 'all' (fan out to store+memory+code, fused by RRF k=60 into one ranked hit list), 'all+web' (all plus the web arm)"
     )]
     #[serde(default)]
     pub(crate) r#type: Option<String>,
@@ -1454,12 +1464,17 @@ pub(crate) struct SearchRequest {
     )]
     #[serde(default)]
     pub(crate) rerank: Option<bool>,
+    #[schemars(
+        description = "type=all/all+web only: token budget. Returns a context pack — hits greedily selected by fused score until the estimated tokens (~4 chars/token) fill the budget, each with a citation {kind, ref}. Absent = unpacked hits."
+    )]
+    #[serde(default)]
+    pub(crate) budget: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct WorkflowRequest {
     #[schemars(
-        description = "Action: run|status|complete_event|cancel|list|list_definitions|metrics|schedule_create|schedule_list|schedule_show|schedule_update|schedule_enable|schedule_disable|schedule_remove|schedule_fire|schedule_runs"
+        description = "Action: run|status|report|complete_event|cancel|list|list_definitions|metrics|schedule_create|schedule_list|schedule_show|schedule_update|schedule_enable|schedule_disable|schedule_remove|schedule_fire|schedule_runs"
     )]
     pub(crate) action: String,
     #[schemars(
@@ -1480,7 +1495,7 @@ pub(crate) struct WorkflowRequest {
     )]
     #[serde(default)]
     pub(crate) params: Option<String>,
-    #[schemars(description = "Run UUID (status, complete_event, cancel)")]
+    #[schemars(description = "Run UUID (status, report, complete_event, cancel)")]
     #[serde(default)]
     pub(crate) run_id: Option<String>,
     #[schemars(description = "WaitEvent name to resolve (complete_event)")]

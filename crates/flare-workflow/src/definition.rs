@@ -26,6 +26,8 @@ pub type StepCondition<D> = Arc<dyn Fn(&WorkflowContext<D>) -> bool + Send + Syn
 /// Errors that can occur during workflow validation.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ValidationError {
+    #[error("invalid workflow budget: {0}")]
+    InvalidBudget(String),
     /// A step depends on another step that doesn't exist.
     #[error("step '{step}' depends on non-existent step '{dependency}'")]
     MissingDependency { step: StepId, dependency: StepId },
@@ -241,6 +243,7 @@ pub struct WorkflowDefinition<D: WorkflowData> {
     pub default_timeout: Duration,
     /// Stable execution configuration/revision required for compatible replay.
     pub resume_identity: Option<String>,
+    pub budget: Option<crate::budget::BudgetLimits>,
     /// Pre-computed reverse dependencies: step_id -> indices of steps that depend on it.
     reverse_deps: HashMap<StepId, Vec<usize>>,
     /// Pre-computed indices of steps with no dependencies (can start immediately).
@@ -256,6 +259,7 @@ impl<D: WorkflowData> Clone for WorkflowDefinition<D> {
             default_retry_policy: self.default_retry_policy.clone(),
             default_timeout: self.default_timeout,
             resume_identity: self.resume_identity.clone(),
+            budget: self.budget.clone(),
             reverse_deps: self.reverse_deps.clone(),
             initial_step_indices: self.initial_step_indices.clone(),
         }
@@ -283,6 +287,7 @@ impl<D: WorkflowData> WorkflowDefinition<D> {
             default_retry_policy: RetryPolicy::default(),
             default_timeout: Duration::from_secs(300),
             resume_identity: None,
+            budget: None,
             reverse_deps: HashMap::new(),
             initial_step_indices: Vec::new(),
         }
@@ -299,6 +304,23 @@ impl<D: WorkflowData> WorkflowDefinition<D> {
     pub fn with_resume_identity(mut self, identity: impl Into<String>) -> Self {
         self.resume_identity = Some(identity.into());
         self
+    }
+
+    pub fn with_budget(mut self, limits: crate::budget::BudgetLimits) -> Self {
+        self.budget = Some(limits);
+        self
+    }
+
+    /// Budget-aware identities also prevent older executors from ignoring a new budget.
+    pub fn run_identity(&self, data: &D) -> crate::WorkflowResult<Option<String>> {
+        match self.budget.clone().or_else(|| data.budget_limits()) {
+            Some(limits) => {
+                serde_json::to_string(&("workflow-budget-v1", &self.resume_identity, limits))
+                    .map(Some)
+                    .map_err(|e| crate::WorkflowError::Store(format!("budget identity: {e}")))
+            }
+            None => Ok(self.resume_identity.clone()),
+        }
     }
 
     pub fn with_default_retry(mut self, policy: RetryPolicy) -> Self {
@@ -329,6 +351,11 @@ impl<D: WorkflowData> WorkflowDefinition<D> {
     /// reverse dependencies and initial (dependency-free) step indices.
     #[must_use = "validation result should be checked"]
     pub fn validate(&mut self) -> Result<(), ValidationError> {
+        if let Some(budget) = &self.budget {
+            budget
+                .validate()
+                .map_err(|e| ValidationError::InvalidBudget(e.to_string()))?;
+        }
         let steps_map: HashMap<&StepId, &StepDefinition<D>> =
             self.steps.iter().map(|s| (&s.id, s)).collect();
 

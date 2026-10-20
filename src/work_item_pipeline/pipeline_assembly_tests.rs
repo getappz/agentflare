@@ -1,6 +1,173 @@
 use super::*;
 
 #[test]
+fn budget_is_shared_by_the_role_and_judge_and_by_stale_session_fallback() {
+    use flare_workflow::budget::{BudgetLimits, BudgetOperation};
+    use flare_workflow::{
+        StateStore, WorkflowDefinition, WorkflowEngine, WorkflowId, WorkflowStatus,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    crate::paths::test_support::with_temp_home(|| {
+        for stale in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let count = calls.clone();
+            let send: flare_workflow::SendMessage = Arc::new(move |_| {
+                count.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    if stale {
+                        Err("No conversation found with session ID stale".into())
+                    } else {
+                        Ok(("reviewed".into(), 0, 0))
+                    }
+                })
+            });
+            let store = flare_workflow::SqliteStore::<WorkItemData>::open_memory().unwrap();
+            let engine = WorkflowEngine::with_store(store.clone());
+            let mut data = super::sdd_test_support::one_task_data();
+            data.review_only = true;
+            data.workflow_budget = Some(BudgetLimits {
+                max_invocations: Some(1),
+                ..Default::default()
+            });
+            if stale {
+                data.agent_name = "claude-code".into();
+                data.agent_sessions
+                    .insert("claude-code".into(), "stale".into());
+            }
+            let definition = WorkflowDefinition::new("budget-test", "budget-test")
+                .add_step(build_sdd_loop_step(send));
+            engine.register_workflow(definition).unwrap();
+            crate::workflow::blocking_runtime().block_on(async {
+                let run = engine
+                    .start_workflow(WorkflowId::new("budget-test"), data, String::new())
+                    .await
+                    .unwrap();
+                assert!(
+                    engine
+                        .wait_for_completion(run, "test", std::time::Duration::from_secs(5))
+                        .await
+                        .is_err()
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                let state = store.load(run).await.unwrap();
+                assert_eq!(state.status, WorkflowStatus::Failed);
+                assert!(
+                    state
+                        .error
+                        .unwrap()
+                        .contains("invocation allowance exhausted")
+                );
+                assert_eq!(
+                    store
+                        .budget_operation(run, BudgetOperation::Snapshot)
+                        .await
+                        .unwrap()
+                        .state
+                        .summary()["invocation_reservations"],
+                    1
+                );
+            });
+        }
+    });
+}
+
+#[test]
+fn budget_policy_changes_are_rejected_before_native_redispatch() {
+    use flare_workflow::budget::{BudgetLimits, BudgetState};
+    use flare_workflow::{StateStore, WorkflowId, WorkflowState, WorkflowStatus};
+    crate::paths::test_support::with_temp_home(|| {
+        let (mcp, _backend, _repo, item_id, _, path) =
+            crate::mcp_server::tests::mcp_with_claimed_item("Budget resume policy fixture");
+        let mcp = std::sync::Arc::new(mcp);
+        let item = mcp
+            .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).ok())
+            .unwrap()
+            .unwrap();
+        let one = BudgetLimits {
+            max_invocations: Some(1),
+            ..Default::default()
+        };
+        let two = BudgetLimits {
+            max_invocations: Some(2),
+            ..Default::default()
+        };
+        for (old, requested, status, expected) in [
+            (
+                None,
+                Some(one.clone()),
+                Some(WorkflowStatus::Paused),
+                "requested policy differs",
+            ),
+            (
+                Some(two),
+                Some(one.clone()),
+                Some(WorkflowStatus::Paused),
+                "requested policy differs",
+            ),
+            (
+                Some(one.clone()),
+                None,
+                Some(WorkflowStatus::Paused),
+                "requested policy differs",
+            ),
+            (
+                Some(one.clone()),
+                Some(one.clone()),
+                Some(WorkflowStatus::Failed),
+                "persisted budgeted run is terminal",
+            ),
+            (
+                Some(one.clone()),
+                Some(one.clone()),
+                Some(WorkflowStatus::Cancelled),
+                "persisted budgeted run is terminal",
+            ),
+            (
+                Some(one.clone()),
+                Some(one.clone()),
+                None,
+                "persisted run is unavailable",
+            ),
+        ] {
+            let run = flare_workflow::WorkflowRunId::new();
+            let mut data = super::sdd_test_support::one_task_data();
+            data.item_id = item_id.clone();
+            data.workflow_budget = old.clone();
+            let mut state = WorkflowState::new(run, WorkflowId::new(WORKFLOW_ID), data);
+            state.status = status.unwrap_or(WorkflowStatus::Paused);
+            state.budget = old.map(|limits| BudgetState::new(limits, chrono::Utc::now()).unwrap());
+            if status.is_some() {
+                crate::workflow::blocking_runtime()
+                    .block_on(engine().state_store().save(state))
+                    .unwrap();
+            }
+            let mut item = item.clone();
+            item.metadata =
+                serde_json::json!({"workflow_run_id":run.to_string(),"workflow_budget":requested})
+                    .to_string();
+            let send: flare_workflow::SendMessage = std::sync::Arc::new(|_| {
+                Box::pin(async { panic!("changed budget must not dispatch") })
+            });
+            let result = run_or_resume_with_sender(
+                mcp.clone(),
+                &item,
+                &path,
+                agent_registry::Agent::ClaudeCode,
+                agent_registry::Agent::ClaudeCode,
+                "inspect".into(),
+                None,
+                None,
+                send,
+            );
+            assert!(result.unwrap_err().contains(expected));
+        }
+    });
+}
+
+#[test]
 fn recovered_cursor_launch_restores_autonomy_and_streaming() {
     let role_args = vec!["--resume".to_string(), "session-379".to_string()];
     let args = work_item_launch_args("cursor", &[], &role_args);
@@ -81,7 +248,7 @@ async fn sdd_loop_resumes_the_implementer_session_on_the_next_fix_round() {
         r#"{"action":"continue_task","rationale":"reviewing","ledger_line":"Task 0: review issues found","task_model_tier":null}"#,
         // Iteration 3: implementer (claude-code) fixes it -- this call
         // must resume iteration 1's session.
-        "did the fix",
+        "did the fix\u{0}AGENTFLARE_SESSION:sess-2",
         r#"{"action":"advance_task","rationale":"fixed","ledger_line":"Task 0: fixed","task_model_tier":null}"#,
     ]);
     let pipeline =
@@ -100,9 +267,13 @@ async fn sdd_loop_resumes_the_implementer_session_on_the_next_fix_round() {
 
     assert_eq!(
         ctx.data.agent_sessions.get("claude-code"),
-        Some(&"sess-1".to_string())
+        Some(&"sess-2".to_string())
     );
-    assert_eq!(ctx.data.session_id.as_deref(), Some("sess-1"));
+    assert_eq!(ctx.data.session_id.as_deref(), Some("sess-2"));
+    assert_eq!(
+        ctx.data.session_ids,
+        ["sess-1".to_string(), "sess-2".to_string()].into()
+    );
 
     let recorded = calls.lock().unwrap();
     let (agent, _prompt, args) = recorded[4].clone();

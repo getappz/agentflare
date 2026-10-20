@@ -29,6 +29,17 @@ pub(super) fn ci_green_stale_stage_label(
         .find(|l| labels.iter().any(|have| have == l))
 }
 
+/// A needs-human label that a CodeRabbit repair cap or a review-stall
+/// escalation put on the PR must survive `handle_ci_green`'s stage revert.
+pub(super) fn keeps_needs_human_label(
+    mcp: &AgentflareMcp,
+    item: &agentflare_backend::item::Item,
+    labels: &[String],
+) -> bool {
+    labels.iter().any(|l| l == NEEDS_HUMAN_PR_LABEL)
+        && (coderabbit_repair_capped_unresolved(mcp, item) || review_stall_notified(mcp, item))
+}
+
 /// Whether a CI-green PR may be merged this tick, and at which head. Both
 /// arms carry the head the green verdict was made on and the PR's
 /// auto-merge handle (`worktree::AutoMergeRef`): once approved, either arm
@@ -109,8 +120,7 @@ pub(super) fn handle_ci_green(
     // when there's actually something to revert.
     // The cap only matters to a PR carrying `NEEDS_HUMAN_PR_LABEL`: skip its
     // item/comment lookups on every other green PR.
-    let coderabbit_capped = labels.iter().any(|l| l == NEEDS_HUMAN_PR_LABEL)
-        && coderabbit_repair_capped_unresolved(mcp, item);
+    let coderabbit_capped = keeps_needs_human_label(mcp, item, labels);
     if let Some(stale) = ci_green_stale_stage_label(labels, coderabbit_capped) {
         update_pr_stage(
             folder_path,
@@ -488,7 +498,7 @@ pub(super) fn merge_or_repair_findings(
         );
     }
     if review.dispatch_needed() {
-        return PassingPrOutcome::Repair(coderabbit_repair_or_gate(
+        let outcome = coderabbit_repair_or_gate(
             mcp,
             queue,
             auth_conn,
@@ -499,11 +509,35 @@ pub(super) fn merge_or_repair_findings(
             labels,
             label_id_by_name,
             folder_path,
-        ));
+        );
+        // Only a plain `Skipped` is a lost repair; `Deferred` (cooldown, host
+        // pressure, live claim, foreign worktree) is transient and self-clears.
+        // And only when nothing else holds the PR: an unknown review state or a
+        // fix still waiting on its push is not a lost repair.
+        let held = matches!(outcome, SelfRepairOutcome::Skipped)
+            && !review.unknown
+            && review.waiting_push == 0;
+        let transient = matches!(outcome, SelfRepairOutcome::Deferred);
+        note_review_stall(
+            mcp,
+            queue,
+            item,
+            number,
+            labels,
+            folder_path,
+            held,
+            transient,
+        );
+        return PassingPrOutcome::Repair(outcome);
     }
     if review.blocks_merge() {
+        // Threads escalated past `max_rounds` hold the merge with no job ever
+        // coming; threads merely waiting on the bot or a push are not stalls.
+        let held = !review.unknown && review.escalated > 0;
+        note_review_stall(mcp, queue, item, number, labels, folder_path, held, false);
         return PassingPrOutcome::NotMerged;
     }
+    note_review_stall(mcp, queue, item, number, labels, folder_path, false, false);
     let summary = maybe_post_repair_complete_summary(
         mcp,
         item,

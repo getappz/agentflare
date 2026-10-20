@@ -74,7 +74,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
     /// uncompensated — use [`cancel_workflow_with_rollback`](Self::cancel_workflow_with_rollback)
     /// to run their saga rollback handlers first.
     pub async fn cancel_workflow(&self, run_id: WorkflowRunId) -> WorkflowResult<()> {
-        self.cancel_workflow_impl(run_id, false).await
+        self.cancel_workflow_impl(run_id, false, None).await
     }
 
     /// Cancel a running workflow, first running the saga rollback phase for
@@ -84,13 +84,14 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
     /// `None` to [`run_rollback_phase`](Self::run_rollback_phase) since
     /// cancellation isn't triggered by any particular step.
     pub async fn cancel_workflow_with_rollback(&self, run_id: WorkflowRunId) -> WorkflowResult<()> {
-        self.cancel_workflow_impl(run_id, true).await
+        self.cancel_workflow_impl(run_id, true, None).await
     }
 
     pub(super) async fn cancel_workflow_impl(
         &self,
         run_id: WorkflowRunId,
         rollback: bool,
+        reason: Option<String>,
     ) -> WorkflowResult<()> {
         if rollback {
             let state = self.state_store.load(run_id).await?;
@@ -114,6 +115,9 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             .update(run_id, |s| {
                 if !s.status.is_terminal() {
                     s.status = WorkflowStatus::Cancelled;
+                    if let Some(reason) = &reason {
+                        s.error = Some(reason.clone());
+                    }
                     cancelled = true;
                 }
             })

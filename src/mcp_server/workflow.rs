@@ -51,13 +51,16 @@ impl AgentflareMcp {
                 }))
                 .unwrap_or_default())
             }
-            "status" => {
+            "status" | "report" => {
                 let run_id = req
                     .run_id
                     .ok_or_else(|| ErrorData::invalid_params("run_id is required", None))?;
-                let status = crate::workflow::workflow_status_async(&run_id, &db_path)
-                    .await
-                    .map_err(|e| ErrorData::invalid_params(e, None))?;
+                let status = if req.action == "report" {
+                    crate::workflow::workflow_report_async(&run_id, &db_path).await
+                } else {
+                    crate::workflow::workflow_status_async(&run_id, &db_path).await
+                }
+                .map_err(|e| ErrorData::invalid_params(e, None))?;
                 Ok(serde_json::to_string_pretty(&status).unwrap_or_default())
             }
             "complete_event" => {
@@ -316,6 +319,31 @@ mod tests {
         r.definition = Some("{bad json".into());
         let err = mcp().workflow(Parameters(r)).await.unwrap_err();
         assert!(format!("{err}").contains("invalid workflow JSON"));
+    }
+
+    #[tokio::test]
+    async fn report_requires_run_id_and_reads_existing_workflow_evidence() {
+        use flare_workflow::StateStore;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("workflow.db");
+        assert!(mcp().workflow_impl(req("report", &db)).await.is_err());
+        let store = flare_workflow::sqlite_store::SqliteStore::open_file(&db).unwrap();
+        let run = flare_workflow::WorkflowRunId::new();
+        store
+            .save(flare_workflow::WorkflowState::new(
+                run,
+                flare_workflow::WorkflowId::new("fixture"),
+                flare_workflow::json::PipelineData,
+            ))
+            .await
+            .unwrap();
+        let mut request = req("report", &db);
+        request.run_id = Some(run.to_string());
+        let report: serde_json::Value =
+            serde_json::from_str(&mcp().workflow_impl(request).await.unwrap()).unwrap();
+        assert_eq!(report["schema_version"], 1);
+        assert_eq!(report["run"]["run_id"], run.to_string());
+        assert_eq!(report["acceptance"]["status"], "unknown");
     }
 
     #[tokio::test]

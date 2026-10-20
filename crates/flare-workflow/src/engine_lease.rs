@@ -33,18 +33,18 @@ pub(super) fn process_executor_id() -> Arc<str> {
 
 /// Whether a process with `pid` currently exists on this host.
 pub(super) fn pid_exists(pid: u32) -> bool {
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
-        std::path::Path::new(&format!("/proc/{pid}")).exists()
-    }
-    #[cfg(all(unix, not(target_os = "linux")))]
-    {
-        flare_process::command("kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return true;
+        };
+        if pid <= 0 {
+            return true;
+        }
+        // SAFETY: signal zero probes a positive PID without sending a signal.
+        let result = unsafe { libc::kill(pid, 0) };
+        // Permission denial and unknown errors cannot prove the holder is dead.
+        result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
     #[cfg(windows)]
     {
@@ -216,7 +216,9 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             let _driving = driving;
             let renewer =
                 AbortOnDrop(engine.spawn(engine.clone_for_execution().renew_lease_loop(run_id)));
-            let result = engine.execute_workflow(run_id, definition).await;
+            let result = engine
+                .execute_with_budget_deadline(run_id, definition)
+                .await;
             drop(renewer);
             engine.release_lease(run_id).await;
             if let Err(e) = result {
@@ -357,7 +359,14 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             tracing::info!(run_id = %run_id, holder = ?state.lease.as_ref().map(|l| &l.owner), "Run is held by another live executor; not resuming it here");
             return Ok(false);
         }
-        if state.resume_identity != definition.resume_identity {
+        let expected_identity = definition.run_identity(&state.context.data)?;
+        if state.resume_identity != expected_identity
+            || state.budget.as_ref().map(|budget| budget.limits.clone())
+                != definition
+                    .budget
+                    .clone()
+                    .or_else(|| state.context.data.budget_limits())
+        {
             return Err(WorkflowError::ResumeIdentityMismatch(run_id));
         }
         let Some(driving) = self.claim_driving(run_id) else {
@@ -381,7 +390,13 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                     taken = false;
                     return;
                 }
-                if s.resume_identity != definition.resume_identity {
+                if s.resume_identity != expected_identity
+                    || s.budget.as_ref().map(|budget| budget.limits.clone())
+                        != definition
+                            .budget
+                            .clone()
+                            .or_else(|| s.context.data.budget_limits())
+                {
                     incompatible = true;
                     return;
                 }

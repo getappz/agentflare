@@ -24,9 +24,40 @@ pub struct RememberInput {
     pub scope: Option<String>,
 }
 
+/// Best-effort semantic index of one observation; failure never fails the write.
+/// `updated` rows may hold a vector for stale content, so it is dropped when it
+/// can't be refreshed (`missing` re-surfaces it for backfill).
+pub(super) fn index_embedding(
+    conn: &rusqlite::Connection,
+    id: i64,
+    title: &str,
+    content: &str,
+    updated: bool,
+) {
+    let text = format!("{title}\n{content}");
+    match super::engine::embed_doc(&text) {
+        Some(vec) => {
+            let model = super::engine::model_name().unwrap_or_default();
+            if let Err(e) = super::embeddings::upsert(conn, id, &vec, &model) {
+                eprintln!("[memory] embedding upsert failed for obs {id}: {e}");
+                let _ = super::embeddings::delete(conn, id);
+            }
+        }
+        None if updated => {
+            let _ = super::embeddings::delete(conn, id);
+        }
+        None => {}
+    }
+}
+
 pub fn handle_remember(input: RememberInput) -> Result<String, String> {
     if input.title.trim().is_empty() || input.content.trim().is_empty() {
         return Err("title and content are required".into());
+    }
+    if input.r#type.eq_ignore_ascii_case(LESSON_TYPE) {
+        return Err(
+            "type 'lesson' is reserved: use action=promote with evidence_ids and confidence".into(),
+        );
     }
     let conn = open_db()?;
     let outcome = observations::save(
@@ -54,25 +85,7 @@ pub fn handle_remember(input: RememberInput) -> Result<String, String> {
     // Best-effort semantic index; failure must never fail the remember.
     // Duplicates keep their existing vector — content is unchanged by definition.
     if status != "duplicate" {
-        let text = format!("{}\n{}", input.title, input.content);
-        match super::engine::embed_doc(&text) {
-            Some(vec) => {
-                let model = super::engine::model_name().unwrap_or_default();
-                if let Err(e) = super::embeddings::upsert(&conn, id, &vec, &model) {
-                    eprintln!("[memory] embedding upsert failed for obs {id}: {e}");
-                    // Refresh failed — drop any stale vector so recall never ranks
-                    // on outdated content; `missing` re-surfaces it for backfill.
-                    let _ = super::embeddings::delete(&conn, id);
-                }
-            }
-            // No embedder available. A prior vector (from when a model was present)
-            // would now point at stale content on an update — remove it. Created
-            // rows have no vector yet, so this is a no-op for them.
-            None if status == "updated" => {
-                let _ = super::embeddings::delete(&conn, id);
-            }
-            None => {}
-        }
+        index_embedding(&conn, id, &input.title, &input.content, status == "updated");
     }
     Ok(json!({"status": status, "id": id}).to_string())
 }
@@ -211,7 +224,10 @@ pub fn handle_recall(input: RecallInput) -> Result<String, String> {
 
 /// Core of `handle_recall`, taking an explicit connection so tests can run
 /// against an isolated in-memory database instead of the real brain.db.
-fn recall_with_conn(conn: &rusqlite::Connection, input: RecallInput) -> Result<String, String> {
+pub(super) fn recall_with_conn(
+    conn: &rusqlite::Connection,
+    input: RecallInput,
+) -> Result<String, String> {
     recall_with_fetch(conn, input, &|conn, q, project, r#type, limit| {
         search::search_hybrid(conn, q, project, r#type, limit, super::engine::embed_query)
     })
@@ -234,7 +250,19 @@ fn recall_with_fetch(
 ) -> Result<String, String> {
     if let Some(id) = input.id {
         let obs = observations::get(conn, id).map_err(|e| format!("lookup failed: {e}"))?;
-        return Ok(json!(obs).to_string());
+        let obs = obs.filter(|o| {
+            input.project.as_deref().is_none_or(|p| {
+                o.project
+                    .as_deref()
+                    .is_some_and(|op| op.eq_ignore_ascii_case(p.trim()))
+            })
+        });
+        return obs
+            .as_ref()
+            .map(|o| observation_view(conn, o))
+            .transpose()
+            .map(|value| json!(value).to_string())
+            .map_err(|e| e.to_string());
     }
     let limit = input.limit.unwrap_or(10).min(50);
     if let Some(ref q) = input.query.filter(|q| !q.trim().is_empty()) {
@@ -256,7 +284,7 @@ fn recall_with_fetch(
         // (FTS/vector merge paths can overlap).
         let mut seen = HashSet::new();
         results.retain(|o| seen.insert(o.id));
-        let response = json!(results).to_string();
+        let response = observations_view(conn, &results)?.to_string();
         if !results.is_empty()
             && let Ok(mut cache) = recall_cache().lock()
         {
@@ -275,7 +303,26 @@ fn recall_with_fetch(
         limit,
     )
     .map_err(|e| format!("list failed: {e}"))?;
-    Ok(json!(results).to_string())
+    Ok(observations_view(conn, &results)?.to_string())
+}
+
+pub(crate) fn observation_view(
+    conn: &rusqlite::Connection,
+    obs: &Observation,
+) -> rusqlite::Result<serde_json::Value> {
+    super::promotion::observation_view(conn, obs)
+}
+
+fn observations_view(
+    conn: &rusqlite::Connection,
+    observations: &[Observation],
+) -> Result<serde_json::Value, String> {
+    observations
+        .iter()
+        .map(|o| observation_view(conn, o))
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map(|values| json!(values))
+        .map_err(|e| format!("read promotion provenance: {e}"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -301,7 +348,7 @@ pub fn handle_context(input: ContextInput) -> Result<String, String> {
     Ok(json!({
         "session": session,
         "recent_sessions": recent_sessions,
-        "recent_observations": recent_obs,
+        "recent_observations": observations_view(&conn, &recent_obs)?,
         "recent_summaries": recent_summaries,
     })
     .to_string())
@@ -448,6 +495,19 @@ pub fn handle_relate(input: RelateInput) -> Result<String, String> {
     Ok(json!({"status": "created", "id": id}).to_string())
 }
 
+use super::promotion::LESSON_TYPE;
+pub use super::promotion::PromoteInput;
+
+pub fn handle_promote(input: PromoteInput, report: &serde_json::Value) -> Result<String, String> {
+    let conn = open_db()?;
+    let project = input.project.clone();
+    let out = super::promotion::promote_with_conn(&conn, input, report)?;
+    if let Ok(mut cache) = recall_cache().lock() {
+        cache.invalidate_project(project.as_deref());
+    }
+    Ok(out)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CompactInput {
     pub lines: String,
@@ -553,6 +613,16 @@ pub struct CurateInput {
 }
 
 pub fn handle_curate(input: CurateInput) -> Result<String, String> {
+    if input.action == "update"
+        && input
+            .r#type
+            .as_deref()
+            .is_some_and(|t| t.eq_ignore_ascii_case(LESSON_TYPE))
+    {
+        return Err(
+            "type 'lesson' is reserved: use action=promote with evidence_ids and confidence".into(),
+        );
+    }
     let conn = open_db()?;
     match input.action.as_str() {
         "update" => {

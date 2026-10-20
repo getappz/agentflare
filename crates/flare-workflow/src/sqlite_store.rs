@@ -16,12 +16,15 @@ use rusqlite_migration::{M, Migrations};
 
 use crate::journal;
 use crate::store::StateStore;
+#[path = "sqlite_budget.rs"]
+mod budget;
 #[path = "sqlite_start_once.rs"]
 mod start_once;
 use crate::types::{
     JournalEntry, MetricsFilter, StepId, StepMetrics, StepStatus, WorkflowContext, WorkflowData,
     WorkflowError, WorkflowMetrics, WorkflowResult, WorkflowRunId, WorkflowState, WorkflowStatus,
 };
+pub use budget::read_budget;
 pub(crate) use start_once::OrphanCancelOutcome;
 
 /// Error opening/creating a SQLite store.
@@ -165,6 +168,12 @@ impl<D: WorkflowData> SqliteStore<D> {
                     run_id TEXT NOT NULL UNIQUE,
                     created_at INTEGER NOT NULL
                 );",
+            ),
+            M::up(
+                "CREATE TABLE workflow_budgets (
+                run_id TEXT PRIMARY KEY REFERENCES workflow_runs(id) ON DELETE CASCADE,
+                budget_json TEXT NOT NULL
+            );",
             ),
         ])
     }
@@ -410,6 +419,13 @@ where
 
 #[async_trait]
 impl<D: WorkflowData> StateStore<D> for SqliteStore<D> {
+    async fn budget_operation(
+        &self,
+        run_id: WorkflowRunId,
+        operation: crate::budget::BudgetOperation,
+    ) -> WorkflowResult<crate::budget::BudgetUpdate> {
+        self.mutate_budget(run_id, operation).await
+    }
     async fn save(&self, state: WorkflowState<D>) -> WorkflowResult<()> {
         let conn = Arc::clone(&self.conn);
         blocking(move || {
