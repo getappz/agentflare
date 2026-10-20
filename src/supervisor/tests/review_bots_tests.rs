@@ -18,7 +18,7 @@ fn gh_repo() -> crate::github::RepoId {
     }
 }
 
-fn comment(id: u64, login: &str, body: &str, at: &str) -> ThreadComment {
+pub(super) fn comment(id: u64, login: &str, body: &str, at: &str) -> ThreadComment {
     ThreadComment {
         database_id: id,
         login: login.into(),
@@ -27,7 +27,7 @@ fn comment(id: u64, login: &str, body: &str, at: &str) -> ThreadComment {
     }
 }
 
-fn thread(id: &str, resolved: bool, comments: Vec<ThreadComment>) -> ReviewThread {
+pub(super) fn thread(id: &str, resolved: bool, comments: Vec<ThreadComment>) -> ReviewThread {
     ReviewThread {
         id: id.into(),
         is_resolved: resolved,
@@ -38,9 +38,9 @@ fn thread(id: &str, resolved: bool, comments: Vec<ThreadComment>) -> ReviewThrea
     }
 }
 
-const BOT: &str = "coderabbitai[bot]";
+pub(super) const BOT: &str = "coderabbitai[bot]";
 
-const MAJOR_BODY: &str = r#"_⚠️ Potential issue_ | _🟠 Major_
+pub(super) const MAJOR_BODY: &str = r#"_⚠️ Potential issue_ | _🟠 Major_
 
 **Empty slice panics here.**
 
@@ -66,7 +66,7 @@ In src/lib.rs around line 42, guard the indexing with items.first() and return e
 
 /// Item metadata recording that we replied on each `(thread, round)` --
 /// what makes a marker on the thread trusted (`marker_trusted`).
-fn replied_meta(rounds: &[(&str, u32)]) -> serde_json::Map<String, serde_json::Value> {
+pub(super) fn replied_meta(rounds: &[(&str, u32)]) -> serde_json::Map<String, serde_json::Value> {
     let mut meta = serde_json::Map::new();
     for (thread, round) in rounds {
         set_thread_replied(&mut meta, thread, *round);
@@ -74,7 +74,7 @@ fn replied_meta(rounds: &[(&str, u32)]) -> serde_json::Map<String, serde_json::V
     meta
 }
 
-fn our_reply(thread_id: &str, round: u32, outcome: ReviewOutcome, sha: &str) -> String {
+pub(super) fn our_reply(thread_id: &str, round: u32, outcome: ReviewOutcome, sha: &str) -> String {
     let marker = ReplyMarker {
         thread: thread_id.into(),
         round,
@@ -533,7 +533,7 @@ type MockComment<'a> = (u64, &'a str, String);
 /// `(thread id, resolved, comments)` for one mock thread.
 type MockThread<'a> = (&'a str, bool, Vec<MockComment<'a>>);
 
-fn threads_page(threads: &[MockThread<'_>]) -> String {
+pub(super) fn threads_page(threads: &[MockThread<'_>]) -> String {
     let nodes: Vec<String> = threads
         .iter()
         .map(|(id, resolved, comments)| {
@@ -561,7 +561,12 @@ fn threads_page(threads: &[MockThread<'_>]) -> String {
     )
 }
 
-fn record_result(mcp: &AgentflareMcp, item_id: &str, thread_id: &str, result: &ReviewResult) {
+pub(super) fn record_result(
+    mcp: &AgentflareMcp,
+    item_id: &str,
+    thread_id: &str,
+    result: &ReviewResult,
+) {
     mcp.with_backend_db(|conn| {
         merge_item_metadata(conn, item_id, |m| {
             set_thread_round(m, thread_id, result.round);
@@ -579,7 +584,7 @@ fn item_meta(mcp: &AgentflareMcp, item_id: &str) -> serde_json::Map<String, serd
     metadata_object(&item.metadata)
 }
 
-fn sweep(
+pub(super) fn sweep(
     server: &MockServer,
     mcp: &AgentflareMcp,
     queue: &agentflare_jobs::Queue,
