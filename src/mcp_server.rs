@@ -1252,7 +1252,7 @@ impl AgentflareMcp {
         Ok((conn, repo))
     }
     #[tool(
-        description = "Review operations — submit findings, run consensus, list/clear/record rounds, check scores; scan performs bounded advisory Jev screening of tracked diffs without submitting findings."
+        description = "Review operations — submit findings, run consensus, list/clear/record rounds, check scores; scan performs bounded advisory Jev screening of tracked diffs without submitting findings; verify records per-criterion pass|fail|uncertain verdicts with cited evidence on an item."
     )]
     async fn review(
         &self,
