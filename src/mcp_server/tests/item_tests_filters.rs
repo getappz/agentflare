@@ -706,7 +706,7 @@ fn needs_input_round_trip_with_enforce_on() {
     let s = AgentflareMcp {
         backend_db_override: Some(tmp.path().join("backend.db")),
         backend_project_link_override: Some(tmp.path().join("project.json")),
-        worktree_repo_root_override: Some(repo),
+        worktree_repo_root_override: Some(repo.clone()),
         agent: Some("claude-code".into()),
         ..Default::default()
     };
@@ -759,7 +759,45 @@ fn needs_input_round_trip_with_enforce_on() {
     )
     .unwrap();
     assert_eq!(claim["status"], "blocked", "{claim}");
+    // Worktrees are only created on `ClaimOutcome::Acquired`: none exists.
+    assert!(!repo.join(".worktrees").exists());
     set("started").unwrap();
     assert_eq!(listed("needs_input")["total"], 0);
     assert_eq!(listed("started")["total"], 1);
+}
+
+/// Enforcement off (no `[verify]` config): no `needs_input` state is
+/// provisioned, so the project's state set is unchanged.
+#[test]
+fn enforce_off_provisions_no_needs_input_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let s = AgentflareMcp {
+        backend_db_override: Some(tmp.path().join("backend.db")),
+        backend_project_link_override: Some(tmp.path().join("project.json")),
+        worktree_repo_root_override: Some(repo),
+        agent: Some("claude-code".into()),
+        ..Default::default()
+    };
+    let a: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("NI off"))).unwrap()).unwrap();
+    let id = a["id"].as_str().unwrap().to_string();
+    let err = s.item(Parameters(ItemRequest {
+        action: "update_state".into(),
+        id: Some(id.clone()),
+        state_group: Some("needs_input".into()),
+        ..Default::default()
+    }));
+    assert!(err.is_err());
+    let got: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "get".into(),
+            id: Some(id),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_ne!(got["state"]["group"], "needs_input", "{got}");
 }
