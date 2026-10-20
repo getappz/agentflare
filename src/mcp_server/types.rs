@@ -1464,6 +1464,11 @@ pub(crate) struct SearchRequest {
     )]
     #[serde(default)]
     pub(crate) rerank: Option<bool>,
+    #[schemars(
+        description = "type=all/all+web only: token budget. Returns a context pack — hits greedily selected by fused score until the estimated tokens (~4 chars/token) fill the budget, each with a citation {kind, ref}. Absent = unpacked hits."
+    )]
+    #[serde(default)]
+    pub(crate) budget: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
