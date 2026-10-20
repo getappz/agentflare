@@ -110,7 +110,7 @@ pub(super) fn handle_ci_green(
     // The cap only matters to a PR carrying `NEEDS_HUMAN_PR_LABEL`: skip its
     // item/comment lookups on every other green PR.
     let coderabbit_capped = labels.iter().any(|l| l == NEEDS_HUMAN_PR_LABEL)
-        && coderabbit_repair_capped_unresolved(mcp, item);
+        && (coderabbit_repair_capped_unresolved(mcp, item) || review_stall_notified(mcp, item));
     if let Some(stale) = ci_green_stale_stage_label(labels, coderabbit_capped) {
         update_pr_stage(
             folder_path,

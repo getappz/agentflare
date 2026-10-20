@@ -98,24 +98,37 @@ fn record_pr_stage_comment_for_test(comment: &str) {
 /// mutation, which has already happened by the time this runs -- same
 /// fail-open contract `relabel_pr_completed` and `merge_approved_pr` use for
 /// their own GitHub calls.
-fn update_pr_stage(folder_path: &str, number: u64, from: Option<&str>, to: &str, comment: &str) {
+/// Returns whether the `to` label was added (always true under test, where
+/// there is no GitHub to talk to).
+fn update_pr_stage(
+    folder_path: &str,
+    number: u64,
+    from: Option<&str>,
+    to: &str,
+    comment: &str,
+) -> bool {
     if !comment.is_empty() {
         #[cfg(test)]
         record_pr_stage_comment_for_test(comment);
     }
     let Some(repo) = crate::github::RepoId::resolve_from_remote(std::path::Path::new(folder_path))
     else {
-        return;
+        return cfg!(test);
     };
     let Ok(client) = crate::github::Client::new() else {
-        return;
+        return cfg!(test);
     };
-    if let Err(e) = crate::github::issues::add_labels(&client, &repo, number, &[to.to_string()]) {
-        eprintln!(
-            "agentflare-supervisor: could not add {to} to PR #{number}: {}",
-            e.log_safe()
-        );
-    }
+    let label_added =
+        match crate::github::issues::add_labels(&client, &repo, number, &[to.to_string()]) {
+            Ok(_) => true,
+            Err(e) => {
+                eprintln!(
+                    "agentflare-supervisor: could not add {to} to PR #{number}: {}",
+                    e.log_safe()
+                );
+                false
+            }
+        };
     if let Some(from) = from
         && let Err(e) = crate::github::issues::remove_label(&client, &repo, number, from)
     {
@@ -134,6 +147,7 @@ fn update_pr_stage(folder_path: &str, number: u64, from: Option<&str>, to: &str,
             e.log_safe()
         );
     }
+    label_added
 }
 
 /// Whether `run_review_sweep` should dispatch an agent to rebase/resolve a

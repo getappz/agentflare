@@ -883,11 +883,15 @@ pub(super) fn note_review_stall(
     if transient {
         return;
     }
-    let stalled = held
-        && !labels.iter().any(|l| l == NEEDS_HUMAN_PR_LABEL)
-        && labels.iter().any(|l| l == PR_APPROVAL_LABEL)
-        && !job_in_flight(queue, &item.id);
     let meta = current_metadata(mcp, item);
+    let needs_human = labels.iter().any(|l| l == NEEDS_HUMAN_PR_LABEL);
+    let stall_conditions =
+        held && labels.iter().any(|l| l == PR_APPROVAL_LABEL) && !job_in_flight(queue, &item.id);
+    // Already surfaced and still stalled: keep the state, don't re-notify.
+    if needs_human && stall_conditions && meta.contains_key(REVIEW_STALL_NOTIFIED_KEY) {
+        return;
+    }
+    let stalled = stall_conditions && !needs_human;
     if !stalled {
         if meta.contains_key(REVIEW_STALL_TICKS_KEY) {
             update_metadata(mcp, &item.id, |m| {
@@ -905,9 +909,6 @@ pub(super) fn note_review_stall(
     let notify = ticks >= REVIEW_STALL_TICK_LIMIT && !meta.contains_key(REVIEW_STALL_NOTIFIED_KEY);
     update_metadata(mcp, &item.id, |m| {
         m.insert(REVIEW_STALL_TICKS_KEY.into(), ticks.into());
-        if notify {
-            m.insert(REVIEW_STALL_NOTIFIED_KEY.into(), true.into());
-        }
     });
     if !notify {
         return;
@@ -917,17 +918,34 @@ pub(super) fn note_review_stall(
 
 This PR is approved and          CI-green but unresolved review-bot threads have held the merge for {ticks} sweeps with          no repair job running. Fix and push (then record the result with `review_result`), or          resolve the threads, to unblock it."
     );
-    update_pr_stage(
+    // Record the notification only once the label landed, so a failed label
+    // add is retried next sweep instead of being skipped for good.
+    if update_pr_stage(
         folder_path,
         pr_number,
         stale_stage_label(labels),
         NEEDS_HUMAN_PR_LABEL,
         &message,
-    );
-    notify_human_gate(
-        item,
-        &format!("PR #{pr_number} is approved and green but stalled on unresolved review threads"),
-    );
+    ) {
+        update_metadata(mcp, &item.id, |m| {
+            m.insert(REVIEW_STALL_NOTIFIED_KEY.into(), true.into());
+        });
+        notify_human_gate(
+            item,
+            &format!(
+                "PR #{pr_number} is approved and green but stalled on unresolved review threads"
+            ),
+        );
+    }
+}
+
+/// Whether this item's PR was already escalated by `note_review_stall`
+/// (so `handle_ci_green` must leave its needs-human label alone).
+pub(super) fn review_stall_notified(
+    mcp: &AgentflareMcp,
+    item: &agentflare_backend::item::Item,
+) -> bool {
+    current_metadata(mcp, item).contains_key(REVIEW_STALL_NOTIFIED_KEY)
 }
 
 /// Dispatches a review-repair job for a CI-green PR whose bot review still
