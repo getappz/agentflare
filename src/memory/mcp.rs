@@ -50,6 +50,54 @@ pub(super) fn index_embedding(
     }
 }
 
+/// Retrieval-card lint: a memory should carry the symptoms, synonyms and scope a
+/// future searcher would type. Heuristic and advisory only — never blocks a write.
+pub fn lint_retrieval_card(title: &str, content: &str) -> Vec<String> {
+    let text = format!("{title} {content}");
+    let words = content.split_whitespace().count();
+    let has_scope = text.split_whitespace().any(|w| {
+        let w = w.trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '/' && c != '.');
+        w.contains('/')
+            || w.contains("::")
+            || w.contains('_')
+            || w.rsplit_once('.').is_some_and(|(a, e)| {
+                !a.is_empty()
+                    && (1..=4).contains(&e.len())
+                    && e.chars().all(|c| c.is_ascii_alphanumeric())
+            })
+            || (w.chars().any(|c| c.is_ascii_lowercase())
+                && w.chars().skip(1).any(|c| c.is_ascii_uppercase()))
+    }) || text.contains('`');
+    let lower = text.to_lowercase();
+    let has_symptom = [
+        "error",
+        "panic",
+        "fail",
+        "exception",
+        "timeout",
+        "deadlock",
+        "crash",
+        "cannot",
+        "denied",
+    ]
+    .iter()
+    .any(|k| lower.contains(k));
+    let mut w = Vec::new();
+    if content.trim().len() < 40 || words < 6 {
+        w.push("text is very short".to_string());
+    }
+    if !has_scope {
+        w.push("no path, identifier or scope (file, module, function, command)".to_string());
+    }
+    if !has_symptom && !has_scope {
+        w.push("no error text or symptom".to_string());
+    }
+    if !w.is_empty() {
+        w.push("rewrite as a retrieval card: error text/symptom + where it shows up (path/identifier) + the fix location — write what a future searcher would type, not display text. Weak: \"deadlock fix\". Strong: \"mcp_server stalls with 'database is locked' in src/memory/store.rs open(); fix: busy_timeout in store::open\"".to_string());
+    }
+    w
+}
+
 pub fn handle_remember(input: RememberInput) -> Result<String, String> {
     if input.title.trim().is_empty() || input.content.trim().is_empty() {
         return Err("title and content are required".into());
@@ -87,7 +135,12 @@ pub fn handle_remember(input: RememberInput) -> Result<String, String> {
     if status != "duplicate" {
         index_embedding(&conn, id, &input.title, &input.content, status == "updated");
     }
-    Ok(json!({"status": status, "id": id}).to_string())
+    let mut out = json!({"status": status, "id": id});
+    let warnings = lint_retrieval_card(&input.title, &input.content);
+    if !warnings.is_empty() {
+        out["warnings"] = json!(warnings);
+    }
+    Ok(out.to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -671,6 +724,16 @@ pub fn handle_curate(input: CurateInput) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retrieval_card_lint_flags_vague_and_passes_cards() {
+        assert!(!lint_retrieval_card("deadlock fix", "fixed deadlock").is_empty());
+        assert!(lint_retrieval_card(
+            "db locked",
+            "mcp stalls with 'database is locked' error in src/memory/store.rs open(); fix: set busy_timeout"
+        )
+        .is_empty());
+    }
+
     use super::*;
     use rusqlite::Connection;
     use std::cell::Cell;

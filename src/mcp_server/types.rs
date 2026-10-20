@@ -460,7 +460,9 @@ pub(crate) struct MemoryRequest {
     #[schemars(description = "Title of the observation (remember)")]
     #[serde(default)]
     pub(crate) title: Option<String>,
-    #[schemars(description = "Content body of the observation (remember, curate)")]
+    #[schemars(
+        description = "Content body of the observation (remember, curate). For remember write a retrieval card: error text/symptom + where it shows up (path/identifier) + fix location — what a future searcher would type, not display text. Vague text returns a non-blocking `warnings` array."
+    )]
     #[serde(default)]
     pub(crate) content: Option<String>,
     #[schemars(
