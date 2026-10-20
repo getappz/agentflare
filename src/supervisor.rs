@@ -130,17 +130,16 @@ fn update_pr_stage(
     let Ok(client) = crate::github::Client::new() else {
         return cfg!(test);
     };
-    let label_added =
-        match crate::github::issues::add_labels(&client, &repo, number, &[to.to_string()]) {
-            Ok(_) => true,
-            Err(e) => {
-                eprintln!(
-                    "agentflare-supervisor: could not add {to} to PR #{number}: {}",
-                    e.log_safe()
-                );
-                false
-            }
-        };
+    // Stop the whole transition if the destination label can't land: removing
+    // `from` / commenting anyway would leave a half-applied stage that the
+    // caller then retries (re-posting the comment) every sweep.
+    if let Err(e) = crate::github::issues::add_labels(&client, &repo, number, &[to.to_string()]) {
+        eprintln!(
+            "agentflare-supervisor: could not add {to} to PR #{number}: {}",
+            e.log_safe()
+        );
+        return false;
+    }
     if let Some(from) = from
         && let Err(e) = crate::github::issues::remove_label(&client, &repo, number, from)
     {
@@ -159,7 +158,7 @@ fn update_pr_stage(
             e.log_safe()
         );
     }
-    label_added
+    true
 }
 
 /// Whether `run_review_sweep` should dispatch an agent to rebase/resolve a
