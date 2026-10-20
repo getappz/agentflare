@@ -46,6 +46,7 @@ regex = { version = "1" }
 regex-syntax = { version = "0.8" }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 rmcp = { version = "1", features = ["client", "transport-child-process", "transport-io", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
+rusqlite = { version = "0.40", features = ["bundled", "limits"] }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", features = ["alloc", "rc"] }
 serde_json = { version = "1", features = ["alloc", "preserve_order", "raw_value"] }

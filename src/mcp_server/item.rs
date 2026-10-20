@@ -362,21 +362,26 @@ fn confirmed_duplicate_ids(
     if item_ids.is_empty() {
         return Ok(std::collections::HashSet::new());
     }
-    let placeholders = item_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let sql = format!(
-        "SELECT item_id FROM item_dependencies WHERE relation_type = 'duplicate' AND item_id IN ({placeholders})
-         UNION
-         SELECT depends_on_item_id FROM item_dependencies WHERE relation_type = 'duplicate' AND depends_on_item_id IN ({placeholders})"
-    );
-    let params: Vec<&String> = item_ids.iter().chain(item_ids.iter()).collect();
-    let mut stmt = conn.prepare(&sql).map_err(internal_err)?;
-    let rows = stmt
-        .query_map(rusqlite::params_from_iter(params), |row| {
-            row.get::<_, String>(0)
-        })
-        .map_err(internal_err)?;
-    rows.collect::<std::result::Result<_, _>>()
-        .map_err(|e: rusqlite::Error| ErrorData::internal_error(e.to_string(), None))
+    let mut found = std::collections::HashSet::new();
+    for batch in agentflare_backend::db::id_batches(conn, item_ids, 2) {
+        let placeholders = batch.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT item_id FROM item_dependencies WHERE relation_type = 'duplicate' AND item_id IN ({placeholders})
+             UNION
+             SELECT depends_on_item_id FROM item_dependencies WHERE relation_type = 'duplicate' AND depends_on_item_id IN ({placeholders})"
+        );
+        let params: Vec<&String> = batch.iter().chain(batch.iter()).collect();
+        let mut stmt = conn.prepare(&sql).map_err(internal_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params), |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(internal_err)?;
+        for row in rows {
+            found.insert(row.map_err(internal_err)?);
+        }
+    }
+    Ok(found)
 }
 
 /// Batched decision-support annotations for a set of items — originally

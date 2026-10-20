@@ -155,23 +155,29 @@ pub fn dependency_edges_for_items(
     if item_ids.is_empty() {
         return Ok(vec![]);
     }
-    let placeholders = item_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let sql = format!(
-        "SELECT d.item_id, d.depends_on_item_id, s.group_name
-         FROM item_dependencies d
-         JOIN items i ON i.id = d.depends_on_item_id AND i.deleted_at IS NULL
-         JOIN states s ON s.id = i.state_id
-         WHERE d.item_id IN ({placeholders}) AND d.relation_type = 'blocks'"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(item_ids.iter()), |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    })?;
-    Ok(rows.collect::<std::result::Result<_, _>>()?)
+    let mut edges = Vec::new();
+    for batch in crate::db::id_batches(conn, item_ids, 1) {
+        let placeholders = batch.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT d.item_id, d.depends_on_item_id, s.group_name
+             FROM item_dependencies d
+             JOIN items i ON i.id = d.depends_on_item_id AND i.deleted_at IS NULL
+             JOIN states s ON s.id = i.state_id
+             WHERE d.item_id IN ({placeholders}) AND d.relation_type = 'blocks'"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(batch.iter()), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            edges.push(row?);
+        }
+    }
+    Ok(edges)
 }
 
 /// Fan-in counts: for each of `item_ids`, how many other (non-deleted) items
@@ -184,19 +190,26 @@ pub fn dependency_fanin_for_items(
     if item_ids.is_empty() {
         return Ok(std::collections::HashMap::new());
     }
-    let placeholders = item_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let sql = format!(
-        "SELECT d.depends_on_item_id, COUNT(*)
-         FROM item_dependencies d
-         JOIN items i ON i.id = d.item_id AND i.deleted_at IS NULL
-         WHERE d.depends_on_item_id IN ({placeholders}) AND d.relation_type = 'blocks'
-         GROUP BY d.depends_on_item_id"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(item_ids.iter()), |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-    })?;
-    Ok(rows.collect::<std::result::Result<_, _>>()?)
+    let mut fanin = std::collections::HashMap::new();
+    for batch in crate::db::id_batches(conn, item_ids, 1) {
+        let placeholders = batch.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT d.depends_on_item_id, COUNT(*)
+             FROM item_dependencies d
+             JOIN items i ON i.id = d.item_id AND i.deleted_at IS NULL
+             WHERE d.depends_on_item_id IN ({placeholders}) AND d.relation_type = 'blocks'
+             GROUP BY d.depends_on_item_id"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(batch.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (id, n) = row?;
+            fanin.insert(id, n);
+        }
+    }
+    Ok(fanin)
 }
 
 /// The three stored relation types (see `0012_item_relation_types.sql`).

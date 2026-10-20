@@ -129,15 +129,22 @@ pub fn count_by_items(
     if item_ids.is_empty() {
         return Ok(std::collections::HashMap::new());
     }
-    let placeholders = item_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let sql = format!(
-        "SELECT item_id, COUNT(*) FROM item_comments WHERE item_id IN ({placeholders}) GROUP BY item_id"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(item_ids.iter()), |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-    })?;
-    Ok(rows.collect::<std::result::Result<_, _>>()?)
+    let mut counts = std::collections::HashMap::new();
+    for batch in crate::db::id_batches(conn, item_ids, 1) {
+        let placeholders = batch.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT item_id, COUNT(*) FROM item_comments WHERE item_id IN ({placeholders}) GROUP BY item_id"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(batch.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (id, n) = row?;
+            counts.insert(id, n);
+        }
+    }
+    Ok(counts)
 }
 
 #[cfg(test)]
