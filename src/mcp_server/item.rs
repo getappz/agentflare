@@ -640,6 +640,14 @@ impl AgentflareMcp {
             };
         }
         let group = state_group.expect("exactly one of the three is Some");
+        if group == agentflare_backend::state::NEEDS_INPUT_GROUP
+            && !states.iter().any(|s| s.group_name == group)
+            && crate::verify::enforce_enabled(&self.worktree_repo_root())
+        {
+            return agentflare_backend::state::ensure_needs_input(conn, project_id)
+                .map(|s| s.id)
+                .map_err(map_backend_err);
+        }
         let matches: Vec<_> = states.iter().filter(|s| s.group_name == group).collect();
         match matches.as_slice() {
             [] => Err(ErrorData::invalid_params(
@@ -1239,6 +1247,15 @@ impl AgentflareMcp {
                     "item_id": item_id,
                     "assignee": assignee,
                     "reason": format!("this item was handed off to '{assignee}' and hasn't been accepted yet — only {assignee} can claim it until they accept, decline, or the handoff is cancelled"),
+                })
+                .to_string()
+            }
+            agentflare_backend::item::ClaimOutcome::BlockedByState { group } => {
+                serde_json::json!({
+                    "status": "blocked",
+                    "item_id": item_id,
+                    "state_group": group,
+                    "reason": format!("item is in '{group}' — waiting on human input; move it back to started once input is supplied"),
                 })
                 .to_string()
             }

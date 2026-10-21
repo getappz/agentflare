@@ -650,3 +650,167 @@ fn item_list_returns_open_dependency_chain_with_blocked_by() {
     assert!(!unblocked_ids.contains(&b_id.as_str()));
     assert!(!unblocked_ids.contains(&c_id.as_str()));
 }
+
+/// With enforcement off, `needs_input` is not provisioned: `update_state`
+/// to it (and to any bogus group) errors cleanly, and `list` on it is empty.
+#[test]
+fn needs_input_group_without_enforce_errors_cleanly_and_lists_empty() {
+    crate::paths::test_support::with_temp_home(
+        needs_input_group_without_enforce_errors_cleanly_and_lists_empty_body,
+    );
+}
+
+fn needs_input_group_without_enforce_errors_cleanly_and_lists_empty_body() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let s = AgentflareMcp {
+        backend_db_override: Some(tmp.path().join("backend.db")),
+        backend_project_link_override: Some(tmp.path().join("project.json")),
+        worktree_repo_root_override: Some(repo),
+        agent: Some("claude-code".into()),
+        ..Default::default()
+    };
+    let a: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("NI"))).unwrap()).unwrap();
+    for group in ["needs_input", "no_such_group"] {
+        let err = s
+            .item(Parameters(ItemRequest {
+                action: "update_state".into(),
+                id: Some(a["id"].as_str().unwrap().into()),
+                state_group: Some(group.into()),
+                ..Default::default()
+            }))
+            .unwrap_err();
+        assert!(
+            err.message.contains("no state in group"),
+            "{group}: {err:?}"
+        );
+    }
+    let listed: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "list".into(),
+            state_group: Some("needs_input".into()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(listed["total"], 0);
+}
+
+/// `[verify] enforce = true`: the project gets a needs_input state, an item
+/// moves into it via `update_state`, `list` finds it there, `claim` refuses
+/// it, and it moves back to started.
+#[test]
+fn needs_input_round_trip_with_enforce_on() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(repo.join(".agentflare")).unwrap();
+    std::fs::write(
+        repo.join(".agentflare").join("config.toml"),
+        "[verify]\nenforce = true\n",
+    )
+    .unwrap();
+    let s = AgentflareMcp {
+        backend_db_override: Some(tmp.path().join("backend.db")),
+        backend_project_link_override: Some(tmp.path().join("project.json")),
+        worktree_repo_root_override: Some(repo.clone()),
+        agent: Some("claude-code".into()),
+        ..Default::default()
+    };
+    let a: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("NI on"))).unwrap()).unwrap();
+    let id = a["id"].as_str().unwrap().to_string();
+    let set = |group: &str| {
+        s.item(Parameters(ItemRequest {
+            action: "update_state".into(),
+            id: Some(id.clone()),
+            state_group: Some(group.into()),
+            ..Default::default()
+        }))
+    };
+    let listed = |group: &str| -> serde_json::Value {
+        serde_json::from_str(
+            &s.item(Parameters(ItemRequest {
+                action: "list".into(),
+                state_group: Some(group.into()),
+                ..Default::default()
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+    };
+    set("needs_input").unwrap();
+    assert_eq!(listed("needs_input")["total"], 1);
+    // Open but non-dispatchable: search still finds it, the default groom
+    // shortlist (backlog,unstarted) and the dispatch-facing reports do not
+    // offer it, and standup/health handle it without error.
+    let run = |action: &str, query: Option<&str>| {
+        s.item(Parameters(ItemRequest {
+            action: action.into(),
+            query: query.map(Into::into),
+            ..Default::default()
+        }))
+        .unwrap()
+    };
+    assert!(run("search", Some("NI on")).contains(&id));
+    assert!(!run("groom", None).contains(&id));
+    run("standup", None);
+    run("health", None);
+    let claim: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "claim".into(),
+            id: Some(id.clone()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(claim["status"], "blocked", "{claim}");
+    // Worktrees are only created on `ClaimOutcome::Acquired`: none exists.
+    assert!(!repo.join(".worktrees").exists());
+    set("started").unwrap();
+    assert_eq!(listed("needs_input")["total"], 0);
+    assert_eq!(listed("started")["total"], 1);
+}
+
+/// Enforcement off (no `[verify]` config): no `needs_input` state is
+/// provisioned, so the project's state set is unchanged.
+#[test]
+fn enforce_off_provisions_no_needs_input_state() {
+    crate::paths::test_support::with_temp_home(enforce_off_provisions_no_needs_input_state_body);
+}
+
+fn enforce_off_provisions_no_needs_input_state_body() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let s = AgentflareMcp {
+        backend_db_override: Some(tmp.path().join("backend.db")),
+        backend_project_link_override: Some(tmp.path().join("project.json")),
+        worktree_repo_root_override: Some(repo),
+        agent: Some("claude-code".into()),
+        ..Default::default()
+    };
+    let a: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("NI off"))).unwrap()).unwrap();
+    let id = a["id"].as_str().unwrap().to_string();
+    let err = s.item(Parameters(ItemRequest {
+        action: "update_state".into(),
+        id: Some(id.clone()),
+        state_group: Some("needs_input".into()),
+        ..Default::default()
+    }));
+    assert!(err.is_err());
+    let got: serde_json::Value = serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "status".into(),
+            id: Some(id),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(got["state_group"], "backlog", "{got}");
+}

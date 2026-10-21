@@ -164,6 +164,19 @@ impl AgentflareMcp {
         &self,
         conn: &rusqlite::Connection,
     ) -> Result<agentflare_backend::project::Project, ErrorData> {
+        let project = self.resolve_project_inner(conn)?;
+        // `[verify] enforce = true` projects always carry a needs_input state.
+        if crate::verify::enforce_enabled(&self.worktree_repo_root()) {
+            agentflare_backend::state::ensure_needs_input(conn, &project.id)
+                .map_err(map_backend_err)?;
+        }
+        Ok(project)
+    }
+
+    fn resolve_project_inner(
+        &self,
+        conn: &rusqlite::Connection,
+    ) -> Result<agentflare_backend::project::Project, ErrorData> {
         if let Some(project_id) = &self.project_id_override {
             return agentflare_backend::project::get(conn, project_id).map_err(map_backend_err);
         }

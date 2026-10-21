@@ -16,9 +16,20 @@ use super::{UpdateItem, now, workspace_id_for_project};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaimOutcome {
     Acquired,
-    Held { owner: String, age_secs: i64 },
-    BlockedByAssignee { assignee: String },
-    BlockedByPlan { status: String },
+    Held {
+        owner: String,
+        age_secs: i64,
+    },
+    BlockedByAssignee {
+        assignee: String,
+    },
+    BlockedByPlan {
+        status: String,
+    },
+    /// Item sits in a non-dispatchable group (`needs_input`).
+    BlockedByState {
+        group: String,
+    },
 }
 
 /// Canonical agent identity of an owner id (`<agent>:<instance>` ->
@@ -164,6 +175,10 @@ fn claim_inner(
     // busy_timeout-honoring path.
     let tx = immediate_tx(conn)?;
     let item = get(&tx, item_id)?;
+    let group = crate::state::get(&tx, &item.state_id)?.group_name;
+    if group == crate::state::NEEDS_INPUT_GROUP {
+        return Ok(ClaimOutcome::BlockedByState { group });
+    }
     if planning {
         if let Some(status) = planning_refusal(&tx, &item)? {
             return Ok(ClaimOutcome::BlockedByPlan { status });
