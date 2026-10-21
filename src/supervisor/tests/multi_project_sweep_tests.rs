@@ -211,6 +211,52 @@ fn run_discovery_tick_skips_a_project_whose_folder_is_gone_but_dispatches_the_re
 }
 
 #[test]
+fn missing_folder_is_noted_once_until_it_comes_back() {
+    let id = format!("proj-{}", db_kit::ids::new_id());
+    assert!(note_missing_folder(&id), "first miss logs");
+    assert!(!note_missing_folder(&id), "every later tick stays quiet");
+    folder_is_back(&id);
+    assert!(note_missing_folder(&id), "a fresh disappearance logs again");
+}
+
+#[test]
+fn run_discovery_tick_skips_archived_and_soft_deleted_projects() {
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let (live, archived, deleted) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let live_item = seed_ready_item_in_project(&mcp, "proj-live", &live.path().to_string_lossy());
+    let archived_item =
+        seed_ready_item_in_project(&mcp, "proj-archived", &archived.path().to_string_lossy());
+    let deleted_item =
+        seed_ready_item_in_project(&mcp, "proj-deleted", &deleted.path().to_string_lossy());
+    let archived_project = project_of(&mcp, &archived_item);
+    let deleted_project = project_of(&mcp, &deleted_item);
+    mcp.with_backend_db(|conn| {
+        agentflare_backend::project::archive(conn, &archived_project).unwrap();
+        agentflare_backend::project::delete(conn, &deleted_project).unwrap();
+    })
+    .unwrap();
+
+    let auth_conn = test_auth_conn();
+    let result = run_discovery_tick(
+        &mcp,
+        &queue,
+        &auth_conn,
+        agentflare_resource_gate::Policy::Normal,
+    );
+
+    assert_eq!(result.dispatched, 1);
+    let jobs = queue.list(None).unwrap();
+    assert!(jobs.iter().any(|j| j.args.contains(&live_item)));
+    assert!(!jobs.iter().any(|j| j.args.contains(&archived_item)));
+    assert!(!jobs.iter().any(|j| j.args.contains(&deleted_item)));
+}
+
+#[test]
 fn one_projects_failing_lookup_does_not_stop_batches_for_the_others() {
     let (repo_a, repo_b) = (throwaway_repo(), throwaway_repo());
     let mcp = test_mcp();
