@@ -1147,6 +1147,27 @@ fn fresh_dispatch_pair(
     (agent, model, state_group)
 }
 
+/// Applies the pre-launch `failover` (an available agent to run instead of
+/// `agent`, which also drops the model pin made for the old agent) and records
+/// the agent the job will run on the job record, so repair after the work job
+/// clears `assignee_agent` targets the agent that actually ran. Recorded here,
+/// before `execute_work`: a mid-run exhaustion failover there ends the job
+/// terminally and re-queues the item for the new agent, so it never switches
+/// agent within this job.
+pub(crate) fn settle_execution_agent(
+    job_id: &str,
+    agent: String,
+    model: Option<String>,
+    failover: impl FnOnce(&str) -> Option<String>,
+) -> (String, Option<String>) {
+    let (agent, model) = match failover(&agent) {
+        Some(to) => (to, None),
+        None => (agent, model),
+    };
+    agentflare_jobs::cancel::record_effective_agent(job_id, &agent);
+    (agent, model)
+}
+
 /// Runs dispatched work items in-process.
 pub struct WorkItemExecutor;
 
@@ -1192,10 +1213,9 @@ impl agentflare_jobs::InProcessExecutor for WorkItemExecutor {
         // exhaustion, or over its usage threshold): run an available agent
         // instead. The item's model pin was for the old agent, so it's
         // dropped along with it.
-        let (agent, model) = match prelaunch_failover(item_id, &agent, repo_root.as_deref(), log) {
-            Some(to) => (to, None),
-            None => (agent, model),
-        };
+        let (agent, model) = settle_execution_agent(job_id, agent, model, |from| {
+            prelaunch_failover(item_id, from, repo_root.as_deref(), log)
+        });
         let work_args = WorkArgs {
             target: item_id.clone(),
             agent: Some(agent.clone()),
