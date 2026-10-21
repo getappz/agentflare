@@ -1323,6 +1323,12 @@ pub(crate) struct ReviewSweepResult {
     /// Items whose PR was closed without merging, sent back to the backlog
     /// for a fresh attempt instead of sitting in "in_review" forever.
     pub requeued: usize,
+    /// Stray items whose PR is still open but whose item is held by a live
+    /// claim -- the sweep cannot restore them, and used to skip them in
+    /// silence, so an approved, CI-green PR could sit unmerged with nothing
+    /// saying why (item #392). Counted so the notice is observable, and so an
+    /// operator can see the sweep is holding something back.
+    pub stray_claimed: usize,
 }
 
 /// Why `self_repair_or_gate` did or didn't dispatch. A plain `bool` can't
@@ -1367,10 +1373,39 @@ struct ReviewBatch {
     /// `NEEDS_DECISION_LABEL`) holding them back deliberately. Not yet
     /// restored to "in_review" here -- see `stray_pr_is_still_relevant`'s
     /// doc comment for why that has to wait until a live GitHub PR check.
-    stray_candidates: Vec<(agentflare_backend::item::Item, u64)>,
+    stray_candidates: Vec<StrayCandidate>,
     /// `projects.external_id` (`git:<owner>/<repo>`) when the project was
     /// auto-provisioned from a git remote; `None` for path-keyed/manual ones.
     expected_repo_key: Option<String>,
+}
+
+/// An item that has fallen out of the "in_review" group while its PR is
+/// still open, plus what is known about the PR and what is holding the item.
+struct StrayCandidate {
+    item: agentflare_backend::item::Item,
+    /// The PR number, when the item recorded one. `None` when the number has
+    /// to come from the branch name instead (item #392).
+    number: Option<u64>,
+    /// The agent holding a live claim on the item, if any. The sweep must not
+    /// restore the item while somebody is working on it -- but staying silent
+    /// about that is how an approved, CI-green PR ends up stranded with
+    /// nobody told (item #392).
+    claim_holder: Option<String>,
+}
+
+/// The one-time notice for a stray item whose PR is still open while a live
+/// claim holds the item back. Split out so its wording is testable without a
+/// Telegram chat (item #392).
+fn claimed_stray_notice(
+    item: &agentflare_backend::item::Item,
+    number: u64,
+    holder: &str,
+) -> String {
+    format!(
+        "PR #{number} is open but item #{} never came back to review: a live claim by {holder} \
+         is holding it. The sweep will not restore the item while that claim is alive.",
+        item.sequence_id
+    )
 }
 
 /// Whether the repo the registry row's folder resolves to is the repo the
@@ -1480,15 +1515,19 @@ fn build_review_batch(
             continue;
         }
         let ttl = agentflare_backend::claim::effective_ttl_secs(conn, &item.id, requested_ttl);
-        let has_live_claim =
-            agentflare_backend::claim::live_claim_on_item(conn, &item.id, now, ttl)
-                .ok()
-                .flatten()
-                .is_some();
-        if has_live_claim {
-            continue;
-        }
-        stray_candidates.push((item.clone(), number));
+        // A live claim does not make the item disappear from the sweep: the
+        // sweep still must not restore it (somebody is working on it), but it
+        // has to say so. Skipping it silently is how an approved, CI-green PR
+        // ends up stranded with nothing saying why (item #392).
+        let claim_holder = agentflare_backend::claim::live_claim_on_item(conn, &item.id, now, ttl)
+            .ok()
+            .flatten()
+            .map(|c| c.owner);
+        stray_candidates.push(StrayCandidate {
+            item: item.clone(),
+            number: Some(number),
+            claim_holder,
+        });
     }
     let expected_repo_key = agentflare_backend::project::get(conn, &dir.project_id)
         .ok()
@@ -1532,6 +1571,7 @@ pub(crate) fn run_review_sweep(
         updated: 0,
         discovered: 0,
         requeued: 0,
+        stray_claimed: 0,
     };
     // Computed once, not per-project/per-PR: identifies this workstation to
     // `claim_pr_for_discovery`'s marker comment so two workstations racing to
@@ -1586,12 +1626,35 @@ pub(crate) fn run_review_sweep(
         // GitHub-touching branch in this sweep: skip this tick, the item
         // stays where it is, and it's retried on the next one.
         if let (Some(repo), Ok(client)) = &resolved {
-            for (item, number) in &stray_candidates {
-                if !stray_pr_is_still_relevant(client, repo, *number) {
+            for candidate in &stray_candidates {
+                let Some(number) = candidate.number else {
+                    continue;
+                };
+                if !stray_pr_is_still_relevant(client, repo, number) {
+                    continue;
+                }
+                if let Some(holder) = &candidate.claim_holder {
+                    // Item #392: a live claim is holding an item whose PR is
+                    // still open. The sweep cannot restore the item while
+                    // somebody is working on it -- but it used to skip the
+                    // item in silence, so an approved, CI-green PR sat
+                    // unmerged with nothing saying why. Say it out loud, once
+                    // per item, the same way the dispatch-gate notice does
+                    // (item #341).
+                    result.stray_claimed += 1;
+                    if first_time_gated(&format!("pr-claimed:{}", candidate.item.id)) {
+                        let reason = claimed_stray_notice(&candidate.item, number, holder);
+                        eprintln!("agentflare-supervisor: {reason}");
+                        notify_human_gate(&candidate.item, &reason);
+                    }
                     continue;
                 }
                 let restored = mcp.with_backend_db(|conn| {
-                    agentflare_backend::item::update_state(conn, &item.id, &in_review_state_id)
+                    agentflare_backend::item::update_state(
+                        conn,
+                        &candidate.item.id,
+                        &in_review_state_id,
+                    )
                 });
                 if let Ok(Ok(restored)) = restored {
                     items.push(restored);

@@ -323,11 +323,12 @@ pub(crate) fn discover_untracked_prs_with_clock(
     // Item #337: the items a PR's head branch can already belong to.
     let items = agentflare_backend::item::list_by_project(conn, project_id).unwrap_or_default();
     for pr in prs {
-        if pr.draft
-            || known_pr_numbers.contains(&pr.number)
-            || !crate::github::is_trusted_author_association(&pr.author_association)
-            || crate::github::pulls::opened_by_agentflare(pr.body.as_deref())
-        {
+        if pr.draft || known_pr_numbers.contains(&pr.number) {
+            continue;
+        }
+        // A PR nobody here tracks, from an author this repo does not trust:
+        // its content must never drive an autonomous action.
+        if !crate::github::is_trusted_author_association(&pr.author_association) {
             continue;
         }
         // A PR whose base lives in another repo was listed from a mismatched
@@ -349,9 +350,27 @@ pub(crate) fn discover_untracked_prs_with_clock(
         // attach the PR there instead of minting a second item that the
         // supervisor would then dispatch repairs against, colliding with the
         // owner's worktree (#334 beside #330).
+        //
+        // Item #392: the same attach has to happen for a PR agentflare
+        // opened ITSELF whose item lost its `metadata.pr` record -- a
+        // redispatch or a worktree cleanup strips it, and the item then falls
+        // out of the "in_review" group with an open PR the sweep can no
+        // longer find, because the self-heal reads the PR number out of that
+        // same metadata. The `opened_by_agentflare` guard used to skip those
+        // PRs outright, so the item never regained the number and an
+        // approved, CI-green PR sat unmerged with nothing to show for it.
+        // The stamp is only a "this one is ours" marker; the branch
+        // ownership check below is what decides where it goes.
         if let Some(owning) = item_owning_branch(&items, &branch, local_branch) {
             attach_pr_to_item(conn, owning, pr.number, &branch);
             stamp_pr(client, repo, &pr, owning, &branch);
+            continue;
+        }
+        // A PR agentflare opened with no local owner belongs to another
+        // instance, or to an item this instance no longer has. Never adopt
+        // it here: that is exactly what would mint a second tracking item
+        // for a PR that already has one.
+        if crate::github::pulls::opened_by_agentflare(pr.body.as_deref()) {
             continue;
         }
         // Item #347 phase 2: an unstamped PR with no local branch evidence
@@ -937,6 +956,74 @@ mod tests {
             "the PR is attached to its owner"
         );
         assert_eq!(metadata["pr"]["branch"], branch.as_str());
+    }
+
+    // Item #392: a PR agentflare opened itself, whose item lost its
+    // `metadata.pr` record -- a redispatch or a worktree cleanup strips it,
+    // and the item then falls out of the "in_review" group with an open PR
+    // the sweep can no longer find, because the self-heal reads the PR number
+    // out of that same metadata. The `opened_by_agentflare` guard used to
+    // skip these PRs outright (it runs before the attach path), so the item
+    // never regained the number: an approved, CI-green PR sat unmerged with
+    // nothing to show for it. The stamp says "this one is ours"; the branch
+    // ownership decides where it goes.
+    #[test]
+    fn an_agentflare_stamped_pr_is_attached_to_the_item_that_owns_its_branch() {
+        let conn = agentflare_backend::db::open_in_memory().unwrap();
+        let (project_id, in_review_state_id) = test_project_with_in_review_state(&conn);
+        let owner_item = create_owner_item(&conn, &project_id, &in_review_state_id);
+        let branch = format!("task/{}-regression-fix", owner_item.sequence_id);
+        // Exactly the stamp `push_and_open_pr` leaves on every PR it opens.
+        let body = crate::github::pulls::origin_tag(
+            "flared:box-a",
+            &owner_item.id,
+            owner_item.sequence_id,
+            &branch,
+        );
+        assert!(
+            crate::github::pulls::opened_by_agentflare(Some(&body)),
+            "the stamp is what used to make discovery skip this PR outright"
+        );
+        let pr = serde_json::json!([{
+            "number": 926,
+            "html_url": "u",
+            "state": "open",
+            "title": "fix: something",
+            "body": body,
+            "head": {"ref": branch, "sha": "abc"},
+            "author_association": "OWNER",
+        }]);
+        let server = crate::github::test_support::MockServer::start(vec![
+            crate::github::test_support::MockResponse::json(200, &pr.to_string()),
+        ]);
+        let client = server.client(Some("tok"));
+        let repo = crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+
+        let created = discover_untracked_prs(
+            &conn,
+            &client,
+            &repo,
+            &project_id,
+            &in_review_state_id,
+            &std::collections::HashSet::new(),
+            "flared:box-a",
+            &|_| true,
+        );
+
+        assert_eq!(
+            created, 0,
+            "no duplicate item for a PR a live item already owns"
+        );
+        let items = agentflare_backend::item::list_by_project(&conn, &project_id).unwrap();
+        assert_eq!(items.len(), 1);
+        let metadata: serde_json::Value = serde_json::from_str(&items[0].metadata).unwrap();
+        assert_eq!(
+            metadata["pr"]["number"], 926,
+            "the item regains the PR number, so the sweep can find the PR again"
+        );
     }
 
     #[test]
