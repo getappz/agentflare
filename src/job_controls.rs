@@ -125,7 +125,9 @@ pub(crate) fn mcp_for_item(item_ref: &str) -> crate::mcp_server::AgentflareMcp {
     let folder = mcp
         .with_backend_db(|conn| {
             let item = agentflare_backend::item::get(conn, item_ref).ok()?;
-            agentflare_backend::project_dir::list(conn)
+            // `list_all`: a control on an archived project's item must still
+            // land on that project, not fall back to the caller's own.
+            agentflare_backend::project_dir::list_all(conn)
                 .ok()?
                 .into_iter()
                 .find(|d| d.project_id == item.project_id)
