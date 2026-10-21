@@ -10,7 +10,11 @@
 # happened in July 2026: the fixtures polluted groom/standup/health for three
 # months, two counted as completed work, alice/bob showed as stuck WIP, and
 # the urgent FIX-07 was auto-dispatched to a real session.  This script now
-# refuses to run without an explicit fixtures project and refuses the live one.
+# refuses to run without an explicit fixtures project and refuses the live one,
+# whether it is linked as `git:getappz/agentflare` or by `path:` to any
+# leanstack checkout/worktree (resolved through that directory's origin remote).
+# A name shared by several projects (names are unique per workspace only) is
+# refused too; pass the project id instead.
 #
 # Seed sequence — follow it exactly:
 #   1. Create a scratch git repo.  agentflare links one project per repo
@@ -42,21 +46,38 @@ FIXTURES="${AGENTFLARE_PM_FIXTURES_PROJECT:-}"
   exit 1
 }
 FIXTURES_SQL=${FIXTURES//\'/\'\'}  # escape single quotes for the SQL literal
-PID=$(sqlite3 "$DB" "
+# Project names are unique per workspace only, so a name can match several
+# live projects; refuse the ambiguity instead of picking one with LIMIT 1.
+MATCHES=$(sqlite3 "$DB" "
   SELECT id FROM projects
   WHERE deleted_at IS NULL
     AND (id = '$FIXTURES_SQL' OR lower(name) = lower('$FIXTURES_SQL'))
-  LIMIT 1;
+  ORDER BY id;
 ")
-[ -n "$PID" ] || { echo "fixtures project '$FIXTURES' not found (name or id, not soft-deleted)" >&2; exit 1; }
+case "$MATCHES" in
+  "") echo "fixtures project '$FIXTURES' not found (name or id, not soft-deleted)" >&2; exit 1 ;;
+  *$'\n'*) echo "fixtures project '$FIXTURES' matches several projects; use its id" >&2; exit 1 ;;
+esac
+PID=$MATCHES
 
-# Refuse the live project: its repo link lives in projects.external_id
-# ("git:getappz/agentflare"; pre-prefix rows hold the bare key).
+# Refuse the live project.  Its link lives in projects.external_id as
+# "git:getappz/agentflare" (pre-prefix rows hold the bare key), but a project
+# can also be linked by "path:<dir>" to a leanstack checkout or worktree, so a
+# path link is resolved through that directory's origin remote.
 REPO_KEY=$(sqlite3 "$DB" "SELECT coalesce(external_id, '') FROM projects WHERE id = '$PID';")
+refuse_live() {
+  echo "refusing: live project '$FIXTURES' ($PID, $REPO_KEY) is linked to $LIVE_REPO_KEY — point AGENTFLARE_PM_FIXTURES_PROJECT at a dedicated fixtures project" >&2
+  exit 1
+}
 case "$REPO_KEY" in
-  "$LIVE_REPO_KEY" | "git:$LIVE_REPO_KEY")
-    echo "refusing: live project '$FIXTURES' ($PID) is linked to $LIVE_REPO_KEY — point AGENTFLARE_PM_FIXTURES_PROJECT at a dedicated fixtures project" >&2
-    exit 1 ;;
+  "$LIVE_REPO_KEY" | "git:$LIVE_REPO_KEY") refuse_live ;;
+  path:*)
+    LINK_DIR=${REPO_KEY#path:}
+    EXT_PREFIX="\\\\?\\"  # Windows extended-length prefix (\\?\), which git rejects
+    LINK_DIR=${LINK_DIR#"$EXT_PREFIX"}
+    REMOTE=$(git -C "$LINK_DIR" remote get-url origin 2>/dev/null || true)
+    REMOTE=${REMOTE%/}; REMOTE=${REMOTE%.git}
+    case "$REMOTE" in *[/:]"$LIVE_REPO_KEY") refuse_live ;; esac ;;
 esac
 
 # Guard: refuse if any live FIX-* row exists outside this project (name
