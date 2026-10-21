@@ -22,3 +22,22 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - run: cargo install cargo-audit
       - run: cargo audit
+      # RUSTSEC-2026-0381 is ignored in .cargo/audit.toml and deny.toml only
+      # because webpki-roots 0.26.11 is a shim over the patched 1.x line (pulled
+      # in by ureq 2). Both tools ignore by advisory id, which would also hide a
+      # genuinely vulnerable webpki-roots, so pin the ignore to that chain.
+      - name: Guard the RUSTSEC-2026-0381 ignore
+        run: |
+          set -euo pipefail
+          cargo tree --locked --workspace --target all -e normal,build,dev --prefix none \
+            | sed -n 's/^webpki-roots v\([^ ]*\).*/\1/p' | sort -u | tee webpki-roots.txt
+          while read -r v; do
+            case "$v" in
+              0.26.11) ;;
+              1.*) [ "$(printf '%s\n' 1.0.10 "$v" | sort -V | head -n1)" = 1.0.10 ] \
+                     || { echo "::error::webpki-roots $v is below the patched 1.0.10"; exit 1; } ;;
+              *) echo "::error::webpki-roots $v is not covered by the RUSTSEC-2026-0381 ignore (only the 0.26.11 shim is)"; exit 1 ;;
+            esac
+          done < webpki-roots.txt
+          cargo tree --locked -p webpki-roots@0.26.11 --depth 1 --prefix none | grep -q '^webpki-roots v1\.' \
+            || { echo "::error::webpki-roots 0.26.11 is gone or no longer re-exports 1.x: drop the RUSTSEC-2026-0381 ignore from .cargo/audit.toml and deny.toml"; exit 1; }
