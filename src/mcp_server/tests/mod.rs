@@ -443,6 +443,7 @@ mod item_tests_cross_project;
 mod item_tests_filters;
 mod item_tests_relations;
 mod item_tests_reporting;
+mod item_verify_gate_tests;
 mod item_wipe_guard_tests;
 mod memory_promotion_tests;
 mod pm_tests;
