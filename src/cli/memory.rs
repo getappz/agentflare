@@ -118,7 +118,10 @@ impl MemoryArgs {
                 };
                 match crate::memory::mcp::handle_remember(input) {
                     Ok(out) => println!("{out}"),
-                    Err(e) => crate::ui::error(&e.to_string()),
+                    Err(e) => {
+                        crate::ui::error(&e);
+                        std::process::exit(1);
+                    }
                 }
             }
             MemoryCommands::Sessions { project, limit } => match crate::memory::store::open() {

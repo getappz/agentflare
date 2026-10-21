@@ -57,7 +57,11 @@ fn is_scope_token(w: &str) -> bool {
     let segments = || w.split('/').filter(|p| !p.is_empty());
     let path = segments().count() >= 2
         && !["and/or", "either/or", "yes/no", "n/a", "i/o"].contains(&w.to_lowercase().as_str());
-    let named = w.rsplit_once('.').is_some_and(|(a, e)| {
+    let name = w
+        .rsplit_once(':')
+        .filter(|(_, line)| !line.is_empty() && line.bytes().all(|b| b.is_ascii_digit()))
+        .map_or(w, |(name, _)| name);
+    let named = name.rsplit_once('.').is_some_and(|(a, e)| {
         !a.is_empty()
             && (1..=4).contains(&e.len())
             && e.chars().all(|c| c.is_ascii_alphanumeric())
@@ -800,6 +804,19 @@ mod tests {
         assert!(weak(
             "the iPhone build hit a timeout when we tried it again"
         ));
+        for reference in ["store.rs:47", "store.rs:47;"] {
+            let card =
+                format!("worker stalls when reading {reference} retries continue until restart");
+            assert!(
+                lint_retrieval_card("worker stall", &card).is_empty(),
+                "{card}"
+            );
+        }
+        for reference in ["v1.2:47", "store.rs:line", "store.rs:"] {
+            assert!(weak(&format!(
+                "worker stalls when reading {reference} retries continue until restart"
+            )));
+        }
         assert!(!weak("panic in src/memory/store.rs when opening"));
         assert!(!weak(
             "run cargo test --lib for the failure in memory::store"
