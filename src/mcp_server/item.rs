@@ -1687,6 +1687,12 @@ impl AgentflareMcp {
             };
             Ok::<_, ErrorData>((item_id, owns_claim, item, target_branch))
         })??;
+        if owns_claim && self.hold_unverified(&item_id, &owner)? {
+            return Ok(serde_json::json!({
+                "done": false, "item_id": item_id, "status": "needs_input",
+            })
+            .to_string());
+        }
         let should_push = req.push.unwrap_or(true);
         let summary = req.summary.as_deref();
         self.commit_and_guard_done(
@@ -1939,6 +1945,9 @@ impl AgentflareMcp {
         item: &agentflare_backend::item::Item,
         repo_root: &std::path::Path,
     ) -> Result<bool, ErrorData> {
+        if self.hold_unverified(item_id, "")? {
+            return Ok(false);
+        }
         let promoted = self.with_backend_db(|conn| {
             // Compare-and-set on the PR verified merged above: a redispatch +
             // new PR landing during that network check must not complete the
