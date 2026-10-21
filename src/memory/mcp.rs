@@ -93,6 +93,9 @@ pub fn lint_retrieval_card(title: &str, content: &str) -> Vec<String> {
                 "exception",
                 "timeout",
                 "deadlock",
+                "stall",
+                "hang",
+                "locked",
                 "crash",
                 "cannot",
                 "denied",
@@ -820,6 +823,15 @@ mod tests {
         assert!(!nosym(
             "errors in src/memory/store.rs when opening the db file"
         ));
+        for symptom in ["stalls", "hangs", "locked"] {
+            let card = format!(
+                "mcp_server {symptom} while opening src/memory/store.rs; fix: configure store connection"
+            );
+            assert!(
+                lint_retrieval_card("database access", &card).is_empty(),
+                "{card}"
+            );
+        }
         assert!(lint_retrieval_card(
             "db locked",
             "mcp stalls with 'database is locked' error in src/memory/store.rs open(); fix: set busy_timeout"
