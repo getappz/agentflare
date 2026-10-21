@@ -71,6 +71,7 @@ pub fn migrations() -> rusqlite_migration::Migrations<'static> {
         rusqlite_migration::M::up(
             "ALTER TABLE agent_jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0;",
         ),
+        rusqlite_migration::M::up("ALTER TABLE agent_jobs ADD COLUMN effective_agent TEXT;"),
     ])
 }
 
@@ -511,9 +512,20 @@ impl Queue {
         Ok(jobs)
     }
 
-    /// Target agent (`args[1]`) of the newest `command` job for `item_id`
-    /// (`args[0]`), in any state. Unlike `list`, not capped at 100 rows, so an
-    /// old job is still found behind a long run of newer unrelated ones.
+    /// Records the agent job `id` actually runs, which can differ from the
+    /// enqueue-time `args[1]` after a fresh re-resolve or failover.
+    pub fn set_effective_agent(&self, id: &str, agent: &str) -> Result<(), Error> {
+        self.conn.lock().execute(
+            "UPDATE agent_jobs SET effective_agent = ?2 WHERE id = ?1",
+            params![id, agent],
+        )?;
+        Ok(())
+    }
+
+    /// Agent of the newest `command` job for `item_id` (`args[0]`), in any
+    /// state: the recorded effective agent, else the enqueue-time `args[1]`.
+    /// Unlike `list`, not capped at 100 rows, so an old job is still found
+    /// behind a long run of newer unrelated ones.
     pub fn last_agent_for_item(
         &self,
         command: &str,
@@ -522,7 +534,8 @@ impl Queue {
         let conn = self.conn.lock();
         let agent = conn
             .query_row(
-                "SELECT json_extract(payload, '$.args[1]') FROM agent_jobs
+                "SELECT COALESCE(effective_agent, json_extract(payload, '$.args[1]'))
+                 FROM agent_jobs
                  WHERE json_extract(payload, '$.command') = ?1
                    AND json_extract(payload, '$.args[0]') = ?2
                  ORDER BY created_at DESC LIMIT 1",
