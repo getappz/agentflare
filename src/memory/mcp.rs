@@ -125,9 +125,12 @@ pub fn handle_remember(input: RememberInput) -> Result<String, String> {
             "type 'lesson' is reserved: use action=promote with evidence_ids and confidence".into(),
         );
     }
-    let conn = open_db()?;
+    remember_in(&open_db()?, input)
+}
+
+fn remember_in(conn: &rusqlite::Connection, input: RememberInput) -> Result<String, String> {
     let outcome = observations::save(
-        &conn,
+        conn,
         input.session_id.as_deref(),
         &input.r#type,
         &input.title,
@@ -151,7 +154,7 @@ pub fn handle_remember(input: RememberInput) -> Result<String, String> {
     // Best-effort semantic index; failure must never fail the remember.
     // Duplicates keep their existing vector — content is unchanged by definition.
     if status != "duplicate" {
-        index_embedding(&conn, id, &input.title, &input.content, status == "updated");
+        index_embedding(conn, id, &input.title, &input.content, status == "updated");
     }
     let mut out = json!({"status": status, "id": id});
     let warnings = lint_retrieval_card(&input.title, &input.content);
@@ -742,6 +745,43 @@ pub fn handle_curate(input: CurateInput) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn remember_warns_on_vague_text_but_still_saves() {
+        let conn = {
+            let mut c = rusqlite::Connection::open_in_memory().unwrap();
+            super::super::schema::migrate(&mut c).unwrap();
+            c
+        };
+        let input = |title: &str, content: &str| RememberInput {
+            title: title.into(),
+            content: content.into(),
+            r#type: "note".into(),
+            session_id: None,
+            project: None,
+            topic_key: None,
+            scope: None,
+        };
+        let vague: serde_json::Value = serde_json::from_str(
+            &remember_in(&conn, input("deadlock fix", "fixed deadlock")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(vague["status"], "created");
+        assert!(vague["warnings"].as_array().is_some_and(|w| !w.is_empty()));
+        let card: serde_json::Value = serde_json::from_str(
+            &remember_in(
+                &conn,
+                input(
+                    "db locked",
+                    "mcp stalls with 'database is locked' error in src/memory/store.rs open(); fix: set busy_timeout",
+                ),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(card["status"], "created");
+        assert!(card.get("warnings").is_none());
+    }
+
     #[test]
     fn retrieval_card_lint_flags_vague_and_passes_cards() {
         assert!(!lint_retrieval_card("deadlock fix", "fixed deadlock").is_empty());

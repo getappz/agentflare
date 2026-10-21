@@ -38,6 +38,21 @@ pub enum MemoryCommands {
         #[arg(long, default_value = "10")]
         limit: usize,
     },
+    /// Save an observation. Write a retrieval card: error text/symptom + where it
+    /// shows up (path/identifier) + fix location. Vague text is saved but the
+    /// output carries `warnings` with a rewrite hint.
+    Remember {
+        title: String,
+        content: String,
+        #[arg(long, default_value = "note")]
+        r#type: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        topic_key: Option<String>,
+        #[arg(long)]
+        scope: Option<String>,
+    },
     /// Compute embeddings for observations missing them.
     /// Requires a build with --features semantic and a downloaded model.
     BackfillEmbeddings {
@@ -80,6 +95,28 @@ impl MemoryArgs {
                     limit: Some(limit),
                 };
                 match crate::memory::mcp::handle_recall(input) {
+                    Ok(out) => println!("{out}"),
+                    Err(e) => crate::ui::error(&e.to_string()),
+                }
+            }
+            MemoryCommands::Remember {
+                title,
+                content,
+                r#type,
+                project,
+                topic_key,
+                scope,
+            } => {
+                let input = crate::memory::mcp::RememberInput {
+                    title,
+                    content,
+                    r#type,
+                    session_id: None,
+                    project,
+                    topic_key,
+                    scope,
+                };
+                match crate::memory::mcp::handle_remember(input) {
                     Ok(out) => println!("{out}"),
                     Err(e) => crate::ui::error(&e.to_string()),
                 }
