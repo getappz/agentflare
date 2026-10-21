@@ -54,6 +54,39 @@ pub const IN_REVIEW_STATE_NAME: &str = "In Review";
 pub const IN_REVIEW_STATE_COLOR: &str = "#818CF8";
 pub const IN_REVIEW_STATE_SEQUENCE: f64 = 40000.0;
 
+/// State group for items parked awaiting human input. Open and
+/// non-dispatchable (like "triage"): `item::claim` refuses it. Not in
+/// `DEFAULT_STATES` — only created via [`ensure_needs_input`] when
+/// `[verify] enforce` is on, so projects without it are unchanged.
+pub const NEEDS_INPUT_GROUP: &str = "needs_input";
+
+/// Idempotently creates the project's "Needs Input" state. The insert is one
+/// conditional statement, so concurrent callers cannot both add a row.
+pub fn ensure_needs_input(conn: &Connection, project_id: &str) -> Result<State> {
+    let ts = now();
+    let inserted = conn.execute(
+        "INSERT INTO states (id, project_id, name, group_name, sequence, is_default, color, created_at, updated_at)
+         SELECT ?1, ?2, 'Needs Input', ?3, 37000.0, 0, '#E5484D', ?4, ?4
+         WHERE NOT EXISTS (
+             SELECT 1 FROM states WHERE project_id = ?2 AND group_name = ?3 AND deleted_at IS NULL
+         )",
+        rusqlite::params![db_kit::ids::new_id(), project_id, NEEDS_INPUT_GROUP, ts],
+    )?;
+    let state = first_in_group(conn, project_id, NEEDS_INPUT_GROUP)?;
+    if inserted == 1
+        && let Ok(wid) = workspace_id_for_project(conn, project_id)
+    {
+        events::emit(
+            conn,
+            &wid,
+            "state",
+            "create",
+            serde_json::to_value(&state).unwrap_or_default(),
+        );
+    }
+    Ok(state)
+}
+
 fn workspace_id_for_project(conn: &Connection, project_id: &str) -> Result<String> {
     conn.query_row(
         "SELECT workspace_id FROM projects WHERE id = ?1 AND deleted_at IS NULL",
@@ -295,6 +328,16 @@ mod tests {
         let started = first_in_group(&conn, &pid, "started").unwrap();
         assert_eq!(started.name, "In Progress");
         assert_eq!(started.group_name, "started");
+    }
+
+    #[test]
+    fn ensure_needs_input_is_idempotent_and_not_seeded() {
+        let conn = db::open_in_memory().unwrap();
+        let pid = seed_project(&conn);
+        assert!(first_in_group(&conn, &pid, NEEDS_INPUT_GROUP).is_err());
+        let a = ensure_needs_input(&conn, &pid).unwrap();
+        let b = ensure_needs_input(&conn, &pid).unwrap();
+        assert_eq!(a.id, b.id);
     }
 
     #[test]

@@ -749,6 +749,8 @@ fn execute_work_impl(
         // handoff, `ClaimOutcome::BlockedByAssignee`) differ: "blocked" has
         // no `owner`/`age_secs`, so formatting it as "held" printed the
         // nonsensical "held by ? (0s)" instead of the real reason.
+        // `ClaimOutcome::BlockedByState` (item in `needs_input`) also reports
+        // "blocked" with a complete `reason`, handled by the same arm.
         // "blocked_by_plan" (`ClaimOutcome::BlockedByPlan`, item #573) is the
         // same shape of problem: it carries `plan_status`/`reason` and no
         // `owner`/`age_secs`, so the `_` arm below would print the exact
