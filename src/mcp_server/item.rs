@@ -1914,16 +1914,18 @@ impl AgentflareMcp {
             let in_review = matches!(state.group_name.as_str(), "in_review" | "started");
             Ok::<_, ErrorData>((item_id, item, in_review))
         })??;
-        if let Some(report) = self.hold_unverified(&item_id)? {
-            return Ok(serde_json::json!({
-                "item_id": item_id,
-                "promoted": false,
-                "status": "needs_input",
-                "reason": report,
-            })
-            .to_string());
-        }
         if !in_review && req.force == Some(true) {
+            // Gate only where this call completes the item (it parks in
+            // needs_input); the merged-PR path gates in the promote helper.
+            if let Some(report) = self.hold_unverified(&item_id)? {
+                return Ok(serde_json::json!({
+                    "item_id": item_id,
+                    "promoted": false,
+                    "status": "needs_input",
+                    "reason": report,
+                })
+                .to_string());
+            }
             // `force_if_requested` above already rejected a missing/blank reason.
             let reason = req.force_reason.as_deref().unwrap_or_default().trim();
             return self.force_complete_merged(&item_id, &item, forced, reason);

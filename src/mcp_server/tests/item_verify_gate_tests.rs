@@ -162,24 +162,30 @@ fn enforcement_off_ignores_missing_criteria() {
 }
 
 #[test]
-fn check_merge_refuses_unverified_in_review_item() {
+fn speculative_check_merge_leaves_an_unmerged_in_review_item_alone() {
     let (s, id, _t, _r) = setup(true, Some(("uncertain", "")));
     s.with_backend_db(|conn| {
         agentflare_backend::item::mark_in_review(conn, &id, &crate::claims::owner_id()).unwrap();
     })
     .unwrap();
-    assert_eq!(group_of(&s, &id), "in_review");
     let r = call(&s, "check_merge", &id, false);
     assert_eq!(r["promoted"], false);
-    assert_eq!(r["status"], "needs_input");
-    assert!(r["reason"].as_str().unwrap().contains("- a: uncertain"));
-    assert_eq!(group_of(&s, &id), "needs_input");
+    assert_eq!(r["reason"], "PR not merged yet");
+    assert_eq!(group_of(&s, &id), "in_review");
 }
 
 #[test]
 fn forced_check_merge_cannot_bypass_the_gate() {
     let (s, id, _t, _r) = setup(true, Some(("fail", "src/a.rs:1")));
+    s.with_backend_db(|conn| {
+        let item = agentflare_backend::item::get(conn, &id).unwrap();
+        let backlog =
+            agentflare_backend::state::first_in_group(conn, &item.project_id, "backlog").unwrap();
+        agentflare_backend::item::update_state(conn, &id, &backlog.id).unwrap();
+    })
+    .unwrap();
     let r = call(&s, "check_merge", &id, true);
     assert_eq!(r["promoted"], false);
+    assert_eq!(r["status"], "needs_input");
     assert_eq!(group_of(&s, &id), "needs_input");
 }
