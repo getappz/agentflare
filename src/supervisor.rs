@@ -34,7 +34,7 @@ pub(crate) const NEEDS_MANUAL_LABEL: &str = "needs-manual-dispatch";
 /// even if `ready-for-work` is added back by hand -- only a resume (which
 /// removes it) re-arms the item.
 pub(crate) const PAUSED_LABEL: &str = "paused";
-const NEEDS_HUMAN_GATE_LABEL: &str = "needs-human-gate";
+pub(crate) const NEEDS_HUMAN_GATE_LABEL: &str = "needs-human-gate";
 /// Blocks auto-dispatch even while `READY_LABEL` is also present -- for a
 /// go/no-go candidate item whose description says "not dispatched, awaiting
 /// decision" but which was created (or handed off) with `ready-for-work`
@@ -2034,7 +2034,7 @@ mod merge;
 pub(crate) use merge::*;
 mod auto_merge;
 use auto_merge::*;
-mod review_bots;
+pub(crate) mod review_bots;
 pub(crate) mod review_findings;
 use review_bots::*;
 

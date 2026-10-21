@@ -1687,9 +1687,9 @@ impl AgentflareMcp {
             };
             Ok::<_, ErrorData>((item_id, owns_claim, item, target_branch))
         })??;
-        if owns_claim && self.hold_unverified(&item_id, &owner)? {
+        if owns_claim && let Some(report) = self.hold_unverified(&item_id)? {
             return Ok(serde_json::json!({
-                "done": false, "item_id": item_id, "status": "needs_input",
+                "done": false, "item_id": item_id, "status": "needs_input", "reason": report,
             })
             .to_string());
         }
@@ -1914,6 +1914,15 @@ impl AgentflareMcp {
             let in_review = matches!(state.group_name.as_str(), "in_review" | "started");
             Ok::<_, ErrorData>((item_id, item, in_review))
         })??;
+        if let Some(report) = self.hold_unverified(&item_id)? {
+            return Ok(serde_json::json!({
+                "item_id": item_id,
+                "promoted": false,
+                "status": "needs_input",
+                "reason": report,
+            })
+            .to_string());
+        }
         if !in_review && req.force == Some(true) {
             // `force_if_requested` above already rejected a missing/blank reason.
             let reason = req.force_reason.as_deref().unwrap_or_default().trim();
@@ -1945,7 +1954,7 @@ impl AgentflareMcp {
         item: &agentflare_backend::item::Item,
         repo_root: &std::path::Path,
     ) -> Result<bool, ErrorData> {
-        if self.hold_unverified(item_id, "")? {
+        if self.hold_unverified(item_id)?.is_some() {
             return Ok(false);
         }
         let promoted = self.with_backend_db(|conn| {
