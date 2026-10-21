@@ -187,7 +187,7 @@ fn coderabbit_cap_announced_for(
         })
 }
 
-fn ensure_needs_human_item_gate(
+pub(crate) fn ensure_needs_human_item_gate(
     mcp: &AgentflareMcp,
     item: &agentflare_backend::item::Item,
     label_id_by_name: &std::collections::HashMap<String, String>,
