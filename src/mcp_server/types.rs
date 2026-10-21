@@ -910,7 +910,7 @@ pub(crate) struct ItemRequest {
     #[serde(default)]
     pub(crate) related_item_id: Option<String>,
     #[schemars(
-        description = "Filter by state group (list): one of backlog|unstarted|started|in_review|completed|cancelled|triage, or a comma-separated list (e.g. \"backlog,unstarted,started\") to match any. Also usable as a target for update_state (single group only) — an alternative to state_id/state_name; errors if zero or more than one state in the project shares that group. Mutually exclusive with state_id and state_name for update_state"
+        description = "Filter by state group (list): one of backlog|unstarted|started|in_review|completed|cancelled|triage|needs_input, or a comma-separated list (e.g. \"backlog,unstarted,started\") to match any. Also usable as a target for update_state (single group only) — an alternative to state_id/state_name; errors if zero or more than one state in the project shares that group. Mutually exclusive with state_id and state_name for update_state"
     )]
     #[serde(default)]
     pub(crate) state_group: Option<String>,
