@@ -683,6 +683,45 @@ diff --git a/f b/f
     }
 
     #[test]
+    fn a_multi_file_diff_keeps_each_file_apart() {
+        let diff = "\
+diff --git a/one.rs b/one.rs
+--- a/one.rs
++++ b/one.rs
+@@ -1,3 +1,3 @@
+ ctx
+-old
++new
+diff --git a/two.rs b/two.rs
+--- a/two.rs
++++ b/two.rs
+@@ -1,2 +1,3 @@
+ keep
++added
+";
+        let files = parse_unified_diff(diff);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].new_path.as_deref(), Some("one.rs"));
+        assert_eq!(files[1].new_path.as_deref(), Some("two.rs"));
+
+        let one = &files[0].chunks[0].lines;
+        assert_eq!(one.len(), 2);
+        assert_eq!(one[0].kind, LineKind::Unchanged);
+        assert_eq!(one[0].old_line, Some(1));
+        assert_eq!(one[0].new_line, Some(1));
+        assert_eq!(one[1].kind, LineKind::Changed);
+        assert_eq!(one[1].old_line, Some(2));
+        assert_eq!(one[1].new_line, Some(2));
+
+        let two = &files[1].chunks[0].lines;
+        assert_eq!(two.len(), 2);
+        assert_eq!(two[0].kind, LineKind::Unchanged);
+        assert_eq!(two[1].kind, LineKind::Added);
+        assert_eq!(two[1].new_line, Some(2));
+        assert_eq!(two[1].old_line, None);
+    }
+
+    #[test]
     fn every_hunk_of_a_file_is_kept() {
         let diff = "\
 diff --git a/f b/f
