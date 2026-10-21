@@ -447,6 +447,7 @@ mod item_wipe_guard_tests;
 mod memory_promotion_tests;
 mod pm_tests;
 mod project_resolution_tests;
+mod project_tests;
 mod review_verify_tests;
 mod search_tests;
 mod state_tests;

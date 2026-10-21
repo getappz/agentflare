@@ -331,6 +331,7 @@ fn asset_attach_to_project() {
         let project: serde_json::Value = serde_json::from_str(
             &s.project(Parameters(ProjectRequest {
                 action: "info".into(),
+                project: None,
             }))
             .unwrap(),
         )

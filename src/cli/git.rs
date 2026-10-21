@@ -718,7 +718,9 @@ fn backend_for_repo(
     let conn = agentflare_backend::db::open_db(&db_path).map_err(|e| e.to_string())?;
     let canonical = |p: &Path| dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let root = canonical(repo_root);
-    let project_id = agentflare_backend::project_dir::list(&conn)
+    // `list_all`: this maps a folder we are standing in back to its project,
+    // which must keep working inside an archived project's checkout.
+    let project_id = agentflare_backend::project_dir::list_all(&conn)
         .map_err(|e| e.to_string())?
         .into_iter()
         .find(|d| canonical(Path::new(&d.folder_path)) == root)

@@ -56,12 +56,47 @@ pub fn upsert(conn: &Connection, project_id: &str, folder_path: &str, now: i64) 
     Ok(())
 }
 
+/// Folders of every *active* project: rows whose project is neither
+/// soft-deleted nor archived. This is what the daemon's discovery tick and
+/// review sweep enumerate, so a soft-deleted project (its row used to
+/// survive, only a hard delete cascades) or an archived one (item #768:
+/// `projects.archived_at` was never read anywhere, so archiving had no
+/// effect on dispatch) no longer gets swept, dispatched, or logged every
+/// tick. Use `list_all` to map a folder back to its project regardless of
+/// that project's state.
 pub fn list(conn: &Connection) -> Result<Vec<ProjectDir>> {
+    let mut stmt = conn.prepare(
+        "SELECT d.project_id, d.folder_path, d.updated_at
+         FROM project_dirs d
+         JOIN projects p ON p.id = d.project_id
+         WHERE p.deleted_at IS NULL AND p.archived_at IS NULL
+         ORDER BY d.project_id",
+    )?;
+    let rows = stmt.query_map([], from_row)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Every registered folder, including those of archived or soft-deleted
+/// projects — for callers that start from a folder or an item and need its
+/// project (`flare doctor` inside an archived repo, item controls), not for
+/// anything that decides which projects to act on.
+pub fn list_all(conn: &Connection) -> Result<Vec<ProjectDir>> {
     let mut stmt = conn.prepare(
         "SELECT project_id, folder_path, updated_at FROM project_dirs ORDER BY project_id",
     )?;
     let rows = stmt.query_map([], from_row)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Drops `project_id`'s folder row. Called by `project::delete` so a
+/// soft-deleted project's folder stops being enumerated (the schema's
+/// `ON DELETE CASCADE` only fires on a hard delete).
+pub fn remove(conn: &Connection, project_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM project_dirs WHERE project_id = ?1",
+        params![project_id],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -148,5 +183,58 @@ mod tests {
 
         let rows = list(&conn).unwrap();
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn list_skips_soft_deleted_and_archived_projects_but_list_all_keeps_them() {
+        let conn = crate::db::open_in_memory().unwrap();
+        let live = seed_project(&conn, "live");
+        let archived = seed_project(&conn, "archived");
+        let deleted = seed_project(&conn, "deleted");
+        upsert(&conn, &live, "/repo/live", 1).unwrap();
+        upsert(&conn, &archived, "/repo/archived", 2).unwrap();
+        upsert(&conn, &deleted, "/repo/deleted", 3).unwrap();
+
+        crate::project::archive(&conn, &archived).unwrap();
+        // Bypass `project::delete` (which also removes the dir row) to prove
+        // the filter alone hides a pre-existing stale row — the exact shape
+        // of the 29 Temp\.tmp* rows from item #768.
+        conn.execute(
+            "UPDATE projects SET deleted_at = 10 WHERE id = ?1",
+            params![deleted],
+        )
+        .unwrap();
+
+        let active: Vec<String> = list(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|d| d.project_id)
+            .collect();
+        assert_eq!(active, vec![live.clone()]);
+
+        let all = list_all(&conn).unwrap();
+        assert_eq!(all.len(), 3, "list_all must keep every registered folder");
+
+        crate::project::unarchive(&conn, &archived).unwrap();
+        let mut active: Vec<String> = list(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|d| d.project_id)
+            .collect();
+        active.sort();
+        let mut expected = vec![live, archived];
+        expected.sort();
+        assert_eq!(active, expected, "unarchive needs no re-registration");
+    }
+
+    #[test]
+    fn project_soft_delete_removes_its_folder_row() {
+        let conn = crate::db::open_in_memory().unwrap();
+        let pid = seed_project(&conn, "proj");
+        upsert(&conn, &pid, "/repo/proj", 1).unwrap();
+
+        crate::project::delete(&conn, &pid).unwrap();
+
+        assert!(list_all(&conn).unwrap().is_empty());
     }
 }
