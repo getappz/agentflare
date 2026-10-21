@@ -655,10 +655,19 @@ fn item_list_returns_open_dependency_chain_with_blocked_by() {
 /// to it (and to any bogus group) errors cleanly, and `list` on it is empty.
 #[test]
 fn needs_input_group_without_enforce_errors_cleanly_and_lists_empty() {
+    crate::paths::test_support::with_temp_home(
+        needs_input_group_without_enforce_errors_cleanly_and_lists_empty_body,
+    );
+}
+
+fn needs_input_group_without_enforce_errors_cleanly_and_lists_empty_body() {
     let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
     let s = AgentflareMcp {
         backend_db_override: Some(tmp.path().join("backend.db")),
         backend_project_link_override: Some(tmp.path().join("project.json")),
+        worktree_repo_root_override: Some(repo),
         agent: Some("claude-code".into()),
         ..Default::default()
     };
@@ -770,6 +779,10 @@ fn needs_input_round_trip_with_enforce_on() {
 /// provisioned, so the project's state set is unchanged.
 #[test]
 fn enforce_off_provisions_no_needs_input_state() {
+    crate::paths::test_support::with_temp_home(enforce_off_provisions_no_needs_input_state_body);
+}
+
+fn enforce_off_provisions_no_needs_input_state_body() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
@@ -792,12 +805,12 @@ fn enforce_off_provisions_no_needs_input_state() {
     assert!(err.is_err());
     let got: serde_json::Value = serde_json::from_str(
         &s.item(Parameters(ItemRequest {
-            action: "get".into(),
+            action: "status".into(),
             id: Some(id),
             ..Default::default()
         }))
         .unwrap(),
     )
     .unwrap();
-    assert_ne!(got["state"]["group"], "needs_input", "{got}");
+    assert_eq!(got["state_group"], "backlog", "{got}");
 }

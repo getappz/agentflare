@@ -60,22 +60,31 @@ pub const IN_REVIEW_STATE_SEQUENCE: f64 = 40000.0;
 /// `[verify] enforce` is on, so projects without it are unchanged.
 pub const NEEDS_INPUT_GROUP: &str = "needs_input";
 
-/// Idempotently creates the project's "Needs Input" state.
+/// Idempotently creates the project's "Needs Input" state. The insert is one
+/// conditional statement, so concurrent callers cannot both add a row.
 pub fn ensure_needs_input(conn: &Connection, project_id: &str) -> Result<State> {
-    match first_in_group(conn, project_id, NEEDS_INPUT_GROUP) {
-        Err(crate::error::Error::NotFound(_)) => create(
+    let ts = now();
+    let inserted = conn.execute(
+        "INSERT INTO states (id, project_id, name, group_name, sequence, is_default, color, created_at, updated_at)
+         SELECT ?1, ?2, 'Needs Input', ?3, 37000.0, 0, '#E5484D', ?4, ?4
+         WHERE NOT EXISTS (
+             SELECT 1 FROM states WHERE project_id = ?2 AND group_name = ?3 AND deleted_at IS NULL
+         )",
+        rusqlite::params![db_kit::ids::new_id(), project_id, NEEDS_INPUT_GROUP, ts],
+    )?;
+    let state = first_in_group(conn, project_id, NEEDS_INPUT_GROUP)?;
+    if inserted == 1
+        && let Ok(wid) = workspace_id_for_project(conn, project_id)
+    {
+        events::emit(
             conn,
-            CreateState {
-                project_id: project_id.to_string(),
-                name: "Needs Input".into(),
-                group_name: NEEDS_INPUT_GROUP.into(),
-                sequence: 37000.0,
-                is_default: None,
-                color: Some("#E5484D".into()),
-            },
-        ),
-        other => other,
+            &wid,
+            "state",
+            "create",
+            serde_json::to_value(&state).unwrap_or_default(),
+        );
     }
+    Ok(state)
 }
 
 fn workspace_id_for_project(conn: &Connection, project_id: &str) -> Result<String> {
