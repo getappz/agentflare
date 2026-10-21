@@ -523,8 +523,9 @@ impl Queue {
     }
 
     /// Agent of the newest `command` job for `item_id` (`args[0]`), in any
-    /// state: the recorded effective agent, else the enqueue-time `args[1]`. Unlike `list`, not capped at 100 rows, so an
-    /// old job is still found behind a long run of newer unrelated ones.
+    /// state: the recorded effective agent, else the enqueue-time `args[1]`.
+    /// Unlike `list`, not capped at 100 rows, so an old job is still found
+    /// behind a long run of newer unrelated ones.
     pub fn last_agent_for_item(
         &self,
         command: &str,

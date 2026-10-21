@@ -71,7 +71,6 @@ pub fn register(id: &str, check: impl Fn() -> bool + Send + Sync + 'static) -> R
 impl Registration {
     /// Also registers `sink` to receive the agent the job actually runs
     /// (see `record_effective_agent`), until this guard drops.
-    #[must_use]
     pub fn with_agent_sink(self, sink: impl Fn(&str) + Send + Sync + 'static) -> Self {
         AGENT_SINKS
             .lock()

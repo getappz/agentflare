@@ -244,7 +244,8 @@ fn run_in_process(
         // Best-effort: a failed write leaves repair on the enqueue-time agent.
         if let Err(e) = agent_queue.set_effective_agent(&agent_job_id, agent) {
             eprintln!(
-                "agentflare-jobs: recording effective agent {agent} for {agent_job_id} failed                  (repair falls back to the enqueue-time agent): {e}"
+                "agentflare-jobs: recording effective agent {agent} for {agent_job_id} failed \
+                 (repair falls back to the enqueue-time agent): {e}"
             );
         }
     });
