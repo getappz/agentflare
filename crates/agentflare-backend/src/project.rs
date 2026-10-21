@@ -146,13 +146,21 @@ pub fn update(conn: &Connection, id: &str, input: UpdateProject) -> Result<Proje
 pub fn delete(conn: &Connection, id: &str) -> Result<()> {
     let proj = get(conn, id)?;
     let ts = now();
-    let changed = conn.execute(
+    // Soft-delete and the `project_dirs` cleanup commit together: the
+    // schema's `ON DELETE CASCADE` only fires on a hard delete, so without
+    // this the folder row survived and the daemon kept sweeping (and, once
+    // the folder was gone, logging about) a project nobody could see
+    // anymore (item #768).
+    let tx = conn.unchecked_transaction()?;
+    let changed = tx.execute(
         "UPDATE projects SET deleted_at = ?1, updated_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
         rusqlite::params![ts, id],
     )?;
     if changed == 0 {
         return Err(crate::error::Error::NotFound(id.to_string()));
     }
+    crate::project_dir::remove(&tx, id)?;
+    tx.commit()?;
     events::emit(
         conn,
         &proj.workspace_id,
@@ -161,6 +169,45 @@ pub fn delete(conn: &Connection, id: &str) -> Result<()> {
         serde_json::json!({"id": proj.id}),
     );
     Ok(())
+}
+
+/// Parks a project: it stays listable and its items stay readable, but
+/// `project_dir::list` stops returning its folder, so the daemon neither
+/// dispatches its ready-for-work items nor sweeps its PRs (item #768 —
+/// `archived_at` existed in the schema but nothing read it). Idempotent: an
+/// already-archived project keeps its original `archived_at`.
+pub fn archive(conn: &Connection, id: &str) -> Result<Project> {
+    set_archived(conn, id, true)
+}
+
+/// Reverses `archive`. The folder row is untouched by archiving, so no
+/// re-registration is needed; if it was removed by hand, the next
+/// agentflare CLI/MCP call from inside the checkout re-registers it.
+pub fn unarchive(conn: &Connection, id: &str) -> Result<Project> {
+    set_archived(conn, id, false)
+}
+
+fn set_archived(conn: &Connection, id: &str, archived: bool) -> Result<Project> {
+    let ts = now();
+    let changed = conn.execute(
+        "UPDATE projects
+         SET archived_at = CASE WHEN ?3 THEN COALESCE(archived_at, ?2) ELSE NULL END,
+             updated_at = ?2
+         WHERE id = ?1 AND deleted_at IS NULL",
+        rusqlite::params![id, ts, archived],
+    )?;
+    if changed == 0 {
+        return Err(crate::error::Error::NotFound(id.to_string()));
+    }
+    let proj = get(conn, id)?;
+    events::emit(
+        conn,
+        &proj.workspace_id,
+        "project",
+        if archived { "archive" } else { "unarchive" },
+        serde_json::to_value(&proj).unwrap_or_default(),
+    );
+    Ok(proj)
 }
 
 #[cfg(test)]
@@ -323,5 +370,39 @@ mod tests {
         )
         .unwrap();
         assert_eq!(proj2.name, "Test");
+    }
+
+    #[test]
+    fn archive_is_idempotent_and_unarchive_clears_it() {
+        let conn = db::open_in_memory().unwrap();
+        let wid = seed_workspace(&conn);
+        let proj = create(
+            &conn,
+            CreateProject {
+                workspace_id: wid,
+                name: "Test".into(),
+                identifier: "T".into(),
+                external_source: None,
+                external_id: None,
+            },
+        )
+        .unwrap();
+        assert!(proj.archived_at.is_none());
+
+        let first = archive(&conn, &proj.id).unwrap();
+        let at = first.archived_at.expect("archive sets archived_at");
+        let again = archive(&conn, &proj.id).unwrap();
+        assert_eq!(again.archived_at, Some(at), "re-archive keeps the stamp");
+        // Still visible: archive is not delete.
+        assert_eq!(get(&conn, &proj.id).unwrap().archived_at, Some(at));
+
+        let back = unarchive(&conn, &proj.id).unwrap();
+        assert!(back.archived_at.is_none());
+
+        delete(&conn, &proj.id).unwrap();
+        assert!(matches!(
+            archive(&conn, &proj.id).unwrap_err(),
+            crate::error::Error::NotFound(_)
+        ));
     }
 }

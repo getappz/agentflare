@@ -473,6 +473,30 @@ fn ensure_dispatched_label(
     }
 }
 
+/// Project ids whose registered folder was missing the last time discovery
+/// looked. The "folder does not exist" line is logged once per project per
+/// daemon session (item #768: 29 stale registrations × every tick buried
+/// every real supervisor line in `agentflare daemon logs`), and again only
+/// after the folder has come back and gone missing a second time.
+static MISSING_FOLDERS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Records that `project_id`'s folder is missing; `true` the first time
+/// since it was last seen, i.e. "log it now".
+fn note_missing_folder(project_id: &str) -> bool {
+    MISSING_FOLDERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(project_id.to_string())
+}
+
+fn folder_is_back(project_id: &str) {
+    MISSING_FOLDERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(project_id);
+}
+
 /// One pass: across every project registered in `project_dirs` (see
 /// `AgentflareMcp::register_project_dir`, called wherever an agentflare
 /// CLI/MCP call runs inside a linked repo) — not just whichever project
@@ -499,15 +523,20 @@ pub(crate) fn run_discovery_tick(
         for dir in dirs {
             // One project's broken or vanished folder (repo deleted/moved,
             // unmounted drive) must not stall dispatch for every other
-            // project -- skip just this one, loudly, and look again next tick.
+            // project -- skip just this one and look again next tick.
             if !std::path::Path::new(&dir.folder_path).is_dir() {
-                eprintln!(
-                    "agentflare-supervisor: project {} is registered at {} but that folder does \
-                     not exist -- skipping its ready-for-work items this tick",
-                    dir.project_id, dir.folder_path
-                );
+                if note_missing_folder(&dir.project_id) {
+                    eprintln!(
+                        "agentflare-supervisor: project {} is registered at {} but that folder \
+                         does not exist -- skipping its ready-for-work items until it is back \
+                         (archive the project with `agentflare project archive` to stop \
+                         checking)",
+                        dir.project_id, dir.folder_path
+                    );
+                }
                 continue;
             }
+            folder_is_back(&dir.project_id);
             // Same isolation for a per-project DB read failure: `?` here
             // used to abort the whole tick, for every project.
             let labels = match agentflare_backend::label::list_by_project(conn, &dir.project_id) {

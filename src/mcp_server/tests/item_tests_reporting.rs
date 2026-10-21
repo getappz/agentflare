@@ -394,6 +394,7 @@ fn read_only_reporting_actions_accept_a_project_override() {
     let projects: serde_json::Value = serde_json::from_str(
         &s.project(Parameters(ProjectRequest {
             action: "list".into(),
+            project: None,
         }))
         .unwrap(),
     )

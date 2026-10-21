@@ -69,6 +69,7 @@ impl AgentflareMcp {
     fn chat_project(&self) -> String {
         let req = ProjectRequest {
             action: "info".into(),
+            project: None,
         };
         match self.project_inner(req).and_then(|json| {
             serde_json::from_str::<serde_json::Value>(&json)

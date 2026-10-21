@@ -13,11 +13,24 @@ pub enum ProjectCommands {
         #[arg(long, default_value_t = true)]
         json: bool,
     },
+    /// Park a project: the daemon stops dispatching its ready-for-work items
+    /// and sweeping its PRs. It stays listed and its items stay readable.
+    Archive {
+        /// Project name or UUID (see `agentflare project list`)
+        project: String,
+    },
+    /// Reverse `archive`. No re-registration of the checkout is needed.
+    Unarchive {
+        /// Project name or UUID (see `agentflare project list`)
+        project: String,
+    },
 }
 
 impl ProjectArgs {
     pub fn run(self) {
         match self.command {
+            ProjectCommands::Archive { project } => set_archived("archive", project),
+            ProjectCommands::Unarchive { project } => set_archived("unarchive", project),
             ProjectCommands::List { json: _ } => {
                 let mcp = crate::mcp_server::AgentflareMcp::default();
                 let res = mcp.with_backend_db(|conn| {
@@ -34,6 +47,7 @@ impl ProjectArgs {
                                 "name": p.name,
                                 "identifier": p.identifier,
                                 "workspace_id": p.workspace_id,
+                                "archived_at": p.archived_at,
                             })
                         })
                         .collect();
@@ -48,5 +62,18 @@ impl ProjectArgs {
                 }
             }
         }
+    }
+}
+
+/// `archive` / `unarchive` share the MCP `project` tool's implementation so
+/// the CLI and MCP surfaces can't drift (name-or-UUID lookup, idempotency).
+fn set_archived(action: &str, project: String) {
+    let mcp = crate::mcp_server::AgentflareMcp::default();
+    match mcp.project_inner(crate::mcp_server::types::ProjectRequest {
+        action: action.into(),
+        project: Some(project),
+    }) {
+        Ok(json) => println!("{json}"),
+        Err(e) => crate::ui::error(&e.to_string()),
     }
 }
