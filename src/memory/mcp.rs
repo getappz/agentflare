@@ -50,38 +50,56 @@ pub(super) fn index_embedding(
     }
 }
 
+/// A real path, qualified/snake_case/call identifier, file name or flag — not a
+/// version (`v1.2`), a prose slash (`and/or`) or a lone camelCase word.
+fn is_scope_token(w: &str) -> bool {
+    let w = w.trim_matches(|c: char| !c.is_alphanumeric() && !"_/.-:()~".contains(c));
+    let segments = || w.split('/').filter(|p| !p.is_empty());
+    let path = segments().count() >= 2
+        && !["and/or", "either/or", "yes/no", "n/a", "i/o"].contains(&w.to_lowercase().as_str());
+    let named = w.rsplit_once('.').is_some_and(|(a, e)| {
+        !a.is_empty()
+            && (1..=4).contains(&e.len())
+            && e.chars().all(|c| c.is_ascii_alphanumeric())
+            && e.chars().any(|c| c.is_ascii_alphabetic())
+    });
+    let humps = w
+        .chars()
+        .zip(w.chars().skip(1))
+        .filter(|(a, b)| a.is_ascii_lowercase() && b.is_ascii_uppercase())
+        .count();
+    path || named
+        || w.contains("::")
+        || w.split('_').filter(|p| !p.is_empty()).count() >= 2
+        || w.ends_with("()")
+        || humps >= 2
+        || (w.len() > 2 && w.starts_with("--"))
+}
+
 /// Retrieval-card lint: a memory should carry the symptoms, synonyms and scope a
 /// future searcher would type. Heuristic and advisory only — never blocks a write.
 pub fn lint_retrieval_card(title: &str, content: &str) -> Vec<String> {
     let text = format!("{title} {content}");
     let words = content.split_whitespace().count();
-    let has_scope = text.split_whitespace().any(|w| {
-        let w = w.trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '/' && c != '.');
-        w.contains('/')
-            || w.contains("::")
-            || w.contains('_')
-            || w.rsplit_once('.').is_some_and(|(a, e)| {
-                !a.is_empty()
-                    && (1..=4).contains(&e.len())
-                    && e.chars().all(|c| c.is_ascii_alphanumeric())
-            })
-            || (w.chars().any(|c| c.is_ascii_lowercase())
-                && w.chars().skip(1).any(|c| c.is_ascii_uppercase()))
-    }) || text.contains('`');
-    let lower = text.to_lowercase();
-    let has_symptom = [
-        "error",
-        "panic",
-        "fail",
-        "exception",
-        "timeout",
-        "deadlock",
-        "crash",
-        "cannot",
-        "denied",
-    ]
-    .iter()
-    .any(|k| lower.contains(k));
+    let has_scope = text.matches('`').count() >= 2 || text.split_whitespace().any(is_scope_token);
+    let has_symptom = text
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|t| {
+            [
+                "error",
+                "panic",
+                "fail",
+                "exception",
+                "timeout",
+                "deadlock",
+                "crash",
+                "cannot",
+                "denied",
+            ]
+            .iter()
+            .any(|k| t.starts_with(k))
+        });
     let mut w = Vec::new();
     if content.trim().len() < 40 || words < 6 {
         w.push("text is very short".to_string());
@@ -89,7 +107,7 @@ pub fn lint_retrieval_card(title: &str, content: &str) -> Vec<String> {
     if !has_scope {
         w.push("no path, identifier or scope (file, module, function, command)".to_string());
     }
-    if !has_symptom && !has_scope {
+    if !has_symptom {
         w.push("no error text or symptom".to_string());
     }
     if !w.is_empty() {
@@ -727,6 +745,41 @@ mod tests {
     #[test]
     fn retrieval_card_lint_flags_vague_and_passes_cards() {
         assert!(!lint_retrieval_card("deadlock fix", "fixed deadlock").is_empty());
+        // Incidental tokens must not suppress the scope warning.
+        let weak = |c: &str| {
+            lint_retrieval_card("t", c)
+                .iter()
+                .any(|m| m.starts_with("no path"))
+        };
+        assert!(weak(
+            "fixed it, see v1.2 and/or retry after timeout, ok thanks"
+        ));
+        assert!(weak(
+            "the iPhone build hit a timeout when we tried it again"
+        ));
+        assert!(!weak("panic in src/memory/store.rs when opening"));
+        assert!(!weak(
+            "run cargo test --lib for the failure in memory::store"
+        ));
+        assert!(!weak("see `open` for the timeout and why it is slow now"));
+        assert!(!weak(
+            "handleRememberInput panics on empty titles in the daemon"
+        ));
+        // A scoped card with no symptom still warns; "terror" is not "error".
+        let nosym = |c: &str| {
+            lint_retrieval_card("t", c)
+                .iter()
+                .any(|m| m.starts_with("no error"))
+        };
+        assert!(nosym(
+            "rewrote the helper in src/memory/store.rs to use a pool"
+        ));
+        assert!(nosym(
+            "terror in src/memory/store.rs when opening the db file"
+        ));
+        assert!(!nosym(
+            "errors in src/memory/store.rs when opening the db file"
+        ));
         assert!(lint_retrieval_card(
             "db locked",
             "mcp stalls with 'database is locked' error in src/memory/store.rs open(); fix: set busy_timeout"
