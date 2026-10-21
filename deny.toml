@@ -9,7 +9,13 @@ all-features = true
 unmaintained = "workspace"
 yanked = "warn"
 unused-ignored-advisory = "warn"
-ignore = []
+ignore = [
+    # 2026-10-21: webpki-roots 0.26.11 is the last 0.26 release and is a shim
+    # that re-exports webpki-roots 1.x; the bundled roots actually come from
+    # webpki-roots 1.0.10 (patched). ureq 2.x pins the 0.26 line, so there is
+    # no patched 0.26 release to update to. Drop once ureq moves to 1.x.
+    { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26.11 is a shim over the patched 1.0.10 (via ureq 2.x)" },
+]
 
 [licenses]
 # The allow-list below is a deliberately curated, forward-looking policy. Some
