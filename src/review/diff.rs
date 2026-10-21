@@ -39,30 +39,30 @@ pub struct DiffLine {
 }
 
 impl DiffLine {
-    fn unchanged(old_line: u32, new_line: u32, text: &str) -> Self {
+    fn unchanged(old_line: Option<u32>, new_line: Option<u32>, text: &str) -> Self {
         Self {
             kind: LineKind::Unchanged,
-            old_line: Some(old_line),
-            new_line: Some(new_line),
+            old_line,
+            new_line,
             old_text: Some(text.to_string()),
             new_text: Some(text.to_string()),
         }
     }
 
-    fn added(new_line: u32, text: &str) -> Self {
+    fn added(new_line: Option<u32>, text: &str) -> Self {
         Self {
             kind: LineKind::Added,
             old_line: None,
-            new_line: Some(new_line),
+            new_line,
             old_text: None,
             new_text: Some(text.to_string()),
         }
     }
 
-    fn deleted(old_line: u32, text: &str) -> Self {
+    fn deleted(old_line: Option<u32>, text: &str) -> Self {
         Self {
             kind: LineKind::Deleted,
-            old_line: Some(old_line),
+            old_line,
             new_line: None,
             old_text: Some(text.to_string()),
             new_text: None,
@@ -260,6 +260,11 @@ impl FileState {
 
 /// The hunk being collected.
 struct ChunkState {
+    /// Whether the `@@` header parsed. When it did not, the hunk's lines
+    /// carry no numbers at all: a line number nobody can check is worse than
+    /// no line number, because it can verify a finding that points at a line
+    /// the file does not have.
+    numbered: bool,
     old_start: u32,
     old_len: u32,
     new_start: u32,
@@ -274,8 +279,10 @@ struct ChunkState {
 
 impl ChunkState {
     fn new(header: Option<(u32, u32, u32, u32)>) -> Self {
+        let numbered = header.is_some();
         let (old_start, old_len, new_start, new_len) = header.unwrap_or((0, 0, 0, 0));
         Self {
+            numbered,
             old_start,
             old_len,
             new_start,
@@ -288,24 +295,27 @@ impl ChunkState {
 
     /// Records one raw diff line, advancing the side counters.
     fn push(&mut self, raw: &str) {
-        let mut chars = raw.chars();
-        match chars.next() {
+        let (old_no, new_no) = if self.numbered {
+            (Some(self.old_next), Some(self.new_next))
+        } else {
+            (None, None)
+        };
+        match raw.chars().next() {
             Some('+') => {
                 let text = &raw[1..];
-                self.entries.push(DiffLine::added(self.new_next, text));
+                self.entries.push(DiffLine::added(new_no, text));
                 self.new_next += 1;
             }
             Some('-') => {
                 let text = &raw[1..];
-                self.entries.push(DiffLine::deleted(self.old_next, text));
+                self.entries.push(DiffLine::deleted(old_no, text));
                 self.old_next += 1;
             }
             Some('\\') => {}
             _ => {
                 // A context line: a leading space, or a bare blank line.
                 let text = raw.strip_prefix(' ').unwrap_or(raw);
-                self.entries
-                    .push(DiffLine::unchanged(self.old_next, self.new_next, text));
+                self.entries.push(DiffLine::unchanged(old_no, new_no, text));
                 self.old_next += 1;
                 self.new_next += 1;
             }
@@ -642,7 +652,13 @@ diff --git a/f b/f
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].chunks.len(), 1);
         assert_eq!(files[0].chunks[0].lines.len(), 1);
-        assert_eq!(files[0].chunks[0].lines[0].kind, LineKind::Added);
+        let line = &files[0].chunks[0].lines[0];
+        assert_eq!(line.kind, LineKind::Added);
+        // The header did not parse, so the line has no number to stand on. A
+        // made-up number could verify a finding that points at a line the
+        // file does not have.
+        assert_eq!(line.new_line, None);
+        assert_eq!(line.old_line, None);
     }
 
     #[test]

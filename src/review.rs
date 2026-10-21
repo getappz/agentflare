@@ -607,6 +607,25 @@ diff --git a/f b/f
     }
 
     #[test]
+    fn changed_lines_ignores_a_hunk_whose_header_did_not_parse() {
+        // A hunk with an unreadable `@@` header has no line numbers to
+        // stand on. Counting made-up numbers would verify a finding that
+        // points at a line the file does not have.
+        let diff = "\
+diff --git a/f b/f
+--- a/f
++++ b/f
+@@ this is not a header @@
++added
+";
+        let c = changed_lines(diff);
+        assert!(
+            c["f"].is_empty(),
+            "an unnumbered hunk must not claim any changed line"
+        );
+    }
+
+    #[test]
     fn finding_off_the_diff_is_unverified() {
         let items = consensus(
             &[sf("a", "src/foo.rs", 99, None)],
