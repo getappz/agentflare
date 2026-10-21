@@ -1030,6 +1030,7 @@ fn project_rejects_unknown_action() {
     let err = s
         .project(Parameters(ProjectRequest {
             action: "nonexistent".into(),
+            project: None,
         }))
         .unwrap_err();
     assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);

@@ -1857,7 +1857,7 @@ impl AgentflareMcp {
         self.webhook_inner(req)
     }
 
-    fn project_inner(&self, req: ProjectRequest) -> Result<String, ErrorData> {
+    pub(crate) fn project_inner(&self, req: ProjectRequest) -> Result<String, ErrorData> {
         match req.action.as_str() {
             "info" => self.with_backend_db(|conn| {
                 let project = self.resolve_project(conn)?;
@@ -1872,15 +1872,29 @@ impl AgentflareMcp {
                     .map_err(map_backend_err)?;
                 Ok(serde_json::to_string_pretty(&projects).unwrap_or_default())
             })?,
+            // Archive is the supported way to park a project the daemon
+            // should stop sweeping (item #768): it survives in `list` and its
+            // items stay readable, but `project_dir::list` hides its folder.
+            // Unarchive needs no re-registration — the dir row is kept.
+            action @ ("archive" | "unarchive") => self.with_backend_db(|conn| {
+                let target = self.resolve_project_for_read(conn, req.project.as_deref())?;
+                let project = if action == "archive" {
+                    agentflare_backend::project::archive(conn, &target.id)
+                } else {
+                    agentflare_backend::project::unarchive(conn, &target.id)
+                }
+                .map_err(map_backend_err)?;
+                Ok(serde_json::to_string_pretty(&project).unwrap_or_default())
+            })?,
             other => Err(ErrorData::invalid_params(
-                format!("unknown project action: '{other}' — expected info|list"),
+                format!("unknown project action: '{other}' — expected info|list|archive|unarchive"),
                 None,
             )),
         }
     }
 
     #[tool(
-        description = "Workspace/project linkage. `info` shows the project this repo is linked to (auto-created/linked on first use); `list` shows every project in the linked workspace — the valid targets for the item tool's read-only `project` override (portfolio roll-ups)."
+        description = "Workspace/project linkage. `info` shows the project this repo is linked to (auto-created/linked on first use); `list` shows every project in the linked workspace — the valid targets for the item tool's read-only `project` override (portfolio roll-ups). `archive` parks a project (`project` = name or UUID, default: this repo's): it stays listed with `archived_at` set and its items stay readable, but the daemon stops dispatching its ready-for-work items and sweeping its PRs; `unarchive` reverses that with no re-registration needed."
     )]
     fn project(&self, Parameters(req): Parameters<ProjectRequest>) -> Result<String, ErrorData> {
         self.project_inner(req)
