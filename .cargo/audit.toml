@@ -1,0 +1,9 @@
+# cargo-audit configuration (security-check workflow). Keep in sync with deny.toml.
+[advisories]
+ignore = [
+    # 2026-10-21: webpki-roots 0.26.11 is the last 0.26 release and is a shim
+    # re-exporting webpki-roots 1.x; the bundled roots come from the patched
+    # 1.0.10. ureq 2.x pins the 0.26 line, so there is no 0.26 fix to update
+    # to. Drop once ureq moves to webpki-roots 1.x.
+    "RUSTSEC-2026-0381",
+]
