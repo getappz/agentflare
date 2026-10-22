@@ -3,7 +3,7 @@
 | Field | Value |
 |-------|-------|
 | Item | #395 — design-spec only (no application code in this item) |
-| Status | Draft for implementation planning (rev 4 — completion-gate + hook-path evidence) |
+| Status | Draft for implementation planning (rev 5 — item-work handoff + verification refresh) |
 | Informed by | PM handoff (item asset), `run_review_sweep` / `review_bots` audit, flare-workflow scheduling (#366) |
 | Related | #393 (workflow engine reliability), #939/#944 (`needs_input` + verify gate at `item_done`), bridge work-item pipeline (`.superpowers/notes/bridge-work-item-workflow-design.md`) |
 
@@ -76,7 +76,48 @@ $ wc -l docs/superpowers/specs/pr-lifecycle-workflow-v1.md
 459 docs/superpowers/specs/pr-lifecycle-workflow-v1.md
 ```
 
-Rev 4 extends the spec on the task branch; `git status` shows the doc delta until committed.
+### Round-5 response (item-work vs PR lifecycle handoff)
+
+| Question | Answer |
+|----------|--------|
+| Does #395 implement `pr-reconcile`? | **No** — analyst turn only authors/commits this spec; Rust workflows are §Follow-up. |
+| What happens after `item done` on a design-spec? | `in_review` + open PR; **today** `run_review_sweep` treats it like any other PR (merge when green); **target** `pr-lifecycle` with the same `handle_pr_status` tree. |
+| Why document item work in a PR-lifecycle spec? | Operators must not conflate **SDD evidence** (tracked markdown on the task branch) with **daemon PR automation** (post-`in_review`). Wrong evidence caused prior completion-gate false positives (§Round-3–4). |
+
+**Handoff sequence (design-spec item such as #395):**
+
+```mermaid
+sequenceDiagram
+  participant A as Analyst agent
+  participant W as work_item_pipeline
+  participant H as completion hooks
+  participant GH as GitHub PR
+  participant S as review sweep / pr-lifecycle
+  A->>A: Write docs/superpowers/specs/*.md (git add/commit)
+  A->>H: git diff evidence + review submit
+  A->>W: item done (summary = spec abstract)
+  W->>GH: push branch, open PR
+  Note over W,GH: item state in_review
+  S->>GH: CI, merge, repair (daemon-owned)
+  GH-->>W: merged → check_merge → completed
+```
+
+### Verification record (rev 5, synchronous — 2026-10-22)
+
+Executed on branch `task/395-design-spec-pr-lifecycle-workflow-replac` at `HEAD=83f1d90a` (spec commits `ff8afa94`…`5f9b6cb5` above merge-base `master` @ `3f93efb7`):
+
+```
+$ git diff master --stat -- docs/ .gitignore
+ .gitignore                                         |   4 +-
+ docs/superpowers/specs/pr-lifecycle-workflow-v1.md | 497 +++++++++++++++++++++
+ 2 files changed, 500 insertions(+), 1 deletion(-)
+
+$ git ls-files docs/superpowers/specs/pr-lifecycle-workflow-v1.md
+docs/superpowers/specs/pr-lifecycle-workflow-v1.md
+
+$ wc -l docs/superpowers/specs/pr-lifecycle-workflow-v1.md
+497 docs/superpowers/specs/pr-lifecycle-workflow-v1.md
+```
 
 ## Item work pipeline (how #395 fits)
 
