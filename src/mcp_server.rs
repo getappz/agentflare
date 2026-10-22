@@ -1688,7 +1688,7 @@ impl AgentflareMcp {
             "doctor" => self.item_doctor(req),
             "status" => self.item_status(req),
             "clear_parent" => self.item_update(ItemRequest {
-                id: Some(require_id(req.id, "clear_parent")?),
+                id: req.id,
                 parent_id: Some(String::new()),
                 ..Default::default()
             }),
