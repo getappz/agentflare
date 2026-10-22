@@ -1741,7 +1741,9 @@ impl AgentflareMcp {
         // `cleanup_worktree` itself still checks for a clean tree and
         // no-ops (logging) rather than trusting push/PR success alone as
         // proof nothing would be lost.
-        let in_review = owns_claim && pr_url.is_some();
+        let in_review = owns_claim
+            && (pr_url.is_some()
+                || (!should_push && super::item_merged_pr::has_open_pr(&item, &repo_root)));
         let diverged = item
             .as_ref()
             .zip(target_branch.as_ref())

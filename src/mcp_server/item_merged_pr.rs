@@ -70,6 +70,45 @@ fn merged_pr_for(
         .then_some(pr)
 }
 
+/// Whether a `push=false` `done` must still leave the item in `in_review`:
+/// it records `metadata.pr.number` and that PR is still open on GitHub. A
+/// lookup that cannot tell (`Unknown`) or a merged/closed PR does not count.
+pub(crate) fn has_open_pr(
+    item: &Option<agentflare_backend::item::Item>,
+    repo_root: &std::path::Path,
+) -> bool {
+    item.as_ref()
+        .filter(|i| crate::worktree::pr_number_from_metadata(i).is_some())
+        .is_some_and(|i| pr_is_open(&crate::worktree::pr_ci_status(i, repo_root)))
+}
+
+fn pr_is_open(status: &crate::worktree::PrCiStatus) -> bool {
+    use crate::worktree::PrCiStatus::*;
+    !matches!(status, Merged | Closed { .. } | Unknown)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::worktree::PrCiStatus::*;
+
+    #[test]
+    fn only_a_live_pr_counts_as_open() {
+        assert!(super::pr_is_open(&Pending {
+            number: 1,
+            head_sha: None
+        }));
+        assert!(super::pr_is_open(&Conflicting { number: 1 }));
+        assert!(!super::pr_is_open(&Merged));
+        assert!(!super::pr_is_open(&Closed { number: 1 }));
+        assert!(!super::pr_is_open(&Unknown));
+    }
+
+    #[test]
+    fn no_pr_record_is_not_open() {
+        assert!(!super::has_open_pr(&None, std::path::Path::new("/nope")));
+    }
+}
+
 /// Releases the claim lease and removes the item's worktree.
 ///
 /// Shared by both "nothing was ever committed" (the worktree is clean by
