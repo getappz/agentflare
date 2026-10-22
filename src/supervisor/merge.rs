@@ -284,6 +284,15 @@ pub(super) fn requeue_closed_pr_item(
     item: &agentflare_backend::item::Item,
     number: u64,
 ) -> bool {
+    requeue_closed_pr_item_with(mcp, item, number, |_| {})
+}
+
+pub(super) fn requeue_closed_pr_item_with(
+    mcp: &AgentflareMcp,
+    item: &agentflare_backend::item::Item,
+    number: u64,
+    before_redispatch: impl FnOnce(&rusqlite::Connection),
+) -> bool {
     let author = crate::claims::owner_id();
     let outcome = mcp.with_backend_db(|conn| -> agentflare_backend::error::Result<bool> {
         let current = agentflare_backend::item::get(conn, &item.id)?;
@@ -296,10 +305,14 @@ pub(super) fn requeue_closed_pr_item(
         if crate::worktree::pr_number_from_metadata(&current).is_some_and(|n| n != number) {
             return Ok(false);
         }
-        // The PR was just seen closed, so no GitHub round-trip is needed to
-        // know its record is dead.
-        let rearmed = match agentflare_backend::item::redispatch(conn, &item.id, None, |_| {
-            agentflare_backend::item::PrRetention::Clear
+        before_redispatch(conn);
+        // Only the PR just seen closed is known dead; a replacement can arrive after the guard.
+        let rearmed = match agentflare_backend::item::redispatch(conn, &item.id, None, |tracked| {
+            if tracked == number {
+                agentflare_backend::item::PrRetention::Clear
+            } else {
+                agentflare_backend::item::PrRetention::Keep
+            }
         })? {
             agentflare_backend::item::RedispatchOutcome::Ready { .. } => true,
             agentflare_backend::item::RedispatchOutcome::NoAssignee => {
@@ -313,8 +326,10 @@ pub(super) fn requeue_closed_pr_item(
                 conn.execute(
                     "UPDATE items SET metadata = json_remove(metadata, '$.pr', \
                      '$.review_threads', '$.coderabbit_repair_announced_for') \
-                     WHERE id = ?1 AND json_valid(metadata)",
-                    rusqlite::params![item.id],
+                     WHERE id = ?1 AND json_valid(metadata) \
+                     AND (json_extract(metadata, '$.pr.number') = ?2 \
+                          OR json_extract(metadata, '$.pr.number') IS NULL)",
+                    rusqlite::params![item.id, i64::try_from(number).ok()],
                 )?;
                 false
             }
