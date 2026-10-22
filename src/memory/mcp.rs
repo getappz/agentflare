@@ -57,10 +57,11 @@ fn is_scope_token(w: &str) -> bool {
     let segments = || w.split('/').filter(|p| !p.is_empty());
     let path = segments().count() >= 2
         && !["and/or", "either/or", "yes/no", "n/a", "i/o"].contains(&w.to_lowercase().as_str());
-    let name = w
+    let name = w.trim_end_matches('.');
+    let name = name
         .rsplit_once(':')
         .filter(|(_, line)| !line.is_empty() && line.bytes().all(|b| b.is_ascii_digit()))
-        .map_or(w, |(name, _)| name);
+        .map_or(name, |(name, _)| name);
     let named = name.rsplit_once('.').is_some_and(|(a, e)| {
         !a.is_empty()
             && (1..=4).contains(&e.len())
@@ -804,7 +805,12 @@ mod tests {
         assert!(weak(
             "the iPhone build hit a timeout when we tried it again"
         ));
-        for reference in ["store.rs:47", "store.rs:47;"] {
+        for reference in [
+            "store.rs:47",
+            "store.rs:47;",
+            "store.rs:47.",
+            "store.rs:47...",
+        ] {
             let card =
                 format!("worker stalls when reading {reference} retries continue until restart");
             assert!(
@@ -812,7 +818,14 @@ mod tests {
                 "{card}"
             );
         }
-        for reference in ["v1.2:47", "store.rs:line", "store.rs:"] {
+        for reference in [
+            "v1.2:47",
+            "v1.2:47.",
+            "store.rs:line",
+            "store.rs:line.",
+            "store.rs:",
+            "store.rs:.",
+        ] {
             assert!(weak(&format!(
                 "worker stalls when reading {reference} retries continue until restart"
             )));
