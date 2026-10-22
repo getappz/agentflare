@@ -437,6 +437,7 @@ mod item_doctor_tests;
 mod item_force_tests;
 mod item_merged_pr_tests;
 mod item_metadata_merge_tests;
+mod item_parent_tests;
 mod item_pr_failure_tests;
 mod item_release_worktree_tests;
 mod item_status_tests;
