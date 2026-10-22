@@ -15,6 +15,14 @@ pub struct WorkflowArgs {
 
 #[derive(Subcommand)]
 pub enum WorkflowCommand {
+    /// Refine an execution harness with isolated trials from a JSON request.
+    Refine(RefineArgs),
+    /// Inspect a durable harness refinement run.
+    RefineStatus(StatusArgs),
+    /// Resume an interrupted harness refinement run and wait for its report.
+    RefineResume(StatusArgs),
+    /// Cancel a refinement run and stop its running subprocesses.
+    RefineCancel(StatusArgs),
     /// Start a JSON-defined workflow from a file, or by name from this
     /// project's `.agentflare/workflows/` directory.
     Run(RunArgs),
@@ -37,6 +45,14 @@ pub enum WorkflowCommand {
     /// Interval schedules for project workflows. `fire` only enqueues;
     /// the daemon executes.
     Schedule(super::workflow_schedule::ScheduleArgs),
+}
+
+#[derive(Args)]
+pub struct RefineArgs {
+    /// Refinement request JSON (task, agents/models, checks, mode, k, limits).
+    pub request: PathBuf,
+    #[arg(long)]
+    pub db_path: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -126,6 +142,74 @@ impl WorkflowArgs {
         let db_path =
             |p: &Option<PathBuf>| p.clone().unwrap_or_else(crate::workflow::default_db_path);
         match &self.command {
+            WorkflowCommand::Refine(args) => {
+                let result = (|| -> Result<(), String> {
+                    let bytes = std::fs::read(&args.request).map_err(|e| e.to_string())?;
+                    if bytes.len() > 1024 * 1024 {
+                        return Err("refinement request exceeds 1 MiB".into());
+                    }
+                    let request = serde_json::from_slice(&bytes)
+                        .map_err(|e| format!("invalid refinement request: {e}"))?;
+                    let db = args
+                        .db_path
+                        .clone()
+                        .unwrap_or_else(crate::refinement::default_db_path);
+                    let run = crate::refinement::start(request, &db)?;
+                    println!("{run}");
+                    use std::io::Write;
+                    std::io::stdout().flush().map_err(|e| e.to_string())?;
+                    let report = crate::refinement::wait(run, &db)?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+                    );
+                    Ok(())
+                })();
+                if let Err(e) = result {
+                    ui::error(&e);
+                    std::process::exit(1);
+                }
+            }
+            WorkflowCommand::RefineStatus(args)
+            | WorkflowCommand::RefineResume(args)
+            | WorkflowCommand::RefineCancel(args) => {
+                let result = (|| -> Result<(), String> {
+                    let run = args
+                        .run_id
+                        .parse()
+                        .map_err(|e| format!("invalid refinement run ID: {e}"))?;
+                    let db = args
+                        .db_path
+                        .clone()
+                        .unwrap_or_else(crate::refinement::default_db_path);
+                    if matches!(&self.command, WorkflowCommand::RefineCancel(_)) {
+                        crate::refinement::cancel(run, &db)?;
+                        println!("{run}");
+                    } else if matches!(&self.command, WorkflowCommand::RefineResume(_)) {
+                        let resumed = crate::refinement::resume(run, &db)?;
+                        if !resumed && !crate::refinement::status(run, &db)?.status.is_terminal() {
+                            return Err("refinement is held by a live executor; inspect it with refine-status".into());
+                        }
+                        println!("{run}");
+                        let report = crate::refinement::wait(run, &db)?;
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+                        );
+                    } else {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&crate::refinement::status(run, &db)?)
+                                .map_err(|e| e.to_string())?
+                        );
+                    }
+                    Ok(())
+                })();
+                if let Err(e) = result {
+                    ui::error(&e);
+                    std::process::exit(1);
+                }
+            }
             WorkflowCommand::Run(args) => {
                 let definition = if Path::new(&args.file).is_file() {
                     match std::fs::read_to_string(&args.file) {

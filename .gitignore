@@ -18,6 +18,12 @@
 # Cursor local hooks/rules — per-machine editor config, not shared
 /.cursor/
 
+# Generated Cline rules; handwritten rules can still be shared
+/.clinerules/agentflare.md
+
+# Ouroboros local artifact database and SQLite journals
+/.ouroboros/
+
 # opencode CLI's own local state (node_modules, package.json/lock, plans dir)
 /.opencode/
 
