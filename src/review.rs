@@ -7,6 +7,7 @@
 use rusqlite::{Connection, params};
 use std::collections::{HashMap, HashSet};
 
+pub mod diff;
 pub mod triage;
 pub mod verify;
 
@@ -305,44 +306,22 @@ pub fn performance_review(
 /// Parses a unified diff into the set of new-side line numbers present in each
 /// file's hunks (added `+` and context lines). A finding is "verified" when it
 /// cites one of these — i.e. it points at a line the diff actually shows.
-pub fn changed_lines(diff: &str) -> HashMap<String, HashSet<u32>> {
+///
+/// Read through [`diff::parse_unified_diff`], so the line set and the
+/// structured view of the same diff can never disagree.
+pub fn changed_lines(unified: &str) -> HashMap<String, HashSet<u32>> {
     let mut out: HashMap<String, HashSet<u32>> = HashMap::new();
-    let mut file: Option<String> = None;
-    let mut new_line: u32 = 0;
-    for raw in diff.lines() {
-        if raw.starts_with("diff --git ") {
-            // New file section. Clear the current file so the metadata lines
-            // that follow (`index …`, `--- …`, mode/rename headers) aren't
-            // mistaken for context lines of the PREVIOUS file — which would
-            // insert phantom changed-line numbers and falsely verify findings.
-            file = None;
-        } else if let Some(path) = raw.strip_prefix("+++ ") {
-            // "+++ b/src/foo.rs" → "src/foo.rs" ("/dev/null" for deletions).
-            let p = path.trim().trim_start_matches("b/");
-            file = (p != "/dev/null").then(|| p.to_string());
-        } else if let Some(hunk) = raw.strip_prefix("@@") {
-            // "@@ -a,b +c,d @@ ..." — grab the new-side start `c`.
-            if let Some(start) = hunk
-                .split('+')
-                .nth(1)
-                .and_then(|s| s.split([',', ' ']).next())
-                .and_then(|s| s.parse::<u32>().ok())
-            {
-                new_line = start;
-            }
-        } else if let Some(f) = &file {
-            match raw.chars().next() {
-                Some('+') => {
-                    out.entry(f.clone()).or_default().insert(new_line);
-                    new_line += 1;
-                }
-                Some('-') => { /* old-side only; new-side counter unchanged */ }
-                // "\ No newline at end of file" is a marker, not a line.
-                Some('\\') => {}
-                _ => {
-                    // context line (leading space, or a blank line in the hunk)
-                    out.entry(f.clone()).or_default().insert(new_line);
-                    new_line += 1;
+    for file in diff::parse_unified_diff(unified) {
+        // A file with no new side (deleted) contributes no line numbers.
+        let Some(key) = diff::file_key(&file) else {
+            continue;
+        };
+        let lines = out.entry(key.to_string()).or_default();
+        for chunk in &file.chunks {
+            for line in &chunk.lines {
+                // A deleted line has no new side; every other line does.
+                if let Some(n) = line.new_line {
+                    lines.insert(n);
                 }
             }
         }
@@ -608,6 +587,42 @@ diff --git a/f b/f
 ";
         let c = changed_lines(diff);
         assert_eq!(c["f"], [1u32].into_iter().collect::<HashSet<_>>());
+    }
+
+    #[test]
+    fn changed_lines_covers_every_hunk_of_a_file() {
+        // A file often has several hunks; every one of them counts.
+        let diff = "\
+diff --git a/f b/f
+--- a/f
++++ b/f
+@@ -1,1 +1,2 @@
+ keep
++added
+@@ -10,1 +11,1 @@
++more
+";
+        let c = changed_lines(diff);
+        assert_eq!(c["f"], [1u32, 2, 11].into_iter().collect::<HashSet<_>>());
+    }
+
+    #[test]
+    fn changed_lines_ignores_a_hunk_whose_header_did_not_parse() {
+        // A hunk with an unreadable `@@` header has no line numbers to
+        // stand on. Counting made-up numbers would verify a finding that
+        // points at a line the file does not have.
+        let diff = "\
+diff --git a/f b/f
+--- a/f
++++ b/f
+@@ this is not a header @@
++added
+";
+        let c = changed_lines(diff);
+        assert!(
+            c["f"].is_empty(),
+            "an unnumbered hunk must not claim any changed line"
+        );
     }
 
     #[test]
