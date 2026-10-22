@@ -1409,21 +1409,25 @@ fn push_diff_range(repo_root: &Path) -> Result<String, String> {
     {
         return Ok(format!("{upstream}..HEAD"));
     }
-    let default = branch::resolve_default_branch_known(repo_root).ok_or_else(|| {
-        "cannot resolve a push base without an upstream or default branch".to_string()
-    })?;
-    let current = branch::current_branch(repo_root).unwrap_or_default();
-    let candidates = [
-        format!("refs/remotes/origin/{current}"),
-        format!("refs/remotes/origin/{default}"),
-        format!("refs/heads/{default}"),
-    ];
-    for candidate in candidates {
-        if let Some(base) = shell::run_in_opt(repo_root, &["rev-parse", "--verify", &candidate]) {
-            return Ok(format!("{base}...HEAD"));
-        }
+    if let Some(current) = branch::current_branch(repo_root)
+        && let Some(base) = shell::run_in_opt(
+            repo_root,
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("refs/remotes/origin/{current}"),
+            ],
+        )
+    {
+        return Ok(format!("{base}...HEAD"));
     }
-    Err("cannot resolve the remote branch for the push diff".to_string())
+    let default = branch::resolve_default_branch_known(repo_root).ok_or_else(|| {
+        "cannot resolve a remote push base without an upstream or default branch".to_string()
+    })?;
+    let candidate = format!("refs/remotes/origin/{default}");
+    let base = shell::run_in_opt(repo_root, &["rev-parse", "--verify", &candidate])
+        .ok_or_else(|| "cannot resolve the remote branch for the push diff".to_string())?;
+    Ok(format!("{base}...HEAD"))
 }
 
 /// Scan-only escape hatch for item #402's commit/push credential scan: set
@@ -1533,10 +1537,9 @@ fn secret_scan_for(
 
 /// `(path, added_text)` per file for the diff `subcommand` is about to
 /// record: staged + working-tree hunks for `commit` (mirroring
-/// `changed_paths`' `git commit -a` semantics), the net `base...HEAD` diff
-/// for `push` where `base` is the upstream when one is configured and the
-/// default branch otherwise. Binary files produce no `+` lines and so are
-/// skipped naturally.
+/// `changed_paths`' `git commit -a` semantics), the net upstream diff or
+/// remote merge-base diff for `push`. Binary files produce no `+` lines and
+/// so are skipped naturally.
 fn secret_scan_added_lines(
     repo_root: &Path,
     subcommand: &str,
@@ -2360,8 +2363,52 @@ mod tests {
     }
 
     #[test]
+    fn secret_scan_push_without_a_remote_base_fails_closed() {
+        let repo = init_repo();
+        std::fs::write(repo.path().join("tracked.txt"), format!("{GH_TOKEN}\n")).unwrap();
+        run_git(repo.path(), &["commit", "-q", "-am", "token"]);
+        run_git(repo.path(), &["checkout", "-q", "-b", "feature"]);
+
+        let result = scan(repo.path(), "push");
+        assert!(
+            result.deny,
+            "a local default at HEAD is not a remote push base"
+        );
+        assert!(result.error.is_some());
+        assert!(changed_paths(repo.path(), "push").is_err());
+        assert!(!result.reason.unwrap().contains(GH_TOKEN));
+    }
+
+    #[test]
+    fn secret_scan_push_uses_remote_current_without_a_known_default() {
+        let repo = init_repo();
+        run_git(repo.path(), &["branch", "-m", "trunk"]);
+        run_git(
+            repo.path(),
+            &["update-ref", "refs/remotes/origin/feature", "HEAD"],
+        );
+        run_git(repo.path(), &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(repo.path().join("tracked.txt"), format!("{GH_TOKEN}\n")).unwrap();
+        run_git(repo.path(), &["commit", "-q", "-am", "token"]);
+        assert!(branch::resolve_default_branch_known(repo.path()).is_none());
+
+        assert_eq!(changed_paths(repo.path(), "push").unwrap(), ["tracked.txt"]);
+        let result = scan(repo.path(), "push");
+        assert!(result.deny);
+        assert!(result.error.is_none());
+        let reason = result.reason.unwrap();
+        assert!(reason.contains("tracked.txt"));
+        assert!(reason.contains("GitHub token"));
+        assert!(!reason.contains(GH_TOKEN));
+    }
+
+    #[test]
     fn secret_scan_push_denies_a_net_added_token_and_passes_once_removed() {
         let repo = init_repo();
+        run_git(
+            repo.path(),
+            &["update-ref", "refs/remotes/origin/master", "HEAD"],
+        );
         run_git(repo.path(), &["checkout", "-q", "-b", "feature"]);
         std::fs::write(repo.path().join("tracked.txt"), "v2\n").unwrap();
         run_git(repo.path(), &["commit", "-q", "-am", "clean change"]);
