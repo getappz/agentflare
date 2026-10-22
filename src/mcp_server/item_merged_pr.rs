@@ -103,23 +103,6 @@ fn pr_is_open(status: &crate::worktree::PrCiStatus) -> bool {
     !matches!(status, Merged | Closed { .. })
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::worktree::PrCiStatus::*;
-
-    #[test]
-    fn only_a_merged_or_closed_pr_is_not_open() {
-        assert!(super::pr_is_open(&Pending {
-            number: 1,
-            head_sha: None
-        }));
-        assert!(super::pr_is_open(&Conflicting { number: 1 }));
-        assert!(super::pr_is_open(&Unknown));
-        assert!(!super::pr_is_open(&Merged));
-        assert!(!super::pr_is_open(&Closed { number: 1 }));
-    }
-}
-
 /// Releases the claim lease and removes the item's worktree.
 ///
 /// Shared by both "nothing was ever committed" (the worktree is clean by
@@ -151,5 +134,22 @@ pub(crate) fn release_claim_and_cleanup(
         Err(e) => {
             eprintln!("worktree: failed to release claim for item {item_id}: {e:?}")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::worktree::PrCiStatus::*;
+
+    #[test]
+    fn only_a_merged_or_closed_pr_is_not_open() {
+        assert!(super::pr_is_open(&Pending {
+            number: 1,
+            head_sha: None
+        }));
+        assert!(super::pr_is_open(&Conflicting { number: 1 }));
+        assert!(super::pr_is_open(&Unknown));
+        assert!(!super::pr_is_open(&Merged));
+        assert!(!super::pr_is_open(&Closed { number: 1 }));
     }
 }
