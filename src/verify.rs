@@ -13,7 +13,6 @@ pub fn enforce_enabled(repo_root: &Path) -> bool {
 
 /// Whether verification applies to one item: the project default, or a
 /// per-item `metadata.require_verify = true` forcing it on.
-#[allow(dead_code)] // consumed by the completion gate (follow-on item)
 pub fn required(enforce: bool, metadata: &serde_json::Value) -> bool {
     enforce
         || metadata

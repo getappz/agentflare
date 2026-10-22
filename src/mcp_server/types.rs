@@ -1383,8 +1383,13 @@ pub(crate) struct WebhookRequest {
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ProjectRequest {
-    #[schemars(description = "Action: info|list")]
+    #[schemars(description = "Action: info|list|archive|unarchive")]
     pub(crate) action: String,
+    #[schemars(
+        description = "Target project (name or UUID from `project action=list`) for archive/unarchive. Defaults to the project this repo is linked to."
+    )]
+    #[serde(default)]
+    pub(crate) project: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]

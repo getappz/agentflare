@@ -142,6 +142,44 @@ pub fn apply_item_verify(
     })
 }
 
+/// Completion gate for an enforced item: `None` when every acceptance
+/// criterion has a current `pass` verdict with evidence, else a per-criterion
+/// report (criterion, verdict, evidence) explaining why a human is needed.
+/// A verdict whose content hash no longer matches the item is stale.
+pub fn completion_gate(metadata: &str, description: &str) -> Option<String> {
+    let acceptance = acceptance_criteria_value(metadata);
+    let Ok(known) = known_criterion_ids(&acceptance) else {
+        return Some(
+            "item has no acceptance_criteria, so nothing can be verified. Add criteria, then run review(action=verify).".into(),
+        );
+    };
+    let stored = read_stored_verify(metadata)
+        .filter(|v| v.content_hash == verify_content_hash(description, &acceptance));
+    let Some(stored) = stored else {
+        return Some(
+            "no current verification verdict for this item's description and acceptance_criteria. Run review(action=verify).".into(),
+        );
+    };
+    let mut blocked = false;
+    let mut lines = Vec::new();
+    for id in &known {
+        let (verdict, evidence) = stored
+            .criteria
+            .iter()
+            .find(|c| c.id == *id)
+            .map(|c| (c.verdict.as_str(), c.evidence.as_str()))
+            .unwrap_or(("uncertain", ""));
+        blocked |= verdict != "pass" || evidence.trim().is_empty();
+        let evidence = if evidence.trim().is_empty() {
+            "(none)"
+        } else {
+            evidence
+        };
+        lines.push(format!("- {id}: {verdict} — evidence: {evidence}"));
+    }
+    blocked.then(|| lines.join("\n"))
+}
+
 fn acceptance_criteria_value(metadata: &str) -> serde_json::Value {
     serde_json::from_str::<serde_json::Value>(metadata)
         .ok()
@@ -714,5 +752,40 @@ mod tests {
         assert!(!second.unchanged);
         assert_eq!(second.criteria[0].verdict, "fail");
         assert_ne!(second.content_hash, first.content_hash);
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    fn meta(verdict: &str, evidence: &str) -> (String, String) {
+        let ac = serde_json::json!([{"id": "a", "text": "t"}]);
+        let hash = verify_content_hash("d", &ac);
+        let m = serde_json::json!({"acceptance_criteria": ac, "verify": {"content_hash": hash,
+            "criteria": [{"id": "a", "verdict": verdict, "evidence": evidence}]}});
+        (m.to_string(), "d".into())
+    }
+
+    #[test]
+    fn gate_blocks_everything_but_cited_pass() {
+        let (m, d) = meta("pass", "src/a.rs:1");
+        assert!(completion_gate(&m, &d).is_none());
+        for (v, e) in [("fail", "src/a.rs:1"), ("uncertain", "x"), ("pass", "")] {
+            let (m, d) = meta(v, e);
+            let r = completion_gate(&m, &d).unwrap();
+            assert!(r.contains("- a:"), "{r}");
+        }
+        assert!(
+            completion_gate("{}", "d")
+                .unwrap()
+                .contains("no acceptance_criteria")
+        );
+        let (m, _) = meta("pass", "src/a.rs:1");
+        assert!(
+            completion_gate(&m, "changed")
+                .unwrap()
+                .contains("no current")
+        );
     }
 }
