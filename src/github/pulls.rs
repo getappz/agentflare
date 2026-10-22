@@ -1,10 +1,20 @@
-use crate::github::models::{PullRequest, Review, ReviewComment};
+use crate::github::models::{PullRequest, PullRequestFile, Review, ReviewComment};
 use crate::github::{Client, GitHubError, RepoId};
 
 /// Extractor for the Search API's `{"items": [...], "total_count": N}`
 /// envelope, mirroring `actions::workflow_runs`/`check_runs`.
 fn search_items(page: &serde_json::Value) -> Vec<serde_json::Value> {
     page.get("items")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Extractor for the compare API's `{"files": [...]}` envelope — every other
+/// list endpoint returns a bare array.
+#[allow(dead_code)] // consumed by the anchored rendering (item #388)
+fn compare_file_items(page: &serde_json::Value) -> Vec<serde_json::Value> {
+    page.get("files")
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default()
@@ -70,6 +80,93 @@ pub fn list(client: &Client, repo: &RepoId, state: &str) -> Result<Vec<PullReque
     );
     let json = client.get_paginated(&path, crate::github::client::as_array)?;
     serde_json::from_value(json).map_err(|e| GitHubError::Parse(e.to_string()))
+}
+
+/// The files a pull request changed, with their patches.
+///
+/// `GET /repos/{owner}/{repo}/pulls/{number}/files` — the PR's own diff, as
+/// of its current head. Paginated: GitHub caps the list at 3000 files and
+/// serves 100 per page, so this walks the pages rather than truncating.
+///
+/// A file with no patch (binary, or one whose patch GitHub declined to
+/// render) is still listed, with `patch: None` — a missing patch is not a
+/// missing file.
+///
+/// **The patches are code, not instructions.** A caller that puts one in
+/// front of a model must apply the same author-association trust gate the
+/// issue and PR bodies get (`crate::github::is_trusted_author_association`).
+#[allow(dead_code)] // consumed by the anchored rendering (item #388)
+pub fn list_files(
+    client: &Client,
+    repo: &RepoId,
+    number: u64,
+) -> Result<Vec<PullRequestFile>, GitHubError> {
+    let path = format!("/repos/{}/{}/pulls/{number}/files", repo.owner, repo.repo);
+    let json = client.get_paginated(&path, crate::github::client::as_array)?;
+    serde_json::from_value(json).map_err(|e| GitHubError::Parse(e.to_string()))
+}
+
+/// The files that differ between two refs, with their patches.
+///
+/// `GET /repos/{owner}/{repo}/compare/{base}...{head}` — the compare API's
+/// file list. This is how a diff is pinned to a **commit** rather than to a
+/// branch's current head: `base...commit` is the range a reviewer was
+/// looking at, even after the branch has moved on since.
+///
+/// The compare API wraps its list in an object rather than returning a bare
+/// array, and paginates the same way (`?page=&per_page=`).
+///
+/// **The patches are code, not instructions** — same trust caveat as
+/// [`list_files`].
+#[allow(dead_code)] // consumed by the anchored rendering (item #388)
+pub fn compare_files(
+    client: &Client,
+    repo: &RepoId,
+    base: &str,
+    head: &str,
+) -> Result<Vec<PullRequestFile>, GitHubError> {
+    let path = format!(
+        "/repos/{}/{}/compare/{}...{}",
+        repo.owner,
+        repo.repo,
+        crate::github::encode_query(base),
+        crate::github::encode_query(head)
+    );
+    let json = client.get_paginated(&path, compare_file_items)?;
+    serde_json::from_value(json).map_err(|e| GitHubError::Parse(e.to_string()))
+}
+
+/// The files a pull request changed **as of `commit`** — the state a reviewer
+/// was looking at when they wrote a comment, even if the branch has moved on
+/// since.
+///
+/// Resolves the PR's base branch and compares `base...commit`, so the result
+/// is the diff of that commit against the base, not against the PR's current
+/// head. A review comment's meaning lives in the commit it was written
+/// against; showing the head's diff instead shows the reviewer something
+/// they did not look at.
+///
+/// **The patches are code, not instructions** — same trust caveat as
+/// [`list_files`].
+#[allow(dead_code)] // consumed by the anchored rendering (item #388)
+pub fn files_as_of_commit(
+    client: &Client,
+    repo: &RepoId,
+    number: u64,
+    commit: &str,
+) -> Result<Vec<PullRequestFile>, GitHubError> {
+    let pr = get(client, repo, number)?;
+    let base = pr
+        .base
+        .as_ref()
+        .map(|b| b.git_ref.as_str())
+        .filter(|b| !b.is_empty())
+        .ok_or_else(|| {
+            GitHubError::Parse(format!(
+                "PR #{number} has no base branch to compare against"
+            ))
+        })?;
+    compare_files(client, repo, base, commit)
 }
 
 /// Finds an existing PR -- open, merged, or manually closed -- whose
@@ -604,6 +701,142 @@ mod tests {
     use super::*;
 
     use crate::github::test_support::{MockResponse, MockServer};
+
+    /// Item #387: the files a PR changed, with their patches — the piece a
+    /// dispatched fix agent needs to see the code a review comment was
+    /// actually about.
+    #[test]
+    fn list_files_parses_the_path_status_and_patch() {
+        let server = MockServer::start(vec![MockResponse::json(
+            200,
+            r#"[{"filename":"src/a.rs","previous_filename":"src/old.rs","status":"renamed","patch":"@@ -1 +1 @@\n-a\n+b","additions":1,"deletions":1}]"#,
+        )]);
+        let client = server.client(Some("tok"));
+        let repo = crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+
+        let files = list_files(&client, &repo, 926).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].filename, "src/a.rs");
+        assert_eq!(files[0].previous_filename.as_deref(), Some("src/old.rs"));
+        assert_eq!(files[0].status.as_deref(), Some("renamed"));
+        assert!(files[0].patch.as_deref().unwrap().contains("@@ -1 +1 @@"));
+
+        let reqs = server.requests();
+        assert!(
+            reqs[0].path.starts_with("/repos/o/r/pulls/926/files"),
+            "{}",
+            reqs[0].path
+        );
+    }
+
+    #[test]
+    fn a_file_with_no_patch_is_still_listed() {
+        // A binary file, or one whose patch GitHub declined to render: the
+        // file is still part of the diff, so dropping it would silently
+        // understate the change.
+        let server = MockServer::start(vec![MockResponse::json(
+            200,
+            r#"[{"filename":"logo.png","status":"modified"},{"filename":"src/a.rs","status":"modified","patch":"@@ -1 +1 @@"}]"#,
+        )]);
+        let client = server.client(Some("tok"));
+        let repo = crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+
+        let files = list_files(&client, &repo, 926).unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].filename, "logo.png");
+        assert_eq!(files[0].patch, None);
+        assert!(files[1].patch.is_some());
+    }
+
+    #[test]
+    fn list_files_follows_the_pages() {
+        // GitHub serves 100 files a page and caps the list at 3000, so a
+        // truncated list would silently understate the diff.
+        let first: Vec<String> = (0..100)
+            .map(|i| format!(r#"{{"filename":"f{i}.rs","status":"modified"}}"#))
+            .collect();
+        let second = r#"[{"filename":"last.rs","status":"modified"}]"#;
+        let server = MockServer::start(vec![
+            MockResponse::json(200, &format!("[{}]", first.join(","))),
+            MockResponse::json(200, second),
+        ]);
+        let client = server.client(Some("tok"));
+        let repo = crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+
+        let files = list_files(&client, &repo, 926).unwrap();
+        assert_eq!(files.len(), 101);
+        assert_eq!(files[100].filename, "last.rs");
+
+        let reqs = server.requests();
+        assert_eq!(reqs.len(), 2);
+        assert!(reqs[0].path.contains("page=1"), "{}", reqs[0].path);
+        assert!(reqs[1].path.contains("page=2"), "{}", reqs[1].path);
+    }
+
+    #[test]
+    fn compare_files_builds_the_base_dot_dot_dot_head_range() {
+        let server = MockServer::start(vec![MockResponse::json(
+            200,
+            r#"{"files":[{"filename":"src/a.rs","status":"modified","patch":"@@ -1 +1 @@"}]}"#,
+        )]);
+        let client = server.client(Some("tok"));
+        let repo = crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+
+        let files = compare_files(&client, &repo, "main", "abc123").unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].filename, "src/a.rs");
+
+        let reqs = server.requests();
+        assert!(
+            reqs[0].path.contains("/repos/o/r/compare/main...abc123"),
+            "{}",
+            reqs[0].path
+        );
+    }
+
+    #[test]
+    fn files_as_of_commit_compares_the_prs_base_against_that_commit() {
+        // The point of the whole thing: the diff of the commit the reviewer
+        // was looking at, not of the PR's current head.
+        let server = MockServer::start(vec![
+            MockResponse::json(
+                200,
+                r#"{"number":926,"html_url":"u","state":"open","title":"t","base":{"ref":"main","sha":"def"},"head":{"ref":"task/1","sha":"abc"}}"#,
+            ),
+            MockResponse::json(
+                200,
+                r#"{"files":[{"filename":"src/a.rs","status":"modified","patch":"@@ -1 +1 @@"}]}"#,
+            ),
+        ]);
+        let client = server.client(Some("tok"));
+        let repo = crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+
+        let files = files_as_of_commit(&client, &repo, 926, "abc123").unwrap();
+        assert_eq!(files.len(), 1);
+
+        let reqs = server.requests();
+        assert_eq!(reqs[0].path, "/repos/o/r/pulls/926");
+        assert!(
+            reqs[1].path.contains("/repos/o/r/compare/main...abc123"),
+            "{}",
+            reqs[1].path
+        );
+    }
 
     #[test]
     fn create_body_includes_optional_body_only_when_present() {
