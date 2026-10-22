@@ -3,7 +3,7 @@
 | Field | Value |
 |-------|-------|
 | Item | #395 — design-spec only (no application code in this item) |
-| Status | Draft for implementation planning |
+| Status | Draft for implementation planning (rev 2 — reviewer gap pass) |
 | Informed by | PM handoff (item asset), `run_review_sweep` / `review_bots` audit, flare-workflow scheduling (#366) |
 | Related | #393 (workflow engine reliability), #939/#944 (`needs_input` + verify gate at `item_done`), bridge work-item pipeline (`.superpowers/notes/bridge-work-item-workflow-design.md`) |
 
@@ -16,7 +16,22 @@
 | **Done when** | Spec merged on the task branch (or main) with a commit that adds/updates only design docs (+ `.gitignore` carve-out if needed) |
 | **Implementation follow-up** | Separate items from §Follow-up; gated on #393 for `engine = workflow` default |
 
-**Reviewer note (prior round):** An earlier pass authored this spec on disk but left `git diff master` empty because `/docs/` was fully gitignored — the file never entered version control. That is **not** a substitute for the deliverable. This revision is meant to be **committed**; verification for #395 is `git ls-files docs/superpowers/specs/pr-lifecycle-workflow-v1.md`, not `cargo test`.
+**Reviewer note (prior round):** An earlier pass authored this spec on disk but left `git diff master` empty because `/docs/` was fully gitignored — the file never entered version control. That is **not** a substitute for the deliverable. Verification for #395 is **git-tracked design docs**, not `cargo test` on unchanged Rust.
+
+### Round-2 response (completion gate)
+
+| Reviewer finding | Response |
+|------------------|----------|
+| No committed changes vs `master` | `.gitignore` carve-out for `docs/superpowers/**` plus this spec are on branch `task/395-design-spec-pr-lifecycle-workflow-replac` (commit `ff8afa94` and follow-ups). |
+| “Passing tests” ≠ design deliverable | Item metadata `task_type=design-spec` — acceptance is the spec file and parity/scheduling analysis, not supervisor behavior changes. |
+| “Implement the requested scope” | Implementation is **out of scope for #395**; §Follow-up lists concrete Rust items. This round adds **code-backed** schedule/engine integration notes (#366) missing from rev 1. |
+
+**#395 verification (run synchronously before marking done):**
+
+```bash
+git diff master --stat   # expects .gitignore + docs/superpowers/specs/pr-lifecycle-workflow-v1.md
+git ls-files docs/superpowers/specs/pr-lifecycle-workflow-v1.md  # must print the path
+```
 
 ## Summary
 
@@ -85,10 +100,12 @@ flowchart TB
 
 | `workflow_id` | Trigger | `start_key` | Purpose |
 |---------------|---------|-------------|---------|
-| `pr-reconcile` | Schedule (`every_secs` ≥ 60, default 60) | `pr-reconcile:{scope_id}:{slot}` where `slot` is schedule fire slot | Batch enumerate, discover, fetch CI snapshot, fan-out |
-| `pr-lifecycle` | Reconciler (and manual debug) | `pr-lifecycle:{project_id}:{item_id}:{pr_number}` | Act on one PR/item until quiescent or waiting |
+| `pr-reconcile` | Schedule row per `repo_root` (`every_secs` ≥ `MIN_EVERY_SECS` = 60) | **`schedule:{occurrence_id}`** — owned by #366 driver (`start_key_for`), not a custom prefix | Batch enumerate, discover, fetch CI snapshot, fan-out |
+| `pr-lifecycle` | Reconciler `FunctionStep` (and manual debug) | `pr-lifecycle:{project_id}:{item_id}:{pr_number}` on the **PR Rust engine** (see below) | Act on one PR/item until quiescent or waiting |
 
-**Scope id (`scope_id`)** — see §3.
+Schedule fires inject `params.schedule` (`schedule_id`, `occurrence_id`, `slot`, …) per `src/schedule/tick.rs`; reconciler steps read `repo_root` from the schedule row and `folder_path` from params, not from a bespoke reconcile key.
+
+**Scope id (`scope_id`)** — deprecated in favor of `repo_root` + schedule row; reconciler still iterates all `project_dirs` registered to that daemon.
 
 ### `pr-reconcile` steps (v1)
 
@@ -131,9 +148,31 @@ For **CI-green paths**, `handle_pr_status` → `handle_ci_green` → `fetch_revi
 
 **Daemon wiring:** on boot, ensure schedule rows exist for each registered `project_dirs.folder_path` (create-or-update), `workflow_name = pr-reconcile`, `every_secs = 60` (or inherit env override), **`overlap = skip`**.
 
-**Coexistence with today’s daemon:** `spawn_schedule_ticker()` already runs at dashboard boot (`src/dashboard/server.rs`) for JSON/agent workflows and schedule rows in `workflows.db`. v1 **reuses that ticker** — no second scheduler. When `engine = workflow`, `pr-reconcile` is just another registered `WorkflowDefinition` plus per-`repo_root` schedule rows; the tick path stays off.
+**Coexistence with today’s daemon:** `spawn_schedule_ticker()` already runs at dashboard boot (`src/dashboard/dispatch_boot.rs`) against `workflows.db`. v1 **reuses that ticker** — no second scheduler. When `engine = workflow`, disable the review-sweep tokio loop and rely on per-`repo_root` schedule rows named e.g. `pr-reconcile` with `overlap = skip`.
 
-**Supervisor interval:** when `engine = workflow`, **disable** the hardcoded `spawn_supervisor_review_sweep` tokio loop for that scope and rely on the schedule driver; when `engine = tick`, keep today’s loop and do not register reconcile schedules (or register disabled). **Never run both** for the same `repo_root` (see overlap table).
+**Supervisor interval:** when `engine = workflow`, **disable** `spawn_supervisor_review_sweep` for that daemon; when `engine = tick`, keep today’s loop and do not enable reconcile schedules. **Never run both** for the same `repo_root` (see overlap table).
+
+### Schedule ↔ Rust workflow integration (#366) — rev-2 finding
+
+Today’s schedule **fire path only compiles JSON** workflows from disk (`resolve_named_definition` → `compile_workflow_in` in `src/schedule/tick.rs`). It uses a `WorkflowEngine<PipelineData>` instance **separate from** `work_item_pipeline::engine()` (`WorkItemData`), though both persist into the same `workflows.db` file.
+
+`pr-reconcile` / `pr-lifecycle` must call existing supervisor Rust (`collect_review_batches`, `handle_pr_status`, …) as `FunctionStep`s — they **cannot** be v1 JSON agent pipelines.
+
+| Approach | Verdict |
+|----------|---------|
+| JSON schedule workflow that prompts an agent to “run review sweep” | Reject — nondeterministic, no parity, no direct `Queue` access |
+| Keep 60s `spawn_supervisor_review_sweep` but fan out `start_workflow_once` from inside `run_review_sweep` | Reject — does not meet “replace monolithic tick” goal; still one blocking sweep |
+| **Builtin schedule names → pre-registered Rust `WorkflowDefinition`** on a dedicated PR engine | **Recommend for v1** |
+| Second custom tokio loop duplicating `Scheduler::tick_once` | Reject — forks #366 |
+
+**Recommended wiring (implementation item, not #395):**
+
+1. Add `src/pr_lifecycle_workflow.rs` (name TBD) mirroring `work_item_pipeline.rs`: `PrLifecycleData`, `engine()`, `WORKFLOW_RECONCILE_ID = "pr-reconcile"`, `WORKFLOW_LIFECYCLE_ID = "pr-lifecycle"`, register both at dashboard boot when `review_sweep.engine == "workflow"`.
+2. Extend schedule fire (or a small hook beside `spawn_fire`) so `workflow_name` **`pr-reconcile`** resolves to the builtin Rust definition instead of JSON — same occurrence/`start_key_for` semantics, `overlap = skip` unchanged.
+3. Fan-out from reconciler’s `fan_out_lifecycle` step calls `pr_lifecycle_workflow::engine().start_workflow_once_with_params(...)` on the **same** engine that registered `pr-lifecycle` (not the JSON `PipelineData` engine).
+4. Register #393 `on_terminal` on that engine (or shared callback) so `schedule_runs` rows converge when reconcile runs finish — same requirement as JSON schedules.
+
+Until step (2) exists, `engine = workflow` must remain off in production even if definitions are registered.
 
 ## Identity and parameters
 
@@ -219,14 +258,18 @@ Follow `work_item_pipeline.rs`, not `.agentflare/workflows/*.json` (those are ag
 
 ### pr-agent audit (session) — v1 stance
 
-External **pr-agent** (Python PR toolkit) was reviewed as a **reference** for optional description/review automation — it is **not** vendored in this repo and does not appear in `run_review_sweep` today.
+External **[pr-agent](https://github.com/qodo-ai/pr-agent)** (Python PR toolkit) was reviewed as a **reference** for optional description/review automation — it is **not** vendored in agentflare and does not appear in `run_review_sweep` today. Production PR automation today is **Rust supervisor + CodeRabbit** (`src/supervisor/review_bots.rs`, `[review_sweep].review_bots` in config).
 
-| pr-agent capability | v1 | Later |
-|---------------------|-----|-------|
-| PR description generation (`/describe`) | Optional **manual** CLI or agent step behind flag | Port algorithms after parity |
-| Review summarization / labels | Not used | Evaluate vs CodeRabbit |
-| Replace CodeRabbit | **No** | N/A |
-| Config / prompts from pr-agent | Reference only for future steps | |
+| pr-agent surface | What it does | agentflare today | v1 workflow stance |
+|------------------|--------------|------------------|-------------------|
+| `/describe` | LLM PR title/body from diff | No equivalent in sweep; humans/agents write PR text via `agentflare pr` | **Defer** — optional flagged CLI step after parity; not in `pr-reconcile` |
+| `/review` | Inline review comments | **CodeRabbit** + `fetch_review_bot_state` / `merge_or_repair_findings` | **No swap** — keep `review_bots.rs` inside `handle_ci_green` |
+| `/improve` | Suggested code edits | Self-repair jobs via `self_repair_or_gate` | **No swap** |
+| `/ask` | Q&A on PR | Out of band (agents, Telegram) | N/A |
+| Auto labels / changelog tools | Repo policy automation | Item labels + PM states | Defer — evaluate after lifecycle parity |
+| Docker / GitHub Action runner | Host pr-agent in CI | agentflare daemon + jobs queue | **Do not** embed Python in supervisor (non-goal) |
+
+**Conclusion:** pr-agent informs **future** optional steps (especially `/describe` for stale PR bodies). v1 lifecycle parity is defined entirely by existing `supervisor.rs` + `review_bots.rs` behavior; no pr-agent subprocess in the critical path.
 
 ## Overlap and double-dispatch policy
 
@@ -288,6 +331,7 @@ Rationale: hybrid track A+C — #393 hardens the scheduler; #395 defines PR sema
 | Title | Depends |
 |-------|---------|
 | Register PR workflow definitions + FunctionStep harness | #395 |
+| Builtin `pr-reconcile` resolution in schedule fire path | #366 + #395 |
 | `review_sweep.engine` config + daemon gating | #395 |
 | Schedule sync per `project_dirs` | #366 driver |
 | `start_key` cleanup on terminal PR states | #395 |
@@ -319,4 +363,7 @@ Rationale: hybrid track A+C — #393 hardens the scheduler; #395 defines PR sema
 - `src/supervisor/auto_merge.rs` — `reconcile_armed_auto_merge`
 - `src/worktree/mod.rs` — `PrCiStatus`
 - `src/dashboard/server.rs` — `spawn_supervisor_review_sweep`
+- `src/dashboard/dispatch_boot.rs` — `spawn_schedule_ticker`
+- `src/schedule/mod.rs` — `start_key_for`, `MIN_EVERY_SECS`
+- `src/schedule/tick.rs` — schedule fire + JSON compile path
 - `crates/flare-workflow` — schedules, `start_workflow_once_with_params`, `overlap`
