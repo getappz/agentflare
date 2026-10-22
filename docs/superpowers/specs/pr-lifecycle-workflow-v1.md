@@ -3,7 +3,7 @@
 | Field | Value |
 |-------|-------|
 | Item | #395 — design-spec only (no application code in this item) |
-| Status | Draft for implementation planning (rev 3 — item-work + completion-evidence pass) |
+| Status | Draft for implementation planning (rev 4 — completion-gate + hook-path evidence) |
 | Informed by | PM handoff (item asset), `run_review_sweep` / `review_bots` audit, flare-workflow scheduling (#366) |
 | Related | #393 (workflow engine reliability), #939/#944 (`needs_input` + verify gate at `item_done`), bridge work-item pipeline (`.superpowers/notes/bridge-work-item-workflow-design.md`) |
 
@@ -41,6 +41,42 @@ test -f docs/superpowers/specs/pr-lifecycle-workflow-v1.md && wc -l docs/superpo
 | “No committed changes vs `master`” | Prior pass wrote the spec under gitignored `/docs/` | Fixed in rev 1–2 (`.gitignore` carve-out + commits on task branch). |
 | “Passing tests on unchanged code” | Agents ran `cargo test` while the tree had **no design diff**; hooks treated that as verification evidence even though acceptance is **git-tracked markdown** | §Item work pipeline documents the correct evidence chain; design-spec items must show a **non-empty `git diff master`** for the spec path before `item done`. |
 | “Implement the requested scope” | Confusion between **#395 (design only)** and **follow-up Rust items** | Scope unchanged: this file + scheduling/pr-agent analysis; implementation remains §Follow-up. |
+
+### Round-4 response (why “green tests, empty diff” passed gates)
+
+| Layer | Behavior today | Gap for `task_type=design-spec` |
+|-------|----------------|----------------------------------|
+| `completion_gate_reason` (`src/hook_redirect.rs`) | Blocks `item` `done`/`check_merge` until **fresh passing verification** (any project test/build/lint via Bash/`ctx_shell`) **and** fresh review evidence | Verification is **not** tied to deliverable type — `cargo test` on an unchanged tree satisfies the gate while `git diff master` stays empty |
+| `task_type` branch | Extra **diagnosis** requirement only for `bugfix` | No analogue for design-spec (no “tracked spec file + non-empty doc diff” check) |
+| `finalize` (`src/work_item_pipeline/finalize.rs`) | `review_only && !design_spec` → comment-only; design-spec → **`item_done`/PR** | Correct for artifacts, but assumes the analyst actually committed the spec before finalize |
+| `is_spec_like_path` + Write/Edit redirect | Paths matching `*/specs/*.md` redirect to **`asset` attach**, not repo commit | **Tension** with this item’s deliverable under `docs/superpowers/specs/` — agents may need shell/`git add` after authoring, or a future hook carve-out for tracked superpowers specs |
+
+**Updated finding:** Reviewer “completion refused” is expected when the only evidence is unrelated test output. For #395, **acceptance evidence = git**, not CI on Rust.
+
+**Recommended product follow-up (not #395 implementation):**
+
+1. **`completion_gate` design-spec mode** — when linked item `metadata.task_type` is `design-spec` (or `WorkItemData::design_spec`), treat verification as satisfied only if a session command proves **tracked spec delta** (e.g. `git diff master --stat docs/superpowers/specs/` non-empty, or `git ls-files` + line count), not generic `cargo test`.
+2. **Hook carve-out** — allow Write/Edit to `docs/superpowers/specs/**` when the claimed item is design-spec (today tests in `hook_redirect.rs` assert redirect for that path).
+3. **Analyst prompt** — state explicitly: “Do not call `item done` until `git diff master` includes the spec path.”
+
+### Verification record (rev 4, synchronous — 2026-10-22)
+
+Executed on branch `task/395-design-spec-pr-lifecycle-workflow-replac` at `HEAD=5f9b6cb5` (3 commits above `master` @ `3f93efb7`):
+
+```
+$ git diff master --stat
+ .gitignore                                         |   4 +-
+ docs/superpowers/specs/pr-lifecycle-workflow-v1.md | 459 +++++++++++++++++++++
+ 2 files changed, 462 insertions(+), 1 deletion(-)
+
+$ git ls-files docs/superpowers/specs/pr-lifecycle-workflow-v1.md
+docs/superpowers/specs/pr-lifecycle-workflow-v1.md
+
+$ wc -l docs/superpowers/specs/pr-lifecycle-workflow-v1.md
+459 docs/superpowers/specs/pr-lifecycle-workflow-v1.md
+```
+
+Rev 4 extends the spec on the task branch; `git status` shows the doc delta until committed.
 
 ## Item work pipeline (how #395 fits)
 
@@ -389,6 +425,8 @@ Rationale: hybrid track A+C — #393 hardens the scheduler; #395 defines PR sema
 | `start_key` cleanup on terminal PR states | #395 |
 | Parity test matrix from §7 | #395 |
 | pr-agent `/describe` optional step (flagged) | Post-v1 |
+| Design-spec completion gate (git delta vs `cargo test`) | Post-#395 |
+| `is_spec_like_path` carve-out for `docs/superpowers/specs/**` | Post-#395 |
 
 ## Open questions
 
