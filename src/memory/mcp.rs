@@ -57,7 +57,7 @@ fn is_scope_token(w: &str) -> bool {
     let segments = || w.split('/').filter(|p| !p.is_empty());
     let path = segments().count() >= 2
         && !["and/or", "either/or", "yes/no", "n/a", "i/o"].contains(&w.to_lowercase().as_str());
-    let name = w.trim_end_matches('.');
+    let name = w.trim_matches(['(', ')', '.']);
     let name = name
         .rsplit_once(':')
         .filter(|(_, line)| !line.is_empty() && line.bytes().all(|b| b.is_ascii_digit()))
@@ -810,6 +810,10 @@ mod tests {
             "store.rs:47;",
             "store.rs:47.",
             "store.rs:47...",
+            "(store.rs:47)",
+            "(store.rs:47).",
+            "(store.rs:47.)",
+            "open()",
         ] {
             let card =
                 format!("worker stalls when reading {reference} retries continue until restart");
@@ -825,6 +829,10 @@ mod tests {
             "store.rs:line.",
             "store.rs:",
             "store.rs:.",
+            "(v1.2:47)",
+            "(store.rs:line)",
+            "(store.rs:)",
+            "(store.rs:.)",
         ] {
             assert!(weak(&format!(
                 "worker stalls when reading {reference} retries continue until restart"
