@@ -1161,7 +1161,7 @@ fn ref_transaction_log() {
     }
 }
 
-#[derive(serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 struct ScopeCheckResult {
     deny: bool,
     reason: Option<String>,
@@ -1244,8 +1244,16 @@ fn partition_claims_by_owner(
 /// "scope-check ran and said no" apart from "scope-check itself failed to
 /// run at all" (the latter is the shim's fail-closed case, per this
 /// feature's spec -- unlike this crate's usual fail-open default).
+///
+/// The same round-trip also carries item #402's credential scan of the
+/// diff CONTENT (`run_secret_scan`): it runs only once the path-scope check
+/// has passed, so the shim sees a single verdict and needs no protocol
+/// change for it.
 fn scope_check(subcommand: &str) {
-    let result = run_scope_check(subcommand);
+    let mut result = run_scope_check(subcommand);
+    if !result.deny {
+        result = run_secret_scan(subcommand);
+    }
     let json = serde_json::to_string(&result).unwrap_or_else(|_| {
         r#"{"deny":true,"reason":"internal error serializing scope-check result"}"#.to_string()
     });
@@ -1342,8 +1350,8 @@ fn too_many_paths_msg(cap: usize) -> String {
 /// `commit` (unioned with the working-tree diff, since `git commit -a`/
 /// `--all` implicitly stages+commits tracked modifications without a prior
 /// `git add` -- checking `--cached` alone would let those paths bypass
-/// scope enforcement entirely), paths diffed against the default branch for
-/// `push`. A v1 simplification for `push`: diffs current-vs-default rather
+/// scope enforcement entirely), paths in the net outgoing diff for
+/// `push`. A v1 simplification for `push`: diffs HEAD rather
 /// than parsing the actual push refspec across the CLI subprocess boundary.
 /// An unreadable diff yields no changed paths (nothing to enforce), matching
 /// this crate's fail-open default for diff resolution specifically -- only
@@ -1380,13 +1388,11 @@ fn changed_paths(repo_root: &Path, subcommand: &str) -> Result<Vec<String>, Stri
         return Ok(paths);
     }
     let range_args: Vec<String> = match subcommand {
-        "push" => {
-            let default_branch = branch::resolve_default_branch(repo_root);
-            let current =
-                branch::current_branch(repo_root).unwrap_or_else(|| default_branch.clone());
-            let range = format!("{default_branch}...{current}");
-            vec!["diff".to_string(), "--name-only".to_string(), range]
-        }
+        "push" => vec![
+            "diff".to_string(),
+            "--name-only".to_string(),
+            push_diff_range(repo_root)?,
+        ],
         _ => return Ok(Vec::new()),
     };
     let args: Vec<&str> = range_args.iter().map(String::as_str).collect();
@@ -1395,6 +1401,215 @@ fn changed_paths(repo_root: &Path, subcommand: &str) -> Result<Vec<String>, Stri
         Err(BoundedLinesError::Git(_)) => Ok(Vec::new()), // fail-open on diff resolution
         Err(BoundedLinesError::TooManyLines) => Err(too_many_paths_msg(cap)),
     }
+}
+
+/// Keep scope enforcement and content scanning on the same net push diff.
+fn push_diff_range(repo_root: &Path) -> Result<String, String> {
+    if let Some(upstream) = shell::run_in_opt(repo_root, &["rev-parse", "--verify", "@{upstream}"])
+    {
+        return Ok(format!("{upstream}..HEAD"));
+    }
+    let default = branch::resolve_default_branch_known(repo_root).ok_or_else(|| {
+        "cannot resolve a push base without an upstream or default branch".to_string()
+    })?;
+    let current = branch::current_branch(repo_root).unwrap_or_default();
+    let candidates = [
+        format!("refs/remotes/origin/{current}"),
+        format!("refs/remotes/origin/{default}"),
+        format!("refs/heads/{default}"),
+    ];
+    for candidate in candidates {
+        if let Some(base) = shell::run_in_opt(repo_root, &["rev-parse", "--verify", &candidate]) {
+            return Ok(format!("{base}...HEAD"));
+        }
+    }
+    Err("cannot resolve the remote branch for the push diff".to_string())
+}
+
+/// Scan-only escape hatch for item #402's commit/push credential scan: set
+/// to `1`, a diff that trips the scanner is let
+/// through (and audited) without having to disable every other shim guard
+/// via `AGENTFLARE_GIT_BYPASS`. Meant for deliberate fixture commits
+/// (scanner test vectors, example configs), not for day-to-day use.
+const ALLOW_SECRETS_ENV: &str = "AGENTFLARE_GIT_ALLOW_SECRETS";
+
+/// Cap on diff lines the secret scan will read. Beyond this the scan cannot
+/// vouch for the change and fails closed, the same way `changed_paths` does
+/// past `MAX_CHANGED_PATHS` -- and for the same reason: streaming an
+/// unbounded diff into the scope-check child is exactly what OOM'd it in
+/// item #472.
+const MAX_SCAN_LINES: usize = 500_000;
+
+/// Item #402: credential scan of the content a `commit`/`push` is about to
+/// record, run from the shim's `scope-check` round-trip. Agent-only and
+/// tracked-repo-only like every other shim guard -- a human with no agent
+/// detected gets no new restriction; `AGENTFLARE_GIT_BYPASS` is honoured
+/// upstream by the shim itself, before this child is ever spawned.
+fn run_secret_scan(subcommand: &str) -> ScopeCheckResult {
+    let agent = classify::agent_invocation_detected();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let Some(repo_root) = branch::repo_toplevel(&cwd) else {
+        return scope_pass(); // not in a repo -- nothing to scan
+    };
+    let allow_secrets = std::env::var_os(ALLOW_SECRETS_ENV).is_some_and(|v| v == "1");
+    secret_scan_for(
+        &repo_root,
+        subcommand,
+        agent,
+        allow_secrets,
+        audit::default_path("git.jsonl").as_deref(),
+    )
+}
+
+/// `run_secret_scan` with its environment made explicit, so tests can drive
+/// the agent gate, the escape hatch and the audit destination without
+/// touching process-global env vars.
+///
+/// Only ADDED lines are scanned -- a removal is never a leak, and a push
+/// whose range first adds and then removes a credential has a clean net
+/// diff. The diff is taken over the whole range (`merge-base...HEAD`), not
+/// per commit, for exactly that reason. On a hit the verdict names the file
+/// and the matched rule but never the matched text; on a diff that cannot
+/// be produced at all it fails closed via `scope_error` (same convention as
+/// `changed_paths`' cap: enforcement that couldn't run is not a pass).
+fn secret_scan_for(
+    repo_root: &Path,
+    subcommand: &str,
+    agent_detected: bool,
+    allow_secrets: bool,
+    audit_path: Option<&Path>,
+) -> ScopeCheckResult {
+    use crate::mcp_server::secret_scan::{check_fields, redact};
+    if !agent_detected || !matches!(subcommand, "commit" | "push") {
+        return scope_pass();
+    }
+    let added = match secret_scan_added_lines(repo_root, subcommand) {
+        Ok(a) => a,
+        Err(e) => {
+            return scope_error(format!(
+                "secret scan could not read the {subcommand} diff: {}",
+                redact(&e)
+            ));
+        }
+    };
+    let Err(hit) = check_fields(
+        added
+            .iter()
+            .map(|(path, text)| (path.as_str(), text.as_str())),
+    ) else {
+        return scope_pass();
+    };
+    let message = redact(&hit.message);
+    // Reuse the scanner's file/rule diagnosis without its handoff-only advice.
+    let message = message
+        .rsplit_once(" -- ")
+        .map_or(message.as_str(), |(diagnosis, _)| diagnosis);
+    let message = message.strip_prefix("handoff blocked: ").unwrap_or(message);
+    if allow_secrets {
+        // Audited like the shim's own `AGENTFLARE_GIT_BYPASS` override
+        // (`SilentExempt`, see flare-git-shim `main`): the waiver is visible
+        // after the fact, never silent. `args` carries what was waived -- the
+        // shim never forwards the real git args to this child -- and stays
+        // within the existing `classify::Event` shape so `doctor`/readers of
+        // git.jsonl keep deserializing every line.
+        if let Some(audit_path) = audit_path {
+            let event = classify::Event {
+                subcommand: subcommand.to_string(),
+                args: vec![
+                    "secret-scan-bypass".to_string(),
+                    format!("{ALLOW_SECRETS_ENV}=1"),
+                    message.to_string(),
+                ],
+                disposition: classify::Disposition::SilentExempt,
+            };
+            let _ = audit::log_event(audit_path, &event);
+        }
+        return scope_pass();
+    }
+    scope_deny(format!(
+        "{subcommand} blocked by secret scan: {message} For an intentional git fixture, re-run with {ALLOW_SECRETS_ENV}=1 (audited)."
+    ))
+}
+
+/// `(path, added_text)` per file for the diff `subcommand` is about to
+/// record: staged + working-tree hunks for `commit` (mirroring
+/// `changed_paths`' `git commit -a` semantics), the net `base...HEAD` diff
+/// for `push` where `base` is the upstream when one is configured and the
+/// default branch otherwise. Binary files produce no `+` lines and so are
+/// skipped naturally.
+fn secret_scan_added_lines(
+    repo_root: &Path,
+    subcommand: &str,
+) -> Result<Vec<(String, String)>, String> {
+    const DIFF: &[&str] = &[
+        "-c",
+        "core.quotepath=false",
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        "--output-indicator-new=+",
+        "--output-indicator-old=-",
+        "--output-indicator-context= ",
+        "--unified=0",
+    ];
+    let run = |extra: &[&str]| -> Result<Vec<String>, String> {
+        let args: Vec<&str> = DIFF.iter().copied().chain(extra.iter().copied()).collect();
+        match shell::run_in_lines_bounded(repo_root, &args, MAX_SCAN_LINES) {
+            Ok(lines) => Ok(lines),
+            Err(BoundedLinesError::Git(e)) => Err(e),
+            Err(BoundedLinesError::TooManyLines) => Err(format!(
+                "the diff exceeds the {MAX_SCAN_LINES}-line secret-scan limit; shrink this {subcommand} and retry"
+            )),
+        }
+    };
+    let lines = match subcommand {
+        "commit" => {
+            let mut lines = run(&["--cached"])?;
+            lines.extend(run(&[])?);
+            lines
+        }
+        "push" => run(&[&push_diff_range(repo_root)?])?,
+        _ => Vec::new(),
+    };
+    Ok(added_lines_by_path(&lines))
+}
+
+/// Folds unified-diff lines into `(path, added_text)` per file. The path is
+/// taken from the `+++ b/<path>` header, which is only trusted between a
+/// `diff --git` line and the first `@@` hunk marker -- a content line
+/// `++ x` also renders as `+++ x`, so matching the prefix alone would
+/// mislabel later hits. Deleted files (`+++ /dev/null`) and binary files
+/// contribute no added lines. Empty lines are already dropped by
+/// `run_in_lines_bounded`; an added blank line is a bare `+`, kept as is.
+fn added_lines_by_path(lines: &[String]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut in_header = false;
+    let mut current: Option<usize> = None;
+    for line in lines {
+        if line.starts_with("diff --git ") {
+            in_header = true;
+            current = None;
+        } else if in_header && line.starts_with("@@") {
+            in_header = false;
+        } else if in_header && let Some(rest) = line.strip_prefix("+++ ") {
+            if rest != "/dev/null" {
+                let path = rest.strip_prefix("b/").unwrap_or(rest);
+                out.push((path.to_string(), String::new()));
+                current = Some(out.len() - 1);
+            }
+        } else if !in_header
+            && let Some(added) = line.strip_prefix('+')
+            && let Some(i) = current
+        {
+            out[i].1.push_str(added);
+            out[i].1.push('\n');
+        }
+    }
+    out
 }
 
 /// The "ship it" macro: push the current branch, open (or reuse) its PR,
@@ -1650,9 +1865,14 @@ mod tests {
     use super::*;
 
     fn run_git(dir: &Path, args: &[&str]) {
+        // Fixture plumbing only: on a dev machine with the agentflare git
+        // shim on PATH this `git` IS the shim, and the secret-scan fixtures
+        // below deliberately commit credentials -- bypass so the installed
+        // shim's own scope-check/secret-scan never judges test setup.
         let out = std::process::Command::new("git")
             .args(args)
             .current_dir(dir)
+            .env("AGENTFLARE_GIT_BYPASS", "1")
             .output()
             .unwrap();
         assert!(
@@ -2004,5 +2224,252 @@ mod tests {
     fn find_session_transcript_returns_none_for_an_unsafe_session_id_without_touching_disk() {
         assert_eq!(find_session_transcript("../../../etc/passwd"), None);
         assert_eq!(find_session_transcript("a/b"), None);
+    }
+
+    // ---- item #402: commit/push credential scan -------------------------
+
+    const AWS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
+    const GH_TOKEN: &str = "ghp_abcdefghijklmnopqrstuvwxyz012345";
+
+    fn scan(repo: &Path, subcommand: &str) -> ScopeCheckResult {
+        secret_scan_for(repo, subcommand, true, false, None)
+    }
+
+    #[test]
+    fn secret_scan_denies_commit_with_a_staged_aws_key_without_echoing_it() {
+        let repo = init_repo();
+        std::fs::write(
+            repo.path().join("config.env"),
+            format!("AWS_ACCESS_KEY_ID={AWS_KEY}\n"),
+        )
+        .unwrap();
+        run_git(repo.path(), &["add", "config.env"]);
+
+        let result = scan(repo.path(), "commit");
+        assert!(result.deny, "{result:?}");
+        assert_eq!(
+            result.error, None,
+            "a hit is a policy verdict, not an error"
+        );
+        let reason = result.reason.unwrap();
+        assert!(reason.contains("config.env"), "{reason}");
+        assert!(reason.contains("AWS access key id"), "{reason}");
+        assert!(!reason.contains(AWS_KEY), "leaked the key: {reason}");
+    }
+
+    #[test]
+    fn secret_scan_also_covers_unstaged_modifications_for_commit() {
+        // `git commit -a` commits tracked modifications without a prior
+        // `git add`; mirror `changed_paths`' staged+unstaged union.
+        let repo = init_repo();
+        std::fs::write(
+            repo.path().join("tracked.txt"),
+            format!("v1\ntoken = {GH_TOKEN}\n"),
+        )
+        .unwrap();
+        let result = scan(repo.path(), "commit");
+        assert!(result.deny, "{result:?}");
+        assert!(result.reason.unwrap().contains("tracked.txt"));
+    }
+
+    #[test]
+    fn secret_scan_redacts_filenames_without_losing_the_rule() {
+        let repo = init_repo();
+        let filename = format!("config -- {AWS_KEY}.env");
+        std::fs::write(repo.path().join(&filename), format!("{AWS_KEY}\n")).unwrap();
+        run_git(repo.path(), &["add", &filename]);
+        let result = scan(repo.path(), "commit");
+        assert!(result.deny, "{result:?}");
+        let reason = result.reason.unwrap();
+        assert!(reason.contains("AWS access key id"), "{reason}");
+        assert!(reason.contains("config -- "), "{reason}");
+        assert!(!reason.contains(AWS_KEY), "{reason}");
+    }
+
+    #[test]
+    fn secret_scan_passes_commit_whose_only_secret_is_in_a_removed_line() {
+        let repo = init_repo();
+        std::fs::write(
+            repo.path().join("tracked.txt"),
+            format!("v1\nkey={AWS_KEY}\n"),
+        )
+        .unwrap();
+        run_git(repo.path(), &["commit", "-q", "-am", "fixture with key"]);
+        std::fs::write(repo.path().join("tracked.txt"), "v1\n").unwrap();
+        run_git(repo.path(), &["add", "tracked.txt"]);
+
+        let result = scan(repo.path(), "commit");
+        assert!(!result.deny, "removals are never a leak: {result:?}");
+    }
+
+    #[test]
+    fn secret_scan_passes_a_clean_commit() {
+        let repo = init_repo();
+        std::fs::write(repo.path().join("tracked.txt"), "v2\n").unwrap();
+        run_git(repo.path(), &["add", "tracked.txt"]);
+        assert!(!scan(repo.path(), "commit").deny);
+    }
+
+    #[test]
+    fn secret_scan_ignores_local_diff_display_settings() {
+        let repo = init_repo();
+        run_git(repo.path(), &["config", "diff.noprefix", "true"]);
+        run_git(repo.path(), &["config", "diff.outputIndicatorNew", "!"]);
+        run_git(repo.path(), &["config", "diff.outputIndicatorOld", "+"]);
+        std::fs::write(repo.path().join("tracked.txt"), format!("{AWS_KEY}\n")).unwrap();
+        let result = scan(repo.path(), "commit");
+        assert!(result.deny, "{result:?}");
+        assert!(result.reason.unwrap().contains("tracked.txt"));
+    }
+
+    #[test]
+    fn secret_scan_passes_binary_only_changes() {
+        let repo = init_repo();
+        std::fs::write(repo.path().join("image.bin"), b"\0binary\0").unwrap();
+        run_git(repo.path(), &["add", "image.bin"]);
+        assert!(!scan(repo.path(), "commit").deny);
+    }
+
+    #[test]
+    fn secret_scan_push_uses_upstream_instead_of_local_default() {
+        let repo = init_repo();
+        run_git(repo.path(), &["branch", "upstream"]);
+        run_git(repo.path(), &["checkout", "-q", "-b", "feature"]);
+        run_git(repo.path(), &["branch", "--set-upstream-to=upstream"]);
+        std::fs::write(repo.path().join("tracked.txt"), format!("{GH_TOKEN}\n")).unwrap();
+        run_git(repo.path(), &["commit", "-q", "-am", "token"]);
+        run_git(repo.path(), &["branch", "-f", "master", "HEAD"]);
+        assert_eq!(changed_paths(repo.path(), "push").unwrap(), ["tracked.txt"]);
+        assert!(scan(repo.path(), "push").deny);
+    }
+
+    #[test]
+    fn secret_scan_push_without_upstream_uses_remote_merge_base() {
+        let repo = init_repo();
+        run_git(
+            repo.path(),
+            &["update-ref", "refs/remotes/origin/master", "HEAD"],
+        );
+        run_git(repo.path(), &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(repo.path().join("tracked.txt"), format!("{GH_TOKEN}\n")).unwrap();
+        run_git(repo.path(), &["commit", "-q", "-am", "token"]);
+        run_git(repo.path(), &["branch", "-f", "master", "HEAD"]);
+        assert_eq!(changed_paths(repo.path(), "push").unwrap(), ["tracked.txt"]);
+        assert!(scan(repo.path(), "push").deny);
+    }
+
+    #[test]
+    fn secret_scan_push_denies_a_net_added_token_and_passes_once_removed() {
+        let repo = init_repo();
+        run_git(repo.path(), &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(repo.path().join("tracked.txt"), "v2\n").unwrap();
+        run_git(repo.path(), &["commit", "-q", "-am", "clean change"]);
+        std::fs::write(repo.path().join("ci.yml"), format!("token: {GH_TOKEN}\n")).unwrap();
+        run_git(repo.path(), &["add", "ci.yml"]);
+        run_git(repo.path(), &["commit", "-q", "-m", "oops"]);
+
+        let result = scan(repo.path(), "push");
+        assert!(result.deny, "{result:?}");
+        let reason = result.reason.unwrap();
+        assert!(reason.contains("ci.yml"), "{reason}");
+        assert!(reason.contains("GitHub token"), "{reason}");
+        assert!(!reason.contains(GH_TOKEN), "leaked the token: {reason}");
+
+        // A third commit removing the token: the RANGE's net added lines
+        // are clean even though one commit in it added the secret.
+        std::fs::write(repo.path().join("ci.yml"), "token: ${{ secrets.GH }}\n").unwrap();
+        run_git(repo.path(), &["commit", "-q", "-am", "fix"]);
+        let result = scan(repo.path(), "push");
+        assert!(!result.deny, "{result:?}");
+    }
+
+    #[test]
+    fn secret_scan_allow_secrets_passes_and_writes_an_audit_line() {
+        let repo = init_repo();
+        std::fs::write(
+            repo.path().join("fixture.txt"),
+            format!("sample key {AWS_KEY}\n"),
+        )
+        .unwrap();
+        run_git(repo.path(), &["add", "fixture.txt"]);
+        let audit_dir = tempfile::tempdir().unwrap();
+        let audit_path = audit_dir.path().join("git.jsonl");
+
+        let result = secret_scan_for(repo.path(), "commit", true, true, Some(&audit_path));
+        assert!(!result.deny, "{result:?}");
+
+        let events: Vec<classify::Event> = audit::read_events(&audit_path).unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let event = &events[0];
+        assert_eq!(event.subcommand, "commit");
+        assert_eq!(event.disposition, classify::Disposition::SilentExempt);
+        assert!(
+            event.args.iter().any(|a| a.contains("fixture.txt")),
+            "{event:?}"
+        );
+        assert!(
+            event.args.iter().any(|a| a.contains("AWS access key id")),
+            "{event:?}"
+        );
+        let raw = std::fs::read_to_string(&audit_path).unwrap();
+        assert!(!raw.contains(AWS_KEY), "audit log leaked the key: {raw}");
+    }
+
+    #[test]
+    fn secret_scan_fails_closed_when_the_diff_cannot_be_produced() {
+        let dir = tempfile::tempdir().unwrap();
+        let bogus = dir.path().join("not-a-repo");
+        let result = scan(&bogus, "commit");
+        assert!(
+            result.deny,
+            "diff failure must not pass through: {result:?}"
+        );
+        assert!(
+            result.error.is_some(),
+            "a scan that could not run is a tooling error, not a policy verdict: {result:?}"
+        );
+    }
+
+    #[test]
+    fn secret_scan_does_not_run_without_an_agent() {
+        // Same unreadable repo that fails closed above: with no agent
+        // detected the scan never runs, so nothing can deny.
+        let dir = tempfile::tempdir().unwrap();
+        let bogus = dir.path().join("not-a-repo");
+        let result = secret_scan_for(&bogus, "commit", false, false, None);
+        assert!(!result.deny, "{result:?}");
+    }
+
+    #[test]
+    fn added_lines_by_path_ignores_removals_headers_and_binary_files() {
+        let lines: Vec<String> = [
+            "diff --git a/a.txt b/a.txt",
+            "index 1..2 100644",
+            "--- a/a.txt",
+            "+++ b/a.txt",
+            "@@ -1 +1,2 @@",
+            "-removed secret",
+            "+kept",
+            "+++ looks like a header but is content",
+            "diff --git a/gone.txt b/gone.txt",
+            "deleted file mode 100644",
+            "--- a/gone.txt",
+            "+++ /dev/null",
+            "@@ -1 +0,0 @@",
+            "-bye",
+            "diff --git a/img.png b/img.png",
+            "Binary files a/img.png and b/img.png differ",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let out = added_lines_by_path(&lines);
+        assert_eq!(
+            out,
+            vec![(
+                "a.txt".to_string(),
+                "kept\n++ looks like a header but is content\n".to_string()
+            )]
+        );
     }
 }
