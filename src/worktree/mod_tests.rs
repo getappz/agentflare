@@ -252,6 +252,108 @@ fn is_pr_merged_uses_metadata_pr_number_even_when_branch_name_would_not_resolve(
     assert_eq!(reqs[0].path, "/repos/o/r/pulls/619");
 }
 
+// Item #373: `done` has to know WHICH PR merged, and whether that merge
+// covered the branch it is on -- so `merged_pr` reports the number and the
+// PR's head, not just a yes/no.
+#[test]
+fn merged_pr_reports_the_number_and_head_of_a_merged_pr() {
+    let server = crate::github::test_support::MockServer::start(vec![
+        crate::github::test_support::MockResponse::json(
+            200,
+            r#"{"number":619,"html_url":"u","state":"closed","title":"t","merged_at":"2026-10-17T00:00:00Z","head":{"ref":"task/191-x","sha":"abc123"}}"#,
+        ),
+    ]);
+    let client = server.client(Some("tok"));
+    let repo = crate::github::RepoId {
+        owner: "o".into(),
+        repo: "r".into(),
+    };
+    let item = item_with_metadata(
+        191,
+        r#"{"pr":{"number":619,"branch":"task/191-opencode-agentflare-work-dispatch-doesn"}}"#,
+    );
+
+    let merged = merged_pr(
+        &item,
+        Path::new("/does/not/exist"),
+        &client,
+        &repo,
+    )
+    .expect("the PR is merged");
+    assert_eq!(merged.number, 619);
+    assert_eq!(merged.head_sha.as_deref(), Some("abc123"));
+}
+
+#[test]
+fn merged_pr_is_none_for_a_pr_that_is_still_open() {
+    let server = crate::github::test_support::MockServer::start(vec![
+        crate::github::test_support::MockResponse::json(
+            200,
+            r#"{"number":619,"html_url":"u","state":"open","title":"t","head":{"ref":"task/191-x","sha":"abc123"}}"#,
+        ),
+    ]);
+    let client = server.client(Some("tok"));
+    let repo = crate::github::RepoId {
+        owner: "o".into(),
+        repo: "r".into(),
+    };
+    let item = item_with_metadata(191, r#"{"pr":{"number":619}}"#);
+
+    assert!(merged_pr(&item, Path::new("/does/not/exist"), &client, &repo).is_none());
+}
+
+#[test]
+fn a_branch_that_moved_on_after_the_merge_is_not_covered_by_it() {
+    // The merge landed commit A; the branch then moved on to commit B, which
+    // the PR never carried. Completing the item would throw B away, so the
+    // branch is not covered.
+    let dir = tempfile::tempdir().unwrap();
+    let run_git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?} failed");
+        out
+    };
+    run_git(&["init", "-b", "master"]);
+    run_git(&["config", "user.email", "test@test.com"]);
+    run_git(&["config", "user.name", "Test"]);
+    std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+    run_git(&["add", "-A"]);
+    run_git(&["commit", "-m", "a"]);
+    let a = String::from_utf8_lossy(&run_git(&["rev-parse", "HEAD"]).stdout)
+        .trim()
+        .to_string();
+    run_git(&["branch", "task/1", "HEAD"]);
+
+    assert!(
+        branch_is_covered_by_merged_pr(dir.path(), "task/1", Some(&a)),
+        "a branch sitting exactly on the merged commit is covered"
+    );
+
+    // One more commit, this time ON the branch -- so the branch moved past
+    // the commit the PR merged.
+    run_git(&["checkout", "task/1"]);
+    std::fs::write(dir.path().join("b.txt"), "b").unwrap();
+    run_git(&["add", "-A"]);
+    run_git(&["commit", "-m", "b"]);
+    assert!(
+        !branch_is_covered_by_merged_pr(dir.path(), "task/1", Some(&a)),
+        "work the merged PR never carried must not be completed away"
+    );
+
+    assert!(
+        branch_is_covered_by_merged_pr(dir.path(), "task/9", Some(&a)),
+        "a branch that is gone holds nothing left to deliver"
+    );
+    assert!(
+        !branch_is_covered_by_merged_pr(dir.path(), "task/1", None),
+        "without the PR's head there is nothing to compare against"
+    );
+}
+
 #[test]
 fn is_pr_merged_falls_back_to_branch_heuristic_when_metadata_pr_is_absent() {
     let dir = tempfile::tempdir().unwrap();

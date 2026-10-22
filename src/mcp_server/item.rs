@@ -1703,6 +1703,19 @@ impl AgentflareMcp {
             (summary, should_push),
             (req.force, req.force_reason.as_deref()),
         )?;
+        // Item #373: the PR this item tracked was merged while this job was
+        // still running -- a human merged it, or another instance's finalize
+        // did -- and the head branch is gone from the remote. That is a
+        // *completed* merge, not a failed push. See
+        // `item_merged_pr::complete_if_pr_already_merged` for the conditions
+        // that keep this from completing work that was never delivered.
+        if owns_claim
+            && let Some(resp) = super::item_merged_pr::complete_if_pr_already_merged(
+                self, &item_id, &item, &repo_root, &owner, now,
+            )?
+        {
+            return Ok(super::item_force::with_forced(resp, forced));
+        }
         let agent = crate::claims::agent_of(&owner);
         let pr_outcome = match (&item, &target_branch) {
             (Some(item), Some(target)) if should_push => crate::worktree::push_and_open_pr(
@@ -1786,29 +1799,12 @@ impl AgentflareMcp {
         // `cleanup_worktree` itself still verifies the tree is clean before
         // removing it, so this is safe even if `nothing_was_ever_committed`
         // somehow raced with an uncommitted local change.
-        let release_claim_and_cleanup = |item: &Option<agentflare_backend::item::Item>| {
-            if let Some(item) = item {
-                crate::worktree::cleanup_worktree(item, &repo_root);
-            }
-            match self.with_backend_db(|conn| {
-                agentflare_backend::claim::done(conn, &item_id, &owner, now)
-            }) {
-                Ok(Ok(true)) => {}
-                Ok(Ok(false)) => eprintln!(
-                    "worktree: releasing claim for item {item_id} affected no rows (owner mismatch or already released)"
-                ),
-                Ok(Err(e)) => {
-                    eprintln!("worktree: failed to release claim for item {item_id}: {e}")
-                }
-                Err(e) => {
-                    eprintln!("worktree: failed to release claim for item {item_id}: {e:?}")
-                }
-            }
-        };
         let done = if !owns_claim {
             false
         } else if nothing_was_ever_committed {
-            release_claim_and_cleanup(&item);
+            super::item_merged_pr::release_claim_and_cleanup(
+                self, &item_id, &item, &repo_root, &owner, now,
+            );
             false
         } else if in_review {
             let marked = self.with_backend_db(|conn| {
@@ -1866,7 +1862,9 @@ impl AgentflareMcp {
                 {
                     self.record_no_pr_completion(&item_id, *pushed, reason);
                 }
-                release_claim_and_cleanup(&item);
+                super::item_merged_pr::release_claim_and_cleanup(
+                    self, &item_id, &item, &repo_root, &owner, now,
+                );
             }
             moved
         };
