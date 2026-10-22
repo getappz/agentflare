@@ -3,7 +3,7 @@
 | Field | Value |
 |-------|-------|
 | Item | #395 — design-spec only (no application code in this item) |
-| Status | Draft for implementation planning (rev 2 — reviewer gap pass) |
+| Status | Draft for implementation planning (rev 3 — item-work + completion-evidence pass) |
 | Informed by | PM handoff (item asset), `run_review_sweep` / `review_bots` audit, flare-workflow scheduling (#366) |
 | Related | #393 (workflow engine reliability), #939/#944 (`needs_input` + verify gate at `item_done`), bridge work-item pipeline (`.superpowers/notes/bridge-work-item-workflow-design.md`) |
 
@@ -31,7 +31,59 @@
 ```bash
 git diff master --stat   # expects .gitignore + docs/superpowers/specs/pr-lifecycle-workflow-v1.md
 git ls-files docs/superpowers/specs/pr-lifecycle-workflow-v1.md  # must print the path
+test -f docs/superpowers/specs/pr-lifecycle-workflow-v1.md && wc -l docs/superpowers/specs/pr-lifecycle-workflow-v1.md
 ```
+
+### Round-3 response (completion-evidence gap)
+
+| Reviewer finding | Root cause | Response in this rev |
+|------------------|------------|----------------------|
+| “No committed changes vs `master`” | Prior pass wrote the spec under gitignored `/docs/` | Fixed in rev 1–2 (`.gitignore` carve-out + commits on task branch). |
+| “Passing tests on unchanged code” | Agents ran `cargo test` while the tree had **no design diff**; hooks treated that as verification evidence even though acceptance is **git-tracked markdown** | §Item work pipeline documents the correct evidence chain; design-spec items must show a **non-empty `git diff master`** for the spec path before `item done`. |
+| “Implement the requested scope” | Confusion between **#395 (design only)** and **follow-up Rust items** | Scope unchanged: this file + scheduling/pr-agent analysis; implementation remains §Follow-up. |
+
+## Item work pipeline (how #395 fits)
+
+This spec replaces only the **post-`in_review` PR automation** slice. Item **#395 itself** is executed by the existing SDD `agentflare-work-item` workflow (`work_item_pipeline.rs`), not by `pr-reconcile`.
+
+```mermaid
+stateDiagram-v2
+  direction LR
+  [*] --> Backlog: handoff / create
+  Backlog --> Started: claim + dispatch
+  Started --> Started: sdd_loop (analyst/implementer/reviewers)
+  Started --> in_review: finalize → item_done (design-spec: committed spec + PR)
+  in_review --> Completed: check_merge (PR merged)
+  note right of Started
+    metadata.task_type=design-spec
+    review_only + design_spec flags
+    deliverable = versioned spec file
+  end note
+  note right of in_review
+    Today: run_review_sweep (60s tick)
+    Target: pr-reconcile + pr-lifecycle
+  end note
+```
+
+| Phase | Engine / owner | #395 behavior |
+|-------|----------------|---------------|
+| Dispatch | `work_item_pipeline` (`WorkItemData`) | `detect_design_spec` + `metadata.task_type=design-spec` → analyst prompts ask for a **written spec**, not application code. |
+| `finalize` | `work_item_pipeline/finalize.rs` | Unlike plain `review_only`, **does not** stop at a findings comment — runs **`item_done`/PR** because the spec is a real artifact (`design_spec: true`). |
+| Pre-`item_done` gates | `hook_completion_gate` + `hold_unverified` | Session verification/review hooks still apply; **`[verify] enforce`** may park in `needs_input` if acceptance criteria lack evidence. |
+| Post-PR | `run_review_sweep` (today) or `pr-lifecycle` (target) | Out of scope for the SDD analyst turn; daemon-owned merge/repair. |
+
+**Design-spec completion evidence (operator + agent checklist):**
+
+1. **Artifact** — `docs/superpowers/specs/pr-lifecycle-workflow-v1.md` (or successor path) exists and is **tracked** (`git ls-files` prints it).
+2. **Delta** — `git diff master --stat` shows the spec (and any `.gitignore` carve-out), not merely a clean tree after unrelated tests.
+3. **Session hooks** — before `item done`, run a **project-appropriate verification command that reflects the diff** (for #395: the git checks above via Bash/`ctx_shell`; running full `cargo test` on an unchanged Rust tree is **not** a substitute for (1–2)).
+4. **Review evidence** — `mcp__flare__review(action="submit", …)` or `ReportFindings` per `hook_redirect::completion_gate_reason`.
+5. **PR body** — `item done` `summary` should restate scheduling recommendation + cutover flag, not “tests passed with no file changes.”
+
+Code anchors for the design-spec vs review-only split:
+
+- `WorkItemData::design_spec` — written spec still uses `item_done`/PR (`src/work_item_pipeline.rs`).
+- `finalize` branch — `review_only && !design_spec` posts comments only; design-spec falls through to success path (`src/work_item_pipeline/finalize.rs`).
 
 ## Summary
 
