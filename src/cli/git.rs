@@ -1161,7 +1161,7 @@ fn ref_transaction_log() {
     }
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(serde::Serialize)]
 struct ScopeCheckResult {
     deny: bool,
     reason: Option<String>,
@@ -2227,6 +2227,7 @@ mod tests {
     }
 
     // ---- item #402: commit/push credential scan -------------------------
+    // Never dump scan results or audit contents on failure: they may contain a leaked credential.
 
     const AWS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
     const GH_TOKEN: &str = "ghp_abcdefghijklmnopqrstuvwxyz012345";
@@ -2246,15 +2247,15 @@ mod tests {
         run_git(repo.path(), &["add", "config.env"]);
 
         let result = scan(repo.path(), "commit");
-        assert!(result.deny, "{result:?}");
-        assert_eq!(
-            result.error, None,
+        assert!(result.deny);
+        assert!(
+            result.error.is_none(),
             "a hit is a policy verdict, not an error"
         );
         let reason = result.reason.unwrap();
-        assert!(reason.contains("config.env"), "{reason}");
-        assert!(reason.contains("AWS access key id"), "{reason}");
-        assert!(!reason.contains(AWS_KEY), "leaked the key: {reason}");
+        assert!(reason.contains("config.env"));
+        assert!(reason.contains("AWS access key id"));
+        assert!(!reason.contains(AWS_KEY));
     }
 
     #[test]
@@ -2268,7 +2269,7 @@ mod tests {
         )
         .unwrap();
         let result = scan(repo.path(), "commit");
-        assert!(result.deny, "{result:?}");
+        assert!(result.deny);
         assert!(result.reason.unwrap().contains("tracked.txt"));
     }
 
@@ -2279,11 +2280,11 @@ mod tests {
         std::fs::write(repo.path().join(&filename), format!("{AWS_KEY}\n")).unwrap();
         run_git(repo.path(), &["add", &filename]);
         let result = scan(repo.path(), "commit");
-        assert!(result.deny, "{result:?}");
+        assert!(result.deny);
         let reason = result.reason.unwrap();
-        assert!(reason.contains("AWS access key id"), "{reason}");
-        assert!(reason.contains("config -- "), "{reason}");
-        assert!(!reason.contains(AWS_KEY), "{reason}");
+        assert!(reason.contains("AWS access key id"));
+        assert!(reason.contains("config -- "));
+        assert!(!reason.contains(AWS_KEY));
     }
 
     #[test]
@@ -2299,7 +2300,7 @@ mod tests {
         run_git(repo.path(), &["add", "tracked.txt"]);
 
         let result = scan(repo.path(), "commit");
-        assert!(!result.deny, "removals are never a leak: {result:?}");
+        assert!(!result.deny, "removals are never a leak");
     }
 
     #[test]
@@ -2318,7 +2319,7 @@ mod tests {
         run_git(repo.path(), &["config", "diff.outputIndicatorOld", "+"]);
         std::fs::write(repo.path().join("tracked.txt"), format!("{AWS_KEY}\n")).unwrap();
         let result = scan(repo.path(), "commit");
-        assert!(result.deny, "{result:?}");
+        assert!(result.deny);
         assert!(result.reason.unwrap().contains("tracked.txt"));
     }
 
@@ -2369,18 +2370,18 @@ mod tests {
         run_git(repo.path(), &["commit", "-q", "-m", "oops"]);
 
         let result = scan(repo.path(), "push");
-        assert!(result.deny, "{result:?}");
+        assert!(result.deny);
         let reason = result.reason.unwrap();
-        assert!(reason.contains("ci.yml"), "{reason}");
-        assert!(reason.contains("GitHub token"), "{reason}");
-        assert!(!reason.contains(GH_TOKEN), "leaked the token: {reason}");
+        assert!(reason.contains("ci.yml"));
+        assert!(reason.contains("GitHub token"));
+        assert!(!reason.contains(GH_TOKEN));
 
         // A third commit removing the token: the RANGE's net added lines
         // are clean even though one commit in it added the secret.
         std::fs::write(repo.path().join("ci.yml"), "token: ${{ secrets.GH }}\n").unwrap();
         run_git(repo.path(), &["commit", "-q", "-am", "fix"]);
         let result = scan(repo.path(), "push");
-        assert!(!result.deny, "{result:?}");
+        assert!(!result.deny);
     }
 
     #[test]
@@ -2396,23 +2397,17 @@ mod tests {
         let audit_path = audit_dir.path().join("git.jsonl");
 
         let result = secret_scan_for(repo.path(), "commit", true, true, Some(&audit_path));
-        assert!(!result.deny, "{result:?}");
+        assert!(!result.deny);
 
         let events: Vec<classify::Event> = audit::read_events(&audit_path).unwrap();
-        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events.len(), 1);
         let event = &events[0];
         assert_eq!(event.subcommand, "commit");
         assert_eq!(event.disposition, classify::Disposition::SilentExempt);
-        assert!(
-            event.args.iter().any(|a| a.contains("fixture.txt")),
-            "{event:?}"
-        );
-        assert!(
-            event.args.iter().any(|a| a.contains("AWS access key id")),
-            "{event:?}"
-        );
+        assert!(event.args.iter().any(|a| a.contains("fixture.txt")));
+        assert!(event.args.iter().any(|a| a.contains("AWS access key id")));
         let raw = std::fs::read_to_string(&audit_path).unwrap();
-        assert!(!raw.contains(AWS_KEY), "audit log leaked the key: {raw}");
+        assert!(!raw.contains(AWS_KEY));
     }
 
     #[test]
@@ -2420,13 +2415,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bogus = dir.path().join("not-a-repo");
         let result = scan(&bogus, "commit");
-        assert!(
-            result.deny,
-            "diff failure must not pass through: {result:?}"
-        );
+        assert!(result.deny, "diff failure must not pass through");
         assert!(
             result.error.is_some(),
-            "a scan that could not run is a tooling error, not a policy verdict: {result:?}"
+            "a scan that could not run is a tooling error, not a policy verdict"
         );
     }
 
@@ -2437,7 +2429,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bogus = dir.path().join("not-a-repo");
         let result = secret_scan_for(&bogus, "commit", false, false, None);
-        assert!(!result.deny, "{result:?}");
+        assert!(!result.deny);
     }
 
     #[test]
