@@ -89,6 +89,7 @@ const ESCAPE_HATCH_FLAGS: &[&str] = &["-C", "--git-dir", "--work-tree"];
 /// `ls-files` / `branch --show-current` reads agents reach for constantly
 /// (item #770 theme c); `escape_hatch_read_only` adds the arg-dependent
 /// cases (`worktree list`, listing-only `branch`, read-only `remote`).
+/// `ls-remote` is excluded because `--upload-pack` can execute a caller's program.
 const READ_ONLY_ESCAPE_SUBCOMMANDS: &[&str] = &[
     "log",
     "status",
@@ -99,7 +100,6 @@ const READ_ONLY_ESCAPE_SUBCOMMANDS: &[&str] = &[
     "describe",
     "ls-files",
     "ls-tree",
-    "ls-remote",
     "cat-file",
     "grep",
     "rev-parse",

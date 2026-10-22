@@ -182,6 +182,33 @@ fn unrecognized_subcommand_passes_through_to_real_git() {
 }
 
 #[test]
+fn escape_hatch_denies_ls_remote_before_running_upload_pack() {
+    let repo = init_repo();
+    let home = tempfile::TempDir::new().unwrap();
+    let marker = repo.path().join("upload-pack-ran");
+    let out = shim(
+        repo.path(),
+        home.path(),
+        &[
+            "-C",
+            repo.path().to_str().unwrap(),
+            "ls-remote",
+            "--upload-pack=echo ran > upload-pack-ran; exit 1",
+            ".",
+        ],
+    );
+    assert!(
+        !marker.exists(),
+        "upload-pack helper ran through the read escape"
+    );
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("denied"), "{stderr}");
+    let audit = std::fs::read_to_string(home.path().join(".agentflare/audit/git.jsonl")).unwrap();
+    assert!(audit.contains("ls-remote"), "{audit}");
+}
+
+#[test]
 fn escape_hatch_flags_are_denied_for_mutating_subcommands() {
     let repo = init_repo();
     let home = tempfile::TempDir::new().unwrap();
