@@ -176,38 +176,105 @@ fn is_pr_merged_impl(
     client: &crate::github::Client,
     repo: &RepoId,
 ) -> bool {
+    merged_pr(item, repo_root, client, repo).is_some()
+}
+
+/// The item's tracked PR, when it has already merged.
+pub(crate) struct MergedPr {
+    /// The PR's number.
+    pub number: u64,
+    /// The sha the PR's head was at when it merged — the commit the merge
+    /// landed. `None` when GitHub did not report one.
+    pub head_sha: Option<String>,
+}
+
+/// The item's tracked PR, when that PR has already merged.
+///
+/// Same identity contract as [`is_pr_merged`] -- `metadata.pr.number` first,
+/// the branch heuristic as the fallback, trusted only once `marks_this_item`
+/// confirms the PR found there is this item's own -- but it answers "which
+/// PR", so a caller can report the merge it found instead of a yes/no.
+pub(crate) fn merged_pr(
+    item: &agentflare_backend::item::Item,
+    repo_root: &Path,
+    client: &crate::github::Client,
+    repo: &RepoId,
+) -> Option<MergedPr> {
     if let Some(number) = pr_number_from_metadata(item) {
         return match crate::github::pulls::get(client, repo, number) {
-            Ok(pr) => pr.merged_at.is_some(),
+            Ok(pr) => pr.merged_at.is_some().then(|| MergedPr {
+                number,
+                head_sha: pr.head.as_ref().map(|h| h.sha.clone()),
+            }),
             Err(e) => {
                 eprintln!(
                     "worktree: could not check merge status for item {}: {e}",
                     item.id
                 );
-                false
+                None
             }
         };
     }
     let branch = flare_git_core::worktree::resolve_item_task_branch(item, repo_root);
     match crate::github::pulls::find_existing(client, repo, &branch) {
-        Ok(Some(pr)) => {
-            pr.merged_at.is_some()
-                && crate::github::pulls::marks_this_item(
-                    pr.body.as_deref(),
-                    item.sequence_id,
-                    &item.id,
-                )
+        Ok(Some(pr))
+            if crate::github::pulls::marks_this_item(
+                pr.body.as_deref(),
+                item.sequence_id,
+                &item.id,
+            ) =>
+        {
+            pr.merged_at.is_some().then(|| MergedPr {
+                number: pr.number,
+                head_sha: pr.head.as_ref().map(|h| h.sha.clone()),
+            })
         }
-        Ok(None) => false,
+        Ok(Some(_)) | Ok(None) => None,
         Err(e) => {
             eprintln!(
                 "worktree: could not check merge status for item {}: {e}",
                 item.id
             );
-            false
+            None
         }
     }
 }
+
+/// Whether the item's local branch holds nothing the merged PR did not carry
+/// — i.e. the merge landed everything this branch has, so there is no
+/// undelivered work left on it.
+///
+/// The branch tip has to be exactly the PR's head. A tip that is *different*
+/// means the branch moved on after the merge (a commit made while the PR was
+/// being merged, say) — that work was never delivered, and completing the
+/// item would throw it away. A branch that cannot be resolved at all counts
+/// as covered: it is gone, so there is nothing local left to deliver.
+///
+/// `false` when the PR reported no head sha: without one there is nothing to
+/// compare against, and "covered" is a claim this cannot back.
+pub(crate) fn branch_is_covered_by_merged_pr(
+    repo_root: &Path,
+    branch: &str,
+    pr_head: Option<&str>,
+) -> bool {
+    let Some(pr_head) = pr_head else {
+        return false;
+    };
+    let Some(tip) = flare_git_core::worktree::run_git_opt_timeout(
+        repo_root,
+        &["rev-parse", branch],
+        BRANCH_REV_PARSE_TIMEOUT_SECS,
+        &[],
+    ) else {
+        // The branch is gone: nothing local is left to deliver.
+        return true;
+    };
+    tip.trim() == pr_head.trim()
+}
+
+/// How long to wait for the local `git rev-parse` that decides whether a
+/// merged PR covered the branch.
+const BRANCH_REV_PARSE_TIMEOUT_SECS: u64 = 10;
 
 /// Swaps a merged PR's stage label from `agentflare:in-review` to
 /// `agentflare:completed` once `check_merge` has confirmed the merge and

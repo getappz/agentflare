@@ -15,6 +15,7 @@ mod handoff;
 pub(crate) mod item;
 mod item_doctor;
 pub(crate) mod item_force;
+mod item_merged_pr;
 mod item_plan_transition;
 mod item_reports;
 mod item_review;
@@ -184,6 +185,12 @@ pub struct AgentflareMcp {
     /// never runs real git worktree/branch operations against this actual
     /// repository (worktree add, force-remove, branch -D).
     worktree_repo_root_override: Option<std::path::PathBuf>,
+    /// Tests inject a GitHub client aimed at a mock server here, so a code
+    /// path that has to ask GitHub about a PR (did it merge? is it still
+    /// open?) can be driven end to end without live credentials -- the same
+    /// seam `github::Client::for_test` gives the unit tests. Production
+    /// leaves it `None` and builds a client from the ambient credentials.
+    pub(crate) github_client_override: Option<crate::github::Client>,
     /// Pins `resolve_project` to this exact project id, bypassing the
     /// link-file/remote/cwd resolution entirely. Set only by
     /// `scoped_to_project`, for daemon-side callers (the review sweep) that
@@ -991,7 +998,19 @@ impl AgentflareMcp {
             ),
             worktree_repo_root_override: Some(repo_root),
             project_id_override: Some(project_id),
+            github_client_override: self.github_client_override.clone(),
             ..Default::default()
+        }
+    }
+
+    /// The GitHub client to talk to: the test override when one is set,
+    /// otherwise one built from the ambient credentials. `None` when there
+    /// are no usable credentials -- every caller treats that as "GitHub
+    /// cannot be reached" and soft-fails rather than erroring.
+    pub(crate) fn github_client(&self) -> Option<crate::github::Client> {
+        match &self.github_client_override {
+            Some(client) => Some(client.clone()),
+            None => crate::github::Client::new().ok(),
         }
     }
 
