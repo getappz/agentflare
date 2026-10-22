@@ -134,6 +134,11 @@ pub struct ScopeCheckArgs {
     /// The subcommand being checked -- "commit" or "push".
     #[arg(long)]
     pub subcommand: String,
+    /// `commit` only: the commit carries exactly the index (no `-a`/
+    /// `--include`/pathspec), so classify staged paths alone -- another
+    /// agent's unstaged edits in a shared checkout are not part of it.
+    #[arg(long, default_value_t = false)]
+    pub staged_only: bool,
 }
 
 #[derive(Args)]
@@ -288,7 +293,7 @@ pub fn run(args: GitArgs) {
         GitCommand::Snapshot(opts) => snapshot_cmd(opts),
         GitCommand::TrailerInject(opts) => trailer_inject(&opts.msg_file),
         GitCommand::RefTransactionLog => ref_transaction_log(),
-        GitCommand::ScopeCheck(opts) => scope_check(&opts.subcommand),
+        GitCommand::ScopeCheck(opts) => scope_check(&opts.subcommand, opts.staged_only),
         GitCommand::Audit(opts) => worktree_audit_cmd(opts),
         GitCommand::Doctor(opts) => doctor_cmd(opts),
         GitCommand::Ship(opts) => ship_cmd(opts),
@@ -1249,8 +1254,8 @@ fn partition_claims_by_owner(
 /// diff CONTENT (`run_secret_scan`): it runs only once the path-scope check
 /// has passed, so the shim sees a single verdict and needs no protocol
 /// change for it.
-fn scope_check(subcommand: &str) {
-    let mut result = run_scope_check(subcommand);
+fn scope_check(subcommand: &str, staged_only: bool) {
+    let mut result = run_scope_check(subcommand, staged_only);
     if !result.deny {
         result = run_secret_scan(subcommand);
     }
@@ -1260,7 +1265,7 @@ fn scope_check(subcommand: &str) {
     println!("{json}");
 }
 
-fn run_scope_check(subcommand: &str) -> ScopeCheckResult {
+fn run_scope_check(subcommand: &str, staged_only: bool) -> ScopeCheckResult {
     // Scope enforcement only applies to agent-driven invocations, mirroring
     // `flare-git-shim`'s existing canonical-detach guard -- interactive
     // human use is never affected.
@@ -1311,7 +1316,7 @@ fn run_scope_check(subcommand: &str) -> ScopeCheckResult {
     let changed = if !out_of_tree && !has_enforced_others {
         Vec::new()
     } else {
-        match changed_paths(&repo_root, subcommand) {
+        match changed_paths(&repo_root, subcommand, staged_only) {
             Ok(p) => p,
             Err(e) => {
                 return scope_error(format!("scope-check could not classify changed paths: {e}"));
@@ -1347,11 +1352,14 @@ fn too_many_paths_msg(cap: usize) -> String {
 }
 
 /// Changed paths for the mutation about to happen -- staged paths for
-/// `commit` (unioned with the working-tree diff, since `git commit -a`/
-/// `--all` implicitly stages+commits tracked modifications without a prior
-/// `git add` -- checking `--cached` alone would let those paths bypass
-/// scope enforcement entirely), paths in the net outgoing diff for
-/// `push`. A v1 simplification for `push`: diffs HEAD rather
+/// `commit` (unioned with the working-tree diff unless `staged_only`, since
+/// `git commit -a`/`--all` implicitly stages+commits tracked modifications
+/// without a prior `git add` -- checking `--cached` alone would let those
+/// paths bypass scope enforcement entirely; the shim passes `staged_only`
+/// for the plain index-only commit shape, where another agent's unstaged
+/// edits in a shared checkout are NOT part of the commit and must not deny
+/// it, item #770), paths in the net outgoing diff for `push`. A v1
+/// simplification for `push`: diffs HEAD rather
 /// than parsing the actual push refspec across the CLI subprocess boundary.
 /// An unreadable diff yields no changed paths (nothing to enforce), matching
 /// this crate's fail-open default for diff resolution specifically -- only
@@ -1361,7 +1369,11 @@ fn too_many_paths_msg(cap: usize) -> String {
 /// changed pathset is so large it cannot be classified at all (see
 /// `MAX_CHANGED_PATHS`). The diff is streamed with a line cap so a
 /// pathological pathset can't blow the child process's memory first.
-fn changed_paths(repo_root: &Path, subcommand: &str) -> Result<Vec<String>, String> {
+fn changed_paths(
+    repo_root: &Path,
+    subcommand: &str,
+    staged_only: bool,
+) -> Result<Vec<String>, String> {
     let cap = MAX_CHANGED_PATHS;
     if subcommand == "commit" {
         let mut paths =
@@ -1371,6 +1383,9 @@ fn changed_paths(repo_root: &Path, subcommand: &str) -> Result<Vec<String>, Stri
                 Err(BoundedLinesError::Git(_)) => Vec::new(), // fail-open on diff resolution
                 Err(BoundedLinesError::TooManyLines) => return Err(too_many_paths_msg(cap)),
             };
+        if staged_only {
+            return Ok(paths);
+        }
         match shell::run_in_lines_bounded(repo_root, &["diff", "--name-only"], cap) {
             Ok(p) => paths.extend(p),
             Err(BoundedLinesError::Git(_)) => {}
@@ -2102,11 +2117,25 @@ mod tests {
         // enforcement entirely.
         let repo = init_repo();
         std::fs::write(repo.path().join("tracked.txt"), "v2\n").unwrap();
-        let paths = changed_paths(repo.path(), "commit").unwrap();
+        let paths = changed_paths(repo.path(), "commit", false).unwrap();
         assert!(
             paths.iter().any(|p| p == "tracked.txt"),
             "unstaged modification must be included: {paths:?}"
         );
+    }
+
+    /// Item #770 theme e: a plain `git commit` commits exactly the index, so
+    /// with `staged_only` another agent's unstaged edit to `tracked.txt` in
+    /// the same checkout is not part of the commit and must not be classified
+    /// against it -- while the staged `new.txt` still is.
+    #[test]
+    fn changed_paths_for_commit_staged_only_excludes_unstaged_modifications() {
+        let repo = init_repo();
+        std::fs::write(repo.path().join("tracked.txt"), "v2\n").unwrap();
+        std::fs::write(repo.path().join("new.txt"), "x\n").unwrap();
+        run_git(repo.path(), &["add", "new.txt"]);
+        let paths = changed_paths(repo.path(), "commit", true).unwrap();
+        assert_eq!(paths, vec!["new.txt".to_string()], "{paths:?}");
     }
 
     #[test]
@@ -2114,7 +2143,7 @@ mod tests {
         let repo = init_repo();
         std::fs::write(repo.path().join("new.txt"), "x\n").unwrap();
         run_git(repo.path(), &["add", "new.txt"]);
-        let paths = changed_paths(repo.path(), "commit").unwrap();
+        let paths = changed_paths(repo.path(), "commit", false).unwrap();
         assert_eq!(
             paths.iter().filter(|p| *p == "new.txt").count(),
             1,
@@ -2125,7 +2154,11 @@ mod tests {
     #[test]
     fn changed_paths_for_commit_is_empty_when_clean() {
         let repo = init_repo();
-        assert!(changed_paths(repo.path(), "commit").unwrap().is_empty());
+        assert!(
+            changed_paths(repo.path(), "commit", false)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// Item #494: `scope_error` (used when `changed_paths()` can't classify
@@ -2350,7 +2383,10 @@ mod tests {
         std::fs::write(repo.path().join("tracked.txt"), format!("{GH_TOKEN}\n")).unwrap();
         run_git(repo.path(), &["commit", "-q", "-am", "token"]);
         run_git(repo.path(), &["branch", "-f", "master", "HEAD"]);
-        assert_eq!(changed_paths(repo.path(), "push").unwrap(), ["tracked.txt"]);
+        assert_eq!(
+            changed_paths(repo.path(), "push", false).unwrap(),
+            ["tracked.txt"]
+        );
         assert!(scan(repo.path(), "push").deny);
     }
 
@@ -2365,7 +2401,10 @@ mod tests {
         std::fs::write(repo.path().join("tracked.txt"), format!("{GH_TOKEN}\n")).unwrap();
         run_git(repo.path(), &["commit", "-q", "-am", "token"]);
         run_git(repo.path(), &["branch", "-f", "master", "HEAD"]);
-        assert_eq!(changed_paths(repo.path(), "push").unwrap(), ["tracked.txt"]);
+        assert_eq!(
+            changed_paths(repo.path(), "push", false).unwrap(),
+            ["tracked.txt"]
+        );
         assert!(scan(repo.path(), "push").deny);
     }
 
@@ -2382,7 +2421,7 @@ mod tests {
             "a local default at HEAD is not a remote push base"
         );
         assert!(result.error.is_some());
-        assert!(changed_paths(repo.path(), "push").is_err());
+        assert!(changed_paths(repo.path(), "push", false).is_err());
         assert!(!result.reason.unwrap().contains(GH_TOKEN));
     }
 
@@ -2399,7 +2438,10 @@ mod tests {
         run_git(repo.path(), &["commit", "-q", "-am", "token"]);
         assert!(branch::resolve_default_branch_known(repo.path()).is_none());
 
-        assert_eq!(changed_paths(repo.path(), "push").unwrap(), ["tracked.txt"]);
+        assert_eq!(
+            changed_paths(repo.path(), "push", false).unwrap(),
+            ["tracked.txt"]
+        );
         let result = scan(repo.path(), "push");
         assert!(result.deny);
         assert!(result.error.is_none());

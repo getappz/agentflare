@@ -115,7 +115,18 @@ if [ -n "${BASH_VERSION:-}" ] && [ -z "${AF_GUARD_OFF:-}" ]; then
     esac
     return 0
   }
-  trap '_af_guard "$BASH_COMMAND" || { echo "[af-guard] BLOCKED: $BASH_COMMAND" >&2; exit 77; }' DEBUG
+  # Every block leaves an audit line (tab-separated: UTC time, cwd, command)
+  # beside the git shim's own log -- a force-push blocked with the user's
+  # explicit approval used to vanish without a trace (item #770 theme f).
+  # Plain text, not git.jsonl: that log's reader fails closed on a malformed
+  # line, and $BASH_COMMAND is arbitrary text.
+  _af_guard_log() {
+    local _af_d="${AGENTFLARE_HOME_OVERRIDE:-$HOME}/.agentflare/audit"
+    command -p mkdir -p "$_af_d" 2>/dev/null || return 0
+    printf '%s\tblocked\t%s\t%s\n' "$(command -p date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" "$PWD" "$1" >> "$_af_d/guard.log" 2>/dev/null
+    return 0
+  }
+  trap '_af_guard "$BASH_COMMAND" || { _af_guard_log "$BASH_COMMAND"; echo "[af-guard] BLOCKED: $BASH_COMMAND -- logged to ~/.agentflare/audit/guard.log. A force-push in an agentflare-tracked repo needs explicit user approval; with it, re-run the command with AF_GUARD_OFF=1 set (prefer --force-with-lease)." >&2; exit 77; }' DEBUG
 fi"#
 }
 
@@ -355,6 +366,50 @@ mod tests {
                     o.status.success() && String::from_utf8_lossy(&o.stdout).contains("GNU bash")
                 })
         })
+    }
+
+    #[test]
+    fn force_push_guard_audits_denials_and_honors_the_shell_override() {
+        let Some(bash) = find_gnu_bash() else {
+            eprintln!("skipping: no GNU bash available");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let script = format!(
+            "_af_in_scoped_project() {{ return 0; }}\ngit() {{ printf ran; }}\n{}\ngit push origin task --force-with-lease\n",
+            guard_block()
+        );
+        for approved in [false, true] {
+            let mut cmd = std::process::Command::new(&bash);
+            cmd.args(["-c", &script])
+                .env_remove("BASH_ENV")
+                .env("PATH", tmp.path())
+                .env(
+                    "AGENTFLARE_HOME_OVERRIDE",
+                    tmp.path().to_string_lossy().replace('\\', "/"),
+                );
+            if approved {
+                cmd.env("AF_GUARD_OFF", "1");
+            } else {
+                cmd.env_remove("AF_GUARD_OFF");
+            }
+            let out = cmd.output().unwrap();
+            if approved {
+                assert!(out.status.success(), "{out:?}");
+                assert_eq!(out.stdout, b"ran");
+            } else {
+                assert_eq!(out.status.code(), Some(77), "{out:?}");
+                assert!(out.stdout.is_empty(), "{out:?}");
+                assert!(String::from_utf8_lossy(&out.stderr).contains("AF_GUARD_OFF=1"));
+            }
+        }
+        let log = fs::read_to_string(tmp.path().join(".agentflare/audit/guard.log")).unwrap();
+        assert_eq!(log.lines().count(), 1, "{log}");
+        assert!(log.contains("\tblocked\t"), "{log}");
+        assert!(
+            log.contains("git push origin task --force-with-lease"),
+            "{log}"
+        );
     }
 
     /// Regression for the 2026-09-16 fork-bomb (image-qc vents #274/#278):

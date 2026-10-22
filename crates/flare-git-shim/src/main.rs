@@ -81,11 +81,76 @@ const ESCAPE_HATCH_FLAGS: &[&str] = &["-C", "--git-dir", "--work-tree"];
 /// Subcommands let through even with an `ESCAPE_HATCH_FLAGS` override
 /// present -- read-only, can't mutate anything this shim's policy exists to
 /// protect, so there's nothing to classify against the (unresolvable) target
-/// repo in the first place. A `git -C <path> log`/`status`/`diff`/`show` is
+/// repo in the first place. A `git -C <path> log`/`rev-parse`/`ls-files` is
 /// exec'd straight to real git, same as it would be with no `-C` at all;
 /// anything else (including a subcommand this list doesn't recognize) still
-/// falls through to the deny below.
-const READ_ONLY_ESCAPE_SUBCOMMANDS: &[&str] = &["log", "status", "diff", "show"];
+/// falls through to the deny below. Used to be just log/status/diff/show,
+/// which denied the benign `git -C <other-worktree> rev-parse HEAD` /
+/// `ls-files` / `branch --show-current` reads agents reach for constantly
+/// (item #770 theme c); `escape_hatch_read_only` adds the arg-dependent
+/// cases (`worktree list`, listing-only `branch`, read-only `remote`).
+const READ_ONLY_ESCAPE_SUBCOMMANDS: &[&str] = &[
+    "log",
+    "status",
+    "diff",
+    "show",
+    "blame",
+    "shortlog",
+    "describe",
+    "ls-files",
+    "ls-tree",
+    "ls-remote",
+    "cat-file",
+    "grep",
+    "rev-parse",
+    "rev-list",
+    "merge-base",
+    "for-each-ref",
+    "name-rev",
+    "show-ref",
+    "diff-tree",
+    "diff-index",
+    "diff-files",
+    "check-ignore",
+    "count-objects",
+    "var",
+];
+
+/// Only positively recognized listing forms may bypass repository classification.
+fn escape_hatch_read_only(subcommand: &str, rest: &[String]) -> bool {
+    if READ_ONLY_ESCAPE_SUBCOMMANDS.contains(&subcommand) {
+        return true;
+    }
+    match subcommand {
+        "worktree" => rest.first().is_some_and(|a| a == "list"),
+        "branch" => {
+            // `-l` creates a reflog; it is not the short form of `--list`.
+            let lists = rest.iter().any(|a| a == "--list");
+            rest.iter().all(|a| {
+                matches!(
+                    a.as_str(),
+                    "--list"
+                        | "--show-current"
+                        | "--all"
+                        | "--remotes"
+                        | "--verbose"
+                        | "--no-color"
+                ) || (a.starts_with('-')
+                    && !a.starts_with("--")
+                    && a.len() > 1
+                    && a[1..].chars().all(|c| matches!(c, 'a' | 'r' | 'v')))
+                    || (lists && !a.starts_with('-'))
+            })
+        }
+        "remote" => {
+            let first = rest
+                .iter()
+                .find(|a| !matches!(a.as_str(), "-v" | "--verbose"));
+            matches!(first.map(String::as_str), None | Some("show" | "get-url"))
+        }
+        _ => false,
+    }
+}
 
 /// Global flags that consume the following argument as their value, so
 /// subcommand detection can skip past both tokens.
@@ -300,7 +365,15 @@ fn interpret_scope_check(
 /// denial. The existing bypass envs (`AGENTFLARE_GIT_BYPASS` and friends,
 /// checked earlier in `main`) remain the escape hatch for a persistently
 /// broken `agentflare` binary, same as any other misclassification.
-fn scope_check_outcome(subcommand: &str) -> ScopeCheckOutcome {
+///
+/// A plain `git commit` (no `-a`/`--include`/pathspec, see
+/// `classify::commit_includes_unstaged`) commits exactly the index, so the
+/// check is told `--staged-only`: another agent's unstaged edits in a
+/// shared checkout are not part of this commit and must not deny it (item
+/// #770 theme e). An `agentflare` binary predating that flag rejects it
+/// with a clap error -> `Crash` -> warned passthrough, the same handling as
+/// any other version skew between the two binaries.
+fn scope_check_outcome(subcommand: &str, args: &[String]) -> ScopeCheckOutcome {
     // Test-only override for the scope-check binary, compiled out of release
     // builds entirely (so the override can never exist in a shipped binary,
     // regardless of env vars) and, in debug builds, honored only alongside
@@ -322,6 +395,9 @@ fn scope_check_outcome(subcommand: &str) -> ScopeCheckOutcome {
     let bin = "agentflare".to_string();
     let mut cmd = std::process::Command::new(&bin);
     cmd.args(["git", "scope-check", "--subcommand", subcommand]);
+    if subcommand == "commit" && !classify::commit_includes_unstaged(args) {
+        cmd.arg("--staged-only");
+    }
     // Runs on every git invocation through this shim; without the no-window
     // flag, whenever the invoking parent has no inherited console (e.g.
     // spawned by an IDE/editor extension), Windows auto-allocates one for
@@ -440,8 +516,7 @@ fn main() {
 
     if escape_hatch {
         let is_read_only = subcommand_idx
-            .map(|idx| str_args[idx].as_str())
-            .is_some_and(|sc| READ_ONLY_ESCAPE_SUBCOMMANDS.contains(&sc));
+            .is_some_and(|idx| escape_hatch_read_only(&str_args[idx], &str_args[idx + 1..]));
         // `diff`/`log`/`show` are nominally read-only, but each accepts
         // `--output=<file>`, which writes the filesystem -- a "read-only"
         // escape can't be allowed to mutate anything (CodeRabbit finding).
@@ -451,10 +526,24 @@ fn main() {
         if is_read_only && !writes_file {
             exec_real(&tool, filtered_path.as_ref(), &args);
         }
-        eprintln!(
-            "agentflare git shim: denied — this invocation uses -C/--git-dir/--work-tree to target a different repository, which this shim cannot classify safely (read-only subcommands -- {} -- are let through; anything else is not).",
+        let reason = format!(
+            "this invocation uses -C/--git-dir/--work-tree to target a different repository, which this shim cannot classify safely. Read-only subcommands ({}; plus `worktree list`, listing-only `branch`, and `remote -v|show|get-url`) are let through; for anything else `cd` into that repository and run the command there instead.",
             READ_ONLY_ESCAPE_SUBCOMMANDS.join(", ")
         );
+        // Audited like every other deny -- this one used to exit without a
+        // trace, leaving nothing to reconcile a "shim blocked me" report
+        // against (item #770 theme f).
+        if let Some(audit_path) = audit::default_path("git.jsonl") {
+            let event = classify::Event {
+                subcommand: subcommand_idx.map_or_else(|| "*".to_string(), |i| str_args[i].clone()),
+                args: str_args.clone(),
+                disposition: classify::Disposition::Deny {
+                    reason: reason.clone(),
+                },
+            };
+            let _ = audit::log_event(&audit_path, &event);
+        }
+        eprintln!("agentflare git shim: denied — {reason}");
         exit(1);
     }
 
@@ -531,7 +620,7 @@ fn main() {
             if matches!(subcommand.as_str(), "commit" | "push")
                 && agentflare_shim::in_scoped_project(&repo_root, dirs::home_dir().as_deref())
             {
-                match scope_check_outcome(&subcommand) {
+                match scope_check_outcome(&subcommand, &rest) {
                     ScopeCheckOutcome::Pass => {}
                     ScopeCheckOutcome::Deny(reason) => {
                         let scope_event = classify::Event {
@@ -714,5 +803,53 @@ mod tests {
             ScopeCheckOutcome::Deny(reason) => assert_eq!(reason, "overlapping claim"),
             other => panic!("expected Deny, got {other:?}"),
         }
+    }
+
+    fn a(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn escape_hatch_read_only_covers_arg_dependent_listing_forms() {
+        assert!(escape_hatch_read_only("rev-parse", &a(&["HEAD"])));
+        assert!(escape_hatch_read_only(
+            "worktree",
+            &a(&["list", "--porcelain"])
+        ));
+        assert!(escape_hatch_read_only("branch", &a(&[])));
+        assert!(escape_hatch_read_only("branch", &a(&["--show-current"])));
+        assert!(escape_hatch_read_only("branch", &a(&["-a", "-vv"])));
+        assert!(escape_hatch_read_only(
+            "branch",
+            &a(&["--list", "feature/*"])
+        ));
+        assert!(escape_hatch_read_only("remote", &a(&[])));
+        assert!(escape_hatch_read_only("remote", &a(&["get-url", "origin"])));
+    }
+
+    #[test]
+    fn escape_hatch_read_only_rejects_anything_that_writes() {
+        assert!(!escape_hatch_read_only("worktree", &a(&["add", "../x"])));
+        assert!(!escape_hatch_read_only("worktree", &a(&["prune"])));
+        assert!(!escape_hatch_read_only("branch", &a(&["feature/x"])));
+        assert!(!escape_hatch_read_only("branch", &a(&["-D", "feature/x"])));
+        assert!(!escape_hatch_read_only(
+            "branch",
+            &a(&["--list", "-f", "x", "HEAD"])
+        ));
+        assert!(!escape_hatch_read_only(
+            "branch",
+            &a(&["--set-upstream-to=origin/x"])
+        ));
+        assert!(!escape_hatch_read_only("remote", &a(&["add", "up", "url"])));
+        assert!(!escape_hatch_read_only(
+            "remote",
+            &a(&["set-url", "origin", "url"])
+        ));
+        assert!(!escape_hatch_read_only("commit", &a(&["-m", "x"])));
+        assert!(!escape_hatch_read_only(
+            "config",
+            &a(&["--get", "user.name"])
+        ));
     }
 }
