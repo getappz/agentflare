@@ -50,6 +50,80 @@ pub(super) fn index_embedding(
     }
 }
 
+/// A real path, qualified/snake_case/call identifier, file name or flag — not a
+/// version (`v1.2`), a prose slash (`and/or`) or a lone camelCase word.
+fn is_scope_token(w: &str) -> bool {
+    let w = w.trim_matches(|c: char| !c.is_alphanumeric() && !"_/.-:()~".contains(c));
+    let segments = || w.split('/').filter(|p| !p.is_empty());
+    let path = segments().count() >= 2
+        && !["and/or", "either/or", "yes/no", "n/a", "i/o"].contains(&w.to_lowercase().as_str());
+    let name = w.trim_matches(['(', ')', '.']);
+    let name = name
+        .rsplit_once(':')
+        .filter(|(_, line)| !line.is_empty() && line.bytes().all(|b| b.is_ascii_digit()))
+        .map_or(name, |(name, _)| name);
+    let named = name.rsplit_once('.').is_some_and(|(a, e)| {
+        !a.is_empty()
+            && (1..=4).contains(&e.len())
+            && e.chars().all(|c| c.is_ascii_alphanumeric())
+            && e.chars().any(|c| c.is_ascii_alphabetic())
+    });
+    let humps = w
+        .chars()
+        .zip(w.chars().skip(1))
+        .filter(|(a, b)| a.is_ascii_lowercase() && b.is_ascii_uppercase())
+        .count();
+    path || named
+        || w.contains("::")
+        || w.split('_').filter(|p| !p.is_empty()).count() >= 2
+        || w.ends_with("()")
+        || humps >= 2
+        || (w.len() > 2 && w.starts_with("--"))
+}
+
+/// Retrieval-card lint: a memory should carry the symptoms, synonyms and scope a
+/// future searcher would type. Heuristic and advisory only — never blocks a write.
+pub fn lint_retrieval_card(title: &str, content: &str) -> Vec<String> {
+    let text = format!("{title} {content}");
+    let words = content.split_whitespace().count();
+    let has_scope = text.matches('`').count() >= 2 || text.split_whitespace().any(is_scope_token);
+    let has_symptom = text
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|t| {
+            [
+                "error",
+                "panic",
+                "fail",
+                "exception",
+                "timeout",
+                "deadlock",
+                "stall",
+                "hang",
+                "locked",
+                "crash",
+                "cannot",
+                "denied",
+            ]
+            .iter()
+            .any(|k| t.starts_with(k))
+        });
+    let mut w = Vec::new();
+    if content.trim().len() < 40 || words < 6 {
+        w.push("text is very short".to_string());
+    }
+    if !has_scope {
+        w.push("no path, identifier or scope (file, module, function, command)".to_string());
+    }
+    if !has_symptom {
+        w.push("no error text or symptom".to_string());
+    }
+    if !w.is_empty() {
+        w.push("rewrite as a retrieval card: error text/symptom + where it shows up (path/identifier) + the fix location — write what a future searcher would type, not display text. Weak: \"deadlock fix\". Strong: \"mcp_server stalls with 'database is locked' in src/memory/store.rs open(); fix: busy_timeout in store::open\"".to_string());
+    }
+    w
+}
+
 pub fn handle_remember(input: RememberInput) -> Result<String, String> {
     if input.title.trim().is_empty() || input.content.trim().is_empty() {
         return Err("title and content are required".into());
@@ -59,9 +133,12 @@ pub fn handle_remember(input: RememberInput) -> Result<String, String> {
             "type 'lesson' is reserved: use action=promote with evidence_ids and confidence".into(),
         );
     }
-    let conn = open_db()?;
+    remember_in(&open_db()?, input)
+}
+
+fn remember_in(conn: &rusqlite::Connection, input: RememberInput) -> Result<String, String> {
     let outcome = observations::save(
-        &conn,
+        conn,
         input.session_id.as_deref(),
         &input.r#type,
         &input.title,
@@ -85,9 +162,14 @@ pub fn handle_remember(input: RememberInput) -> Result<String, String> {
     // Best-effort semantic index; failure must never fail the remember.
     // Duplicates keep their existing vector — content is unchanged by definition.
     if status != "duplicate" {
-        index_embedding(&conn, id, &input.title, &input.content, status == "updated");
+        index_embedding(conn, id, &input.title, &input.content, status == "updated");
     }
-    Ok(json!({"status": status, "id": id}).to_string())
+    let mut out = json!({"status": status, "id": id});
+    let warnings = lint_retrieval_card(&input.title, &input.content);
+    if !warnings.is_empty() {
+        out["warnings"] = json!(warnings);
+    }
+    Ok(out.to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -671,6 +753,130 @@ pub fn handle_curate(input: CurateInput) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn remember_warns_on_vague_text_but_still_saves() {
+        let conn = {
+            let mut c = rusqlite::Connection::open_in_memory().unwrap();
+            super::super::schema::migrate(&mut c).unwrap();
+            c
+        };
+        let input = |title: &str, content: &str| RememberInput {
+            title: title.into(),
+            content: content.into(),
+            r#type: "note".into(),
+            session_id: None,
+            project: None,
+            topic_key: None,
+            scope: None,
+        };
+        let vague: serde_json::Value = serde_json::from_str(
+            &remember_in(&conn, input("deadlock fix", "fixed deadlock")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(vague["status"], "created");
+        assert!(vague["warnings"].as_array().is_some_and(|w| !w.is_empty()));
+        let card: serde_json::Value = serde_json::from_str(
+            &remember_in(
+                &conn,
+                input(
+                    "db locked",
+                    "mcp stalls with 'database is locked' error in src/memory/store.rs open(); fix: set busy_timeout",
+                ),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(card["status"], "created");
+        assert!(card.get("warnings").is_none());
+    }
+
+    #[test]
+    fn retrieval_card_lint_flags_vague_and_passes_cards() {
+        assert!(!lint_retrieval_card("deadlock fix", "fixed deadlock").is_empty());
+        // Incidental tokens must not suppress the scope warning.
+        let weak = |c: &str| {
+            lint_retrieval_card("t", c)
+                .iter()
+                .any(|m| m.starts_with("no path"))
+        };
+        assert!(weak(
+            "fixed it, see v1.2 and/or retry after timeout, ok thanks"
+        ));
+        assert!(weak(
+            "the iPhone build hit a timeout when we tried it again"
+        ));
+        for reference in [
+            "store.rs:47",
+            "store.rs:47;",
+            "store.rs:47.",
+            "store.rs:47...",
+            "(store.rs:47)",
+            "(store.rs:47).",
+            "(store.rs:47.)",
+            "open()",
+        ] {
+            let card =
+                format!("worker stalls when reading {reference} retries continue until restart");
+            assert!(
+                lint_retrieval_card("worker stall", &card).is_empty(),
+                "{card}"
+            );
+        }
+        for reference in [
+            "v1.2:47",
+            "v1.2:47.",
+            "store.rs:line",
+            "store.rs:line.",
+            "store.rs:",
+            "store.rs:.",
+            "(v1.2:47)",
+            "(store.rs:line)",
+            "(store.rs:)",
+            "(store.rs:.)",
+        ] {
+            assert!(weak(&format!(
+                "worker stalls when reading {reference} retries continue until restart"
+            )));
+        }
+        assert!(!weak("panic in src/memory/store.rs when opening"));
+        assert!(!weak(
+            "run cargo test --lib for the failure in memory::store"
+        ));
+        assert!(!weak("see `open` for the timeout and why it is slow now"));
+        assert!(!weak(
+            "handleRememberInput panics on empty titles in the daemon"
+        ));
+        // A scoped card with no symptom still warns; "terror" is not "error".
+        let nosym = |c: &str| {
+            lint_retrieval_card("t", c)
+                .iter()
+                .any(|m| m.starts_with("no error"))
+        };
+        assert!(nosym(
+            "rewrote the helper in src/memory/store.rs to use a pool"
+        ));
+        assert!(nosym(
+            "terror in src/memory/store.rs when opening the db file"
+        ));
+        assert!(!nosym(
+            "errors in src/memory/store.rs when opening the db file"
+        ));
+        for symptom in ["stalls", "hangs", "locked"] {
+            let card = format!(
+                "mcp_server {symptom} while opening src/memory/store.rs; fix: configure store connection"
+            );
+            assert!(
+                lint_retrieval_card("database access", &card).is_empty(),
+                "{card}"
+            );
+        }
+        assert!(lint_retrieval_card(
+            "db locked",
+            "mcp stalls with 'database is locked' error in src/memory/store.rs open(); fix: set busy_timeout"
+        )
+        .is_empty());
+    }
+
     use super::*;
     use rusqlite::Connection;
     use std::cell::Cell;
