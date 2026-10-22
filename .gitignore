@@ -5,7 +5,9 @@
 /.worktrees/
 
 # Machine-local docs output / notes, not part of the project
-/docs/
+/docs/*
+!/docs/superpowers/
+!/docs/superpowers/**
 
 # Competitive audit clones and reports — large, transient, per-machine
 /.competitive-audit/
