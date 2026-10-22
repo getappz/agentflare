@@ -1743,7 +1743,7 @@ impl AgentflareMcp {
         // proof nothing would be lost.
         let in_review = owns_claim
             && (pr_url.is_some()
-                || (!should_push && super::item_merged_pr::has_open_pr(&item, &repo_root)));
+                || (!should_push && super::item_merged_pr::has_open_pr(self, &item, &repo_root)));
         let diverged = item
             .as_ref()
             .zip(target_branch.as_ref())

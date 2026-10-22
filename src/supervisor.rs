@@ -370,7 +370,7 @@ pub(crate) struct DiscoveryTickResult {
 /// under (from the `project_dirs` registry, not this process's cwd).
 struct ProjectBatch {
     folder_path: String,
-    items: Vec<agentflare_backend::item::Item>,
+    pub(crate) items: Vec<agentflare_backend::item::Item>,
     label_id_by_name: std::collections::HashMap<String, String>,
     ready_id: String,
 }
@@ -1388,12 +1388,12 @@ enum PassingPrOutcome {
 /// `discover_untracked_prs` create a correctly-scoped item directly (item
 /// creation needs an explicit project, unlike every other mutation here,
 /// which is addressed by an existing item's own id).
-struct ReviewBatch {
+pub(crate) struct ReviewBatch {
     folder_path: String,
     project_id: String,
     in_review_state_id: String,
     known_pr_numbers: std::collections::HashSet<u64>,
-    items: Vec<agentflare_backend::item::Item>,
+    pub(crate) items: Vec<agentflare_backend::item::Item>,
     label_id_by_name: std::collections::HashMap<String, String>,
     /// Items #234's self-heal: items that regressed out of "in_review" (e.g.
     /// an orphaned self-repair job's claim getting reconciled) while still
@@ -1465,7 +1465,7 @@ fn collect_review_batches(
     batches
 }
 
-fn build_review_batch(
+pub(crate) fn build_review_batch(
     conn: &rusqlite::Connection,
     dir: agentflare_backend::project_dir::ProjectDir,
 ) -> agentflare_backend::error::Result<Option<ReviewBatch>> {

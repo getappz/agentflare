@@ -71,20 +71,36 @@ fn merged_pr_for(
 }
 
 /// Whether a `push=false` `done` must still leave the item in `in_review`:
-/// it records `metadata.pr.number` and that PR is still open on GitHub. A
-/// lookup that cannot tell (`Unknown`) or a merged/closed PR does not count.
+/// it records `metadata.pr.number` and that PR is not known to be merged or
+/// closed. A lookup that cannot tell (`Unknown`: no token, transient GitHub
+/// error) counts as open -- completing on a failed lookup is the very bug this
+/// guards against, and the sweep sorts a stale `in_review` item out itself.
 pub(crate) fn has_open_pr(
+    mcp: &AgentflareMcp,
     item: &Option<agentflare_backend::item::Item>,
     repo_root: &std::path::Path,
 ) -> bool {
-    item.as_ref()
+    let Some(item) = item
+        .as_ref()
         .filter(|i| crate::worktree::pr_number_from_metadata(i).is_some())
-        .is_some_and(|i| pr_is_open(&crate::worktree::pr_ci_status(i, repo_root)))
+    else {
+        return false;
+    };
+    let status = match (
+        mcp.github_client(),
+        crate::github::RepoId::resolve_from_remote(repo_root),
+    ) {
+        (Some(client), Some(repo)) => {
+            crate::worktree::pr_ci_status_impl(item, repo_root, &client, &repo)
+        }
+        _ => crate::worktree::PrCiStatus::Unknown,
+    };
+    pr_is_open(&status)
 }
 
 fn pr_is_open(status: &crate::worktree::PrCiStatus) -> bool {
     use crate::worktree::PrCiStatus::*;
-    !matches!(status, Merged | Closed { .. } | Unknown)
+    !matches!(status, Merged | Closed { .. })
 }
 
 #[cfg(test)]
@@ -92,20 +108,15 @@ mod tests {
     use crate::worktree::PrCiStatus::*;
 
     #[test]
-    fn only_a_live_pr_counts_as_open() {
+    fn only_a_merged_or_closed_pr_is_not_open() {
         assert!(super::pr_is_open(&Pending {
             number: 1,
             head_sha: None
         }));
         assert!(super::pr_is_open(&Conflicting { number: 1 }));
+        assert!(super::pr_is_open(&Unknown));
         assert!(!super::pr_is_open(&Merged));
         assert!(!super::pr_is_open(&Closed { number: 1 }));
-        assert!(!super::pr_is_open(&Unknown));
-    }
-
-    #[test]
-    fn no_pr_record_is_not_open() {
-        assert!(!super::has_open_pr(&None, std::path::Path::new("/nope")));
     }
 }
 
