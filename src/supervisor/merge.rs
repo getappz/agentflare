@@ -296,17 +296,23 @@ pub(super) fn requeue_closed_pr_item(
         if crate::worktree::pr_number_from_metadata(&current).is_some_and(|n| n != number) {
             return Ok(false);
         }
-        let rearmed = match agentflare_backend::item::redispatch(conn, &item.id, None)? {
+        // The PR was just seen closed, so no GitHub round-trip is needed to
+        // know its record is dead.
+        let rearmed = match agentflare_backend::item::redispatch(conn, &item.id, None, |_| {
+            agentflare_backend::item::PrRetention::Clear
+        })? {
             agentflare_backend::item::RedispatchOutcome::Ready { .. } => true,
             agentflare_backend::item::RedispatchOutcome::NoAssignee => {
                 // Nobody to hand it back to automatically: still leave
-                // "in_review" and drop the dead PR, so it waits in the
+                // "in_review" and drop the dead PR (and the review state
+                // derived from it, same as `redispatch`), so it waits in the
                 // backlog for an assignee instead of polling a closed PR.
                 let backlog =
                     agentflare_backend::state::first_in_group(conn, &current.project_id, "backlog")?;
                 agentflare_backend::item::update_state(conn, &item.id, &backlog.id)?;
                 conn.execute(
-                    "UPDATE items SET metadata = json_remove(metadata, '$.pr') \
+                    "UPDATE items SET metadata = json_remove(metadata, '$.pr', \
+                     '$.review_threads', '$.coderabbit_repair_announced_for') \
                      WHERE id = ?1 AND json_valid(metadata)",
                     rusqlite::params![item.id],
                 )?;

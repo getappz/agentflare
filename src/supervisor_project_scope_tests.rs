@@ -255,7 +255,10 @@ fn reassignment_holds_the_new_dispatch_until_the_old_job_stops_then_dispatches_t
     let (old_job, _) = queue.dequeue().unwrap().expect("old job is picked up");
 
     mcp.with_backend_db(|conn| {
-        agentflare_backend::item::redispatch(conn, &item_id, Some("opencode")).unwrap();
+        agentflare_backend::item::redispatch(conn, &item_id, Some("opencode"), |_| {
+            agentflare_backend::item::PrRetention::Clear
+        })
+        .unwrap();
     })
     .unwrap();
     let cancelled = crate::claims::reassignment_cancels_jobs(&queue, &item_id, "opencode").unwrap();
