@@ -340,6 +340,7 @@ fn handle_ci_green_notifies_once_for_a_gated_approved_pr() {
                 updated: 0,
                 discovered: 0,
                 requeued: 0,
+                stray_claimed: 0,
             };
             handle_ci_green(
                 &mcp,
@@ -669,6 +670,7 @@ fn coderabbit_cap_and_ci_green_do_not_flip_flop_across_sweeps() {
                 updated: 0,
                 discovered: 0,
                 requeued: 0,
+                stray_claimed: 0,
             };
             handle_ci_green(
                 &mcp,

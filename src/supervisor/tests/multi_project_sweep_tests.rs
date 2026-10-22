@@ -38,6 +38,7 @@ fn empty_sweep_result() -> ReviewSweepResult {
         updated: 0,
         discovered: 0,
         requeued: 0,
+        stray_claimed: 0,
     }
 }
 

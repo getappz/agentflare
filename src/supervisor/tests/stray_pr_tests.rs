@@ -253,6 +253,128 @@ fn run_review_sweep_leaves_a_stray_pr_item_alone_when_gated_by_needs_decision() 
 }
 
 #[test]
+fn a_stray_item_held_by_a_live_claim_is_still_collected_and_names_the_holder() {
+    // Item #392: a live claim used to make the sweep skip a stray item in
+    // silence. The claim still keeps the sweep from restoring the item --
+    // somebody is working on it -- but the sweep has to say so, or an
+    // approved, CI-green PR sits unmerged with nothing telling anyone why.
+    let repo = throwaway_repo();
+    let mcp = test_mcp_with_repo(repo.path().to_path_buf());
+    let item_id = mcp
+        .with_backend_db(|conn| {
+            let project = mcp.resolve_project(conn).unwrap();
+            let started =
+                agentflare_backend::state::first_in_group(conn, &project.id, "started").unwrap();
+            let item = agentflare_backend::item::create(
+                conn,
+                agentflare_backend::item::CreateItem {
+                    project_id: project.id.clone(),
+                    state_id: started.id,
+                    name: "Fix CI".into(),
+                    description: Some("do it well".into()),
+                    priority: None,
+                    parent_id: None,
+                    assignee_agent: Some("claude-code".into()),
+                    sort_order: None,
+                    external_source: None,
+                    external_id: None,
+                    metadata: Some(r#"{"pr":{"number":501,"branch":"task/501"}}"#.into()),
+                    label_ids: vec![],
+                    assignee_ids: vec![],
+                    dependency_ids: vec![],
+                    start_date: None,
+                    due_date: None,
+                },
+            )
+            .unwrap();
+            agentflare_backend::claim::acquire(
+                conn,
+                &item.id,
+                "claude-code:self-repair-job",
+                crate::claims::now(),
+                crate::claims::ttl_secs(),
+            )
+            .unwrap();
+            item.id
+        })
+        .unwrap();
+
+    let batch = mcp
+        .with_backend_db(|conn| {
+            let project = mcp.resolve_project(conn).unwrap();
+            build_review_batch(
+                conn,
+                agentflare_backend::project_dir::ProjectDir {
+                    project_id: project.id.clone(),
+                    folder_path: repo.path().to_string_lossy().to_string(),
+                    updated_at: 0,
+                },
+            )
+        })
+        .unwrap()
+        .expect("a batch")
+        .expect("a batch for this project");
+
+    let candidate = batch
+        .stray_candidates
+        .iter()
+        .find(|c| c.item.id == item_id)
+        .expect("a claimed stray item is still a candidate, not silently dropped");
+    assert_eq!(candidate.number, Some(501));
+    assert_eq!(
+        candidate.claim_holder.as_deref(),
+        Some("claude-code:self-repair-job"),
+        "the claim holder is recorded, so the sweep can name it"
+    );
+}
+
+#[test]
+fn the_claimed_stray_notice_names_the_pr_the_item_and_the_holder() {
+    let repo = throwaway_repo();
+    let mcp = test_mcp_with_repo(repo.path().to_path_buf());
+    let item = mcp
+        .with_backend_db(|conn| {
+            let project = mcp.resolve_project(conn).unwrap();
+            let started =
+                agentflare_backend::state::first_in_group(conn, &project.id, "started").unwrap();
+            agentflare_backend::item::create(
+                conn,
+                agentflare_backend::item::CreateItem {
+                    project_id: project.id.clone(),
+                    state_id: started.id,
+                    name: "Fix CI".into(),
+                    description: None,
+                    priority: None,
+                    parent_id: None,
+                    assignee_agent: Some("claude-code".into()),
+                    sort_order: None,
+                    external_source: None,
+                    external_id: None,
+                    metadata: None,
+                    label_ids: vec![],
+                    assignee_ids: vec![],
+                    dependency_ids: vec![],
+                    start_date: None,
+                    due_date: None,
+                },
+            )
+            .unwrap()
+        })
+        .unwrap();
+
+    let notice = claimed_stray_notice(&item, 501, "claude-code:self-repair-job");
+    assert!(notice.contains("#501"), "the notice names the PR: {notice}");
+    assert!(
+        notice.contains(&format!("#{}", item.sequence_id)),
+        "the notice names the item: {notice}"
+    );
+    assert!(
+        notice.contains("claude-code:self-repair-job"),
+        "the notice names the claim holder: {notice}"
+    );
+}
+
+#[test]
 fn stray_pr_is_still_relevant_true_for_an_open_pr() {
     let server = crate::github::test_support::MockServer::start(vec![
         crate::github::test_support::MockResponse::json(
