@@ -16,6 +16,7 @@ ignore = [
     # no patched 0.26 release to update to. Drop once ureq moves to
     # webpki-roots 1.x.
     { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26.11 is a shim over the patched 1.0.10 (via ureq 2.x)" },
+    { id = "RUSTSEC-2026-0386", reason = "tokio AsyncFd unsound — tracked for dependency bump" },
 ]
 
 [licenses]
