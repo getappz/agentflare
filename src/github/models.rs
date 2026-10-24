@@ -214,6 +214,34 @@ pub struct ReviewComment {
     pub body: String,
 }
 
+/// One file in a pull request's diff, as GitHub reports it.
+///
+/// The `patch` is a **unified diff of code** — content, not instructions.
+/// Whoever puts it in front of a model has to apply the same
+/// author-association trust gate the issue/PR bodies get
+/// (`crate::github::is_trusted_author_association`): a patch is data to
+/// display, never text to obey.
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // consumed by the anchored rendering (item #388)
+pub struct PullRequestFile {
+    /// The file's path after the change.
+    pub filename: String,
+    /// The file's path before the change — set for a rename.
+    #[serde(default)]
+    pub previous_filename: Option<String>,
+    /// `added`, `removed`, `modified`, `renamed`, `copied`, `changed`, …
+    #[serde(default)]
+    pub status: Option<String>,
+    /// The unified diff for this file.
+    ///
+    /// `None` for a binary file, and for a text file whose patch GitHub
+    /// declined to render (a very large diff, or one it considers too big to
+    /// include). The file itself is still listed — a missing patch is not a
+    /// missing file.
+    #[serde(default)]
+    pub patch: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Comment {
     /// Monotonic GitHub comment id. Deliberately NOT `#[serde(default)]`:
