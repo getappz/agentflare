@@ -1469,10 +1469,10 @@ fn run_secret_scan(subcommand: &str) -> ScopeCheckResult {
 /// the agent gate, the escape hatch and the audit destination without
 /// touching process-global env vars.
 ///
-/// Only ADDED lines are scanned -- a removal is never a leak, and a push
-/// whose range first adds and then removes a credential has a clean net
-/// diff. The diff is taken over the whole range (`merge-base...HEAD`), not
-/// per commit, for exactly that reason. On a hit the verdict names the file
+/// Only ADDED lines are scanned -- a removal is never a leak. A push is
+/// scanned commit by commit, not as one net diff: a credential that an
+/// earlier commit adds and a later one removes is still published with the
+/// range. On a hit the verdict names the file
 /// and the matched rule but never the matched text; on a diff that cannot
 /// be produced at all it fails closed via `scope_error` (same convention as
 /// `changed_paths`' cap: enforcement that couldn't run is not a pass).
@@ -1538,16 +1538,13 @@ fn secret_scan_for(
 /// `(path, added_text)` per file for the diff `subcommand` is about to
 /// record: staged + working-tree hunks for `commit` (mirroring
 /// `changed_paths`' `git commit -a` semantics), the net upstream diff or
-/// remote merge-base diff for `push`. Binary files produce no `+` lines and
-/// so are skipped naturally.
+/// remote merge-base range for `push`, scanned commit by commit. Binary files
+/// produce no `+` lines and so are skipped naturally.
 fn secret_scan_added_lines(
     repo_root: &Path,
     subcommand: &str,
 ) -> Result<Vec<(String, String)>, String> {
     const DIFF: &[&str] = &[
-        "-c",
-        "core.quotepath=false",
-        "diff",
         "--no-color",
         "--no-ext-diff",
         "--no-textconv",
@@ -1559,8 +1556,13 @@ fn secret_scan_added_lines(
         "--output-indicator-context= ",
         "--unified=0",
     ];
-    let run = |extra: &[&str]| -> Result<Vec<String>, String> {
-        let args: Vec<&str> = DIFF.iter().copied().chain(extra.iter().copied()).collect();
+    let run = |verb: &[&str], extra: &[&str]| -> Result<Vec<String>, String> {
+        let args: Vec<&str> = ["-c", "core.quotepath=false"]
+            .into_iter()
+            .chain(verb.iter().copied())
+            .chain(DIFF.iter().copied())
+            .chain(extra.iter().copied())
+            .collect();
         match shell::run_in_lines_bounded(repo_root, &args, MAX_SCAN_LINES) {
             Ok(lines) => Ok(lines),
             Err(BoundedLinesError::Git(e)) => Err(e),
@@ -1571,11 +1573,16 @@ fn secret_scan_added_lines(
     };
     let lines = match subcommand {
         "commit" => {
-            let mut lines = run(&["--cached"])?;
-            lines.extend(run(&[])?);
+            let mut lines = run(&["diff"], &["--cached"])?;
+            lines.extend(run(&["diff"], &[])?);
             lines
         }
-        "push" => run(&[&push_diff_range(repo_root)?])?,
+        // Per-commit patches, not the net diff: a later commit removing a
+        // credential does not un-publish the earlier commit that added it.
+        "push" => {
+            let range = push_diff_range(repo_root)?.replace("...", "..");
+            run(&["log", "--no-merges", "-p", "--format="], &[&range])?
+        }
         _ => Vec::new(),
     };
     Ok(added_lines_by_path(&lines))
@@ -2403,7 +2410,7 @@ mod tests {
     }
 
     #[test]
-    fn secret_scan_push_denies_a_net_added_token_and_passes_once_removed() {
+    fn secret_scan_push_denies_a_token_added_in_any_outgoing_commit() {
         let repo = init_repo();
         run_git(
             repo.path(),
@@ -2423,12 +2430,13 @@ mod tests {
         assert!(reason.contains("GitHub token"));
         assert!(!reason.contains(GH_TOKEN));
 
-        // A third commit removing the token: the RANGE's net added lines
-        // are clean even though one commit in it added the secret.
+        // A third commit removing the token: the net diff is clean, but the
+        // earlier commit that added it is still in the outgoing history.
         std::fs::write(repo.path().join("ci.yml"), "token: ${{ secrets.GH }}\n").unwrap();
         run_git(repo.path(), &["commit", "-q", "-am", "fix"]);
         let result = scan(repo.path(), "push");
-        assert!(!result.deny);
+        assert!(result.deny, "an earlier commit in the range leaked it");
+        assert!(result.reason.unwrap().contains("ci.yml"));
     }
 
     #[test]
