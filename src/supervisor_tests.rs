@@ -1939,6 +1939,7 @@ fn coderabbit_repair_or_gate_skips_without_touching_anything_when_there_are_no_f
         &[],
         &label_id_by_name,
         "/repo",
+        None,
     );
 
     assert!(matches!(outcome, SelfRepairOutcome::Skipped));
@@ -1978,6 +1979,7 @@ fn coderabbit_repair_or_gate_dispatches_a_job_and_posts_a_summary_of_the_finding
         &[],
         &label_id_by_name,
         "/repo",
+        None,
     );
 
     assert!(matches!(outcome, SelfRepairOutcome::Dispatched));
@@ -2037,6 +2039,7 @@ fn coderabbit_repair_or_gate_gates_instead_of_dispatching_once_the_cap_is_reache
             &[],
             &label_id_by_name,
             "/repo",
+            None,
         );
 
         assert!(matches!(outcome, SelfRepairOutcome::Skipped));
@@ -2078,6 +2081,7 @@ fn coderabbit_repair_or_gate_stays_quiet_once_already_gated() {
         &[],
         &label_id_by_name,
         "/repo",
+        None,
     );
 
     assert!(matches!(outcome, SelfRepairOutcome::Skipped));
@@ -2111,6 +2115,7 @@ fn coderabbit_repair_or_gate_does_not_double_dispatch_while_a_job_is_already_in_
         &[],
         &label_id_by_name,
         "/repo",
+        None,
     );
 
     assert!(matches!(outcome, SelfRepairOutcome::Skipped));
@@ -2147,6 +2152,7 @@ fn coderabbit_repair_or_gate_reverts_the_stage_label_once_findings_are_resolved(
         &[CODERABBIT_REPAIR_PR_LABEL.to_string()],
         &label_id_by_name,
         "/repo",
+        None,
     );
 
     assert!(matches!(outcome, SelfRepairOutcome::Skipped));
