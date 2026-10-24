@@ -62,6 +62,23 @@ fn without_metadata_keys(metadata: &str, keys: &[&str]) -> Option<String> {
     removed_any.then(|| value.to_string())
 }
 
+const PR_DERIVED_METADATA_KEYS: &[&str] =
+    &["pr", "review_threads", "coderabbit_repair_announced_for"];
+
+/// What `redispatch` does with a tracked `metadata.pr`. Decided by the
+/// caller because only the main binary can ask GitHub whether the PR is
+/// still open; the backend has no GitHub client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrRetention {
+    /// The PR is still open (or GitHub could not say, or the caller passed
+    /// `keep_pr`): the record survives so the retried attempt pushes fixes
+    /// to the same branch instead of opening a duplicate PR (item #736).
+    Keep,
+    /// The PR is merged, closed or gone: `pr` and the review state derived
+    /// from it (`PR_DERIVED_METADATA_KEYS`) are cleared together.
+    Clear,
+}
+
 /// `metadata.pr.number`, the PR `push_and_open_pr`/`discover_untracked_prs`
 /// tracked for this item — same read as the main binary's
 /// `worktree::pr_number_from_metadata`.
@@ -492,11 +509,20 @@ pub enum RedispatchOutcome {
 /// the item's existing one is available — the caller needs to supply one
 /// before this can do anything useful, but that's an ordinary expected
 /// case, not exceptional.
+///
+/// `pr_retention` is consulted once, with the tracked `metadata.pr.number`,
+/// only when the item has one — and before the write transaction opens, so
+/// a caller that asks GitHub in there never holds the DB write lock across
+/// the network round-trip. See `PrRetention` for what each answer does.
 pub fn redispatch(
     conn: &Connection,
     item_id: &str,
     assignee_agent: Option<&str>,
+    pr_retention: impl FnOnce(u64) -> PrRetention,
 ) -> Result<RedispatchOutcome> {
+    let checked_pr = metadata_pr_number(&get(conn, item_id)?.metadata);
+    let retention = checked_pr.map(pr_retention);
+
     let tx = immediate_tx(conn)?;
     let item = get(&tx, item_id)?;
     let state = crate::state::get(&tx, &item.state_id)?;
@@ -526,20 +552,17 @@ pub fn redispatch(
     // redispatch is about to hand the item to someone else.
     let agent_changed =
         item.assignee_agent.as_deref().map(agent_part).as_deref() != Some(agent.as_str());
-    // `metadata.pr` (set by `push_and_open_pr`/`discover_untracked_prs` at
-    // PR-creation/discovery time) is always cleared here, regardless of
-    // `agent_changed` -- redispatch resets state to "backlog" specifically
-    // for a *fresh* attempt, so a PR tracked from whatever attempt is being
-    // abandoned is stale by construction. Leaving it in place used to mean
-    // `run_review_sweep`'s stray-PR self-heal (item #234) would see the old
-    // `metadata.pr.number` on a backlog item and drag it straight back into
-    // "in_review" on the very next tick, undoing the redispatch.
-    let cleared_keys: &[&str] = if agent_changed {
-        &["model", "pr"]
-    } else {
-        &["pr"]
-    };
-    let metadata = without_metadata_keys(&item.metadata, cleared_keys);
+    // A PR attached during the lookup has not been checked; keep it and its review state.
+    let keep_pr =
+        retention == Some(PrRetention::Keep) || metadata_pr_number(&item.metadata) != checked_pr;
+    let mut cleared_keys: Vec<&str> = Vec::new();
+    if agent_changed {
+        cleared_keys.push("model");
+    }
+    if !keep_pr {
+        cleared_keys.extend_from_slice(PR_DERIVED_METADATA_KEYS);
+    }
+    let metadata = without_metadata_keys(&item.metadata, &cleared_keys);
 
     let backlog_state = crate::state::first_in_group(&tx, &item.project_id, "backlog")?;
     update_state(&tx, item_id, &backlog_state.id)?;

@@ -329,6 +329,97 @@ fn a_stray_item_held_by_a_live_claim_is_still_collected_and_names_the_holder() {
 }
 
 #[test]
+fn a_redispatched_item_keeping_its_open_pr_is_not_a_stray_candidate() {
+    // Item #736: redispatch now keeps `metadata.pr` for an open PR and
+    // re-arms the item with `ready-for-work`. The stray self-heal must leave
+    // it for dispatch, or it is dragged back to in_review and the redispatch
+    // is undone.
+    let repo = throwaway_repo();
+    let mcp = test_mcp_with_repo(repo.path().to_path_buf());
+    let (kept_id, stray_id) = mcp
+        .with_backend_db(|conn| {
+            let project = mcp.resolve_project(conn).unwrap();
+            let backlog =
+                agentflare_backend::state::first_in_group(conn, &project.id, "backlog").unwrap();
+            let mut ids = Vec::new();
+            for name in ["Redispatched", "Plain stray"] {
+                let item = agentflare_backend::item::create(
+                    conn,
+                    agentflare_backend::item::CreateItem {
+                        project_id: project.id.clone(),
+                        state_id: backlog.id.clone(),
+                        name: name.into(),
+                        description: Some("do it well".into()),
+                        priority: None,
+                        parent_id: None,
+                        assignee_agent: Some("claude-code".into()),
+                        sort_order: None,
+                        external_source: None,
+                        external_id: None,
+                        metadata: Some(r#"{"pr":{"number":501,"branch":"task/501"}}"#.into()),
+                        label_ids: vec![],
+                        assignee_ids: vec![],
+                        dependency_ids: vec![],
+                        start_date: None,
+                        due_date: None,
+                    },
+                )
+                .unwrap();
+                ids.push(item.id);
+            }
+            agentflare_backend::label::create(
+                conn,
+                agentflare_backend::label::CreateLabel {
+                    project_id: Some(project.id.clone()),
+                    workspace_id: project.workspace_id.clone(),
+                    name: READY_LABEL.into(),
+                    color: None,
+                    parent_id: None,
+                    sort_order: None,
+                    external_source: None,
+                    external_id: None,
+                },
+            )
+            .unwrap();
+            let labels = agentflare_backend::label::list_by_project(conn, &project.id).unwrap();
+            let ready_id = &labels.iter().find(|l| l.name == READY_LABEL).unwrap().id;
+            agentflare_backend::item::add_label(conn, &ids[0], ready_id).unwrap();
+            (ids[0].clone(), ids[1].clone())
+        })
+        .unwrap();
+
+    let batch = mcp
+        .with_backend_db(|conn| {
+            let project = mcp.resolve_project(conn).unwrap();
+            build_review_batch(
+                conn,
+                agentflare_backend::project_dir::ProjectDir {
+                    project_id: project.id.clone(),
+                    folder_path: repo.path().to_string_lossy().to_string(),
+                    updated_at: 0,
+                },
+            )
+        })
+        .unwrap()
+        .expect("a batch")
+        .expect("a batch for this project");
+
+    let candidates: Vec<&str> = batch
+        .stray_candidates
+        .iter()
+        .map(|c| c.item.id.as_str())
+        .collect();
+    assert!(
+        !candidates.contains(&kept_id.as_str()),
+        "a ready-for-work item with a kept PR is dispatch's, not the sweep's"
+    );
+    assert!(
+        candidates.contains(&stray_id.as_str()),
+        "control: the same item without the label is still a candidate"
+    );
+}
+
+#[test]
 fn the_claimed_stray_notice_names_the_pr_the_item_and_the_holder() {
     let repo = throwaway_repo();
     let mcp = test_mcp_with_repo(repo.path().to_path_buf());

@@ -1,6 +1,73 @@
 use super::*;
 
 #[test]
+fn redispatch_pr_retention_tracks_github_state_and_keeps_on_errors() {
+    use crate::github::test_support::{MockResponse, MockServer};
+    use agentflare_backend::item::PrRetention::{Clear, Keep};
+
+    let repo = RepoId {
+        owner: "o".into(),
+        repo: "r".into(),
+    };
+    for (status, body, expected) in [
+        (
+            200,
+            r#"{"number":501,"html_url":"u","state":"open","title":"t"}"#,
+            Keep,
+        ),
+        (
+            200,
+            r#"{"number":501,"html_url":"u","state":"unknown","title":"t"}"#,
+            Keep,
+        ),
+        (
+            200,
+            r#"{"number":501,"html_url":"u","state":"closed","title":"t"}"#,
+            Clear,
+        ),
+        (
+            200,
+            r#"{"number":501,"html_url":"u","state":"closed","title":"t","merged_at":"2026-10-08T00:00:00Z"}"#,
+            Clear,
+        ),
+        (404, r#"{"message":"Not Found"}"#, Clear),
+        (403, r#"{"message":"API rate limit exceeded"}"#, Keep),
+        (500, r#"{"message":"Unavailable"}"#, Keep),
+        (200, "invalid json", Keep),
+    ] {
+        let server = MockServer::start_with(move |_| MockResponse::json(status, body));
+        let client = server.client(Some("tok"));
+        assert_eq!(
+            redispatch_pr_retention_impl(&client, &repo, 501),
+            expected,
+            "HTTP {status}: {body}"
+        );
+        let requests = server.requests();
+        assert!(!requests.is_empty());
+        assert!(
+            requests
+                .iter()
+                .all(|req| req.method == "GET" && req.path == "/repos/o/r/pulls/501")
+        );
+    }
+}
+
+#[test]
+fn redispatch_pr_retention_keeps_on_transport_failure() {
+    let server = crate::github::test_support::MockServer::start(vec![]);
+    let client = server.client(Some("tok"));
+    server.requests();
+    let repo = RepoId {
+        owner: "o".into(),
+        repo: "r".into(),
+    };
+    assert_eq!(
+        redispatch_pr_retention_impl(&client, &repo, 501),
+        agentflare_backend::item::PrRetention::Keep
+    );
+}
+
+#[test]
 fn pr_body_uses_the_summary_when_given_one() {
     assert_eq!(
         pr_body("item-1", Some("Fixed the race by adding a mutex.")),

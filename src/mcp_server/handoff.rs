@@ -317,8 +317,18 @@ impl AgentflareMcp {
                         let in_progress = agentflare_backend::state::get(conn, &item.state_id)
                             .is_ok_and(|s| s.group_name == "started");
                         if released && in_progress {
-                            agentflare_backend::item::redispatch(conn, id, Some(&recipient))
-                                .map_err(map_backend_err)?;
+                            agentflare_backend::item::redispatch(
+                                conn,
+                                id,
+                                Some(&recipient),
+                                |number| {
+                                    crate::worktree::redispatch_pr_retention(
+                                        &self.worktree_repo_root(),
+                                        number,
+                                    )
+                                },
+                            )
+                            .map_err(map_backend_err)?;
                         }
                     }
                     let item = agentflare_backend::item::get(conn, id).map_err(map_backend_err)?;
