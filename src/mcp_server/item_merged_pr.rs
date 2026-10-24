@@ -165,4 +165,3 @@ mod tests {
         assert!(!super::pr_is_open(&Closed { number: 1 }));
     }
 }
-
