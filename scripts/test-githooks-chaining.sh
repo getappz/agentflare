@@ -61,12 +61,14 @@ echo "0 1 refs/heads/z" | .githooks/reference-transaction prepared; rc=$?
 grep -q refs/heads/z .git/rt.in && ok "ref-transaction stdin replayed" || bad "rt stdin"
 echo "0 1 refs/heads/z" | .githooks/reference-transaction committed; rc=$?
 [ "$rc" = 0 ] && ok "committed failure ignored" || bad "committed rc=$rc"
+echo "0 1 refs/heads/z" | .githooks/reference-transaction preparing; rc=$?
+[ "$rc" = 4 ] && ok "preparing veto propagates" || bad "preparing rc=$rc"
 
-# 6. pre-merge-commit: runs local pre-merge-commit; pre-commit's local not run twice
+# 6. pre-merge-commit: runs local pre-merge-commit, then local pre-commit (a custom merge hook may not)
 new_repo; local_hook pre-merge-commit 'echo mm >> "$(git rev-parse --git-dir)/mm.log"'
 local_hook pre-commit 'echo pc >> "$(git rev-parse --git-dir)/pc2.log"'
 .githooks/pre-merge-commit
 [ -f .git/mm.log ] && ok "local pre-merge-commit ran" || bad "local pre-merge-commit"
-[ ! -f .git/pc2.log ] && ok "pre-commit local not chained from merge hook" || bad "double chain"
+[ -f .git/pc2.log ] && ok "local pre-commit veto applies to merges" || bad "local pre-commit skipped on merge"
 
 exit $fail

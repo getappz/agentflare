@@ -38,8 +38,9 @@ af_local="$(git rev-parse --git-common-dir 2>/dev/null)/hooks/reference-transact
 if [ -x "$af_local" ] && [ ! "$af_local" -ef "$0" ]; then
     af_rc=0
     "$af_local" "$@" <<<"$af_in" || af_rc=$?
-    # Only the "prepared" state may veto; a failure after commit is ignored.
-    if [ "$af_rc" -ne 0 ] && [ "$state" = "prepared" ]; then
+    # Only "preparing" (git >= 2.46) and "prepared" may veto; a failure after
+    # commit is ignored.
+    if [ "$af_rc" -ne 0 ] && { [ "$state" = "preparing" ] || [ "$state" = "prepared" ]; }; then
         exit "$af_rc"
     fi
 fi
