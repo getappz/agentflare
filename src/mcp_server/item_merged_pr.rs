@@ -1,3 +1,7 @@
+[mode overridden: auto -> full, reason=bounce-prevention, pass fresh=true to keep the requested mode]
+
+[mode overridden: auto -> full, reason=bounce-prevention, pass fresh=true to keep the requested mode]
+
 //! `done`'s "the PR I tracked has already merged" path (item #373).
 //!
 //! Split out of `item.rs` purely to keep that file under the repo's
@@ -109,6 +113,7 @@ fn has_open_pr_status(
     }
 }
 
+#[cfg(test)]
 fn pr_is_open(status: &crate::worktree::PrCiStatus) -> bool {
     use crate::worktree::PrCiStatus::*;
     !matches!(status, Merged | Closed { .. })
@@ -164,3 +169,4 @@ mod tests {
         assert!(!super::pr_is_open(&Closed { number: 1 }));
     }
 }
+
