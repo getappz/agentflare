@@ -5,6 +5,7 @@
 //! here beyond `super`.
 
 use super::*;
+use crate::dispatch_failure_ceiling::PR_CREATION_FAILED_MARKER;
 
 /// Completes the item when the PR it tracked has already merged.
 ///
