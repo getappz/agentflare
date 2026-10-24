@@ -1391,6 +1391,78 @@ fn run_review_sweep_skips_a_numbered_item_the_same_way_when_no_remote_resolves()
     assert!(queue.list(None).unwrap().is_empty());
 }
 
+// Item #396: an item finished with `push=false` while its PR is open must stay
+// in the group this sweep queries. No remote resolves here, so the PR lookup is
+// `Unknown`, which `done` treats as open and the sweep counts as `skipped` --
+// the sweep picked the item up (a completed item would never be counted).
+#[test]
+fn run_review_sweep_picks_up_an_item_done_without_push_while_its_pr_is_open() {
+    let repo = throwaway_repo();
+    let mcp = test_mcp_with_repo(repo.path().to_path_buf());
+    let queue = test_queue();
+    let owner = crate::claims::owner_id();
+    let item_id = mcp
+        .with_backend_db(|conn| {
+            let project = mcp.resolve_project(conn).unwrap();
+            let states = agentflare_backend::state::list_by_project(conn, &project.id).unwrap();
+            let state_id = states.iter().find(|s| s.is_default).unwrap().id.clone();
+            let item = agentflare_backend::item::create(
+                conn,
+                agentflare_backend::item::CreateItem {
+                    project_id: project.id.clone(),
+                    state_id,
+                    name: "Fix CI".into(),
+                    description: None,
+                    priority: None,
+                    parent_id: None,
+                    assignee_agent: None,
+                    sort_order: None,
+                    external_source: None,
+                    external_id: None,
+                    metadata: Some(r#"{"pr":{"number":501,"branch":"task/501"}}"#.into()),
+                    label_ids: vec![],
+                    assignee_ids: vec![],
+                    dependency_ids: vec![],
+                    start_date: None,
+                    due_date: None,
+                },
+            )
+            .unwrap();
+            agentflare_backend::item::claim(
+                conn,
+                &item.id,
+                &owner,
+                crate::claims::now(),
+                crate::claims::ttl_secs(),
+            )
+            .unwrap();
+            item.id
+        })
+        .unwrap();
+
+    let done: serde_json::Value = serde_json::from_str(
+        &mcp.item_done(crate::mcp_server::types::ItemRequest {
+            action: "done".into(),
+            id: Some(item_id.clone()),
+            push: Some(false),
+            ..Default::default()
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(done["status"], "in_review", "{done}");
+
+    let auth_conn = test_auth_conn();
+    let result = run_review_sweep(
+        &mcp,
+        &queue,
+        &auth_conn,
+        agentflare_resource_gate::Policy::Normal,
+    );
+    assert_eq!(result.skipped, 1, "the sweep must see the item's PR");
+    assert_eq!(result.promoted, 0);
+}
+
 #[path = "supervisor/tests/stray_pr_tests.rs"]
 mod stray_pr_tests;
 

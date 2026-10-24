@@ -147,3 +147,178 @@ fn item_done_completes_an_item_whose_pr_merged_while_the_job_was_running() {
     );
     assert_eq!(reqs[0].path, "/repos/o/r/pulls/910");
 }
+
+/// A claimed item with a worktree holding one real commit, in a repo with a
+/// GitHub-shaped remote. `pr` is recorded as `metadata.pr.number` when set.
+/// Returns (mcp, item id, worktree path, mock server, temp dirs to keep alive).
+fn claimed_item_with_commit(
+    pr: Option<u64>,
+    responses: Vec<crate::github::test_support::MockResponse>,
+) -> (
+    AgentflareMcp,
+    String,
+    std::path::PathBuf,
+    crate::github::test_support::MockServer,
+    (tempfile::TempDir, tempfile::TempDir),
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_root = repo_dir.path().to_path_buf();
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap()
+    };
+    git(&repo_root, &["init", "-b", "master"]);
+    git(&repo_root, &["config", "user.email", "test@test.com"]);
+    git(&repo_root, &["config", "user.name", "Test"]);
+    std::fs::write(repo_root.join("a.txt"), "a").unwrap();
+    git(&repo_root, &["add", "-A"]);
+    git(&repo_root, &["commit", "-m", "a"]);
+    git(
+        &repo_root,
+        &["remote", "add", "origin", "https://github.com/o/r.git"],
+    );
+    let server = crate::github::test_support::MockServer::start(responses);
+    let s = AgentflareMcp {
+        backend_db_override: Some(tmp.path().join("backend.db")),
+        backend_project_link_override: Some(tmp.path().join("project.json")),
+        worktree_repo_root_override: Some(repo_root.clone()),
+        github_client_override: Some(server.client(Some("tok"))),
+        ..Default::default()
+    };
+    let created: serde_json::Value =
+        serde_json::from_str(&s.item(Parameters(empty_item_create("Fix CI"))).unwrap()).unwrap();
+    let item_id = created["id"].as_str().unwrap().to_string();
+    let seq = created["sequence_id"].as_i64().unwrap();
+    let branch = format!("task/{seq}-x");
+    if let Some(number) = pr {
+        s.with_backend_db(|conn| {
+            crate::mcp_server::merge_item_metadata(conn, &item_id, |map| {
+                map.insert(
+                    "pr".into(),
+                    serde_json::json!({"number": number, "branch": branch}),
+                );
+            })
+            .unwrap();
+        })
+        .unwrap();
+    }
+    let worktree = repo_root
+        .join(".worktrees")
+        .join("task")
+        .join(seq.to_string());
+    std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+    git(
+        &repo_root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &branch,
+            worktree.to_str().unwrap(),
+            "master",
+        ],
+    );
+    std::fs::write(worktree.join("b.txt"), "b").unwrap();
+    git(&worktree, &["add", "-A"]);
+    git(&worktree, &["commit", "-m", "work"]);
+    let owner = crate::claims::owner_id();
+    s.with_backend_db(|conn| {
+        agentflare_backend::item::claim(
+            conn,
+            &item_id,
+            &owner,
+            crate::claims::now(),
+            crate::claims::ttl_secs(),
+        )
+        .unwrap();
+    })
+    .unwrap();
+    (s, item_id, worktree, server, (tmp, repo_dir))
+}
+
+fn done_without_push(s: &AgentflareMcp, item_id: &str) -> serde_json::Value {
+    serde_json::from_str(
+        &s.item(Parameters(ItemRequest {
+            action: "done".into(),
+            id: Some(item_id.to_string()),
+            push: Some(false),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn item_done_without_push_keeps_an_item_with_an_open_pr_in_review() {
+    // Item #396: `push=false` used to complete the item whatever its PR was
+    // doing, hiding an open PR from the review sweep for good.
+    let open_pr = r#"{"number":77,"html_url":"u","state":"open","title":"t","mergeable":true,"mergeable_state":"behind","head":{"ref":"b","sha":"abc"}}"#;
+    // First lookup: the #373 merged check; second: the open-PR check.
+    let (s, item_id, worktree, server, _keep) = claimed_item_with_commit(
+        Some(77),
+        vec![
+            crate::github::test_support::MockResponse::json(200, open_pr),
+            crate::github::test_support::MockResponse::json(200, open_pr),
+        ],
+    );
+
+    let resp = done_without_push(&s, &item_id);
+
+    assert_eq!(resp["status"], "in_review", "{resp}");
+    assert!(
+        worktree.exists(),
+        "the worktree stays for follow-up commits"
+    );
+    let owner = crate::claims::owner_id();
+    s.with_backend_db(|conn| {
+        assert!(
+            agentflare_backend::claim::is_owner(conn, &item_id, &owner).unwrap(),
+            "the claim stays held"
+        );
+        // The sweep's own query: the item must be in its batch.
+        let project = s.resolve_project(conn).unwrap();
+        let batch = crate::supervisor::build_review_batch(
+            conn,
+            agentflare_backend::project_dir::ProjectDir {
+                project_id: project.id,
+                folder_path: String::new(),
+                updated_at: 0,
+            },
+        )
+        .unwrap()
+        .expect("project has an in_review state");
+        assert!(
+            batch.items.iter().any(|i| i.id == item_id),
+            "the sweep sees the item and so its PR"
+        );
+    })
+    .unwrap();
+    assert!(
+        server
+            .requests()
+            .iter()
+            .all(|r| r.path.ends_with("/pulls/77"))
+    );
+}
+
+#[test]
+fn item_done_without_push_completes_an_item_with_no_pr() {
+    let (s, item_id, worktree, server, _keep) = claimed_item_with_commit(None, vec![]);
+
+    let resp = done_without_push(&s, &item_id);
+
+    assert_eq!(resp["status"], "completed", "{resp}");
+    assert!(!worktree.exists(), "cleaned up as before");
+    // (the pre-existing #373 branch lookup may still ask GitHub; the open-PR check must not)
+    assert!(
+        server
+            .requests()
+            .iter()
+            .all(|r| !r.path.contains("/pulls/"))
+    );
+}

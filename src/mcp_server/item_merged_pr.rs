@@ -70,6 +70,51 @@ fn merged_pr_for(
         .then_some(pr)
 }
 
+/// Whether a `push=false` `done` must still leave the item in `in_review`:
+/// the item has an open tracked PR (`metadata.pr.number` or branch lookup).
+/// A lookup that cannot tell (`Unknown`: no token, transient GitHub
+/// error) counts as open -- completing on a failed lookup is the very bug this
+/// guards against, and the sweep sorts a stale `in_review` item out itself.
+pub(crate) fn has_open_pr(
+    mcp: &AgentflareMcp,
+    item: &Option<agentflare_backend::item::Item>,
+    repo_root: &std::path::Path,
+) -> bool {
+    let Some(item) = item.as_ref() else {
+        return false;
+    };
+    let status = match (
+        mcp.github_client(),
+        crate::github::RepoId::resolve_from_remote(repo_root),
+    ) {
+        (Some(client), Some(repo)) => {
+            crate::worktree::pr_ci_status_impl(item, repo_root, &client, &repo)
+        }
+        _ => crate::worktree::PrCiStatus::Unknown,
+    };
+    has_open_pr_status(item, &status)
+}
+
+fn has_open_pr_status(
+    item: &agentflare_backend::item::Item,
+    status: &crate::worktree::PrCiStatus,
+) -> bool {
+    use crate::worktree::PrCiStatus::*;
+    match status {
+        Merged | Closed { .. } => false,
+        // No PR identity on the item and no open PR on the branch — a failed
+        // or absent lookup must not force in_review (item #396 push=false).
+        Unknown => crate::worktree::pr_number_from_metadata(item).is_some(),
+        _ => true,
+    }
+}
+
+#[cfg(test)]
+fn pr_is_open(status: &crate::worktree::PrCiStatus) -> bool {
+    use crate::worktree::PrCiStatus::*;
+    !matches!(status, Merged | Closed { .. })
+}
+
 /// Releases the claim lease and removes the item's worktree.
 ///
 /// Shared by both "nothing was ever committed" (the worktree is clean by
@@ -101,5 +146,22 @@ pub(crate) fn release_claim_and_cleanup(
         Err(e) => {
             eprintln!("worktree: failed to release claim for item {item_id}: {e:?}")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::worktree::PrCiStatus::*;
+
+    #[test]
+    fn only_a_merged_or_closed_pr_is_not_open() {
+        assert!(super::pr_is_open(&Pending {
+            number: 1,
+            head_sha: None
+        }));
+        assert!(super::pr_is_open(&Conflicting { number: 1 }));
+        assert!(super::pr_is_open(&Unknown));
+        assert!(!super::pr_is_open(&Merged));
+        assert!(!super::pr_is_open(&Closed { number: 1 }));
     }
 }
