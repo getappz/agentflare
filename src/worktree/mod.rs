@@ -1481,7 +1481,16 @@ pub fn push_and_open_pr(
         .join("task")
         .join(item.sequence_id.to_string());
     if !worktree_path.exists() {
-        return PrOutcome::NothingToPush;
+        // A vanished worktree whose branch still holds commits is lost work,
+        // not "nothing to push" -- fail loudly so the caller doesn't complete.
+        return if branch_diverged(item, repo_root, target_branch) {
+            PrOutcome::Failed(format!(
+                "worktree {} is missing but its branch has unpushed commits",
+                worktree_path.display()
+            ))
+        } else {
+            PrOutcome::NothingToPush
+        };
     }
     // No `origin` at all: there is nowhere to push, and never will be until
     // someone configures one -- not a failure worth retrying.
