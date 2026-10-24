@@ -19,6 +19,10 @@ pub(super) fn merge_user_metadata_patch(
     current_metadata: &str,
     patch: serde_json::Value,
 ) -> Result<String, ErrorData> {
+    // Legacy rows may hold the object double-encoded as a JSON string.
+    let current_metadata = serde_json::from_str(current_metadata)
+        .map_or_else(|_| "{}".to_string(), metadata_to_json_string);
+    let current_metadata = current_metadata.as_str();
     let patch: serde_json::Value = serde_json::from_str(&metadata_to_json_string(patch))
         .map_err(|e| ErrorData::invalid_params(format!("metadata is not valid JSON: {e}"), None))?;
     let serde_json::Value::Object(patch_obj) = patch else {

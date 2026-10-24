@@ -125,6 +125,31 @@ fn item_update_metadata_merges_a_double_encoded_patch() {
     assert_eq!(metadata["task_type"], "chore");
 }
 
+/// Legacy rows hold the object double-encoded as a JSON string; a partial
+/// update must still keep their existing keys.
+#[test]
+fn item_update_metadata_merges_into_a_double_encoded_stored_object() {
+    let (tmp, s) = harness();
+    let id = item_with_metadata(&s, serde_json::json!({}));
+    {
+        let conn = backend_conn(&tmp);
+        agentflare_backend::item::update(
+            &conn,
+            &id,
+            agentflare_backend::item::UpdateItem {
+                metadata: Some(serde_json::json!(r#"{"size":"S"}"#).to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
+    let metadata = update_metadata(&s, &id, serde_json::json!({"task_type": "chore"})).unwrap();
+
+    assert_eq!(metadata["size"], "S", "legacy key must survive: {metadata}");
+    assert_eq!(metadata["task_type"], "chore");
+}
+
 /// A non-object patch can't be merged; it is rejected instead of silently
 /// replacing the stored object (the old behaviour) or being ignored.
 #[test]
