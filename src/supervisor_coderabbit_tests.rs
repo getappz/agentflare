@@ -191,7 +191,6 @@ fn tick(
             head_sha: None,
             auto_merge: &auto,
         },
-        None,
     )
 }
 
@@ -557,7 +556,6 @@ fn tick_with_head(
             head_sha: Some(head),
             auto_merge: &auto,
         },
-        Some(head),
     )
 }
 

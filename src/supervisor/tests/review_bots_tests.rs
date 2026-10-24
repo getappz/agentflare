@@ -1279,7 +1279,7 @@ fn coderabbit_repair_or_gate_records_the_dispatched_round_per_thread() {
         &findings,
         &[],
         &label_id_by_name,
-        "/repo",
+        "/repo", None,
     );
     assert!(matches!(outcome, SelfRepairOutcome::Dispatched));
     let meta = item_meta(&mcp, &item_id);
