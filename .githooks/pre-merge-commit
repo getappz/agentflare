@@ -9,4 +9,10 @@
 # rather than duplicating its logic -- one source of truth for what "direct
 # commit to the default branch" means, whether it's a plain commit or a
 # merge commit.
-exec "$(dirname "$0")/pre-commit"
+# Chain to the repo's own pre-existing pre-merge-commit (core.hooksPath hides
+# <git-dir>/hooks); the flag stops pre-commit chaining its own local hook here.
+af_local="$(git rev-parse --git-common-dir 2>/dev/null)/hooks/pre-merge-commit"
+if [ -x "$af_local" ] && [ ! "$af_local" -ef "$0" ]; then
+    "$af_local" "$@" || exit $?
+fi
+AGENTFLARE_HOOK_CHAINED=1 exec "$(dirname "$0")/pre-commit"

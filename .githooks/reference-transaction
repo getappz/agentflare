@@ -30,6 +30,14 @@
 # pre-commit/pre-push/prepare-commit-msg.
 
 state="$1"
+af_in="$(cat)"
+
+# Chain to the repo's own pre-existing hook: core.hooksPath=.githooks makes git
+# ignore <git-dir>/hooks, so run it ourselves (skipped if it is this file).
+af_local="$(git rev-parse --git-common-dir 2>/dev/null)/hooks/reference-transaction"
+if [ -x "$af_local" ] && [ ! "$af_local" -ef "$0" ]; then
+    "$af_local" "$@" <<<"$af_in" || { [ "$state" = "prepared" ] && exit $?; }
+fi
 
 resolve_default_branch() {
     if ! git rev-parse --git-dir >/dev/null 2>&1; then
@@ -60,7 +68,7 @@ resolve_default_branch() {
 
 if [ "$state" = "committed" ]; then
     if command -v agentflare >/dev/null 2>&1; then
-        agentflare git ref-transaction-log || true
+        agentflare git ref-transaction-log <<<"$af_in" || true
     fi
     exit 0
 fi
@@ -111,6 +119,6 @@ Then commit there and open a PR. To override in an emergency (not recommended):
     git -c core.hooksPath= <command>
 EOF
     exit 1
-done
+done <<<"$af_in"
 
 exit 0

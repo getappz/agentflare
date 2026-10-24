@@ -17,6 +17,13 @@
 
 set -euo pipefail
 
+# Chain to the repo's own pre-existing hook: core.hooksPath=.githooks makes git
+# ignore <git-dir>/hooks, so run it ourselves (skipped if it is this file).
+af_local="$(git rev-parse --git-common-dir 2>/dev/null)/hooks/pre-commit"
+if [ -x "$af_local" ] && [ ! "$af_local" -ef "$0" ] && [ -z "${AGENTFLARE_HOOK_CHAINED:-}" ]; then
+    "$af_local" "$@" || exit $?
+fi
+
 resolve_default_branch() {
     if ! git rev-parse --git-dir >/dev/null 2>&1; then
         return 0
