@@ -2551,6 +2551,18 @@ impl AgentflareMcp {
         })?
     }
 
+    /// Detaches an item from its parent through the normal update path, so a
+    /// client only needs `id` (an empty `parent_id` is stripped by many MCP
+    /// clients).
+    pub(crate) fn item_clear_parent(&self, req: ItemRequest) -> Result<String, ErrorData> {
+        let id = require_id(req.id, "clear_parent")?;
+        self.item_update(ItemRequest {
+            id: Some(id),
+            parent_id: Some(String::new()),
+            ..Default::default()
+        })
+    }
+
     /// Same shape as `item_clear_start_date`, for `due_date`.
     pub(crate) fn item_clear_due_date(&self, req: ItemRequest) -> Result<String, ErrorData> {
         let raw = require_id(req.id, "clear_due_date")?;

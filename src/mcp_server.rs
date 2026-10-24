@@ -1687,11 +1687,7 @@ impl AgentflareMcp {
             "health" => self.item_health(req),
             "doctor" => self.item_doctor(req),
             "status" => self.item_status(req),
-            "clear_parent" => self.item_update(ItemRequest {
-                id: req.id,
-                parent_id: Some(String::new()),
-                ..Default::default()
-            }),
+            "clear_parent" => self.item_clear_parent(req),
             "clear_start_date" => self.item_clear_start_date(req),
             "clear_due_date" => self.item_clear_due_date(req),
             "submit_plan" => self.item_submit_plan(req),

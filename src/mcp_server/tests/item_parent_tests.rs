@@ -55,6 +55,19 @@ fn item_clear_parent_on_root_item_is_noop() {
 }
 
 #[test]
+fn item_clear_parent_without_id_names_its_own_action() {
+    let (_tmp, s) = harness();
+    let err = s
+        .item(Parameters(ItemRequest {
+            action: "clear_parent".into(),
+            ..Default::default()
+        }))
+        .unwrap_err();
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    assert!(err.message.contains("clear_parent"), "{}", err.message);
+}
+
+#[test]
 fn item_update_parent_id_whitespace_detaches() {
     let (_tmp, s) = harness();
     let parent = call(&s, empty_item_create("Parent"));
