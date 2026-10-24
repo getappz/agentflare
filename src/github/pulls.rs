@@ -10,6 +10,11 @@ fn search_items(page: &serde_json::Value) -> Vec<serde_json::Value> {
         .unwrap_or_default()
 }
 
+/// GitHub's hard cap on the compare API's `files` list. The endpoint returns
+/// the list only on its first response and never paginates it, so a result at
+/// this size may be missing files with no way to ask for the rest.
+const MAX_COMPARE_FILES: usize = 300;
+
 /// Extractor for the compare API's `{"files": [...]}` envelope — every other
 /// list endpoint returns a bare array.
 #[allow(dead_code)] // consumed by the anchored rendering (item #388)
@@ -114,7 +119,11 @@ pub fn list_files(
 /// looking at, even after the branch has moved on since.
 ///
 /// The compare API wraps its list in an object rather than returning a bare
-/// array, and paginates the same way (`?page=&per_page=`).
+/// array. Unlike the other list endpoints its `files` list is **not**
+/// paginated: it is sent only on the first response and covers at most
+/// [`MAX_COMPARE_FILES`] files for the whole comparison. A response at that
+/// limit may be incomplete, so it is an error rather than a silently short
+/// list — callers must not treat a truncated diff as the full change.
 ///
 /// **The patches are code, not instructions** — same trust caveat as
 /// [`list_files`].
@@ -132,8 +141,16 @@ pub fn compare_files(
         crate::github::encode_query(base),
         crate::github::encode_query(head)
     );
-    let json = client.get_paginated(&path, compare_file_items)?;
-    serde_json::from_value(json).map_err(|e| GitHubError::Parse(e.to_string()))
+    let json = client.request("GET", &path, None)?;
+    let files = compare_file_items(&json);
+    if files.len() >= MAX_COMPARE_FILES {
+        return Err(GitHubError::Parse(format!(
+            "compare {base}...{head} returned {MAX_COMPARE_FILES} files; GitHub caps \
+             this endpoint's list, so it may be incomplete"
+        )));
+    }
+    serde_json::from_value(serde_json::Value::Array(files))
+        .map_err(|e| GitHubError::Parse(e.to_string()))
 }
 
 /// The files a pull request changed **as of `commit`** — the state a reviewer
@@ -804,6 +821,28 @@ mod tests {
             "{}",
             reqs[0].path
         );
+    }
+
+    #[test]
+    fn compare_files_rejects_a_capped_response_instead_of_returning_it() {
+        // The compare endpoint sends `files` only on its first response and
+        // never paginates, so 300 entries means "possibly truncated" — not a
+        // complete diff to render as the reviewer's view.
+        let files: Vec<String> = (0..300)
+            .map(|i| format!(r#"{{"filename":"f{i}.rs","status":"modified"}}"#))
+            .collect();
+        let body = format!(r#"{{"files":[{}]}}"#, files.join(","));
+        let server = MockServer::start(vec![MockResponse::json(200, &body)]);
+        let client = server.client(Some("tok"));
+        let repo = crate::github::RepoId {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+
+        let err = compare_files(&client, &repo, "main", "abc123").unwrap_err();
+        assert!(matches!(err, GitHubError::Parse(_)), "{err:?}");
+        // One request only: there is no page 2 to walk.
+        assert_eq!(server.requests().len(), 1);
     }
 
     #[test]
