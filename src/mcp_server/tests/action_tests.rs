@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "redispatch_tests.rs"]
+mod redispatch_tests;
+
 #[test]
 fn item_claim_response_includes_worktree_path() {
     let tmp = tempfile::tempdir().unwrap();

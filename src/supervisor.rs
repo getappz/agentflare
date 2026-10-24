@@ -1543,6 +1543,15 @@ fn build_review_batch(
         if gated {
             continue;
         }
+        // A redispatch that kept its open PR (item #736) is waiting for a
+        // worker to push fixes to it; restoring it to in_review here would
+        // undo the redispatch before dispatch ever runs.
+        if label_id_by_name
+            .get(READY_LABEL)
+            .is_some_and(|id| item_label_ids.contains(id))
+        {
+            continue;
+        }
         let ttl = agentflare_backend::claim::effective_ttl_secs(conn, &item.id, requested_ttl);
         // A live claim does not make the item disappear from the sweep: the
         // sweep still must not restore it (somebody is working on it), but it

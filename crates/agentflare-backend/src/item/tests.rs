@@ -2098,7 +2098,7 @@ fn redispatch_without_ready_label_creates_and_attaches_it() {
     let conn = db::open_in_memory().unwrap();
     let (pid, sid) = seed_project(&conn, "");
     let item = make_item(&conn, &pid, &sid);
-    let outcome = redispatch(&conn, &item.id, Some("claude-code")).unwrap();
+    let outcome = redispatch(&conn, &item.id, Some("claude-code"), |_| PrRetention::Clear).unwrap();
     assert!(matches!(outcome, RedispatchOutcome::Ready { .. }));
     let ready = crate::label::get_by_name(&conn, &pid, "ready-for-work").unwrap();
     assert!(list_labels(&conn, &item.id).unwrap().contains(&ready.id));
@@ -2120,7 +2120,7 @@ fn redispatch_resets_state_clears_stale_labels_reattaches_ready_and_normalizes_a
     add_label(&conn, &item.id, &dispatched.id).unwrap();
     add_label(&conn, &item.id, &needs_manual.id).unwrap();
 
-    let outcome = redispatch(&conn, &item.id, None).unwrap();
+    let outcome = redispatch(&conn, &item.id, None, |_| PrRetention::Clear).unwrap();
     assert_eq!(
         outcome,
         RedispatchOutcome::Ready {
@@ -2146,7 +2146,10 @@ fn redispatch_explicit_assignee_overrides_the_items_existing_one() {
     let item = make_item(&conn, &pid, &sid);
     claim(&conn, &item.id, "opencode:1", 1000, TTL).unwrap();
 
-    let outcome = redispatch(&conn, &item.id, Some("claude-code:override")).unwrap();
+    let outcome = redispatch(&conn, &item.id, Some("claude-code:override"), |_| {
+        PrRetention::Clear
+    })
+    .unwrap();
     assert_eq!(
         outcome,
         RedispatchOutcome::Ready {
@@ -2176,7 +2179,10 @@ fn redispatch_to_a_different_agent_clears_a_model_scoped_to_the_old_one() {
     )
     .unwrap();
 
-    let outcome = redispatch(&conn, &item.id, Some("claude-code:override")).unwrap();
+    let outcome = redispatch(&conn, &item.id, Some("claude-code:override"), |_| {
+        PrRetention::Clear
+    })
+    .unwrap();
     assert_eq!(
         outcome,
         RedispatchOutcome::Ready {
@@ -2210,7 +2216,7 @@ fn redispatch_to_the_same_agent_keeps_the_model_override() {
     )
     .unwrap();
 
-    redispatch(&conn, &item.id, None).unwrap();
+    redispatch(&conn, &item.id, None, |_| PrRetention::Clear).unwrap();
 
     let updated = get(&conn, &item.id).unwrap();
     let metadata: serde_json::Value = serde_json::from_str(&updated.metadata).unwrap();
@@ -2226,31 +2232,137 @@ fn redispatch_to_the_same_agent_keeps_the_model_override() {
 // for a fresh attempt while it still carries a stale PR reference from the
 // abandoned attempt would get immediately dragged back into "in_review" by
 // the very next sweep tick, undoing the redispatch.
+//
+// Item #736: the review state derived from that PR (`review_threads`,
+// `coderabbit_repair_announced_for`) goes in the same write -- keeping it
+// made the supervisor believe the next PR's findings were already announced.
+const TRACKED_PR_METADATA: &str = r#"{"pr":{"number":501,"branch":"task/501"},"review_threads":{"7":{"round":1}},"coderabbit_repair_announced_for":"abc","size":"M"}"#;
+
+fn item_with_tracked_pr(conn: &Connection) -> Item {
+    let (pid, sid) = seed_project(conn, "");
+    make_label(conn, &pid, "ready-for-work");
+    let item = make_item(conn, &pid, &sid);
+    claim(conn, &item.id, "claude-code:1", 1000, TTL).unwrap();
+    update(
+        conn,
+        &item.id,
+        UpdateItem {
+            metadata: Some(TRACKED_PR_METADATA.to_string()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    item
+}
+
+fn metadata_of(conn: &Connection, item_id: &str) -> serde_json::Value {
+    serde_json::from_str(&get(conn, item_id).unwrap().metadata).unwrap()
+}
+
 #[test]
 fn redispatch_clears_a_stale_pr_reference_from_a_prior_attempt() {
+    let conn = db::open_in_memory().unwrap();
+    let item = item_with_tracked_pr(&conn);
+
+    let mut asked_for = None;
+    redispatch(&conn, &item.id, None, |number| {
+        asked_for = Some(number);
+        PrRetention::Clear
+    })
+    .unwrap();
+
+    assert_eq!(
+        asked_for,
+        Some(501),
+        "the policy is consulted with the tracked PR number"
+    );
+    let metadata = metadata_of(&conn, &item.id);
+    for key in ["pr", "review_threads", "coderabbit_repair_announced_for"] {
+        assert!(
+            metadata.get(key).is_none(),
+            "`{key}` tracked by an abandoned attempt must not survive redispatch: {metadata:?}"
+        );
+    }
+    assert_eq!(metadata.get("size").and_then(|v| v.as_str()), Some("M"));
+}
+
+// Item #736: redispatch is also how an item whose PR is still open gets
+// re-armed to push more fixes. Dropping `metadata.pr` there made the worker
+// open a duplicate PR and took the live PR out of review-sweep coverage.
+#[test]
+fn redispatch_keeps_an_open_pr_and_its_review_state() {
+    let conn = db::open_in_memory().unwrap();
+    let item = item_with_tracked_pr(&conn);
+
+    let outcome = redispatch(&conn, &item.id, None, |_| PrRetention::Keep).unwrap();
+
+    assert!(matches!(outcome, RedispatchOutcome::Ready { .. }));
+    let metadata = metadata_of(&conn, &item.id);
+    assert_eq!(
+        metadata,
+        serde_json::from_str::<serde_json::Value>(TRACKED_PR_METADATA).unwrap(),
+        "an open PR and the review state derived from it survive redispatch"
+    );
+    // Everything else redispatch does still happens.
+    let updated = get(&conn, &item.id).unwrap();
+    assert_eq!(
+        crate::state::get(&conn, &updated.state_id)
+            .unwrap()
+            .group_name,
+        "backlog"
+    );
+    assert_eq!(updated.assignee_agent.as_deref(), Some("claude-code"));
+}
+
+#[test]
+fn redispatch_does_not_clear_a_pr_attached_during_the_lookup() {
+    let conn = db::open_in_memory().unwrap();
+    let item = item_with_tracked_pr(&conn);
+    let mut replacement = metadata_of(&conn, &item.id);
+    replacement["pr"]["number"] = 502.into();
+    replacement["pr"]["branch"] = "task/502".into();
+
+    redispatch(&conn, &item.id, None, |number| {
+        assert_eq!(number, 501);
+        update(
+            &conn,
+            &item.id,
+            UpdateItem {
+                metadata: Some(replacement.to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        PrRetention::Clear
+    })
+    .unwrap();
+
+    assert_eq!(metadata_of(&conn, &item.id), replacement);
+}
+
+#[test]
+fn redispatch_without_a_tracked_pr_never_asks_and_still_drops_derived_review_state() {
     let conn = db::open_in_memory().unwrap();
     let (pid, sid) = seed_project(&conn, "");
     make_label(&conn, &pid, "ready-for-work");
     let item = make_item(&conn, &pid, &sid);
-    claim(&conn, &item.id, "claude-code:1", 1000, TTL).unwrap();
     update(
         &conn,
         &item.id,
         UpdateItem {
-            metadata: Some(r#"{"pr":{"number":501,"branch":"task/501"},"size":"M"}"#.to_string()),
+            metadata: Some(r#"{"review_threads":{"7":{"round":1}},"size":"M"}"#.to_string()),
             ..Default::default()
         },
     )
     .unwrap();
 
-    redispatch(&conn, &item.id, None).unwrap();
+    redispatch(&conn, &item.id, Some("claude-code"), |number| {
+        panic!("no tracked PR, yet the policy was asked about #{number}")
+    })
+    .unwrap();
 
-    let updated = get(&conn, &item.id).unwrap();
-    let metadata: serde_json::Value = serde_json::from_str(&updated.metadata).unwrap();
-    assert!(
-        metadata.get("pr").is_none(),
-        "a PR tracked by an abandoned attempt must not survive redispatch: {metadata:?}"
-    );
+    let metadata = metadata_of(&conn, &item.id);
+    assert!(metadata.get("review_threads").is_none(), "{metadata:?}");
     assert_eq!(metadata.get("size").and_then(|v| v.as_str()), Some("M"));
 }
 
@@ -2261,7 +2373,7 @@ fn redispatch_with_no_assignee_anywhere_returns_no_assignee_and_makes_no_changes
     let item = make_item(&conn, &pid, &sid);
     let before = get(&conn, &item.id).unwrap();
 
-    let outcome = redispatch(&conn, &item.id, None).unwrap();
+    let outcome = redispatch(&conn, &item.id, None, |_| PrRetention::Clear).unwrap();
     assert_eq!(outcome, RedispatchOutcome::NoAssignee);
 
     let after = get(&conn, &item.id).unwrap();
@@ -2277,7 +2389,7 @@ fn redispatch_rejects_a_completed_item() {
     claim(&conn, &item.id, "claude-code:1", 1000, TTL).unwrap();
     mark_completed(&conn, &item.id, "claude-code:1").unwrap();
 
-    let err = redispatch(&conn, &item.id, Some("claude-code")).unwrap_err();
+    let err = redispatch(&conn, &item.id, Some("claude-code"), |_| PrRetention::Clear).unwrap_err();
     assert!(
         matches!(err, crate::error::Error::Validation(ref m) if m.contains("completed")),
         "{err:?}"

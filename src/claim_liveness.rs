@@ -305,8 +305,17 @@ fn restore_item(
                    `needs-manual-dispatch` instead of being re-queued."
             .to_string();
     } else {
+        // Reuse the status already fetched, but only for the PR it describes.
+        let pr_retention = |number: u64| match &status {
+            crate::worktree::PrCiStatus::Closed { .. } | crate::worktree::PrCiStatus::Merged
+                if crate::worktree::pr_number_from_metadata(&item) == Some(number) =>
+            {
+                agentflare_backend::item::PrRetention::Clear
+            }
+            _ => agentflare_backend::item::PrRetention::Keep,
+        };
         redispatched = matches!(
-            agentflare_backend::item::redispatch(conn, item_id, None),
+            agentflare_backend::item::redispatch(conn, item_id, None, pr_retention),
             Ok(agentflare_backend::item::RedispatchOutcome::Ready { .. })
         );
         if redispatched {
