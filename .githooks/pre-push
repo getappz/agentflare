@@ -15,6 +15,14 @@
 
 set -euo pipefail
 
+# Chain to the repo's own pre-existing hook: core.hooksPath=.githooks makes git
+# ignore <git-dir>/hooks, so run it ourselves (skipped if it is this file).
+af_in="$(cat)"
+af_local="$(git rev-parse --git-common-dir 2>/dev/null)/hooks/pre-push"
+if [ -x "$af_local" ] && [ ! "$af_local" -ef "$0" ]; then
+    "$af_local" "$@" <<<"$af_in" || exit $?
+fi
+
 resolve_default_branch() {
     if git symbolic-ref refs/remotes/origin/HEAD >/dev/null 2>&1; then
         git symbolic-ref refs/remotes/origin/HEAD | sed 's@^refs/remotes/origin/@@'
@@ -55,6 +63,6 @@ EOF
         *)
             ;;
     esac
-done
+done <<<"$af_in"
 
 exit 0
