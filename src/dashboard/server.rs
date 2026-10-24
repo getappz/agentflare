@@ -1381,34 +1381,40 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn events_endpoint_streams_claims_and_cost_snapshot() {
+    #[test]
+    fn events_endpoint_streams_claims_and_cost_snapshot() {
         use tokio_stream::StreamExt as _;
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, router(test_queue())).await.unwrap();
+        // The first snapshot must not scan the user's real transcript history.
+        crate::paths::test_support::with_temp_home(|| {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async {
+                let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                    .await
+                    .unwrap();
+                let addr = listener.local_addr().unwrap();
+                tokio::spawn(async move {
+                    axum::serve(listener, router(test_queue())).await.unwrap();
+                });
+                let resp = reqwest::get(format!("http://{addr}/events")).await.unwrap();
+                let mut stream = resp.bytes_stream();
+                let first = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+                    .await
+                    .expect("first SSE frame within 10s")
+                    .expect("stream item")
+                    .unwrap();
+                let text = String::from_utf8(first.to_vec()).unwrap();
+                let data_line = text
+                    .lines()
+                    .find_map(|l| l.strip_prefix("data: "))
+                    .expect("SSE data line");
+                let v: serde_json::Value = serde_json::from_str(data_line).unwrap();
+                assert!(v.get("claims").is_some(), "expected claims field in {v}");
+                assert!(
+                    v.get("cost_today").is_some(),
+                    "expected cost_today field in {v}"
+                );
+            });
         });
-        let resp = reqwest::get(format!("http://{addr}/events")).await.unwrap();
-        let mut stream = resp.bytes_stream();
-        let first = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
-            .await
-            .expect("first SSE frame within 10s")
-            .expect("stream item")
-            .unwrap();
-        let text = String::from_utf8(first.to_vec()).unwrap();
-        let data_line = text
-            .lines()
-            .find_map(|l| l.strip_prefix("data: "))
-            .expect("SSE data line");
-        let v: serde_json::Value = serde_json::from_str(data_line).unwrap();
-        assert!(v.get("claims").is_some(), "expected claims field in {v}");
-        assert!(
-            v.get("cost_today").is_some(),
-            "expected cost_today field in {v}"
-        );
     }
 
     // The PATH_LOCK guard below is intentionally held across `.await`

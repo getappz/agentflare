@@ -869,7 +869,7 @@ pub(crate) struct ItemRequest {
     #[serde(default)]
     pub(crate) assignee_agent: Option<String>,
     #[schemars(
-        description = "Domain-specific fields as a JSON object (create, update). Set {\"size\": \"S\"|\"M\"|\"L\"} so `groom` can score effort instead of reporting the item unestimated."
+        description = "Domain-specific fields as a JSON object (create, update). Set {\"size\": \"S\"|\"M\"|\"L\"} so `groom` can score effort instead of reporting the item unestimated. On update the object is MERGED into the item's stored metadata: keys you send overwrite, keys you omit are kept (size, task_type, pr, plan_*, model, ...), and a key sent as JSON null is deleted — e.g. {\"pr\": null} clears the tracked PR."
     )]
     #[serde(default)]
     pub(crate) metadata: Option<serde_json::Value>,

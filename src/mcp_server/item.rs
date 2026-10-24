@@ -70,24 +70,7 @@ fn parsed_metadata(metadata: &str) -> Option<serde_json::Value> {
     Some(value)
 }
 
-/// Converts a caller-supplied `metadata` value into the JSON string
-/// `CreateItem`/`UpdateItem` store. A `Value::String` whose content is
-/// itself valid JSON is already-encoded text (see `parsed_metadata`'s doc
-/// comment for why that shape shows up) and must be used as-is; anything
-/// else -- including a genuine plain-string metadata value like `"hello"`,
-/// which is NOT already-encoded JSON -- is serialized normally, same as
-/// `Value::to_string()` did. Mirrors `parsed_metadata`'s own "does the
-/// inner string reparse as JSON" test so both sides agree on what counts
-/// as double-encoded.
-fn metadata_to_json_string(value: serde_json::Value) -> String {
-    match &value {
-        serde_json::Value::String(s) if serde_json::from_str::<serde_json::Value>(s).is_ok() => {
-            s.clone()
-        }
-        _ => value.to_string(),
-    }
-}
-
+use super::item_metadata::{merge_user_metadata_patch, metadata_to_json_string};
 use super::item_plan_transition::{restore_plan_transition_fields, strip_plan_transition_fields};
 
 /// Applies Task 1's default plan-gate policy
@@ -943,9 +926,11 @@ impl AgentflareMcp {
             let current_metadata = agentflare_backend::item::get(conn, &id)
                 .map(|i| i.metadata)
                 .unwrap_or_else(|_| "{}".to_string());
+            // Merge before restoring server-authoritative approval fields.
             let metadata_str = req
                 .metadata
-                .map(metadata_to_json_string)
+                .map(|patch| merge_user_metadata_patch(&current_metadata, patch))
+                .transpose()?
                 .map(|m| restore_plan_transition_fields(&m, &current_metadata));
             // Only recompute the default plan-gate policy when priority is
             // actually changing in this call -- an update that leaves
