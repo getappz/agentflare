@@ -134,6 +134,18 @@ pub enum CodeAction {
     Playbook,
     /// Print the no-hallucination skill text.
     NoHallucination,
+    /// Print exactly the instruction text that would be sent to a model (offline).
+    Preview { mode: Option<String> },
+    /// Offline check: instruction text is non-empty and within the size cap.
+    Check {
+        mode: Option<String>,
+        /// Maximum instruction length in characters.
+        #[arg(long, default_value_t = INSTRUCTIONS_MAX_CHARS)]
+        max_chars: usize,
+        /// Also apply the cap to built-in (shipped) instruction text.
+        #[arg(long)]
+        strict: bool,
+    },
     /// Internal: emit the skill text for a lifecycle hook event. Not meant for direct use.
     Hook {
         #[command(subcommand)]
@@ -227,9 +239,83 @@ fn code_report_message(mode: &str) -> String {
     }
 }
 
+/// Default cap on instruction text length, in characters.
+const INSTRUCTIONS_MAX_CHARS: usize = 3000;
+
+fn instructions_for(mode: Option<&str>) -> crate::optimize::code::Instructions {
+    let resolved = match mode {
+        Some(m) => crate::optimize::code::normalize_config_mode(m)
+            .unwrap_or_else(|| {
+                crate::ui::error(&format!("invalid mode: {m}"));
+                std::process::exit(1);
+            })
+            .to_string(),
+        None => {
+            crate::optimize::code::active_mode().unwrap_or_else(crate::optimize::code::default_mode)
+        }
+    };
+    crate::optimize::code::build_instructions(&resolved, None)
+}
+
+/// Whether the sent text is authored by the repo/user (custom skill, or a
+/// workspace `AGENTS.md` overriding the embedded skill) rather than shipped
+/// built-in text. Only authored text is subject to the size cap.
+fn is_authored(inst: &crate::optimize::code::Instructions) -> bool {
+    if crate::optimize::code::sub_skills::get_custom(&inst.mode).is_some() {
+        return true;
+    }
+    // A missing skill path falls back to the embedded skill, giving the
+    // built-in rendering to compare against.
+    let builtin = crate::optimize::code::build_instructions(
+        &inst.mode,
+        Some(std::path::Path::new("/nonexistent/agentflare-skill.md")),
+    );
+    builtin.body != inst.body
+}
+
+/// `Ok` carries the status line; `Err` the reason the text fails the check.
+fn check_instructions(body: &str, authored: bool, max_chars: usize) -> Result<String, String> {
+    let n = body.chars().count();
+    if body.trim().is_empty() {
+        Err("instructions are empty".into())
+    } else if !authored {
+        Ok(format!("{n} chars, built-in text (cap not applied)"))
+    } else if n > max_chars {
+        Err(format!(
+            "instructions are {n} chars, over the {max_chars} cap"
+        ))
+    } else {
+        Ok(format!("{n}/{max_chars} chars"))
+    }
+}
+
 impl CodeAction {
     fn run(self) {
         match self {
+            CodeAction::Preview { mode } => {
+                let inst = instructions_for(mode.as_deref());
+                if inst.mode != "off" {
+                    println!("{}", inst.body);
+                }
+            }
+            CodeAction::Check {
+                mode,
+                max_chars,
+                strict,
+            } => {
+                let inst = instructions_for(mode.as_deref());
+                if inst.mode == "off" {
+                    println!("ok: mode off — nothing is sent");
+                    return;
+                }
+                match check_instructions(&inst.body, strict || is_authored(&inst), max_chars) {
+                    Ok(msg) => println!("ok: mode {} — {msg}", inst.mode),
+                    Err(e) => {
+                        crate::ui::error(&format!("mode {}: {e}", inst.mode));
+                        std::process::exit(1);
+                    }
+                }
+            }
             CodeAction::Status => {
                 let mode = crate::optimize::code::active_mode()
                     .unwrap_or_else(crate::optimize::code::default_mode);
@@ -652,5 +738,33 @@ mod tests {
         assert!(line.contains("r-abc123"), "line: {line}");
         assert!(line.contains("100") && line.contains("10"), "line: {line}");
         assert!(line.contains("file:/tmp/x.md"), "line: {line}");
+    }
+
+    #[test]
+    fn check_instructions_caps_authored_text_only() {
+        assert!(check_instructions("abc", true, 3).is_ok());
+        assert!(check_instructions("abcd", true, 3).is_err());
+        assert!(check_instructions("  \n", true, 3).is_err());
+        assert!(check_instructions("ééé", true, 3).is_ok());
+        assert!(check_instructions("abcd", false, 3).is_ok());
+        assert!(check_instructions("", false, 3).is_err());
+    }
+
+    #[test]
+    fn is_authored_detects_text_differing_from_builtin() {
+        let builtin = crate::optimize::code::build_instructions("review", None);
+        assert!(!is_authored(&builtin));
+        let edited = crate::optimize::code::Instructions {
+            mode: builtin.mode.clone(),
+            body: format!("{} extra", builtin.body),
+        };
+        assert!(is_authored(&edited));
+    }
+
+    #[test]
+    fn strict_applies_cap_to_builtin_text() {
+        let full = crate::optimize::code::build_instructions("full", None);
+        assert!(check_instructions(&full.body, is_authored(&full), 3000).is_ok());
+        assert!(check_instructions(&full.body, true, 3000).is_err());
     }
 }
