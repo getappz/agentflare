@@ -71,8 +71,8 @@ fn merged_pr_for(
 }
 
 /// Whether a `push=false` `done` must still leave the item in `in_review`:
-/// it records `metadata.pr.number` and that PR is not known to be merged or
-/// closed. A lookup that cannot tell (`Unknown`: no token, transient GitHub
+/// the item has an open tracked PR (`metadata.pr.number` or branch lookup).
+/// A lookup that cannot tell (`Unknown`: no token, transient GitHub
 /// error) counts as open -- completing on a failed lookup is the very bug this
 /// guards against, and the sweep sorts a stale `in_review` item out itself.
 pub(crate) fn has_open_pr(
@@ -80,10 +80,7 @@ pub(crate) fn has_open_pr(
     item: &Option<agentflare_backend::item::Item>,
     repo_root: &std::path::Path,
 ) -> bool {
-    let Some(item) = item
-        .as_ref()
-        .filter(|i| crate::worktree::pr_number_from_metadata(i).is_some())
-    else {
+    let Some(item) = item.as_ref() else {
         return false;
     };
     let status = match (
