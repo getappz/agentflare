@@ -142,6 +142,9 @@ pub enum CodeAction {
         /// Maximum instruction length in characters.
         #[arg(long, default_value_t = INSTRUCTIONS_MAX_CHARS)]
         max_chars: usize,
+        /// Also apply the cap to built-in (shipped) instruction text.
+        #[arg(long)]
+        strict: bool,
     },
     /// Internal: emit the skill text for a lifecycle hook event. Not meant for direct use.
     Hook {
@@ -295,13 +298,17 @@ impl CodeAction {
                     println!("{}", inst.body);
                 }
             }
-            CodeAction::Check { mode, max_chars } => {
+            CodeAction::Check {
+                mode,
+                max_chars,
+                strict,
+            } => {
                 let inst = instructions_for(mode.as_deref());
                 if inst.mode == "off" {
                     println!("ok: mode off — nothing is sent");
                     return;
                 }
-                match check_instructions(&inst.body, is_authored(&inst), max_chars) {
+                match check_instructions(&inst.body, strict || is_authored(&inst), max_chars) {
                     Ok(msg) => println!("ok: mode {} — {msg}", inst.mode),
                     Err(e) => {
                         crate::ui::error(&format!("mode {}: {e}", inst.mode));
@@ -744,15 +751,20 @@ mod tests {
     }
 
     #[test]
-    fn builtin_modes_are_not_authored_and_match_hook_text() {
-        for m in ["full", "review"] {
-            let inst = crate::optimize::code::build_instructions(m, None);
-            // Preview prints build_instructions(mode, None) — the same body
-            // code_emit_hook sends.
-            assert!(!inst.body.is_empty());
-            if m == "review" {
-                assert!(!is_authored(&inst));
-            }
-        }
+    fn is_authored_detects_text_differing_from_builtin() {
+        let builtin = crate::optimize::code::build_instructions("review", None);
+        assert!(!is_authored(&builtin));
+        let edited = crate::optimize::code::Instructions {
+            mode: builtin.mode.clone(),
+            body: format!("{} extra", builtin.body),
+        };
+        assert!(is_authored(&edited));
+    }
+
+    #[test]
+    fn strict_applies_cap_to_builtin_text() {
+        let full = crate::optimize::code::build_instructions("full", None);
+        assert!(check_instructions(&full.body, is_authored(&full), 3000).is_ok());
+        assert!(check_instructions(&full.body, true, 3000).is_err());
     }
 }
