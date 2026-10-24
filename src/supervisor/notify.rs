@@ -264,6 +264,7 @@ fn pr_approval_card_text(
     repo: &crate::github::RepoId,
     number: u64,
     blocker: PrApprovalBlocker,
+    diff_context: Option<&str>,
 ) -> String {
     let excerpt: String = item.description.chars().take(200).collect();
     let pr_link = format!("PR <a href=\"https://github.com/{repo}/pull/{number}\">#{number}</a>");
@@ -292,15 +293,25 @@ fn pr_approval_card_text(
             )
         }
     };
+    let diff_block = diff_context
+        .filter(|s| !s.is_empty())
+        .map(|ctx| {
+            format!(
+                "\n<b>Changes:</b>\n<pre>{ctx}</pre>\n",
+                ctx = html_escape(ctx)
+            )
+        })
+        .unwrap_or_default();
     format!(
         "\u{1F514} <b>agentflare</b> needs a human\n\
          <b>Repo:</b> {repo}\n\
          <b>Item:</b> #{} \u{2014} {}\n\
-         {}\n\n\
+         {}{}\n\n\
          {status}",
         item.sequence_id,
         html_escape(&item.name),
         html_escape(&excerpt),
+        diff_block,
     )
 }
 
@@ -327,7 +338,7 @@ pub(crate) fn notify_pr_approval_gate(
     else {
         return;
     };
-    let text = pr_approval_card_text(item, &repo, number, blocker);
+    let text = pr_approval_card_text(item, &repo, number, blocker, None);
     let wants_label = !matches!(
         blocker,
         PrApprovalBlocker::GitHubReview {
@@ -436,7 +447,8 @@ mod pr_approval_card_tests {
 
     #[test]
     fn label_blocker_asks_for_the_approval_label() {
-        let text = pr_approval_card_text(&item(), &repo(), 7, PrApprovalBlocker::ApprovalLabel);
+        let text =
+            pr_approval_card_text(&item(), &repo(), 7, PrApprovalBlocker::ApprovalLabel, None);
         assert!(
             text.contains("awaiting <code>status:pr:approved</code>"),
             "{text}"
@@ -458,6 +470,7 @@ mod pr_approval_card_tests {
                 changes_requested: false,
                 label_missing: false,
             },
+            None,
         );
         assert!(
             text.contains("branch protection requires an approving review"),
@@ -484,6 +497,7 @@ mod pr_approval_card_tests {
                 changes_requested: true,
                 label_missing: true,
             },
+            None,
         );
         assert!(text.contains("a reviewer requested changes"), "{text}");
         assert!(

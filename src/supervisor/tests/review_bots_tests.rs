@@ -7,7 +7,7 @@
 use super::tests::{seed_gate_label, seed_in_review_item_with_claim_age, test_mcp, test_queue};
 use super::*;
 use crate::github::models::{Comment, Review, User};
-use crate::github::review_threads::{CommitStatusDetail, ReviewThread, ThreadComment};
+use crate::github::review_threads::{CommitStatusDetail, DiffSide, ReviewThread, ThreadComment};
 use crate::github::test_support::{MockResponse, MockServer};
 use crate::mcp_server::{merge_item_metadata, metadata_object};
 
@@ -26,7 +26,6 @@ pub(super) fn comment(id: u64, login: &str, body: &str, at: &str) -> ThreadComme
         created_at: at.into(),
     }
 }
-
 pub(super) fn thread(id: &str, resolved: bool, comments: Vec<ThreadComment>) -> ReviewThread {
     ReviewThread {
         id: id.into(),
@@ -34,6 +33,7 @@ pub(super) fn thread(id: &str, resolved: bool, comments: Vec<ThreadComment>) -> 
         is_outdated: false,
         path: "src/lib.rs".into(),
         line: Some(42),
+        diff_side: DiffSide::Right,
         comments,
     }
 }
@@ -1493,8 +1493,5 @@ fn only_a_worktree_other_than_the_items_own_counts_as_a_branch_collision() {
     let own = Path::new("/repo/.worktrees/task/334");
     assert!(!super::is_foreign_worktree(None, own));
     assert!(!super::is_foreign_worktree(Some(own), own));
-    assert!(super::is_foreign_worktree(
-        Some(Path::new("/repo/.worktrees/task/330")),
-        own
-    ));
+    assert!(super::is_foreign_worktree(Some(Path::new("/repo/.worktrees/task/330")), own));
 }
