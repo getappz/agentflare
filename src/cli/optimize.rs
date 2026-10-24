@@ -134,6 +134,15 @@ pub enum CodeAction {
     Playbook,
     /// Print the no-hallucination skill text.
     NoHallucination,
+    /// Print exactly the instruction text that would be sent to a model (offline).
+    Preview { mode: Option<String> },
+    /// Offline check: instruction text is non-empty and within the size cap.
+    Check {
+        mode: Option<String>,
+        /// Maximum instruction length in characters.
+        #[arg(long, default_value_t = INSTRUCTIONS_MAX_CHARS)]
+        max_chars: usize,
+    },
     /// Internal: emit the skill text for a lifecycle hook event. Not meant for direct use.
     Hook {
         #[command(subcommand)]
@@ -227,9 +236,54 @@ fn code_report_message(mode: &str) -> String {
     }
 }
 
+/// Default cap on instruction text length, in characters.
+const INSTRUCTIONS_MAX_CHARS: usize = 3000;
+
+fn instructions_for(mode: Option<&str>) -> crate::optimize::code::Instructions {
+    let resolved = match mode {
+        Some(m) => crate::optimize::code::normalize_config_mode(m)
+            .unwrap_or_else(|| {
+                crate::ui::error(&format!("invalid mode: {m}"));
+                std::process::exit(1);
+            })
+            .to_string(),
+        None => {
+            crate::optimize::code::active_mode().unwrap_or_else(crate::optimize::code::default_mode)
+        }
+    };
+    crate::optimize::code::build_instructions(&resolved, None)
+}
+
+/// `Err` carries the reason the instruction text fails the check.
+fn check_instructions(body: &str, max_chars: usize) -> Result<usize, String> {
+    let n = body.chars().count();
+    if body.trim().is_empty() {
+        Err("instructions are empty".into())
+    } else if n > max_chars {
+        Err(format!(
+            "instructions are {n} chars, over the {max_chars} cap"
+        ))
+    } else {
+        Ok(n)
+    }
+}
+
 impl CodeAction {
     fn run(self) {
         match self {
+            CodeAction::Preview { mode } => {
+                println!("{}", instructions_for(mode.as_deref()).body);
+            }
+            CodeAction::Check { mode, max_chars } => {
+                let inst = instructions_for(mode.as_deref());
+                match check_instructions(&inst.body, max_chars) {
+                    Ok(n) => println!("ok: mode {} — {n}/{max_chars} chars", inst.mode),
+                    Err(e) => {
+                        crate::ui::error(&format!("mode {}: {e}", inst.mode));
+                        std::process::exit(1);
+                    }
+                }
+            }
             CodeAction::Status => {
                 let mode = crate::optimize::code::active_mode()
                     .unwrap_or_else(crate::optimize::code::default_mode);
@@ -652,5 +706,13 @@ mod tests {
         assert!(line.contains("r-abc123"), "line: {line}");
         assert!(line.contains("100") && line.contains("10"), "line: {line}");
         assert!(line.contains("file:/tmp/x.md"), "line: {line}");
+    }
+
+    #[test]
+    fn check_instructions_enforces_cap_and_non_empty() {
+        assert_eq!(check_instructions("abc", 3), Ok(3));
+        assert!(check_instructions("abcd", 3).is_err());
+        assert!(check_instructions("  \n", 3).is_err());
+        assert_eq!(check_instructions("ééé", 3), Ok(3));
     }
 }
