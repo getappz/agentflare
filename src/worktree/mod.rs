@@ -575,7 +575,7 @@ pub(crate) fn pending_if_ci_running(
     }
 }
 
-fn pr_ci_status_impl(
+pub(crate) fn pr_ci_status_impl(
     item: &agentflare_backend::item::Item,
     repo_root: &Path,
     client: &crate::github::Client,
