@@ -498,6 +498,112 @@ pub fn post_tool_use(agent: &str) {
     crate::optimize::save_runtime(&runtime);
 }
 
+/// Whether `f` (a freshness check) accepts the record against the cwd tree
+/// or the item's own worktree tree. Evidence for any other tree stays stale.
+fn fresh_in_either(
+    record: &crate::optimize::SessionRecord,
+    now: u64,
+    cwd_tree: Option<&str>,
+    item_tree: Option<&str>,
+    f: fn(&crate::optimize::SessionRecord, u64, Option<&str>) -> bool,
+) -> bool {
+    f(record, now, cwd_tree) || item_tree.is_some_and(|t| f(record, now, Some(t)))
+}
+
+/// Appends the directories and hashes the gate compared to a refusal.
+fn describe_compared_trees(
+    reason: &mut String,
+    cwd: &str,
+    cwd_tree: Option<&str>,
+    item: Option<(&str, Option<&str>)>,
+) {
+    let show = |t: Option<&str>| t.unwrap_or("unavailable").to_string();
+    reason.push_str(&format!(
+        " Compared against: cwd {cwd} tree {}",
+        show(cwd_tree)
+    ));
+    if let Some((dir, tree)) = item {
+        reason.push_str(&format!("; item worktree {dir} tree {}", show(tree)));
+    }
+    reason.push_str(
+        ". Evidence recorded for a different tree (e.g. reviewed in another checkout) does not count.",
+    );
+}
+
+/// Completion-gate decision for a PreToolUse call (see
+/// `hook_redirect::completion_gate_reason`). Evidence may have been recorded
+/// in the main checkout while `item done` runs from the task worktree (or
+/// vice versa), so freshness is checked against the cwd tree *and* the
+/// item's own worktree tree; evidence for any other tree stays stale. A
+/// denial names the directories and hashes compared.
+pub(crate) fn completion_gate_denial(
+    record: &crate::optimize::SessionRecord,
+    now: u64,
+    tool_name: &str,
+    tool_input: Option<&serde_json::Value>,
+    task_type: Option<&str>,
+) -> Option<String> {
+    // Only item calls can hit the gate, so only they pay for the git hash.
+    let is_item_call = tool_name == crate::hook_redirect::ITEM_TOOL_NAME || tool_name == "item";
+    let cwd_tree = is_item_call
+        .then(crate::optimize::tree_fingerprint)
+        .flatten();
+    let item_dir = is_item_call
+        .then(|| resolve_item_worktree(tool_input))
+        .flatten();
+    let item_tree = item_dir
+        .as_deref()
+        .and_then(crate::optimize::tree_fingerprint_in);
+    let fresh = |f| fresh_in_either(record, now, cwd_tree.as_deref(), item_tree.as_deref(), f);
+    let mut reason = crate::hook_redirect::completion_gate_reason(
+        tool_name,
+        tool_input,
+        fresh(crate::optimize::has_fresh_passing_verification),
+        fresh(crate::optimize::has_fresh_review),
+        crate::optimize::has_fresh_diagnosis_evidence(record),
+        task_type,
+    )?;
+    let cwd = std::env::current_dir()
+        .map(|d| d.display().to_string())
+        .unwrap_or_default();
+    let item_dir = item_dir.map(|d| d.display().to_string());
+    describe_compared_trees(
+        &mut reason,
+        &cwd,
+        cwd_tree.as_deref(),
+        item_dir.as_deref().map(|d| (d, item_tree.as_deref())),
+    );
+    Some(reason)
+}
+
+/// The item's task worktree (`<repo>/.worktrees/task/<seq>`), found among
+/// the cwd repo's registered worktrees. `None` on any lookup failure.
+fn resolve_item_worktree(tool_input: Option<&serde_json::Value>) -> Option<std::path::PathBuf> {
+    let id_or_seq = tool_input?.get("id")?.as_str()?;
+    let db_path = crate::paths::agentflare_dir().join("backend.db");
+    if !db_path.exists() {
+        return None;
+    }
+    let conn = agentflare_backend::db::open_db(&db_path).ok()?;
+    let item_id = agentflare_backend::item::resolve_id(&conn, None, id_or_seq).ok()?;
+    let seq = agentflare_backend::item::get(&conn, &item_id)
+        .ok()?
+        .sequence_id;
+    let suffix = std::path::Path::new(".worktrees")
+        .join("task")
+        .join(seq.to_string());
+    let list = flare_git_core::worktree::run_git_opt_timeout(
+        &std::env::current_dir().ok()?,
+        &["worktree", "list", "--porcelain"],
+        2,
+        &[],
+    )?;
+    list.lines()
+        .filter_map(|l| l.strip_prefix("worktree "))
+        .map(std::path::PathBuf::from)
+        .find(|p| p.ends_with(&suffix))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -780,88 +886,71 @@ mod tests {
             None
         ));
     }
-}
 
-/// Completion-gate decision for a PreToolUse call (see
-/// `hook_redirect::completion_gate_reason`). Evidence may have been recorded
-/// in the main checkout while `item done` runs from the task worktree (or
-/// vice versa), so freshness is checked against the cwd tree *and* the
-/// item's own worktree tree; evidence for any other tree stays stale. A
-/// denial names the directories and hashes compared.
-pub(crate) fn completion_gate_denial(
-    record: &crate::optimize::SessionRecord,
-    now: u64,
-    tool_name: &str,
-    tool_input: Option<&serde_json::Value>,
-    task_type: Option<&str>,
-) -> Option<String> {
-    // Only item calls can hit the gate, so only they pay for the git hash.
-    let is_item_call = tool_name == crate::hook_redirect::ITEM_TOOL_NAME || tool_name == "item";
-    let current_tree = is_item_call
-        .then(crate::optimize::tree_fingerprint)
-        .flatten();
-    let item_dir = is_item_call
-        .then(|| resolve_item_worktree(tool_input))
-        .flatten();
-    let item_tree = item_dir
-        .as_deref()
-        .and_then(crate::optimize::tree_fingerprint_in);
-    let fresh = |f: fn(&crate::optimize::SessionRecord, u64, Option<&str>) -> bool| {
-        f(record, now, current_tree.as_deref())
-            || item_tree
-                .as_deref()
-                .is_some_and(|t| f(record, now, Some(t)))
-    };
-    let mut reason = crate::hook_redirect::completion_gate_reason(
-        tool_name,
-        tool_input,
-        fresh(crate::optimize::has_fresh_passing_verification),
-        fresh(crate::optimize::has_fresh_review),
-        crate::optimize::has_fresh_diagnosis_evidence(record),
-        task_type,
-    )?;
-    let show = |t: &Option<String>| t.clone().unwrap_or_else(|| "unavailable".into());
-    let cwd = std::env::current_dir()
-        .map(|d| d.display().to_string())
-        .unwrap_or_default();
-    reason.push_str(&format!(
-        " Compared against: cwd {cwd} tree {}",
-        show(&current_tree)
-    ));
-    if let Some(d) = &item_dir {
-        reason.push_str(&format!(
-            "; item worktree {} tree {}",
-            d.display(),
-            show(&item_tree)
+    use crate::optimize::{ReviewEvidence, SessionRecord, VerificationEvidence};
+
+    fn record_with_tree(tree: &str) -> SessionRecord {
+        SessionRecord {
+            last_review: Some(ReviewEvidence {
+                source: "ReportFindings".into(),
+                ts: 1000,
+                tree: Some(tree.into()),
+            }),
+            last_verification: Some(VerificationEvidence {
+                command: "cargo test".into(),
+                exit_code: Some(0),
+                passed: true,
+                ts: 1000,
+                tree: Some(tree.into()),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn evidence_from_item_worktree_tree_is_accepted_from_other_cwd() {
+        let r = record_with_tree("A");
+        for f in [
+            crate::optimize::has_fresh_review as fn(&SessionRecord, u64, Option<&str>) -> bool,
+            crate::optimize::has_fresh_passing_verification,
+        ] {
+            assert!(fresh_in_either(&r, 1010, Some("B"), Some("A"), f));
+            assert!(fresh_in_either(&r, 1010, Some("A"), Some("B"), f));
+        }
+    }
+
+    #[test]
+    fn evidence_for_a_different_tree_is_still_stale() {
+        let r = record_with_tree("A");
+        assert!(!fresh_in_either(
+            &r,
+            1010,
+            Some("B"),
+            Some("C"),
+            crate::optimize::has_fresh_review
+        ));
+        assert!(!fresh_in_either(
+            &r,
+            1010,
+            Some("B"),
+            None,
+            crate::optimize::has_fresh_passing_verification
         ));
     }
-    reason.push_str(
-        ". Evidence recorded for a different tree (e.g. reviewed in another checkout) does not count.",
-    );
-    Some(reason)
-}
 
-/// The item's task worktree (`<repo>/.worktrees/task/<seq>`), found among
-/// the cwd repo's registered worktrees. `None` on any lookup failure.
-fn resolve_item_worktree(tool_input: Option<&serde_json::Value>) -> Option<std::path::PathBuf> {
-    let id_or_seq = tool_input?.get("id")?.as_str()?;
-    let db_path = crate::paths::agentflare_dir().join("backend.db");
-    let conn = agentflare_backend::db::open_db(&db_path).ok()?;
-    let item_id = agentflare_backend::item::resolve_id(&conn, None, id_or_seq).ok()?;
-    let seq = agentflare_backend::item::get(&conn, &item_id)
-        .ok()?
-        .sequence_id;
-    let suffix = std::path::Path::new(".worktrees")
-        .join("task")
-        .join(seq.to_string());
-    let list = flare_git_core::worktree::run_git_opt_timeout(
-        &std::env::current_dir().ok()?,
-        &["worktree", "list", "--porcelain"],
-        2,
-        &[],
-    )?;
-    list.lines()
-        .filter_map(|l| l.strip_prefix("worktree "))
-        .map(std::path::PathBuf::from)
-        .find(|p| p.ends_with(&suffix))
+    #[test]
+    fn refusal_names_directories_and_hashes() {
+        let mut s = String::from("refused.");
+        describe_compared_trees(
+            &mut s,
+            "/main",
+            Some("aaa"),
+            Some(("/wt/task/9", Some("bbb"))),
+        );
+        assert!(s.contains("cwd /main tree aaa"), "{s}");
+        assert!(s.contains("item worktree /wt/task/9 tree bbb"), "{s}");
+        let mut s = String::new();
+        describe_compared_trees(&mut s, "/main", None, None);
+        assert!(s.contains("tree unavailable"), "{s}");
+    }
 }
