@@ -9,4 +9,12 @@
 # rather than duplicating its logic -- one source of truth for what "direct
 # commit to the default branch" means, whether it's a plain commit or a
 # merge commit.
+# Chain to the repo's own pre-existing pre-merge-commit (core.hooksPath hides
+# <git-dir>/hooks). pre-commit then chains the local pre-commit too: git's
+# default pre-merge-commit is what normally runs it, and a custom local hook may
+# not, so a local pre-commit veto must still apply to merges.
+af_local="$(git rev-parse --git-common-dir 2>/dev/null)/hooks/pre-merge-commit"
+if [ -x "$af_local" ] && [ ! "$af_local" -ef "$0" ]; then
+    "$af_local" "$@" || exit $?
+fi
 exec "$(dirname "$0")/pre-commit"

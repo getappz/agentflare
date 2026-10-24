@@ -18,6 +18,20 @@
 # ~/.agentflare/githooks/).
 
 msg_file="$1"
+# Chain to the repo's own pre-existing hook: core.hooksPath=.githooks makes git
+# ignore <git-dir>/hooks, so run it ourselves (skipped if it is this file).
+af_local="$(git rev-parse --git-common-dir 2>/dev/null)/hooks/prepare-commit-msg"
+if [ -x "$af_local" ] && [ ! "$af_local" -ef "$0" ]; then
+    "$af_local" "$@" || exit $?
+fi
+
+# Skip provenance stamping while replaying/merging commits (rebase, merge,
+# cherry-pick): the stamp would name the replaying agent, not the author.
+af_gd="$(git rev-parse --git-dir 2>/dev/null)"
+if [ -d "$af_gd/rebase-apply" ] || [ -d "$af_gd/rebase-merge" ] \
+    || [ -f "$af_gd/MERGE_HEAD" ] || [ -f "$af_gd/CHERRY_PICK_HEAD" ]; then
+    exit 0
+fi
 
 if command -v agentflare >/dev/null 2>&1; then
     agentflare git trailer-inject "$msg_file" || true
