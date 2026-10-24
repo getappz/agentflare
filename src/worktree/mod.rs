@@ -170,6 +170,38 @@ pub fn is_pr_merged(item: &agentflare_backend::item::Item, repo_root: &Path) -> 
     is_pr_merged_impl(item, repo_root, &client, &repo)
 }
 
+/// Keep live PR tracking for repair attempts; keep it on lookup failures too.
+pub fn redispatch_pr_retention(
+    repo_root: &Path,
+    number: u64,
+) -> agentflare_backend::item::PrRetention {
+    use agentflare_backend::item::PrRetention;
+    let Some(repo) = RepoId::resolve_from_remote(repo_root) else {
+        return PrRetention::Keep;
+    };
+    let Ok(client) = crate::github::Client::new() else {
+        return PrRetention::Keep;
+    };
+    redispatch_pr_retention_impl(&client, &repo, number)
+}
+
+fn redispatch_pr_retention_impl(
+    client: &crate::github::Client,
+    repo: &RepoId,
+    number: u64,
+) -> agentflare_backend::item::PrRetention {
+    use agentflare_backend::item::PrRetention;
+    match crate::github::pulls::get(client, repo, number) {
+        Ok(pr) if pr.merged_at.is_some() || pr.state == "closed" => PrRetention::Clear,
+        Err(crate::github::GitHubError::NotFound) => PrRetention::Clear,
+        Ok(_) => PrRetention::Keep,
+        Err(e) => {
+            eprintln!("worktree: could not check whether PR #{number} is still open: {e}");
+            PrRetention::Keep
+        }
+    }
+}
+
 fn is_pr_merged_impl(
     item: &agentflare_backend::item::Item,
     repo_root: &Path,

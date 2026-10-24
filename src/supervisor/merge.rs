@@ -284,6 +284,15 @@ pub(super) fn requeue_closed_pr_item(
     item: &agentflare_backend::item::Item,
     number: u64,
 ) -> bool {
+    requeue_closed_pr_item_with(mcp, item, number, |_| {})
+}
+
+pub(super) fn requeue_closed_pr_item_with(
+    mcp: &AgentflareMcp,
+    item: &agentflare_backend::item::Item,
+    number: u64,
+    before_redispatch: impl FnOnce(&rusqlite::Connection),
+) -> bool {
     let author = crate::claims::owner_id();
     let outcome = mcp.with_backend_db(|conn| -> agentflare_backend::error::Result<bool> {
         let current = agentflare_backend::item::get(conn, &item.id)?;
@@ -296,19 +305,31 @@ pub(super) fn requeue_closed_pr_item(
         if crate::worktree::pr_number_from_metadata(&current).is_some_and(|n| n != number) {
             return Ok(false);
         }
-        let rearmed = match agentflare_backend::item::redispatch(conn, &item.id, None)? {
+        before_redispatch(conn);
+        // Only the PR just seen closed is known dead; a replacement can arrive after the guard.
+        let rearmed = match agentflare_backend::item::redispatch(conn, &item.id, None, |tracked| {
+            if tracked == number {
+                agentflare_backend::item::PrRetention::Clear
+            } else {
+                agentflare_backend::item::PrRetention::Keep
+            }
+        })? {
             agentflare_backend::item::RedispatchOutcome::Ready { .. } => true,
             agentflare_backend::item::RedispatchOutcome::NoAssignee => {
                 // Nobody to hand it back to automatically: still leave
-                // "in_review" and drop the dead PR, so it waits in the
+                // "in_review" and drop the dead PR (and the review state
+                // derived from it, same as `redispatch`), so it waits in the
                 // backlog for an assignee instead of polling a closed PR.
                 let backlog =
                     agentflare_backend::state::first_in_group(conn, &current.project_id, "backlog")?;
                 agentflare_backend::item::update_state(conn, &item.id, &backlog.id)?;
                 conn.execute(
-                    "UPDATE items SET metadata = json_remove(metadata, '$.pr') \
-                     WHERE id = ?1 AND json_valid(metadata)",
-                    rusqlite::params![item.id],
+                    "UPDATE items SET metadata = json_remove(metadata, '$.pr', \
+                     '$.review_threads', '$.coderabbit_repair_announced_for') \
+                     WHERE id = ?1 AND json_valid(metadata) \
+                     AND (json_extract(metadata, '$.pr.number') = ?2 \
+                          OR json_extract(metadata, '$.pr.number') IS NULL)",
+                    rusqlite::params![item.id, i64::try_from(number).ok()],
                 )?;
                 false
             }

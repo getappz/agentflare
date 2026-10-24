@@ -168,6 +168,69 @@ fn a_pr_closed_without_merging_requeues_its_item_exactly_once() {
 }
 
 #[test]
+fn closed_pr_requeue_keeps_a_replacement_attached_after_its_guard() {
+    for assigned in [true, false] {
+        let repo = throwaway_repo();
+        let mcp = test_mcp();
+        let item_id = seed_in_review_item_in_project(
+            &mcp,
+            "proj-replacement",
+            &repo.path().to_string_lossy(),
+        );
+        let item = mcp
+            .with_backend_db(|conn| {
+                agentflare_backend::item::update(
+                    conn,
+                    &item_id,
+                    agentflare_backend::item::UpdateItem {
+                        metadata: Some(r#"{"pr":{"number":501,"branch":"task/501"}}"#.into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                if !assigned {
+                    conn.execute(
+                        "UPDATE items SET assignee_agent = NULL WHERE id = ?1",
+                        [&item_id],
+                    )
+                    .unwrap();
+                }
+                agentflare_backend::item::get(conn, &item_id).unwrap()
+            })
+            .unwrap();
+        let replacement = serde_json::json!({
+            "pr": {"number": 502, "branch": "task/502", "ready": true},
+            "review_threads": [{"id": "replacement-thread"}],
+            "coderabbit_repair_announced_for": [502],
+            "size": "S"
+        });
+        assert!(requeue_closed_pr_item_with(&mcp, &item, 501, |conn| {
+            agentflare_backend::item::update(
+                conn,
+                &item_id,
+                agentflare_backend::item::UpdateItem {
+                    metadata: Some(replacement.to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }));
+        let metadata = mcp
+            .with_backend_db(|conn| {
+                agentflare_backend::item::get(conn, &item_id)
+                    .unwrap()
+                    .metadata
+            })
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&metadata).unwrap(),
+            replacement
+        );
+        assert_eq!(state_group_of(&mcp, &item_id), "backlog");
+    }
+}
+
+#[test]
 fn job_in_flight_sees_an_active_job_older_than_the_newest_hundred() {
     let queue = test_queue();
     let job = |item: &str| {

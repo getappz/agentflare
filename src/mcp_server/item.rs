@@ -8,6 +8,9 @@ use super::*;
 use crate::dispatch_failure_ceiling::PR_CREATION_FAILED_MARKER;
 use rusqlite::Connection;
 
+#[path = "item_redispatch.rs"]
+mod redispatch;
+
 /// Default/max page size for `list` — omitting `limit` used to return every
 /// matching item unbounded, which can blow past the MCP response token cap
 /// on large projects (155 items / 52k chars observed). Mirrors the
@@ -2192,8 +2195,10 @@ impl AgentflareMcp {
                 false,
             )
             .map_err(map_backend_err)?;
-            let outcome = agentflare_backend::item::redispatch(conn, &item_id, None)
-                .map_err(map_backend_err)?;
+            let outcome = agentflare_backend::item::redispatch(conn, &item_id, None, |number| {
+                crate::worktree::redispatch_pr_retention(&self.worktree_repo_root(), number)
+            })
+            .map_err(map_backend_err)?;
             let agentflare_backend::item::RedispatchOutcome::Ready { assignee_agent } = outcome
             else {
                 // Keep it parked rather than half-resumed.
@@ -2554,95 +2559,6 @@ impl AgentflareMcp {
             let item = agentflare_backend::item::clear_item_due_date(conn, &id)
                 .map_err(map_backend_err)?;
             Ok(serde_json::to_string_pretty(&item).unwrap_or_default())
-        })?
-    }
-
-    /// AI-agent-safe alternative to `agentflare work <id>` (which is
-    /// human-only-gated): re-arms a stuck or failed item so the daemon's own
-    /// supervisor discovery tick dispatches it, instead of the caller trying
-    /// to dispatch it directly. See `agentflare_backend::item::redispatch`
-    /// for exactly what it resets.
-    pub(crate) fn item_redispatch(&self, req: ItemRequest) -> Result<String, ErrorData> {
-        let raw = require_id(req.id, "redispatch")?;
-        let req_assignee = req.assignee_agent.clone();
-        let now = crate::claims::now();
-        let ttl = crate::mcp_server::types::backend_claim_ttl_secs();
-        self.with_backend_db(|conn| {
-            let item_id = self.resolve_item_id(conn, &raw)?;
-            let outcome = agentflare_backend::item::redispatch(
-                conn,
-                &item_id,
-                req_assignee.as_deref(),
-            )
-            .map_err(map_backend_err)?;
-            match outcome {
-                agentflare_backend::item::RedispatchOutcome::Ready { assignee_agent } => {
-                    // An explicit `assignee_agent` is a hand-off, same as
-                    // `item_update`: release the previous agent's claim so the
-                    // item isn't stuck non-dispatchable until the TTL lapses.
-                    // Without one the assignee is unchanged, so a live claim
-                    // still legitimately blocks dispatch.
-                    let mut cancel_result = None;
-                    if req_assignee.is_some() {
-                        // Cancel first, release second: the old job's finalize
-                        // step checks for cancellation before `item_done`, and
-                        // once the claim is gone `item_done` would re-acquire
-                        // it under the old owner. Flagging the job first means
-                        // that check already sees the cancel by then.
-                        cancel_result =
-                            Some(self.cancel_jobs_for_reassignment(&item_id, &assignee_agent));
-                        crate::claims::reassignment_releases_claim(
-                            conn,
-                            &item_id,
-                            Some(&assignee_agent),
-                        )
-                        .map_err(internal_err)?;
-                    }
-                    let effective_ttl =
-                        agentflare_backend::claim::effective_ttl_secs(conn, &item_id, ttl);
-                    let live = agentflare_backend::claim::live_claim_on_item(
-                        conn,
-                        &item_id,
-                        now,
-                        effective_ttl,
-                    )
-                    .map_err(internal_err)?;
-                    let blocked_by = live.filter(|c| c.owner != assignee_agent);
-                    let dispatchable = blocked_by.is_none();
-                    let mut resp = serde_json::json!({
-                        "item_id": item_id,
-                        "ready": true,
-                        "dispatchable": dispatchable,
-                        "assignee_agent": assignee_agent,
-                    });
-                    match cancel_result {
-                        Some(Ok(n)) => resp["jobs_cancelled"] = n.into(),
-                        Some(Err(e)) => resp["warning"] = job_cancel_warning(&e).into(),
-                        None => {}
-                    }
-                    if let Some(live) = blocked_by {
-                        resp["blocked_by_live_claim"] = serde_json::json!({
-                            "owner": live.owner,
-                            "age_secs": live.age_secs,
-                            "ttl_secs": effective_ttl,
-                            "reason": "another agent already holds a live claim on this item",
-                        });
-                    }
-                    crate::quota::failover::attach_warning(
-                        &mut resp,
-                        crate::quota::failover::unavailability_warning(&assignee_agent),
-                    );
-                    Ok(resp.to_string())
-                },
-                agentflare_backend::item::RedispatchOutcome::NoAssignee => {
-                    Err(ErrorData::invalid_params(
-                        format!(
-                            "item {item_id} has no assignee_agent to redispatch to -- pass one explicitly (assignee_agent=\"claude-code\") or set it first via item(action=\"update\")"
-                        ),
-                        None,
-                    ))
-                }
-            }
         })?
     }
 }

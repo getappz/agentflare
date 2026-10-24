@@ -61,7 +61,7 @@ fn late_finalize_does_not_undo_a_redispatch() {
     make_label(&conn, &pid, "ready-for-work");
     let item = make_item(&conn, &pid, &sid);
     claim(&conn, &item.id, "claude-code:1", 1000, TTL).unwrap();
-    redispatch(&conn, &item.id, None).unwrap();
+    redispatch(&conn, &item.id, None, |_| PrRetention::Clear).unwrap();
 
     assert!(!mark_completed(&conn, &item.id, "claude-code:1").unwrap());
     assert!(!mark_in_review(&conn, &item.id, "claude-code:1").unwrap());
@@ -196,7 +196,7 @@ fn finalize_paths_survive_concurrent_writers_on_a_shared_file_db() {
                         Ok(ClaimOutcome::Acquired) => {}
                         other => return Err(format!("thread {t} round {round}: claim {other:?}")),
                     }
-                    redispatch(&conn, &item_id, None)
+                    redispatch(&conn, &item_id, None, |_| PrRetention::Clear)
                         .map_err(|e| format!("thread {t} round {round}: redispatch: {e}"))?;
                     match claim(&conn, &item_id, &owner, now + 1, TTL) {
                         Ok(ClaimOutcome::Acquired) => {}
