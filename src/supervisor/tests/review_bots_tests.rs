@@ -1493,5 +1493,8 @@ fn only_a_worktree_other_than_the_items_own_counts_as_a_branch_collision() {
     let own = Path::new("/repo/.worktrees/task/334");
     assert!(!super::is_foreign_worktree(None, own));
     assert!(!super::is_foreign_worktree(Some(own), own));
-    assert!(super::is_foreign_worktree(Some(Path::new("/repo/.worktrees/task/330")), own));
+    assert!(super::is_foreign_worktree(
+        Some(Path::new("/repo/.worktrees/task/330")),
+        own
+    ));
 }
