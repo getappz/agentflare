@@ -831,11 +831,11 @@ pub(crate) fn base64_encode(bytes: &[u8]) -> String {
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ItemRequest {
     #[schemars(
-        description = "Action: create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|add_relation|remove_relation|list_relations|redispatch|review_result|submit_plan|approve_plan|reject_plan|groom|standup|health|doctor|status|clear_start_date|clear_due_date"
+        description = "Action: create|get|list|search|update|update_state|delete|claim|heartbeat|release|done|check_merge|cancel|add_label|remove_label|add_relation|remove_relation|list_relations|redispatch|review_result|submit_plan|approve_plan|reject_plan|groom|standup|health|doctor|status|clear_parent|clear_start_date|clear_due_date. Use clear_parent with id to detach an item from its parent"
     )]
     pub(crate) action: String,
     #[schemars(
-        description = "Item ID (UUID or numeric sequence_id) — required for get, update, update_state, delete, claim, heartbeat, release, done, check_merge, add_label, remove_label, add_relation, remove_relation, list_relations, redispatch, submit_plan, approve_plan, reject_plan, status, clear_start_date, clear_due_date"
+        description = "Item ID (UUID or numeric sequence_id) — required for get, update, update_state, delete, claim, heartbeat, release, done, check_merge, add_label, remove_label, add_relation, remove_relation, list_relations, redispatch, submit_plan, approve_plan, reject_plan, status, clear_parent, clear_start_date, clear_due_date"
     )]
     #[serde(default)]
     pub(crate) id: Option<String>,
@@ -859,7 +859,7 @@ pub(crate) struct ItemRequest {
     #[serde(default)]
     pub(crate) priority: Option<String>,
     #[schemars(
-        description = "Parent item ID or sequence_id, for sub-items (create, update). On update, an empty string detaches the item from its parent"
+        description = "Parent item ID or sequence_id, for sub-items (create, update). Prefer action=clear_parent with id to detach an item from its parent. On update, an empty or whitespace-only string also detaches; omitting parent_id leaves it unchanged"
     )]
     #[serde(default)]
     pub(crate) parent_id: Option<String>,
