@@ -257,6 +257,13 @@ pub(crate) enum PrApprovalBlocker {
     },
 }
 
+/// Side-by-side diff excerpt for the approval card; fail-open on GitHub errors.
+fn pr_approval_diff_context(repo: &crate::github::RepoId, number: u64) -> Option<String> {
+    let client = crate::github::Client::new().ok()?;
+    let files = crate::github::pulls::list_files(&client, repo, number).ok()?;
+    crate::review::diff_display::first_change_summary(&files)
+}
+
 /// The HTML card body for [`notify_pr_approval_gate`], split out so its
 /// wording is testable without a Telegram chat.
 fn pr_approval_card_text(
@@ -338,7 +345,8 @@ pub(crate) fn notify_pr_approval_gate(
     else {
         return;
     };
-    let text = pr_approval_card_text(item, &repo, number, blocker, None);
+    let diff_context = pr_approval_diff_context(&repo, number);
+    let text = pr_approval_card_text(item, &repo, number, blocker, diff_context.as_deref());
     let wants_label = !matches!(
         blocker,
         PrApprovalBlocker::GitHubReview {

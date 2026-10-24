@@ -84,6 +84,46 @@ pub fn no_context_message(path: &str) -> String {
     format!("no context for {path}")
 }
 
+/// First changed line in `files` (PR file list), for summary cards.
+pub fn first_change_summary(files: &[PullRequestFile]) -> Option<String> {
+    let parsed = file_diffs_from_pull_files(files);
+    for file in &parsed {
+        if let (Some(path), Some(anchor)) = (file.path(), first_anchor_in_file(file)) {
+            return Some(render_anchored_plain(&parsed, path, &anchor));
+        }
+    }
+    None
+}
+
+fn first_anchor_in_file(file: &FileDiff) -> Option<Anchor> {
+    for chunk in &file.chunks {
+        for line in &chunk.lines {
+            match line.kind {
+                LineKind::Added if line.new_line.is_some() => {
+                    return Some(Anchor::single_line(
+                        line.new_line.unwrap(),
+                        AnchorSide::Right,
+                    ));
+                }
+                LineKind::Deleted if line.old_line.is_some() => {
+                    return Some(Anchor::single_line(
+                        line.old_line.unwrap(),
+                        AnchorSide::Left,
+                    ));
+                }
+                LineKind::Changed if line.new_line.is_some() => {
+                    return Some(Anchor::single_line(
+                        line.new_line.unwrap(),
+                        AnchorSide::Right,
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
 // --- plain --------------------------------------------------------------------
 
 fn render_file_plain(file: &FileDiff, anchor: &Anchor) -> String {
@@ -194,7 +234,12 @@ fn render_file_ansi(file: &FileDiff, anchor: &Anchor) -> String {
             out.push('\n');
         }
     }
-    out.trim_end().to_string()
+    let trimmed = out.trim_end().to_string();
+    debug_assert!(
+        ansi_backgrounds_have_foreground(&trimmed),
+        "anchored diff ansi missing foreground on a background span"
+    );
+    trimmed
 }
 
 fn format_ansi_row(out: &mut String, row: &DisplayRow) {
