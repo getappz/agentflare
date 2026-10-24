@@ -149,6 +149,78 @@ pub(crate) fn release_claim_and_cleanup(
     }
 }
 
+/// Outcome of the optional push/PR step inside `item_done`.
+pub(crate) struct DonePushOutcome {
+    pub opened_pr: Option<crate::worktree::OpenedPr>,
+    pub no_pr: Option<(bool, String)>,
+    pub pr_failure: Option<String>,
+    pub pr_url: Option<String>,
+}
+
+/// Pushes the task branch and opens/reuses a PR when `should_push`, then
+/// rejects `done` when metadata records a PR but unpushed commits remain.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn push_for_item_done(
+    mcp: &AgentflareMcp,
+    item_id: &str,
+    item: &Option<agentflare_backend::item::Item>,
+    target_branch: &Option<String>,
+    repo_root: &std::path::Path,
+    agent: &str,
+    should_push: bool,
+    summary: Option<&str>,
+    progress: Option<&crate::progress::ProgressSender>,
+) -> Result<DonePushOutcome, ErrorData> {
+    use crate::worktree::PrOutcome;
+    let remote_tip_before = item
+        .as_ref()
+        .zip(target_branch.as_ref())
+        .filter(|_| should_push)
+        .and_then(|(i, _)| crate::worktree::remote_task_branch_tip(i, repo_root));
+    let pr_outcome = match (item.as_ref(), target_branch.as_ref()) {
+        (Some(item), Some(target)) if should_push => {
+            crate::worktree::push_and_open_pr(item, agent, repo_root, target, progress, summary)
+        }
+        _ => PrOutcome::NothingToPush,
+    };
+    let noop_push_on_open_pr =
+        matches!(&pr_outcome, PrOutcome::Opened(_) | PrOutcome::NothingToPush);
+    let (opened_pr, no_pr, pr_failure) = match pr_outcome {
+        PrOutcome::Opened(pr) => (Some(pr), None, None),
+        PrOutcome::NoPrPossible { pushed, reason } => (None, Some((pushed, reason)), None),
+        PrOutcome::Failed(reason) => (None, None, Some(reason)),
+        PrOutcome::NothingToPush => (None, None, None),
+    };
+    let pr_url = opened_pr.as_ref().map(|pr| pr.url.clone());
+    if should_push
+        && let (Some(item), Some(target)) = (item.as_ref(), target_branch.as_ref())
+        && crate::worktree::pr_number_from_metadata(item).is_some()
+        && noop_push_on_open_pr
+        && opened_pr.is_none()
+        && remote_tip_before.is_some()
+        && crate::worktree::branch_diverged(item, repo_root, target)
+    {
+        mcp.post_item_comment(
+            item_id,
+            format!(
+                "{PR_CREATION_FAILED_MARKER}\n\nThe branch has unpushed commits but \
+                 nothing was published for item {item_id}. Left in place rather than \
+                 completed."
+            ),
+        );
+        return Err(ErrorData::internal_error(
+            format!("item {item_id}: unpushed commits remain on the branch -- not marking done"),
+            None,
+        ));
+    }
+    Ok(DonePushOutcome {
+        opened_pr,
+        no_pr,
+        pr_failure,
+        pr_url,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use crate::worktree::PrCiStatus::*;
