@@ -92,7 +92,21 @@ pub(crate) fn has_open_pr(
         }
         _ => crate::worktree::PrCiStatus::Unknown,
     };
-    pr_is_open(&status)
+    has_open_pr_status(item, &status)
+}
+
+fn has_open_pr_status(
+    item: &agentflare_backend::item::Item,
+    status: &crate::worktree::PrCiStatus,
+) -> bool {
+    use crate::worktree::PrCiStatus::*;
+    match status {
+        Merged | Closed { .. } => false,
+        // No PR identity on the item and no open PR on the branch — a failed
+        // or absent lookup must not force in_review (item #396 push=false).
+        Unknown => crate::worktree::pr_number_from_metadata(item).is_some(),
+        _ => true,
+    }
 }
 
 fn pr_is_open(status: &crate::worktree::PrCiStatus) -> bool {
