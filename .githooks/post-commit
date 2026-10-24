@@ -15,6 +15,12 @@
 # pre-commit/pre-push/prepare-commit-msg (agentflare stores the canonical
 # copy under ~/.agentflare/githooks/).
 
+# Chain to the repo's own pre-existing hook (core.hooksPath hides <git-dir>/hooks).
+af_local="$(git rev-parse --git-common-dir 2>/dev/null)/hooks/post-commit"
+if [ -x "$af_local" ] && [ ! "$af_local" -ef "$0" ]; then
+    "$af_local" "$@" || true
+fi
+
 if command -v lean-ctx >/dev/null 2>&1; then
     ( lean-ctx index build >/dev/null 2>&1; lean-ctx graph build >/dev/null 2>&1 ) &
     disown 2>/dev/null || true
