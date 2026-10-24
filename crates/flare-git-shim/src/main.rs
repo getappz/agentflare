@@ -528,7 +528,9 @@ fn main() {
         classify::Disposition::Deny { .. }
         | classify::Disposition::Passthrough
         | classify::Disposition::SilentExempt => {
-            if matches!(subcommand.as_str(), "commit" | "push") {
+            if matches!(subcommand.as_str(), "commit" | "push")
+                && agentflare_shim::in_scoped_project(&repo_root, dirs::home_dir().as_deref())
+            {
                 match scope_check_outcome(&subcommand) {
                     ScopeCheckOutcome::Pass => {}
                     ScopeCheckOutcome::Deny(reason) => {

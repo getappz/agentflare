@@ -128,6 +128,26 @@ fn read_only_command_passes_through_and_succeeds() {
 }
 
 #[test]
+fn untracked_repo_commit_never_runs_scope_or_secret_checks() {
+    let repo = init_repo();
+    std::fs::remove_dir(repo.path().join(".agentflare")).unwrap();
+    let home = tempfile::TempDir::new().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_git"))
+        .args(["commit", "--allow-empty", "-m", "untracked"])
+        .current_dir(repo.path())
+        .env("CLAUDECODE", "1")
+        .env("AGENTFLARE_HOME_OVERRIDE", home.path())
+        .env(
+            "AGENTFLARE_GIT_SCOPE_CHECK_BIN",
+            home.path().join("missing-checker"),
+        )
+        .env_remove("AGENTFLARE_GIT_BYPASS")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+}
+
+#[test]
 fn checkout_to_protected_branch_is_denied_and_real_git_never_runs() {
     let repo = init_repo();
     let home = tempfile::TempDir::new().unwrap();
