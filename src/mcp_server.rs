@@ -16,6 +16,7 @@ pub(crate) mod item;
 mod item_doctor;
 pub(crate) mod item_force;
 mod item_merged_pr;
+mod item_metadata;
 mod item_plan_transition;
 mod item_reports;
 mod item_review;
