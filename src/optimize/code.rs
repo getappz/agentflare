@@ -1,5 +1,6 @@
 //! Flare code minimalism layer — lazy senior dev rules for AI agents.
 pub use flare_code::config::config_path;
+pub use flare_code::instructions::Instructions;
 pub use flare_code::sub_skills::{
     SKILL_AUDIT, SKILL_DEBT, SKILL_GAIN, SKILL_HELP, SKILL_NO_HALLUCINATION, SKILL_PLAYBOOK,
     SKILL_REVIEW,
