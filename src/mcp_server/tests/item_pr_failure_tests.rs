@@ -444,3 +444,49 @@ fn a_repo_scoped_instance_resolves_its_project_from_that_repo_not_the_cwd() {
         project.external_id
     );
 }
+
+// Item #406: the claimed worktree vanished after its commit landed on the
+// branch. `done` must not read that as "nothing to push" -- it hard-errors and
+// leaves the item uncompleted so the commits aren't orphaned.
+#[test]
+fn item_done_errors_when_the_worktree_is_gone_but_the_branch_has_commits() {
+    let missing = tempfile::tempdir().unwrap().path().join("gone.git");
+    let (_tmp, _repo_dir, repo_root, s) = repo_with_origin(Some(&missing));
+    let item_id = claim_and_write_work(&s, "Test");
+    let wt = std::fs::read_dir(repo_root.join(".worktrees/task"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?} failed");
+    };
+    git(&wt, &["config", "user.email", "test@test.com"]);
+    git(&wt, &["config", "user.name", "Test"]);
+    git(&wt, &["add", "-A"]);
+    git(&wt, &["commit", "-m", "real work"]);
+    std::fs::remove_dir_all(&wt).unwrap();
+    git(&repo_root, &["worktree", "prune"]);
+
+    let err = s
+        .item(Parameters(ItemRequest {
+            action: "done".into(),
+            id: Some(item_id.clone()),
+            summary: Some("Did the real work.".into()),
+            ..Default::default()
+        }))
+        .unwrap_err();
+
+    assert!(
+        err.message.contains("not marking completed"),
+        "{}",
+        err.message
+    );
+    assert_ne!(state_group(&s, &item_id), "completed");
+}

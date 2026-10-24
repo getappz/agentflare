@@ -1852,3 +1852,38 @@ fn reusable_own_pr_rejects_this_items_own_pr_once_closed_unmerged() {
     assert!(!reusable_own_pr(&closed, &item));
     assert!(reusable_own_pr(&merged, &item));
 }
+
+#[test]
+fn missing_worktree_with_unpushed_commits_is_a_failure_not_nothing_to_push() {
+    let dir = tempfile::tempdir().unwrap();
+    let run_git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?} failed");
+    };
+    run_git(&["init", "-b", "master"]);
+    run_git(&["config", "user.email", "test@test.com"]);
+    run_git(&["config", "user.name", "Test"]);
+    std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+    run_git(&["add", "-A"]);
+    run_git(&["commit", "-m", "a"]);
+    let item = item_with_metadata(406, "{}");
+    let branch = flare_git_core::worktree::resolve_item_task_branch(&item, dir.path());
+    run_git(&["checkout", "-b", &branch]);
+    std::fs::write(dir.path().join("b.txt"), "b").unwrap();
+    run_git(&["add", "-A"]);
+    run_git(&["commit", "-m", "b"]);
+    run_git(&["checkout", "master"]);
+
+    // Branch is ahead but no `.worktrees/task/406` dir exists.
+    let ahead = push_and_open_pr(&item, "a", dir.path(), "master", None, None);
+    assert!(matches!(ahead, PrOutcome::Failed(_)), "got {ahead:?}");
+
+    // A branch with no new commits is still genuinely nothing to push.
+    let other = item_with_metadata(407, "{}");
+    let none = push_and_open_pr(&other, "a", dir.path(), "master", None, None);
+    assert!(matches!(none, PrOutcome::NothingToPush), "got {none:?}");
+}
