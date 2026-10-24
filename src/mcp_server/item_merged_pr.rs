@@ -1,7 +1,3 @@
-[mode overridden: auto -> full, reason=bounce-prevention, pass fresh=true to keep the requested mode]
-
-[mode overridden: auto -> full, reason=bounce-prevention, pass fresh=true to keep the requested mode]
-
 //! `done`'s "the PR I tracked has already merged" path (item #373).
 //!
 //! Split out of `item.rs` purely to keep that file under the repo's
