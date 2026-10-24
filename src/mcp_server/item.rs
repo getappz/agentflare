@@ -1787,14 +1787,6 @@ impl AgentflareMcp {
         // `cleanup_worktree` itself still verifies the tree is clean before
         // removing it, so this is safe even if `nothing_was_ever_committed`
         // somehow raced with an uncommitted local change.
-        if !owns_claim && should_push && diverged && pr_url.is_none() && no_pr.is_none() {
-            return Err(ErrorData::internal_error(
-                format!(
-                    "item {item_id}: branch has unpushed commits but this session does not own the claim -- no PR resulted, state unchanged"
-                ),
-                None,
-            ));
-        }
         let done = if !owns_claim {
             false
         } else if nothing_was_ever_committed {
