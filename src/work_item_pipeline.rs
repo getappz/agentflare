@@ -1854,6 +1854,8 @@ mod prompt_builder_tests;
 #[cfg(test)]
 mod review_only_detection_tests;
 #[cfg(test)]
+mod review_repair_tests;
+#[cfg(test)]
 mod sdd_data_tests;
 #[cfg(test)]
 mod sdd_loop_tests;

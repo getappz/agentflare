@@ -2,6 +2,24 @@ use agentflare_backend::item::Item;
 
 use crate::github::{models::PullRequest, pulls};
 
+pub(super) fn flag_discovery_mismatch(
+    client: &crate::github::Client,
+    repo: &crate::github::RepoId,
+    pr: &PullRequest,
+    reason: &str,
+) -> Result<(), crate::github::GitHubError> {
+    let label = "agentflare:needs-human";
+    if !pr.labels.iter().any(|l| l.name == label) {
+        crate::github::issues::add_labels(client, repo, pr.number, &[label.into()])?;
+    }
+    let body = format!("<!-- agentflare-review-identity-mismatch -->\n\n{reason}");
+    let comments = crate::github::issues::list_comments(client, repo, pr.number, None)?;
+    if !comments.iter().any(|c| c.body == body) {
+        crate::github::issues::comment(client, repo, pr.number, &body)?;
+    }
+    Ok(())
+}
+
 /// Autonomous review needs task identity, not just a workstation-local sequence number.
 pub(crate) fn pr_item_mismatch(item: &Item, pr: &PullRequest) -> Option<String> {
     pr_item_mismatch_for_instance(

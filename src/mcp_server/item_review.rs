@@ -19,6 +19,19 @@ fn plausible_sha(sha: &str) -> bool {
 }
 
 impl AgentflareMcp {
+    pub(crate) fn item_review_parked(&self, item_id: &str, reason: &str) -> Result<(), ErrorData> {
+        let owner = crate::claims::owner_id();
+        let now = crate::claims::now();
+        self.with_backend_db(|conn| {
+            let id = self.resolve_item_id(conn, item_id)?;
+            merge_item_metadata(conn, &id, |meta| {
+                crate::supervisor::review_attempts::record_parked(meta, &owner, reason, now);
+            })
+            .map(|_| ())
+            .map_err(map_backend_err)
+        })?
+    }
+
     pub(crate) fn item_review_result(&self, req: ItemRequest) -> Result<String, ErrorData> {
         let raw = req
             .id

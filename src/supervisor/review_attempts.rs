@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use super::review_findings::{BotFinding, ReviewOutcome};
+use super::review_findings::{
+    BotFinding, ReviewOutcome, ReviewResult, insert_thread_result, thread_record, thread_result,
+};
 
 const ATTEMPT: &str = "coderabbit_repair_attempt";
 const CREDITS: &str = "coderabbit_repair_noop_credits";
@@ -76,6 +78,44 @@ pub(crate) fn record_outcome(
         ATTEMPT.into(),
         serde_json::to_value(attempt).expect("serializable attempt"),
     );
+}
+
+/// Explicit parking still owes a reply for every finding the job did not report.
+pub(crate) fn record_parked(meta: &mut Map<String, Value>, owner: &str, reason: &str, now: i64) {
+    let Some(attempt) = meta
+        .get(ATTEMPT)
+        .cloned()
+        .and_then(|v| serde_json::from_value::<Attempt>(v).ok())
+    else {
+        return;
+    };
+    if owner.rsplit_once(':').map(|(_, id)| id) != Some(attempt.job_id.as_str()) {
+        return;
+    }
+    for (thread, round) in &attempt.threads {
+        if attempt.outcomes.contains_key(thread)
+            || thread_record(meta, thread).round != *round
+            || thread_result(meta, thread).is_some()
+        {
+            continue;
+        }
+        insert_thread_result(
+            meta,
+            thread,
+            &ReviewResult {
+                round: *round,
+                outcome: ReviewOutcome::Skipped,
+                sha: None,
+                note: format!("Repair parked before reporting this finding: {reason}")
+                    .chars()
+                    .take(1500)
+                    .collect(),
+                test: None,
+            },
+            now,
+        );
+        record_outcome(meta, owner, thread, *round, ReviewOutcome::Skipped);
+    }
 }
 
 pub(super) fn charged_attempts(meta: &Map<String, Value>, gross: u32) -> u32 {

@@ -703,8 +703,8 @@ pub(crate) fn render_fix_task(
          outcome=\"fixed\"|\"not_valid\"|\"out_of_scope\"|\"skipped\", \
          sha=\"<full commit sha>\" (fixed only), note=\"<what changed, or why it stays>\", \
          test=\"<test name>\" (fixed only)). Findings marked optional may be skipped with \
-         outcome=\"skipped\" and a one-line reason; every other finding needs fixed, \
-         not_valid or out_of_scope with a reason.\n\
+         outcome=\"skipped\" and a one-line reason. If blocked or parking the run, still \
+         report every unfinished finding as skipped with the blocking reason before stopping.\n\
          Do NOT reply on the GitHub threads yourself: the supervisor replies on each thread \
          and resolves the fixed ones once your push is confirmed on the remote. A thread that \
          keeps coming back is escalated to a human after {max_rounds} rounds.\n\n\

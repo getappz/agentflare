@@ -11,35 +11,71 @@ fn item724_does_not_attach_an_unrelated_task_with_the_same_local_sequence() {
     let (project, state) = test_project_with_in_review_state(&conn);
     let item = create_owner_item(&conn, &project, &state);
     let branch = format!("task/{}-unrelated-auth-repair", item.sequence_id);
-    let server = MockServer::start(vec![
-        MockResponse::json(
-            200,
-            &serde_json::json!([{
-                "number": 870, "html_url": "u", "state": "open",
-                "title": "fix: unrelated authentication repair",
-                "body": "Opened by agentflare for item #999 via agentflare.",
-                "head": {"ref": branch, "sha": "abc"}, "author_association": "OWNER"
-            }])
-            .to_string(),
-        ),
-        MockResponse::json(200, "{}"),
-    ]);
-    discover_untracked_prs(
-        &conn,
-        &server.client(Some("tok")),
-        &RepoId {
-            owner: "o".into(),
-            repo: "r".into(),
-        },
-        &project,
-        &state,
-        &std::collections::HashSet::new(),
-        "flared:box-a",
-        &|_| true,
-    );
+    let prs = serde_json::json!([{
+        "number": 870, "html_url": "u", "state": "open",
+        "title": "fix: unrelated authentication repair",
+        "body": "Opened by agentflare for item #999 via agentflare.",
+        "head": {"ref": branch, "sha": "abc"}, "author_association": "OWNER"
+    }])
+    .to_string();
+    let comments = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+    let stored = comments.clone();
+    let server =
+        MockServer::start_with(move |req| match (req.method.as_str(), req.path.as_str()) {
+            ("GET", "/repos/o/r/pulls?state=open&per_page=100&page=1") => {
+                MockResponse::json(200, &prs)
+            }
+            ("POST", "/repos/o/r/issues/870/labels") => MockResponse::json(200, "[]"),
+            ("GET", "/repos/o/r/issues/870/comments?per_page=100&page=1") => MockResponse::json(
+                200,
+                &serde_json::to_string(&*stored.lock().unwrap()).unwrap(),
+            ),
+            ("POST", "/repos/o/r/issues/870/comments") => {
+                let body: serde_json::Value = serde_json::from_str(&req.body).unwrap();
+                stored.lock().unwrap().push(serde_json::json!({
+                    "id": 1, "user": {"login": "agentflare"}, "body": body["body"]
+                }));
+                MockResponse::json(201, r#"{"id":1}"#)
+            }
+            _ => MockResponse::json(
+                500,
+                &format!("unexpected request: {} {}", req.method, req.path),
+            ),
+        });
+    for _ in 0..2 {
+        discover_untracked_prs(
+            &conn,
+            &server.client(Some("tok")),
+            &RepoId {
+                owner: "o".into(),
+                repo: "r".into(),
+            },
+            &project,
+            &state,
+            &std::collections::HashSet::new(),
+            "flared:box-a",
+            &|_| true,
+        );
+    }
     let current = agentflare_backend::item::get(&conn, &item.id).unwrap();
     assert!(
         super::super::pr_number_from_metadata(&current).is_none(),
         "a matching local task number is not evidence of task identity"
+    );
+    let requests = server.requests();
+    assert!(requests.iter().any(|r| r.method == "POST"
+        && r.path.ends_with("/labels")
+        && r.body.contains("agentflare:needs-human")));
+    let comments = comments.lock().unwrap();
+    assert_eq!(
+        comments.len(),
+        1,
+        "a repeat sweep must not duplicate the reason"
+    );
+    assert!(
+        comments[0]["body"]
+            .as_str()
+            .unwrap()
+            .contains("Verify the PR-to-item mapping")
     );
 }

@@ -94,6 +94,12 @@ pub(crate) fn build_finalize_step(
                 let owner = ctx.data.owner.clone();
                 crate::claims::with_owner_override(owner, || {
                     if let Some(reason) = ctx.data.hold_reason.clone() {
+                        mcp.item_review_parked(&item_id, &reason).map_err(|e| {
+                            WorkflowError::StepFailed {
+                                step_id: StepId::new("finalize"),
+                                message: e.message.to_string(),
+                            }
+                        })?;
                         finalize_release_claim_best_effort(&mcp, &item_id, false);
                         let body = format!("## agentflare work — on hold\n\n{reason}");
                         mcp.post_item_comment(&item_id, &body);
@@ -145,6 +151,12 @@ pub(crate) fn build_finalize_step(
                     // approach a comment said to disregard).
                     if !ctx.data.pending_corrections.is_empty() {
                         let corrections = ctx.data.pending_corrections.join("\n\n---\n\n");
+                        mcp.item_review_parked(&item_id, &corrections).map_err(|e| {
+                            WorkflowError::StepFailed {
+                                step_id: StepId::new("finalize"),
+                                message: e.message.to_string(),
+                            }
+                        })?;
                         finalize_release_claim_best_effort(&mcp, &item_id, false);
                         let body = format!(
                             "## agentflare work — on hold\n\n\

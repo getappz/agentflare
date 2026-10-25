@@ -61,7 +61,7 @@ Interfaces: `begin_attempt(meta, job_id, findings)`, `record_outcome(meta, owner
 - [x] Add result-recording regressions for complete no-op, partial, mixed-fixed, duplicate/corrected outcomes and a stale owner.
 - [x] Observe missing credit against the current implementation before writing accounting logic.
 - [x] Persist current dispatch identity/thread rounds, outcomes and one-time credit in existing metadata. Match the reporting claim owner to the dispatch job.
-- [x] Keep marker/silent counts as gross attempts; subtract durable credits with saturation. Missing reports and legacy attempts remain charged.
+- [x] Keep marker/silent counts as gross attempts; subtract durable credits with saturation. Lost jobs and legacy attempts remain charged. Explicit parking records missing per-thread outcomes before settling the attempt.
 - [x] Verify all-no-op batches do not consume the cap and lost runs remain bounded.
 
 ### Final validation
@@ -78,3 +78,11 @@ Interfaces: `begin_attempt(meta, job_id, findings)`, `record_outcome(meta, owner
 - The expanded supervisor suite passed all 208 tests. The affected-module run passed 221 checks and exposed one discovery owner-seam regression, which was corrected; all 31 discovery/routing checks then passed on the final code.
 - Rustfmt and `git diff --check` passed. The full workspace suite and live cross-instance adoption were not run.
 - Follow-up verification: all 10 `item724` regression tests, `cargo fmt --check`, `git diff --check`, `cargo deny check`, and the exact CI workspace/all-targets/all-features clippy command passed. Removed the needless borrow that failed PR #965's clippy check; GitHub checks for #870 and #965 were inspected.
+
+## Reviewer fix round
+
+- P1: explicit holds and holds for unread corrections now record missing current-job/current-round findings as `skipped` with the hold reason, in the same metadata transaction as attempt accounting. Existing results are preserved; any reported fix keeps the attempt charged. Repeated finalization cannot duplicate a credit, and a superseded job cannot report for the new attempt through this path.
+- P2: discovery flags a local identity collision with `agentflare:needs-human` and a PR comment containing the mapping reason. Repeated sweeps reuse the same reason; foreign-origin PRs remain untouched and the wrong item is never attached.
+- The new parked-finalization regression and strengthened discovery regression failed before the fixes. All 11 `item724` tests passed afterward, including mixed fixed/parked outcomes, stale owners and finalization retries.
+- Independent read-only review found no blockers in these changes. It set aside a pre-existing race where a late direct `review_result` can overwrite a newer result: a blanket owner rejection would also block supported manual reporting, so that needs a separate distinction between dispatched and manual reporters.
+- Final verification passed: 11 item #724 regressions; 24 discovery, 9 finalization, 5 review-result and 1 brief-rendering tests; `cargo fmt --check`; `git diff --check`; `cargo deny check`; and `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings -A unsafe_code -A clippy::pedantic`. All commands finished before commit. GitHub checks on #870 and #965 were inspected; the full workspace test suite was not run.

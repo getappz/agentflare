@@ -362,7 +362,15 @@ pub(crate) fn discover_untracked_prs_with_clock(
         // The stamp is only a "this one is ours" marker; the branch
         // ownership check below is what decides where it goes.
         if let Some(owning) = item_owning_branch(&items, &branch, local_branch) {
-            if super::review_identity::pr_item_mismatch_for_instance(owning, &pr, owner).is_some() {
+            if let Some(reason) =
+                super::review_identity::pr_item_mismatch_for_instance(owning, &pr, owner)
+            {
+                if crate::github::pulls::origin_allows(pr.body.as_deref(), owner)
+                    && let Err(e) =
+                        super::review_identity::flag_discovery_mismatch(client, repo, &pr, &reason)
+                {
+                    eprintln!("worktree: could not flag PR #{}: {reason} {e}", pr.number);
+                }
                 continue;
             }
             attach_pr_to_item(conn, owning, pr.number, &branch);
