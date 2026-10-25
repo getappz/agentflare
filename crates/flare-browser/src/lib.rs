@@ -21,6 +21,8 @@ use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 /// Sidecar binary v1 shells out to. Pure Rust (same stack as agentflare) —
 /// installed via mise (`mise use -g agent-browser`, aqua prebuilt binaries),
@@ -37,7 +39,7 @@ pub const MAX_OUTPUT_CHARS: usize = 12_000;
 /// before the rest is drained and discarded -- generous headroom over
 /// `MAX_OUTPUT_CHARS` so a normal snapshot is never itself truncated here;
 /// only a runaway/page-controlled stream (e.g. `console`) hits it.
-const STREAM_READ_CAP_BYTES: u64 = 1024 * 1024;
+const STREAM_READ_CAP_BYTES: usize = 1024 * 1024;
 
 /// One consolidated browser verb.
 pub struct ActionDef {
@@ -272,13 +274,27 @@ pub fn resolve_session(explicit: Option<&str>, cwd: &Path) -> String {
 /// the absolute path `mise which` resolves in `browser_install`.
 pub fn find_backend() -> Result<PathBuf, String> {
     let paths = std::env::var_os("PATH").unwrap_or_default();
+    let mut mise_shim: Option<PathBuf> = None;
     for dir in std::env::split_paths(&paths) {
         if is_mise_shims_dir(&dir) {
+            if cfg!(windows) && mise_shim.is_none() {
+                mise_shim = check_bin_dir(&dir);
+            }
             continue;
         }
         if let Some(p) = check_bin_dir(&dir) {
+            if let Some(shim) = &mise_shim {
+                // Only bypass the active shim for mise's already-activated install paths.
+                let root = shim.parent().and_then(Path::parent);
+                if !root.is_some_and(|root| p.starts_with(root.join("installs"))) {
+                    continue;
+                }
+            }
             return Ok(p);
         }
+    }
+    if let Some(shim) = mise_shim {
+        return Ok(shim);
     }
     if let Some(p) = cargo_bin_candidates().into_iter().find(|p| p.is_file()) {
         return Ok(p);
@@ -306,7 +322,13 @@ fn is_mise_shims_dir(dir: &Path) -> bool {
     })
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(windows)]
+fn is_mise_shims_dir(dir: &Path) -> bool {
+    std::env::var_os("LOCALAPPDATA")
+        .is_some_and(|root| dir == PathBuf::from(root).join("mise/shims"))
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 fn is_mise_shims_dir(_dir: &Path) -> bool {
     false
 }
@@ -410,11 +432,16 @@ pub fn run_blocking(
     secrets: &[String],
     path_env: Option<&str>,
 ) -> Result<String, String> {
+    flare_process::prevent_stdio_inheritance()
+        .map_err(|e| format!("failed to protect browser caller's stdio: {e}"))?;
     // flare_process::command (not std::process::Command::new) so a daemon or
     // IDE-launched MCP server with no inherited console never flashes one
     // over the user's desktop when it spawns the sidecar (Windows).
     let mut cmd = flare_process::command(program);
-    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     if let Some(path) = path_env {
         cmd.env("PATH", path);
     }
@@ -429,14 +456,22 @@ pub fn run_blocking(
     // Reading the two pipes one at a time instead of concurrently risks
     // deadlock — the child blocks writing to whichever pipe fills its OS
     // buffer first while we're still draining the other.
-    let (stdout_buf, stderr_buf) = std::thread::scope(|scope| {
-        let stdout_job = scope.spawn(|| read_capped(&mut stdout_pipe, STREAM_READ_CAP_BYTES));
-        let stderr_buf = read_capped(&mut stderr_pipe, STREAM_READ_CAP_BYTES);
-        (stdout_job.join().unwrap_or_default(), stderr_buf)
+    // The persistent daemon can inherit these writers; EOF is not command completion.
+    let finished = AtomicBool::new(false);
+    let (status, stdout_buf, stderr_buf) = std::thread::scope(|scope| {
+        let stdout_job =
+            scope.spawn(|| read_capped(&mut stdout_pipe, STREAM_READ_CAP_BYTES, &finished));
+        let stderr_job =
+            scope.spawn(|| read_capped(&mut stderr_pipe, STREAM_READ_CAP_BYTES, &finished));
+        let status = child.wait();
+        finished.store(true, Ordering::Relaxed);
+        (
+            status,
+            stdout_job.join().unwrap_or_default(),
+            stderr_job.join().unwrap_or_default(),
+        )
     });
-    let status = child
-        .wait()
-        .map_err(|e| format!("failed to wait on {}: {e}", program.display()))?;
+    let status = status.map_err(|e| format!("failed to wait on {}: {e}", program.display()))?;
     let stdout = String::from_utf8_lossy(&stdout_buf).trim().to_string();
     if status.success() {
         return Ok(stdout);
@@ -453,14 +488,44 @@ pub fn run_blocking(
     })
 }
 
-/// Reads up to `cap` bytes from `pipe`, then drains (and discards) any
-/// remainder without buffering it — keeps memory bounded on a runaway
-/// stream while still letting the child finish writing instead of
-/// blocking forever on a full OS pipe buffer.
-fn read_capped(pipe: &mut impl Read, cap: u64) -> Vec<u8> {
+/// Capture up to `cap`, draining excess while the command runs. After exit,
+/// drain pending bytes without waiting for EOF from the persistent daemon.
+fn read_capped(
+    pipe: &mut (impl Read + flare_process::PipeHandle),
+    cap: usize,
+    finished: &AtomicBool,
+) -> Vec<u8> {
     let mut buf = Vec::new();
-    let _ = std::io::copy(&mut pipe.by_ref().take(cap), &mut buf);
-    let _ = std::io::copy(pipe, &mut std::io::sink());
+    let mut chunk = [0u8; 8192];
+    let mut trailing = cap;
+    loop {
+        let done = finished.load(Ordering::Relaxed);
+        // Bound the final drain even if a daemon keeps writing continuously.
+        if done && trailing == 0 {
+            break;
+        }
+        let capacity = match flare_process::available_output_bytes(pipe, chunk.len()) {
+            Ok(Some(capacity)) => capacity,
+            Ok(None) if done => break,
+            Ok(None) => {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        match pipe.read(&mut chunk[..capacity]) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n.min(cap - buf.len())]);
+                if done {
+                    trailing = trailing.saturating_sub(n);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
     buf
 }
 
@@ -514,6 +579,215 @@ pub fn observe_filter(snapshot: &str, query: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn find_backend_bypasses_mise_only_for_its_activated_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shims = tmp.path().join("mise/shims");
+        let activated = tmp.path().join("mise/installs/browser/pinned");
+        let standalone = tmp.path().join("standalone");
+        for dir in [&shims, &activated, &standalone] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("agent-browser.exe"), "fixture").unwrap();
+        }
+        let saved_path = std::env::var_os("PATH");
+        let saved_local = std::env::var_os("LOCALAPPDATA");
+        // SAFETY: these tests run serially and restore both lookup variables before assertions.
+        unsafe {
+            std::env::set_var("LOCALAPPDATA", tmp.path());
+            std::env::set_var(
+                "PATH",
+                std::env::join_paths([&shims, &standalone, &activated]).unwrap(),
+            );
+        }
+        let direct = find_backend();
+        unsafe { std::env::set_var("PATH", std::env::join_paths([&shims, &standalone]).unwrap()) };
+        let fallback = find_backend();
+        for (key, saved) in [("PATH", saved_path), ("LOCALAPPDATA", saved_local)] {
+            unsafe {
+                match saved {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+        assert_eq!(direct, Ok(activated.join("agent-browser.exe")));
+        assert_eq!(fallback, Ok(shims.join("agent-browser.exe")));
+    }
+
+    #[test]
+    fn run_blocking_returns_when_a_daemon_inherits_the_output_pipes() {
+        let started = std::time::Instant::now();
+        let output = run_blocking(
+            &std::env::current_exe().unwrap(),
+            &[
+                "--ignored".into(),
+                "--exact".into(),
+                "tests::sidecar_parent".into(),
+                "--nocapture".into(),
+            ],
+            &[],
+            None,
+        )
+        .unwrap();
+        assert!(output.contains("sidecar-ready"), "{output}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "waited for the daemon: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn run_blocking_does_not_leak_the_callers_output_pipes() {
+        let started = std::time::Instant::now();
+        let output = flare_process::command(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "tests::sidecar_wrapper",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("wrapper-ready"));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "caller's pipe leaked into the daemon: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture"]
+    fn sidecar_wrapper() {
+        #[cfg(windows)]
+        use std::os::windows::io::AsRawHandle;
+        #[cfg(windows)]
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn SetHandleInformation(handle: *mut core::ffi::c_void, mask: u32, flags: u32) -> i32;
+            fn GetHandleInformation(handle: *mut core::ffi::c_void, flags: *mut u32) -> i32;
+        }
+        // PowerShell gives a captured program inheritable output handles.
+        #[cfg(windows)]
+        for handle in [
+            std::io::stdout().as_raw_handle(),
+            std::io::stderr().as_raw_handle(),
+        ] {
+            // SAFETY: these are live standard handles; only their inheritance flag changes.
+            assert_ne!(unsafe { SetHandleInformation(handle, 1, 1) }, 0);
+        }
+        run_blocking(
+            &std::env::current_exe().unwrap(),
+            &[
+                "--ignored".into(),
+                "--exact".into(),
+                "tests::sidecar_parent".into(),
+                "--nocapture".into(),
+            ],
+            &[],
+            None,
+        )
+        .unwrap();
+        #[cfg(windows)]
+        for handle in [
+            std::io::stdout().as_raw_handle(),
+            std::io::stderr().as_raw_handle(),
+        ] {
+            let mut flags = 0;
+            // SAFETY: the handles and the output pointer remain valid throughout this call.
+            assert_ne!(unsafe { GetHandleInformation(handle, &mut flags) }, 0);
+            assert_eq!(
+                flags & 1,
+                0,
+                "caller's output must not be inherited by Chrome"
+            );
+        }
+        println!("wrapper-ready");
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture"]
+    #[allow(
+        clippy::zombie_processes,
+        reason = "the regression requires the daemon to outlive its parent"
+    )]
+    fn sidecar_parent() {
+        flare_process::command(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "tests::sidecar_daemon",
+                "--nocapture",
+            ])
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        println!("sidecar-ready");
+        eprintln!("sidecar-stderr");
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture"]
+    fn sidecar_daemon() {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+    }
+
+    #[test]
+    fn run_blocking_caps_and_drains_both_streams() {
+        let output = run_blocking(
+            &std::env::current_exe().unwrap(),
+            &[
+                "--ignored".into(),
+                "--exact".into(),
+                "tests::sidecar_large_output".into(),
+                "--nocapture".into(),
+            ],
+            &[],
+            None,
+        )
+        .unwrap();
+        assert!(output.len() <= STREAM_READ_CAP_BYTES);
+        assert!(output.matches('x').count() > 1_000_000);
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture"]
+    fn sidecar_large_output() {
+        use std::io::Write;
+        let bytes = vec![b'x'; 2 * 1024 * 1024];
+        std::io::stdout().write_all(&bytes).unwrap();
+        std::io::stderr().write_all(&bytes).unwrap();
+    }
+
+    #[test]
+    fn run_blocking_preserves_and_redacts_errors() {
+        let error = run_blocking(
+            &std::env::current_exe().unwrap(),
+            &[
+                "--ignored".into(),
+                "--exact".into(),
+                "tests::sidecar_failure".into(),
+                "--nocapture".into(),
+            ],
+            &["stderr-secret".into()],
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("status 7"), "{error}");
+        assert!(error.contains("***"), "{error}");
+        assert!(!error.contains("stderr-secret"), "{error}");
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture"]
+    fn sidecar_failure() {
+        eprintln!("stderr-secret");
+        std::process::exit(7);
+    }
 
     #[test]
     fn default_session_is_stable_and_scoped() {
