@@ -10,6 +10,10 @@
 
 **Spec:** Agentflare item #724, acceptance criteria in its current description.
 
+## Mapping investigation
+
+Discovery selected `item_owning_branch` through `item_owns_branch_here`, which accepts a matching numeric task prefix when the branch exists locally; it ignores the slug and item title. PR #870's live body contains `Fixes #308` but no UUID or origin tag. That allows an unrelated workstation-local item #308 to be attached to the failover branch before discovery stamps it. The original database mutation was not recovered, so this identifies the reproducible collision path rather than proving which discovery tick performed it.
+
 ## Global constraints
 
 - Work only in `.worktrees/task/724`; preserve the main checkout and other worktrees.
@@ -64,7 +68,7 @@ Interfaces: `begin_attempt(meta, job_id, findings)`, `record_outcome(meta, owner
 
 - [x] Run focused identity, discovery, review scope, review-result and repair-cap tests.
 - [x] Run rustfmt, git diff checks and an independent review of the full patch.
-- [ ] Commit, push and open the stamped PR for item #724; report verification limits.
+- [x] Commit, push and open the stamped PR for item #724; report verification limits (PR #965).
 
 ## Review and compatibility notes
 
@@ -73,3 +77,4 @@ Interfaces: `begin_attempt(meta, job_id, findings)`, `record_outcome(meta, owner
 - Existing adoptions without the new source-identity record may need `agentflare pr adopt` again. Historical dispatches without an attempt snapshot remain charged; no speculative refunds.
 - The expanded supervisor suite passed all 208 tests. The affected-module run passed 221 checks and exposed one discovery owner-seam regression, which was corrected; all 31 discovery/routing checks then passed on the final code.
 - Rustfmt and `git diff --check` passed. The full workspace suite and live cross-instance adoption were not run.
+- Follow-up verification: all 10 `item724` regression tests, `cargo fmt --check`, `git diff --check`, `cargo deny check`, and the exact CI workspace/all-targets/all-features clippy command passed. Removed the needless borrow that failed PR #965's clippy check; GitHub checks for #870 and #965 were inspected.

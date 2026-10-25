@@ -255,7 +255,7 @@ fn item724_fully_reported_noops_do_not_exhaust_the_repair_cap() {
         ));
         let jobs = queue.list(Some(agentflare_jobs::JobState::Queued)).unwrap();
         assert_eq!(jobs.len(), 1);
-        crate::claims::with_owner_override(&format!("claude-code:{}", jobs[0].id), || {
+        crate::claims::with_owner_override(format!("claude-code:{}", jobs[0].id), || {
             mcp.item_review_result(ItemRequest {
                 action: "review_result".into(),
                 id: Some(id.clone()),
