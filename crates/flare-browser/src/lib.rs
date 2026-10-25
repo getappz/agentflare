@@ -274,27 +274,13 @@ pub fn resolve_session(explicit: Option<&str>, cwd: &Path) -> String {
 /// the absolute path `mise which` resolves in `browser_install`.
 pub fn find_backend() -> Result<PathBuf, String> {
     let paths = std::env::var_os("PATH").unwrap_or_default();
-    let mut mise_shim: Option<PathBuf> = None;
     for dir in std::env::split_paths(&paths) {
         if is_mise_shims_dir(&dir) {
-            if cfg!(windows) && mise_shim.is_none() {
-                mise_shim = check_bin_dir(&dir);
-            }
             continue;
         }
         if let Some(p) = check_bin_dir(&dir) {
-            if let Some(shim) = &mise_shim {
-                // Only bypass the active shim for mise's already-activated install paths.
-                let root = shim.parent().and_then(Path::parent);
-                if !root.is_some_and(|root| p.starts_with(root.join("installs"))) {
-                    continue;
-                }
-            }
             return Ok(p);
         }
-    }
-    if let Some(shim) = mise_shim {
-        return Ok(shim);
     }
     if let Some(p) = cargo_bin_candidates().into_iter().find(|p| p.is_file()) {
         return Ok(p);
@@ -322,13 +308,7 @@ fn is_mise_shims_dir(dir: &Path) -> bool {
     })
 }
 
-#[cfg(windows)]
-fn is_mise_shims_dir(dir: &Path) -> bool {
-    std::env::var_os("LOCALAPPDATA")
-        .is_some_and(|root| dir == PathBuf::from(root).join("mise/shims"))
-}
-
-#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn is_mise_shims_dir(_dir: &Path) -> bool {
     false
 }
@@ -582,10 +562,10 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn find_backend_bypasses_mise_only_for_its_activated_install() {
+    fn find_backend_preserves_mise_shim_priority_over_cached_installs() {
         let tmp = tempfile::tempdir().unwrap();
         let shims = tmp.path().join("mise/shims");
-        let activated = tmp.path().join("mise/installs/browser/pinned");
+        let activated = tmp.path().join("mise/installs/browser/cached-version");
         let standalone = tmp.path().join("standalone");
         for dir in [&shims, &activated, &standalone] {
             std::fs::create_dir_all(dir).unwrap();
@@ -604,6 +584,13 @@ mod tests {
         let direct = find_backend();
         unsafe { std::env::set_var("PATH", std::env::join_paths([&shims, &standalone]).unwrap()) };
         let fallback = find_backend();
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                std::env::join_paths([&standalone, &shims, &activated]).unwrap(),
+            )
+        };
+        let standalone_first = find_backend();
         for (key, saved) in [("PATH", saved_path), ("LOCALAPPDATA", saved_local)] {
             unsafe {
                 match saved {
@@ -612,8 +599,9 @@ mod tests {
                 }
             }
         }
-        assert_eq!(direct, Ok(activated.join("agent-browser.exe")));
+        assert_eq!(direct, Ok(shims.join("agent-browser.exe")));
         assert_eq!(fallback, Ok(shims.join("agent-browser.exe")));
+        assert_eq!(standalone_first, Ok(standalone.join("agent-browser.exe")));
     }
 
     #[test]
