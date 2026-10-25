@@ -406,11 +406,13 @@ pub fn build_argv(
 /// set, is the `PATH` `browser_install::ensure_agent_browser` resolved via
 /// `mise env --json` for a mise-installed backend — merged into the child's
 /// env so it sees the same `PATH` mise would activate for it.
+/// CLI callers inherit stdin; MCP callers must use null stdin to protect their protocol stream.
 pub fn run_blocking(
     program: &Path,
     args: &[String],
     secrets: &[String],
     path_env: Option<&str>,
+    stdin: Stdio,
 ) -> Result<String, String> {
     flare_process::prevent_stdio_inheritance()
         .map_err(|e| format!("failed to protect browser caller's stdio: {e}"))?;
@@ -419,7 +421,7 @@ pub fn run_blocking(
     // over the user's desktop when it spawns the sidecar (Windows).
     let mut cmd = flare_process::command(program);
     cmd.args(args)
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(path) = path_env {
@@ -605,6 +607,65 @@ mod tests {
     }
 
     #[test]
+    fn run_blocking_preserves_cli_stdin() {
+        use std::io::Write;
+        let script = format!(
+            "const value = '{}';\nvalue.length;\n",
+            "x".repeat(64 * 1024)
+        );
+        let mut child = flare_process::command(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "tests::sidecar_stdin_wrapper",
+                "--nocapture",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains(&format!("script:{script}")));
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture"]
+    fn sidecar_stdin_wrapper() {
+        let exe = std::env::current_exe().unwrap();
+        let args = [
+            "--ignored".into(),
+            "--exact".into(),
+            "tests::sidecar_read_stdin".into(),
+            "--nocapture".into(),
+        ];
+        let isolated = run_blocking(&exe, &args, &[], None, Stdio::null()).unwrap();
+        assert!(isolated.contains("script-bytes:0\n"));
+        let output = run_blocking(&exe, &args, &[], None, Stdio::inherit()).unwrap();
+        println!("{output}");
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture"]
+    fn sidecar_read_stdin() {
+        let mut script = String::new();
+        std::io::stdin().read_to_string(&mut script).unwrap();
+        println!("script-bytes:{}", script.len());
+        print!("script:{script}");
+    }
+
+    #[test]
     fn run_blocking_returns_when_a_daemon_inherits_the_output_pipes() {
         let started = std::time::Instant::now();
         let output = run_blocking(
@@ -617,6 +678,7 @@ mod tests {
             ],
             &[],
             None,
+            Stdio::null(),
         )
         .unwrap();
         assert!(output.contains("sidecar-ready"), "{output}");
@@ -678,6 +740,7 @@ mod tests {
             ],
             &[],
             None,
+            Stdio::null(),
         )
         .unwrap();
         #[cfg(windows)]
@@ -736,6 +799,7 @@ mod tests {
             ],
             &[],
             None,
+            Stdio::null(),
         )
         .unwrap();
         assert!(output.len() <= STREAM_READ_CAP_BYTES);
@@ -763,6 +827,7 @@ mod tests {
             ],
             &["stderr-secret".into()],
             None,
+            Stdio::null(),
         )
         .unwrap_err();
         assert!(error.contains("status 7"), "{error}");

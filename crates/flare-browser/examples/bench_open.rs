@@ -12,7 +12,7 @@ fn main() -> Result<(), String> {
     let session = format!("af-bench-{}", std::process::id());
     let run = |action: &str, args: &[String]| {
         let argv = flare_browser::build_argv(&session, action, args, &[])?;
-        flare_browser::run_blocking(&backend, &argv, &[], None)
+        flare_browser::run_blocking(&backend, &argv, &[], None, std::process::Stdio::null())
     };
     let result = (|| -> Result<(), String> {
         println!("phase,run,elapsed_ms");
