@@ -78,6 +78,7 @@ impl AgentflareMcp {
             .map(|t| t.trim().chars().take(300).collect::<String>())
             .filter(|t| !t.is_empty());
         let now = crate::claims::now();
+        let owner = crate::claims::owner_id();
         self.with_backend_db(|conn| {
             let id = self.resolve_item_id(conn, &raw)?;
             let mut round = 0;
@@ -94,6 +95,9 @@ impl AgentflareMcp {
                         test: test.clone(),
                     },
                     now,
+                );
+                crate::supervisor::review_attempts::record_outcome(
+                    meta, &owner, &thread_id, round, outcome,
                 );
             })
             .map_err(map_backend_err)?;
@@ -161,6 +165,81 @@ mod tests {
             outcome: Some(outcome.into()),
             ..Default::default()
         }
+    }
+
+    fn item724_attempt(mcp: &AgentflareMcp) -> String {
+        let id = seeded(mcp);
+        mcp.with_backend_db(|conn| {
+            merge_item_metadata(conn, &id, |meta| {
+                crate::supervisor::review_findings::set_thread_round(meta, "PRRT_2", 2);
+                meta.insert(
+                    "coderabbit_repair_attempt".into(),
+                    serde_json::json!({
+                        "job_id": "repair-job", "threads": {"PRRT_1": 2, "PRRT_2": 2},
+                        "outcomes": {}, "credited": false
+                    }),
+                );
+            })
+            .unwrap();
+        })
+        .unwrap();
+        id
+    }
+
+    fn item724_credits(mcp: &AgentflareMcp, id: &str) -> u64 {
+        mcp.with_backend_db(|conn| {
+            let item = agentflare_backend::item::get(conn, id).unwrap();
+            metadata_object(&item.metadata)
+                .get("coderabbit_repair_noop_credits")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn item724_noop_batch_is_credited_once_and_a_corrected_fix_reverses_credit() {
+        let mcp = AgentflareMcp::for_test_memory();
+        let id = item724_attempt(&mcp);
+        crate::claims::with_owner_override("codex:repair-job", || {
+            let mut first = req(&id, "PRRT_1", "out_of_scope");
+            first.note = Some("path is outside the PR diff".into());
+            mcp.item_review_result(first).unwrap();
+            assert_eq!(
+                item724_credits(&mcp, &id),
+                0,
+                "partial results must stay charged"
+            );
+            for _ in 0..2 {
+                let mut second = req(&id, "PRRT_2", "skipped");
+                second.note = Some("optional finding; no change made".into());
+                mcp.item_review_result(second).unwrap();
+                assert_eq!(item724_credits(&mcp, &id), 1);
+            }
+            let mut corrected = req(&id, "PRRT_2", "fixed");
+            corrected.sha = Some("abcdef1234567".into());
+            corrected.note = Some("a fix was made after all".into());
+            mcp.item_review_result(corrected).unwrap();
+            assert_eq!(
+                item724_credits(&mcp, &id),
+                0,
+                "mixed/fixed batches remain charged"
+            );
+        });
+    }
+
+    #[test]
+    fn item724_stale_dispatch_owner_cannot_credit_the_current_attempt() {
+        let mcp = AgentflareMcp::for_test_memory();
+        let id = item724_attempt(&mcp);
+        crate::claims::with_owner_override("codex:old-job", || {
+            for thread in ["PRRT_1", "PRRT_2"] {
+                let mut result = req(&id, thread, "out_of_scope");
+                result.note = Some("old dispatch report".into());
+                mcp.item_review_result(result).unwrap();
+            }
+        });
+        assert_eq!(item724_credits(&mcp, &id), 0);
     }
 
     #[test]

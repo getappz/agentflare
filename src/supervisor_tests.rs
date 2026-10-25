@@ -1910,6 +1910,7 @@ pub(crate) fn coderabbit_finding(id: u64, login: &str) -> BotFinding {
         path: "src/lib.rs".to_string(),
         line: Some(42),
         is_outdated: false,
+        outside_diff: false,
         parsed: parse_finding_body(&body),
         body,
         status: ThreadStatus::Actionable { next_round: 1 },

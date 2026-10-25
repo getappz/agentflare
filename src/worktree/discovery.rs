@@ -362,6 +362,9 @@ pub(crate) fn discover_untracked_prs_with_clock(
         // The stamp is only a "this one is ours" marker; the branch
         // ownership check below is what decides where it goes.
         if let Some(owning) = item_owning_branch(&items, &branch, local_branch) {
+            if super::review_identity::pr_item_mismatch_for_instance(owning, &pr, owner).is_some() {
+                continue;
+            }
             attach_pr_to_item(conn, owning, pr.number, &branch);
             stamp_pr(client, repo, &pr, owning, &branch);
             continue;
@@ -420,6 +423,10 @@ pub(crate) fn discover_untracked_prs_with_clock(
 }
 
 #[cfg(test)]
+#[path = "tests/discovery_identity_tests.rs"]
+mod identity_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -449,7 +456,9 @@ mod tests {
         }
     }
 
-    fn test_project_with_in_review_state(conn: &rusqlite::Connection) -> (String, String) {
+    pub(super) fn test_project_with_in_review_state(
+        conn: &rusqlite::Connection,
+    ) -> (String, String) {
         let ws = agentflare_backend::workspace::create(
             conn,
             agentflare_backend::workspace::CreateWorkspace {
@@ -875,7 +884,7 @@ mod tests {
         );
     }
 
-    fn create_owner_item(
+    pub(super) fn create_owner_item(
         conn: &rusqlite::Connection,
         project_id: &str,
         state_id: &str,

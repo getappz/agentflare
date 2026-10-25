@@ -2135,6 +2135,7 @@ mod merge;
 pub(crate) use merge::*;
 mod auto_merge;
 use auto_merge::*;
+pub(crate) mod review_attempts;
 pub(crate) mod review_bots;
 pub(crate) mod review_findings;
 use review_bots::*;
@@ -2571,6 +2572,10 @@ mod review_bots_tests;
 #[cfg(test)]
 #[path = "supervisor/tests/review_bots_out_of_scope_tests.rs"]
 mod review_bots_out_of_scope_tests;
+
+#[cfg(test)]
+#[path = "supervisor/tests/review_routing_tests.rs"]
+mod review_routing_tests;
 
 #[cfg(test)]
 #[path = "supervisor_self_repair_tests.rs"]
