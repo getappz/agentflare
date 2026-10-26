@@ -52,7 +52,9 @@ pub(super) fn pr_item_mismatch_for_instance(
     } else if let Some(origin) = pulls::origin_of(body) {
         (origin.item != expected_id || expected_seq.is_some_and(|seq| origin.seq != seq))
             .then_some("PR origin names a different item")
-    } else if body.is_some_and(|b| b.contains(&pulls::item_id_tag(expected_id)))
+    } else if (meta["pr"]["number"].as_u64() == Some(pr.number)
+        && meta["pr"]["identity_validated"].as_bool() == Some(true))
+        || body.is_some_and(|b| b.contains(&pulls::item_id_tag(expected_id)))
         || (branch == flare_git_core::worktree::task_branch_name(item)
             && branch != format!("task/{}", item.sequence_id))
         || (super::item_owns_branch(item, branch) && title_key(&pr.title) == title_key(&item.name))
@@ -77,14 +79,16 @@ pub(crate) fn record_adopted_identity(
         .as_ref()
         .map(|o| o.item.as_str())
         .or_else(|| pulls::item_id_of(pr.body.as_deref()));
-    if let Some(id) = id
-        && let Some(record) = meta.get_mut("pr").and_then(|v| v.as_object_mut())
+    if let Some(record) = meta.get_mut("pr").and_then(|v| v.as_object_mut())
         && record.get("number").and_then(|v| v.as_u64()) == Some(pr.number)
     {
-        record.insert(
-            "adopted_identity".into(),
-            serde_json::json!({"item": id, "seq": origin.as_ref().map(|o| o.seq)}),
-        );
+        record.insert("identity_validated".into(), true.into());
+        if let Some(id) = id {
+            record.insert(
+                "adopted_identity".into(),
+                serde_json::json!({"item": id, "seq": origin.as_ref().map(|o| o.seq)}),
+            );
+        }
     }
 }
 

@@ -32,6 +32,7 @@ fn item_owning_branch<'a>(
 
 /// Records `number`/`branch` as `item`'s PR when it has none yet, so the next
 /// sweep tracks it by number like any PR opened through `item done`.
+/// The caller must validate the PR's task identity before attaching it.
 fn attach_pr_to_item(
     conn: &rusqlite::Connection,
     item: &agentflare_backend::item::Item,
@@ -44,7 +45,7 @@ fn attach_pr_to_item(
     let result = crate::mcp_server::merge_item_metadata(conn, &item.id, |map| {
         map.insert(
             "pr".into(),
-            serde_json::json!({"number": number, "branch": branch}),
+            serde_json::json!({"number": number, "branch": branch, "identity_validated": true}),
         );
     });
     if let Err(e) = result {
@@ -203,7 +204,9 @@ pub(crate) fn create_tracking_item(
         .body
         .clone()
         .unwrap_or_else(|| format!("Auto-tracked PR: {}", pr.html_url));
-    let metadata = serde_json::json!({"pr": {"number": pr.number, "branch": branch}});
+    let metadata = serde_json::json!({"pr": {
+        "number": pr.number, "branch": branch, "identity_validated": true
+    }});
     let input = agentflare_backend::item::CreateItem {
         project_id: project_id.to_string(),
         state_id: in_review_state_id.to_string(),

@@ -250,6 +250,7 @@ fn item724_fully_reported_noops_do_not_exhaust_the_repair_cap() {
                 &[],
                 &labels,
                 "/repo",
+                None,
             ),
             SelfRepairOutcome::Dispatched
         ));
