@@ -28,8 +28,7 @@ pub(crate) use super::review_findings::*;
 /// Marker prefix on a review-repair-dispatch comment -- counted the same
 /// way `CI_SELF_REPAIR_MARKER` is, against the same
 /// `quota::decide::SELF_REPAIR_CAP`, so a PR a bot keeps flagging doesn't
-/// retry-dispatch forever either. The wording predates configurable bots
-/// and stays: it is what earlier dispatches on live items already carry.
+/// retry-dispatch forever. Keep the marker compatible with earlier live dispatches.
 pub(super) const CODERABBIT_REPAIR_MARKER: &str =
     "## supervisor — CodeRabbit review repair dispatched";
 
@@ -435,18 +434,13 @@ pub(super) fn validated_review_bot_state(
     if gate_review_identity(mcp, input.item, &pr, input.label_id_by_name) {
         return ReviewBotState::unknown();
     }
-    let number = input.number;
-    let mut state = sweep_review_threads(client, repo, mcp, queue, cfg, input);
-    if !state.to_dispatch.is_empty() {
-        let Ok(files) = crate::github::pulls::list_files(client, repo, number) else {
-            return ReviewBotState::unknown();
-        };
-        if pr.changed_files.is_some_and(|n| n != files.len() as u64) {
-            return ReviewBotState::unknown();
-        }
-        mark_finding_scope(&mut state.to_dispatch, &files);
+    let Ok(files) = crate::github::pulls::list_files(client, repo, input.number) else {
+        return ReviewBotState::unknown();
+    };
+    if pr.changed_files.is_some_and(|n| n != files.len() as u64) {
+        return ReviewBotState::unknown();
     }
-    state
+    sweep_review_threads(client, repo, mcp, queue, cfg, input, &files)
 }
 
 pub(super) fn gate_review_identity(
@@ -509,7 +503,8 @@ fn update_metadata(
 }
 
 /// One sweep of `input.number`'s bot threads (see the module doc). Takes the
-/// client so tests can point it at a mock server.
+/// client so tests can point it at a mock server. `files` must be validated
+/// against the live PR before any stored result is applied.
 pub(crate) fn sweep_review_threads(
     client: &Client,
     repo: &RepoId,
@@ -517,6 +512,7 @@ pub(crate) fn sweep_review_threads(
     queue: &agentflare_jobs::Queue,
     cfg: &ReviewBotConfig,
     input: ReviewSweepInput<'_>,
+    files: &[crate::github::models::PullRequestFile],
 ) -> ReviewBotState {
     let item = input.item;
     let mut state = ReviewBotState::default();
@@ -534,8 +530,53 @@ pub(crate) fn sweep_review_threads(
     };
     let by_id: std::collections::HashMap<&str, &ReviewThread> =
         threads.iter().map(|t| (t.id.as_str(), t)).collect();
-    let meta = current_metadata(mcp, item);
-    let findings = classify_threads(&threads, cfg, &meta);
+    let mut meta = current_metadata(mcp, item);
+    let mut findings = classify_threads(&threads, cfg, &meta);
+    mark_finding_scope(&mut findings, files);
+    for f in findings.iter_mut().filter(|f| !f.outside_diff) {
+        // A later commit can bring a previously foreign path into this PR.
+        let marker = by_id
+            .get(f.thread_id.as_str())
+            .and_then(|t| {
+                t.comments.iter().rev().find_map(|c| {
+                    ReplyMarker::parse(&c.body).filter(|m| marker_trusted(m, &t.id, &meta))
+                })
+            })
+            .filter(|m| m.outcome == ReviewOutcome::OutOfScope);
+        if !f.actionable()
+            && let Some(marker) = &marker
+        {
+            f.status = ThreadStatus::Actionable {
+                next_round: marker.round.saturating_add(1),
+            };
+        }
+        let stale_scope = |m: &serde_json::Map<String, serde_json::Value>| {
+            thread_result(m, &f.thread_id).is_some_and(|r| {
+                r.outcome == ReviewOutcome::OutOfScope && r.round.max(1) <= f.round()
+            })
+        };
+        if stale_scope(&meta) {
+            update_metadata(mcp, &item.id, |m| {
+                if stale_scope(m) {
+                    // Keep a posted reply trusted when its pending result is the only proof.
+                    if let Some(marker) = &marker {
+                        let replied = thread_record(m, &f.thread_id)
+                            .replied_round
+                            .max(marker.round);
+                        set_thread_replied(m, &f.thread_id, replied);
+                    }
+                    remove_thread_result(m, &f.thread_id);
+                }
+            });
+            if let Some(marker) = marker {
+                let replied = thread_record(&meta, &f.thread_id)
+                    .replied_round
+                    .max(marker.round);
+                set_thread_replied(&mut meta, &f.thread_id, replied);
+            }
+            remove_thread_result(&mut meta, &f.thread_id);
+        }
+    }
     let in_flight = job_in_flight(queue, &item.id);
     let mut commits: Option<Vec<String>> = None;
     let mut head_commit_date: Option<Option<String>> = None;

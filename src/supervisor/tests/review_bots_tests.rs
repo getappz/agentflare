@@ -1,8 +1,6 @@
-//! Review-bot thread follow-up (`supervisor::review_bots` /
-//! `review_findings`): thread filtering, finding-body parsing, the
-//! reply-then-resolve order, marker idempotency, round escalation, the
-//! merge gate, and the paused-review nudge. GitHub is a `MockServer`; the
-//! item lives in the test backend.
+//! Review-bot follow-up: filtering, finding parsing, reply/resolve order,
+//! marker idempotency, round escalation, merge gating and paused-review nudges.
+//! Uses a mock GitHub server and the test backend.
 
 use super::tests::{seed_gate_label, seed_in_review_item_with_claim_age, test_mcp, test_queue};
 use super::*;
@@ -611,6 +609,7 @@ pub(super) fn sweep(
             label_id_by_name: &label_id_by_name,
             folder_path: "/repo",
         },
+        &[],
     )
 }
 

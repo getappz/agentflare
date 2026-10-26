@@ -399,3 +399,217 @@ fn item724_scope_fingerprint_survives_long_bodies_and_large_batches() {
     findings.reverse();
     assert_eq!(changed, coderabbit_findings_fingerprint(&findings));
 }
+
+#[test]
+fn item724_rechecks_out_of_scope_results_against_the_current_diff() {
+    use super::review_bots_tests::{record_result, threads_page};
+
+    for disposition in [
+        "pending",
+        "replied",
+        "accepted",
+        "posted",
+        "posted_pushback",
+    ] {
+        for in_diff in [false, true] {
+            let mcp = test_mcp();
+            let queue = test_queue();
+            let id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1900);
+            let labels = seed_gate_label(&mcp);
+            record_result(
+                &mcp,
+                &id,
+                "PRRT_1",
+                &ReviewResult {
+                    round: 1,
+                    outcome: ReviewOutcome::OutOfScope,
+                    sha: None,
+                    note: "path was outside the PR diff".into(),
+                    test: None,
+                },
+            );
+            let mut comments = vec![(
+                11,
+                "coderabbitai[bot]",
+                "🟠 Major\n**Validate input.**".into(),
+            )];
+            if disposition != "pending" {
+                if !disposition.starts_with("posted") {
+                    mcp.with_backend_db(|conn| {
+                        crate::mcp_server::merge_item_metadata(conn, &id, |meta| {
+                            set_thread_replied(meta, "PRRT_1", 1);
+                            remove_thread_result(meta, "PRRT_1");
+                        })
+                        .unwrap();
+                    })
+                    .unwrap();
+                }
+                comments.push((
+                    12,
+                    "agent",
+                    ReplyMarker {
+                        thread: "PRRT_1".into(),
+                        round: 1,
+                        sha: String::new(),
+                        outcome: ReviewOutcome::OutOfScope,
+                    }
+                    .render(),
+                ));
+                if disposition == "accepted" {
+                    comments.push((13, "coderabbitai[bot]", "✅ Thanks, agreed.".into()));
+                } else if disposition == "posted_pushback" {
+                    comments.push((
+                        13,
+                        "coderabbitai[bot]",
+                        "🟠 Major: this still needs fixing.".into(),
+                    ));
+                }
+            }
+            let item = mcp
+                .with_backend_db(|conn| agentflare_backend::item::get(conn, &id).unwrap())
+                .unwrap();
+            let live_pr = serde_json::json!({
+                "number": 870, "html_url": "u", "state": "open", "title": item.name,
+                "head": {"ref": flare_git_core::worktree::task_branch_name(&item)}, "changed_files": 1,
+            }).to_string();
+            let page = threads_page(&[("PRRT_1", false, comments)]);
+            let server = MockServer::start_with(move |req| match req.path.as_str() {
+                "/repos/o/r/pulls/870" => MockResponse::json(200, &live_pr),
+                "/repos/o/r/pulls/870/files?per_page=100&page=1" => MockResponse::json(
+                    200,
+                    if in_diff {
+                        r#"[{"filename":"src/lib.rs"}]"#
+                    } else {
+                        r#"[{"filename":"src/other.rs"}]"#
+                    },
+                ),
+                "/graphql" => MockResponse::json(200, &page),
+                _ => MockResponse::json(201, r#"{"id":99}"#),
+            });
+            let sweep = || {
+                validated_review_bot_state(
+                    &server.client(Some("tok")),
+                    &RepoId {
+                        owner: "o".into(),
+                        repo: "r".into(),
+                    },
+                    &mcp,
+                    &queue,
+                    &ReviewBotConfig::default(),
+                    ReviewSweepInput {
+                        item: &item,
+                        number: 870,
+                        head_sha: None,
+                        labels: &[],
+                        label_id_by_name: &labels,
+                        folder_path: "/repo",
+                    },
+                )
+            };
+            let state = sweep();
+            assert!(!state.unknown, "{disposition}, in_diff={in_diff}");
+            let needs_action = in_diff || disposition == "posted_pushback";
+            assert_eq!(state.blocks_merge(), needs_action, "{disposition}");
+            assert_eq!(state.dispatch_needed(), needs_action, "{disposition}");
+            assert_eq!(
+                state.replied,
+                usize::from(!in_diff && disposition == "pending")
+            );
+            if in_diff {
+                assert!(!state.to_dispatch[0].outside_diff);
+                assert_eq!(
+                    state.to_dispatch[0].round(),
+                    if disposition == "pending" { 1 } else { 2 }
+                );
+                if disposition.starts_with("posted") {
+                    assert_eq!(
+                        sweep().to_dispatch[0].round(),
+                        2,
+                        "posted reply must stay trusted after invalidating its pending result"
+                    );
+                }
+                assert!(
+                    server
+                        .requests()
+                        .iter()
+                        .all(|req| req.method == "GET" || req.path == "/graphql")
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn item724_scope_lookup_failure_preserves_pending_results_without_replying() {
+    use super::review_bots_tests::{record_result, threads_page};
+
+    for status in [200, 403] {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        let id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1900);
+        let labels = seed_gate_label(&mcp);
+        record_result(
+            &mcp,
+            &id,
+            "PRRT_1",
+            &ReviewResult {
+                round: 1,
+                outcome: ReviewOutcome::OutOfScope,
+                sha: None,
+                note: "previously outside the diff".into(),
+                test: None,
+            },
+        );
+        let item = mcp
+            .with_backend_db(|conn| agentflare_backend::item::get(conn, &id).unwrap())
+            .unwrap();
+        let live_pr = serde_json::json!({
+            "number": 870, "html_url": "u", "state": "open", "title": item.name,
+            "head": {"ref": flare_git_core::worktree::task_branch_name(&item)}, "changed_files": 1,
+        })
+        .to_string();
+        let page = threads_page(&[(
+            "PRRT_1",
+            false,
+            vec![(11, "coderabbitai[bot]", "🟠 Major".into())],
+        )]);
+        let server = MockServer::start_with(move |req| match req.path.as_str() {
+            "/repos/o/r/pulls/870" => MockResponse::json(200, &live_pr),
+            "/repos/o/r/pulls/870/files?per_page=100&page=1" => MockResponse::json(status, "[]"),
+            "/graphql" => MockResponse::json(200, &page),
+            _ => MockResponse::json(201, r#"{"id":99}"#),
+        });
+        let state = validated_review_bot_state(
+            &server.client(Some("tok")),
+            &RepoId {
+                owner: "o".into(),
+                repo: "r".into(),
+            },
+            &mcp,
+            &queue,
+            &ReviewBotConfig::default(),
+            ReviewSweepInput {
+                item: &item,
+                number: 870,
+                head_sha: None,
+                labels: &[],
+                label_id_by_name: &labels,
+                folder_path: "/repo",
+            },
+        );
+        assert!(state.unknown);
+        assert!(state.blocks_merge());
+        assert!(!state.dispatch_needed());
+        let current = mcp
+            .with_backend_db(|conn| agentflare_backend::item::get(conn, &id).unwrap())
+            .unwrap();
+        assert!(
+            thread_result(
+                &crate::mcp_server::metadata_object(&current.metadata),
+                "PRRT_1"
+            )
+            .is_some()
+        );
+        assert!(server.requests().iter().all(|req| req.method == "GET"));
+    }
+}
