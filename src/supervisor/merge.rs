@@ -530,6 +530,7 @@ pub(super) fn merge_or_repair_findings(
             labels,
             label_id_by_name,
             folder_path,
+            merge.head_sha(),
         );
         // Only a plain `Skipped` is a lost repair; `Deferred` (cooldown, host
         // pressure, live claim, foreign worktree) is transient and self-clears.
