@@ -45,6 +45,14 @@ The local task covers the basic format/lint/test checks, not every CI gate.
 See the [commands and verification inventory](ARCHITECTURE.md#commands-and-verification-inventory)
 for exact commands, workflow triggers and what has actually been exercised.
 
+CodeQL uses [a repository-owned workflow](.github/workflows/codeql.yml).
+Pushes and PRs containing only Markdown in the listed documentation locations
+skip CodeQL; Markdown under source directories remains eligible for scanning.
+Weekly, manual and merge-queue runs still scan Actions, JavaScript/TypeScript and
+Rust with the default query suite. Rust analysis uses `build-mode: none`, so it
+does not compile the application. GitHub's CodeQL default setup must stay disabled
+because it bypasses these path filters and blocks advanced-workflow uploads.
+
 ## Repo structure
 
 Use the [source-backed architecture guide](ARCHITECTURE.md) for subsystem
