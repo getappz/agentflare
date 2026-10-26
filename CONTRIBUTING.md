@@ -6,7 +6,9 @@ Thanks for your interest in agentflare — contributions are welcome.
 
 ### Prerequisites
 
-- Rust (stable) via [rustup](https://rustup.rs/)
+- Rust via [rustup](https://rustup.rs/); the checkout pins **1.98.0** with
+  clippy/rustfmt in [rust-toolchain.toml](rust-toolchain.toml). The manifest's
+  declared minimum is 1.91; that is distinct from the development pin.
 - Git
 
 ### Setup
@@ -21,7 +23,7 @@ cargo test
 
 ### Quality bar (required)
 
-Run the local gate before pushing — it mirrors CI (`.github/workflows/ci.yml`) exactly:
+Run the local gate before pushing:
 
 ```bash
 mise run verify
@@ -35,12 +37,19 @@ cargo clippy --locked --workspace --all-targets --all-features -- -D warnings -A
 cargo test --workspace
 ```
 
-CI also runs `cargo-deny` (dependency licensing/advisories) and a target-dir guard; those aren't part of the local gate since they need network access or are CI-environment-specific.
+CI uses `cargo nextest run --workspace --verbose` plus
+`cargo test --doc --workspace --verbose` instead of the local `cargo test`
+invocation. It also checks hakari-generated dependencies, runs cargo-deny and
+an ambient target-directory guard; a separate security workflow runs cargo-audit.
+The local task covers the basic format/lint/test checks, not every CI gate.
+See the [commands and verification inventory](ARCHITECTURE.md#commands-and-verification-inventory)
+for exact commands, workflow triggers and what has actually been exercised.
 
 ## Repo structure
 
-Same source of truth as the README's [Architecture](README.md#architecture) section —
-keep the two in sync if you add or move a module.
+Use the [source-backed architecture guide](ARCHITECTURE.md) for subsystem
+boundaries and the README's [Architecture](README.md#architecture) section for
+the compact map. Keep these in sync if you add or move a module.
 
 ```text
 agentflare/
@@ -73,7 +82,8 @@ agentflare/
 │   │   daemon_client.rs                                # daemon lifecycle
 │   ├── cost.rs, pricing.rs                               # cost/pricing tracking
 │   └── mcp_server.rs, mcp_prompts.rs                       # MCP stdio server wiring
-├── crates/                  # 28-member Cargo workspace (flare-code, flare-output,
+├── crates/                  # 32 workspace packages including root + workspace-hack
+│                            # (flare-code, flare-output,
 │                            # agentflare-store, agentflare-backend, gateway-registry,
 │                            # agentflare-bin-lib, ...)
 ├── dashboard/web/           # static frontend served by `agentflare serve`
