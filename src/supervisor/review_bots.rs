@@ -1044,10 +1044,16 @@ pub(super) fn note_review_stall(
     if !notify {
         return;
     }
-    let message = format!(
-        "## supervisor — approved PR stalled on review threads
-
-This PR is approved and CI-green but unresolved review-bot threads have held the merge for {ticks} sweeps with no repair job running. Fix and push (then record the result with `review_result`), or resolve the threads, to unblock it."
+    let why = format!(
+        "This PR is approved and CI-green but unresolved review-bot threads have held the merge for {ticks} sweep(s) with no repair job running."
+    );
+    let message = format_merge_block_comment(
+        &why,
+        &[
+            "Resolve or reply on the open review-bot threads on this PR.",
+            "Push any fixes, then record the outcome with `agentflare item review_result` on the work item.",
+            "Remove `agentflare:needs-human` once threads are cleared so the sweep can merge.",
+        ],
     );
     // Record the notification only once the label landed, so a failed label
     // add is retried next sweep instead of being skipped for good.
@@ -1159,7 +1165,20 @@ pub(super) fn coderabbit_repair_or_gate(
         ensure_needs_human_item_gate(mcp, item, label_id_by_name);
         let pr_gated = labels.iter().any(|l| l == NEEDS_HUMAN_PR_LABEL);
         if pr_gated {
-            // Already announced, or gated for another reason: nothing to add.
+            let cap_message = format_repair_cap_pr_comment(
+                CODERABBIT_REPAIR_CAP_MARKER,
+                &fingerprint,
+                findings.len(),
+                crate::quota::decide::SELF_REPAIR_CAP,
+            );
+            post_pr_merge_block_once(
+                mcp,
+                item,
+                folder_path,
+                pr_number,
+                &format!("repair-cap:{fingerprint}"),
+                &cap_message,
+            );
         } else if coderabbit_cap_announced_for(mcp, item, &fingerprint) {
             // Announced, but the PR is not carrying its stage label (the
             // swap below failed, or it was reverted out-of-band): ensure it
@@ -1172,10 +1191,9 @@ pub(super) fn coderabbit_repair_or_gate(
                 "",
             );
         } else {
-            let cap_message = format!(
-                "{CODERABBIT_REPAIR_CAP_MARKER}\n\nfindings fingerprint: {fingerprint}\n\n\
-                 {} unresolved finding(s) remain. {} automatic repair attempt(s) already made — \
-                 needs a human look.",
+            let cap_message = format_repair_cap_pr_comment(
+                CODERABBIT_REPAIR_CAP_MARKER,
+                &fingerprint,
                 findings.len(),
                 crate::quota::decide::SELF_REPAIR_CAP,
             );
