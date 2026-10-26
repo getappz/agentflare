@@ -21,6 +21,13 @@ pub struct ThreadComment {
     pub created_at: String,
 }
 
+/// Which side of the diff a thread is anchored on (GitHub `diffSide`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffSide {
+    Left,
+    Right,
+}
+
 /// A review thread: one line-anchored conversation on the PR diff.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewThread {
@@ -30,6 +37,8 @@ pub struct ReviewThread {
     pub is_outdated: bool,
     pub path: String,
     pub line: Option<u64>,
+    /// `LEFT` when the comment targets the pre-change side; `RIGHT` for the new side.
+    pub diff_side: DiffSide,
     /// Root comment first, replies after, in creation order.
     pub comments: Vec<ThreadComment>,
 }
@@ -40,7 +49,7 @@ impl ReviewThread {
     }
 }
 
-const THREADS_QUERY: &str = "query($owner:String!,$repo:String!,$number:Int!,$after:String){repository(owner:$owner,name:$repo){pullRequest(number:$number){reviewThreads(first:100,after:$after){pageInfo{hasNextPage endCursor} nodes{id isResolved isOutdated path line comments(first:50){nodes{databaseId author{login} body createdAt}}}}}}}";
+const THREADS_QUERY: &str = "query($owner:String!,$repo:String!,$number:Int!,$after:String){repository(owner:$owner,name:$repo){pullRequest(number:$number){reviewThreads(first:100,after:$after){pageInfo{hasNextPage endCursor} nodes{id isResolved isOutdated path line diffSide comments(first:50){nodes{databaseId author{login} body createdAt}}}}}}}";
 
 /// Every review thread on `number`, following `reviewThreads` pagination
 /// until GitHub reports no further page. Comments per thread are capped at
@@ -102,7 +111,15 @@ fn parse_thread(node: &serde_json::Value) -> ReviewThread {
         is_outdated: node["isOutdated"].as_bool().unwrap_or(false),
         path: node["path"].as_str().unwrap_or("").to_string(),
         line: node["line"].as_u64(),
+        diff_side: parse_diff_side(node["diffSide"].as_str()),
         comments,
+    }
+}
+
+fn parse_diff_side(raw: Option<&str>) -> DiffSide {
+    match raw {
+        Some("LEFT") => DiffSide::Left,
+        _ => DiffSide::Right,
     }
 }
 
@@ -241,7 +258,7 @@ mod tests {
         )
     }
 
-    const ROOT_THREAD: &str = r#"{"id":"PRRT_1","isResolved":false,"isOutdated":false,"path":"src/x.rs","line":42,
+    const ROOT_THREAD: &str = r#"{"id":"PRRT_1","isResolved":false,"isOutdated":false,"path":"src/x.rs","line":42,"diffSide":"RIGHT",
         "comments":{"nodes":[
             {"databaseId":11,"author":{"login":"coderabbitai[bot]"},"body":"finding","createdAt":"2026-09-01T00:00:00Z"},
             {"databaseId":12,"author":{"login":"me"},"body":"reply","createdAt":"2026-09-01T01:00:00Z"}
@@ -249,7 +266,7 @@ mod tests {
 
     #[test]
     fn list_review_threads_follows_pagination_and_parses_every_field() {
-        let page_two = r#"{"id":"PRRT_2","isResolved":true,"isOutdated":true,"path":"src/y.rs","line":null,"comments":{"nodes":[]}}"#;
+        let page_two = r#"{"id":"PRRT_2","isResolved":true,"isOutdated":true,"path":"src/y.rs","line":null,"diffSide":"LEFT","comments":{"nodes":[]}}"#;
         let server = MockServer::start(vec![
             MockResponse::json(200, &thread_page(ROOT_THREAD, true, "cur1")),
             MockResponse::json(200, &thread_page(page_two, false, "cur2")),
@@ -261,11 +278,13 @@ mod tests {
         assert_eq!(first.id, "PRRT_1");
         assert_eq!(first.path, "src/x.rs");
         assert_eq!(first.line, Some(42));
+        assert_eq!(first.diff_side, DiffSide::Right);
         assert!(!first.is_resolved && !first.is_outdated);
         assert_eq!(first.root().unwrap().login, "coderabbitai[bot]");
         assert_eq!(first.comments.last().unwrap().database_id, 12);
         assert!(threads[1].is_resolved && threads[1].is_outdated);
         assert_eq!(threads[1].line, None);
+        assert_eq!(threads[1].diff_side, DiffSide::Left);
 
         let reqs = server.requests();
         assert_eq!(reqs.len(), 2, "one call per page");
