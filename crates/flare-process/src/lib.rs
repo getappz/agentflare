@@ -25,7 +25,35 @@ use std::process::Command;
 
 pub mod agent;
 pub mod cwd;
+mod pipe;
 pub use agent::{agent_name, is_agent};
+pub use pipe::{PipeHandle, available_output_bytes};
+
+/// Keep the caller's original stdio out of redirected children and their daemons.
+/// Explicit `Stdio::inherit()` still works: Rust duplicates those handles for the child.
+pub fn prevent_stdio_inheritance() -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{
+            HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+        };
+        for handle in [
+            std::io::stdin().as_raw_handle(),
+            std::io::stdout().as_raw_handle(),
+            std::io::stderr().as_raw_handle(),
+        ] {
+            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                continue;
+            }
+            // SAFETY: these are live standard handles; this only clears their inheritance flag.
+            if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+    }
+    Ok(())
+}
 
 /// `Command::new(program)` plus `CREATE_NO_WINDOW` on Windows: the child never
 /// allocates a console window of its own. Only fresh console *allocation* is
