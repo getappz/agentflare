@@ -2131,6 +2131,8 @@ fn job_in_flight(queue: &agentflare_jobs::Queue, item_id: &str) -> bool {
 /// keeps working unchanged.
 pub(crate) mod notify;
 pub(crate) use notify::*;
+mod pr_merge_gate;
+use pr_merge_gate::*;
 mod merge;
 pub(crate) use merge::*;
 mod auto_merge;
@@ -2282,7 +2284,35 @@ fn self_repair_or_gate(
     label_id_by_name: &std::collections::HashMap<String, String>,
     folder_path: &str,
 ) -> SelfRepairOutcome {
+    let failing_checks = match trigger {
+        RepairTrigger::FailingChecks(checks) => Some(checks),
+        _ => None,
+    };
+    let ci_repair_nudge = |reason_key: &str, why: &str, actions: &[&str], deferred: bool| {
+        if let Some(checks) = failing_checks {
+            post_ci_self_repair_blocked_pr_comment(
+                mcp,
+                item,
+                folder_path,
+                pr_number,
+                checks,
+                reason_key,
+                why,
+                actions,
+                deferred,
+            );
+        }
+    };
     if already_gated_or_in_flight(mcp, queue, item, label_id_by_name) {
+        ci_repair_nudge(
+            "gated",
+            "the work item is gated (`needs-human-gate` / `needs-manual-dispatch`) or a repair job is already in flight",
+            &[
+                "Clear the dispatch gate label on the item if you want the sweep to retry.",
+                "Wait for the in-flight job to finish, or cancel it before expecting another dispatch.",
+            ],
+            false,
+        );
         return SelfRepairOutcome::Skipped;
     }
 
@@ -2358,6 +2388,12 @@ fn self_repair_or_gate(
     // Item #341: after the cap handling above, so an exhausted item still
     // reaches its human gate while the branch stays occupied.
     if branch_held_by_foreign_worktree(item, folder_path) {
+        ci_repair_nudge(
+            "foreign-worktree",
+            "another worktree holds this PR branch",
+            &["Finish work in the other worktree, or merge from the machine that owns the branch."],
+            true,
+        );
         return SelfRepairOutcome::Deferred;
     }
 
@@ -2385,20 +2421,47 @@ fn self_repair_or_gate(
         .and_then(Result::ok)
         .unwrap_or(false);
     if claim_still_live {
+        ci_repair_nudge(
+            "live-claim",
+            "another agent still holds the item claim",
+            &["Wait for the claim TTL to expire, then the sweep will retry."],
+            true,
+        );
         return SelfRepairOutcome::Deferred;
     }
 
     // Resolved before the claim comment so a skipped repair never leaves a
     // claim marker behind to be re-posted on every TTL expiry.
     let Some(agent) = resolve_repair_agent(queue, item, pr_number) else {
+        ci_repair_nudge(
+            "no-agent",
+            "no autonomous repair agent could be resolved for this item/PR",
+            &[
+                "Use branch `task/<seq>-…`, link the PR with `agentflare pr open --item <seq>`, and assign an autonomous agent on the item.",
+                "Fix failing checks locally and push, or merge manually once green.",
+            ],
+            false,
+        );
         return SelfRepairOutcome::Skipped;
     };
     if crate::auth_db::is_cooling_down(auth_conn, agent.as_str()) {
+        ci_repair_nudge(
+            "agent-cooldown",
+            "the repair agent is in cooldown after a recent failure",
+            &["Wait for cooldown to clear; the sweep will retry automatically."],
+            true,
+        );
         return SelfRepairOutcome::Deferred;
     }
     // Independent of the per-agent cooldown above — the host's own
     // CPU-pressure tier. Both gates must pass.
     if host_policy.blocks_dispatch() {
+        ci_repair_nudge(
+            "cpu-pressure",
+            "host CPU pressure paused autonomous dispatches",
+            &["Wait for load to drop; the sweep will retry when dispatch is allowed again."],
+            true,
+        );
         return SelfRepairOutcome::Deferred;
     }
 
@@ -2420,11 +2483,26 @@ fn self_repair_or_gate(
     if let Some((repo, client)) = repo_and_client
         && !claim_self_repair(&client, &repo, pr_number, &item.id, crate::claims::now())
     {
+        ci_repair_nudge(
+            "pr-claim",
+            "another workstation holds the self-repair claim on this PR",
+            &["Wait for the other instance to finish, or fix CI on the machine that owns the PR."],
+            true,
+        );
         return SelfRepairOutcome::Deferred;
     }
 
     let reason = trigger.dispatch_reason();
     let Some(info) = enqueue_work_job(queue, item, agent, Some(folder_path), Some(&reason)) else {
+        ci_repair_nudge(
+            "enqueue-failed",
+            "the repair job could not be enqueued",
+            &[
+                "Check the agentflare jobs queue / logs on this machine.",
+                "Fix failing checks locally and push.",
+            ],
+            false,
+        );
         return SelfRepairOutcome::Skipped;
     };
     if announced_for.as_deref() == Some(fingerprint.as_str()) {

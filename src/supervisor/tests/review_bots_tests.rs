@@ -7,7 +7,7 @@
 use super::tests::{seed_gate_label, seed_in_review_item_with_claim_age, test_mcp, test_queue};
 use super::*;
 use crate::github::models::{Comment, Review, User};
-use crate::github::review_threads::{CommitStatusDetail, ReviewThread, ThreadComment};
+use crate::github::review_threads::{CommitStatusDetail, DiffSide, ReviewThread, ThreadComment};
 use crate::github::test_support::{MockResponse, MockServer};
 use crate::mcp_server::{merge_item_metadata, metadata_object};
 
@@ -26,7 +26,6 @@ pub(super) fn comment(id: u64, login: &str, body: &str, at: &str) -> ThreadComme
         created_at: at.into(),
     }
 }
-
 pub(super) fn thread(id: &str, resolved: bool, comments: Vec<ThreadComment>) -> ReviewThread {
     ReviewThread {
         id: id.into(),
@@ -34,6 +33,7 @@ pub(super) fn thread(id: &str, resolved: bool, comments: Vec<ThreadComment>) -> 
         is_outdated: false,
         path: "src/lib.rs".into(),
         line: Some(42),
+        diff_side: DiffSide::Right,
         comments,
     }
 }
@@ -1280,6 +1280,7 @@ fn coderabbit_repair_or_gate_records_the_dispatched_round_per_thread() {
         &[],
         &label_id_by_name,
         "/repo",
+        None,
     );
     assert!(matches!(outcome, SelfRepairOutcome::Dispatched));
     let meta = item_meta(&mcp, &item_id);
@@ -1300,7 +1301,6 @@ fn coderabbit_repair_or_gate_records_the_dispatched_round_per_thread() {
     assert!(dispatch.body.contains("round=\"2\""));
     assert!(dispatch.body.contains("action=\"review_result\""));
 }
-
 // --- merge gate ------------------------------------------------------------
 
 #[test]

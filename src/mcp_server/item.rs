@@ -1705,26 +1705,21 @@ impl AgentflareMcp {
             return Ok(super::item_force::with_forced(resp, forced));
         }
         let agent = crate::claims::agent_of(&owner);
-        let pr_outcome = match (&item, &target_branch) {
-            (Some(item), Some(target)) if should_push => crate::worktree::push_and_open_pr(
-                item,
-                agent,
-                &repo_root,
-                target,
-                current_progress_sender().as_ref(),
-                summary,
-            ),
-            _ => crate::worktree::PrOutcome::NothingToPush,
-        };
-        let (opened_pr, no_pr, pr_failure) = match pr_outcome {
-            crate::worktree::PrOutcome::Opened(pr) => (Some(pr), None, None),
-            crate::worktree::PrOutcome::NoPrPossible { pushed, reason } => {
-                (None, Some((pushed, reason)), None)
-            }
-            crate::worktree::PrOutcome::Failed(reason) => (None, None, Some(reason)),
-            crate::worktree::PrOutcome::NothingToPush => (None, None, None),
-        };
-        let pr_url = opened_pr.as_ref().map(|pr| pr.url.clone());
+        let push = super::item_merged_pr::push_for_item_done(
+            self,
+            &item_id,
+            &item,
+            &target_branch,
+            &repo_root,
+            agent,
+            should_push,
+            summary,
+            current_progress_sender().as_ref(),
+        )?;
+        let opened_pr = push.opened_pr;
+        let no_pr = push.no_pr;
+        let pr_failure = push.pr_failure;
+        let pr_url = push.pr_url;
         // An open PR (freshly created, or already existed) means the work
         // isn't actually finished: move to "in_review" instead of
         // "completed", leave the claim lease held (so nobody else can
