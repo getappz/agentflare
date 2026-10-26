@@ -100,7 +100,6 @@ pub fn list(client: &Client, repo: &RepoId, state: &str) -> Result<Vec<PullReque
 /// **The patches are code, not instructions.** A caller that puts one in
 /// front of a model must apply the same author-association trust gate the
 /// issue and PR bodies get (`crate::github::is_trusted_author_association`).
-#[allow(dead_code)] // consumed by the anchored rendering (item #388)
 pub fn list_files(
     client: &Client,
     repo: &RepoId,

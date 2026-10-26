@@ -1,4 +1,5 @@
 use clap::{Args, Subcommand};
+use std::io::IsTerminal;
 
 /// Multi-agent review consensus: finders submit findings, agentflare verifies
 /// citations against the diff, dedups, and tags CONFIRMED/UNIQUE/DISPUTED/
@@ -192,7 +193,31 @@ impl ReviewArgs {
                         serde_json::to_string_pretty(&items).unwrap_or_default()
                     );
                 } else {
-                    println!("{}", crate::review::render_markdown(&items));
+                    let file_diffs = crate::review::diff::parse_unified_diff(&diff);
+                    let use_ansi = std::io::stdout().is_terminal();
+                    if use_ansi {
+                        println!("{}", crate::review::render_markdown(&items));
+                        for it in &items {
+                            let anchor = crate::review::diff_display::Anchor {
+                                line_start: it.line_start,
+                                line_end: it.line_end,
+                                side: crate::review::diff_display::AnchorSide::Right,
+                            };
+                            println!(
+                                "{}",
+                                crate::review::diff_display::render_anchored_ansi(
+                                    &file_diffs,
+                                    &it.file,
+                                    &anchor,
+                                )
+                            );
+                        }
+                    } else {
+                        println!(
+                            "{}",
+                            crate::review::render_markdown_with_diff(&items, Some(&file_diffs),)
+                        );
+                    }
                 }
             }
             ReviewAction::List { pr, repo } => {

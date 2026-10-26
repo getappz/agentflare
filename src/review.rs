@@ -8,6 +8,7 @@ use rusqlite::{Connection, params};
 use std::collections::{HashMap, HashSet};
 
 pub mod diff;
+pub mod diff_display;
 pub mod triage;
 pub mod verify;
 
@@ -436,6 +437,15 @@ fn dedup_preserve(iter: impl Iterator<Item = String>) -> Vec<String> {
 
 /// Renders the ranked items as a markdown review body.
 pub fn render_markdown(items: &[ConsensusItem]) -> String {
+    render_markdown_with_diff(items, None)
+}
+
+/// Like [`render_markdown`], appending an anchored diff hunk per finding when
+/// `files` is set (structured diffs from [`diff_display::file_diffs_from_pull_files`]).
+pub fn render_markdown_with_diff(
+    items: &[ConsensusItem],
+    files: Option<&[diff::FileDiff]>,
+) -> String {
     if items.is_empty() {
         return "No findings submitted.".to_string();
     }
@@ -465,6 +475,21 @@ pub fn render_markdown(items: &[ConsensusItem]) -> String {
         ));
         for m in &it.messages {
             out.push_str(&format!("  - {m}\n"));
+        }
+        if let Some(file_diffs) = files {
+            let anchor = diff_display::Anchor {
+                line_start: it.line_start,
+                line_end: it.line_end,
+                side: diff_display::AnchorSide::Right,
+            };
+            let ctx = diff_display::render_anchored_plain(file_diffs, &it.file, &anchor);
+            out.push_str("  ```\n");
+            for line in ctx.lines() {
+                out.push_str("  ");
+                out.push_str(line);
+                out.push('\n');
+            }
+            out.push_str("  ```\n");
         }
     }
     out
