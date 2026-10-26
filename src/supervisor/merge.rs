@@ -568,16 +568,18 @@ pub(super) fn merge_or_repair_findings(
         // coming; threads merely waiting on the bot or a push are not stalls.
         let held = !review.unknown && review.escalated > 0;
         note_review_stall(mcp, queue, item, number, labels, folder_path, held, false);
-        post_review_threads_hold_pr_comment(
-            mcp,
-            item,
-            folder_path,
-            number,
-            review.blocking,
-            review.escalated,
-            review.waiting_push,
-            review.unknown,
-        );
+        if review.escalated == 0 {
+            post_review_threads_hold_pr_comment(
+                mcp,
+                item,
+                folder_path,
+                number,
+                review.blocking,
+                review.escalated,
+                review.waiting_push,
+                review.unknown,
+            );
+        }
         return PassingPrOutcome::NotMerged;
     }
     note_review_stall(mcp, queue, item, number, labels, folder_path, false, false);

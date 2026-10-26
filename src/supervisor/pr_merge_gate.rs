@@ -245,6 +245,7 @@ pub(super) fn format_repair_cap_pr_comment(
 }
 
 /// PR comment when CI self-repair did not run (skipped or deferred).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn post_ci_self_repair_blocked_pr_comment(
     mcp: &AgentflareMcp,
     item: &Item,

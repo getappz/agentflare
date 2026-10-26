@@ -282,7 +282,7 @@ fn approved_green_pr_stalled_on_threads_is_surfaced_once() {
     assert!(get_meta().contains("review_stall_notified"));
     let cards = take_pr_stage_comments_for_test();
     assert_eq!(cards.len(), 1, "surfaced exactly once: {cards:?}");
-    assert!(cards[0].contains("stalled on review threads"));
+    assert!(cards[0].contains("held the merge for"));
     // Merely waiting on the bot is not a stall.
     let waiting = ReviewBotState {
         blocking: 1,
