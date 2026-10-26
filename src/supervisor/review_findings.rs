@@ -237,6 +237,15 @@ pub(crate) fn parse_finding_body(body: &str) -> ParsedFinding {
         || header_lower.contains("(optional)")
         || header_words.iter().any(|w| w == "nit" || w == "nits");
 
+    // CodeRabbit's bold icon/severity header is metadata, not a title.
+    // Exclude it before truncating so summaries never contain partial HTML.
+    let lines: Vec<_> = lines
+        .into_iter()
+        .filter(|line| {
+            let text = line.trim_start_matches(['*', '_', ' ']);
+            !text.starts_with("<picture") && !text.starts_with("<img")
+        })
+        .collect();
     let title = lines
         .iter()
         .find(|l| l.starts_with("**") && l.len() > 4 && l.ends_with("**"))
@@ -547,9 +556,8 @@ impl BotFinding {
 
     /// One-line summary for the item's dispatch comment.
     pub fn summary_line(&self) -> String {
-        let first = self.body.lines().next().unwrap_or("").trim();
         let title = if self.parsed.title.is_empty() {
-            first
+            "Review finding"
         } else {
             self.parsed.title.as_str()
         };
@@ -973,3 +981,7 @@ pub(crate) fn nudge_posted(comments: &[Comment], head_sha: &str) -> bool {
     let needle = format!("{NUDGE_MARKER_OPEN}{} -->", marker_field(head_sha));
     comments.iter().any(|c| c.body.contains(&needle))
 }
+
+#[cfg(test)]
+#[path = "tests/review_finding_summary_tests.rs"]
+mod summary_tests;
