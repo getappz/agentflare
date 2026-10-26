@@ -22,6 +22,10 @@
 use super::*;
 use crate::github::review_threads::{self, ReviewThread};
 use crate::github::{Client, RepoId};
+use crate::review::diff::FileDiff;
+use crate::review::diff_display::file_diffs_from_pull_files;
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 pub(crate) use super::review_findings::*;
 
@@ -1218,6 +1222,103 @@ pub(super) fn note_review_stall(
     }
 }
 
+/// Commit-pinned file diffs for fix-task dispatch (best-effort; never blocks repair).
+struct FixTaskDiffCache<'a> {
+    client: &'a Client,
+    repo: &'a RepoId,
+    pr_number: u64,
+    head_sha: String,
+    commit_by_root: HashMap<u64, String>,
+    files_by_commit: RefCell<HashMap<String, Vec<FileDiff>>>,
+}
+
+impl<'a> FixTaskDiffCache<'a> {
+    fn new(
+        client: &'a Client,
+        repo: &'a RepoId,
+        pr_number: u64,
+        head_sha: &str,
+        commit_by_root: HashMap<u64, String>,
+    ) -> Self {
+        Self {
+            client,
+            repo,
+            pr_number,
+            head_sha: head_sha.to_string(),
+            commit_by_root,
+            files_by_commit: RefCell::new(HashMap::new()),
+        }
+    }
+
+    fn files_for_commit(&self, commit: &str) -> Option<Vec<FileDiff>> {
+        if let Some(hit) = self.files_by_commit.borrow().get(commit) {
+            return Some(hit.clone());
+        }
+        let pull_files = crate::github::pulls::files_as_of_commit(
+            self.client,
+            self.repo,
+            self.pr_number,
+            commit,
+        )
+        .ok()?;
+        let parsed = file_diffs_from_pull_files(&pull_files);
+        self.files_by_commit
+            .borrow_mut()
+            .insert(commit.to_string(), parsed.clone());
+        Some(parsed)
+    }
+}
+
+impl FixTaskDiffProvider for FixTaskDiffCache<'_> {
+    fn diff_for(&self, finding: &BotFinding) -> FixTaskDiff {
+        fix_task_diff_for_finding(self, finding)
+    }
+}
+
+fn fix_task_diff_for_finding(cache: &FixTaskDiffCache<'_>, f: &BotFinding) -> FixTaskDiff {
+    let line = match f.line {
+        Some(l) if l <= u32::MAX as u64 => l as u32,
+        _ => return FixTaskDiff::Unavailable,
+    };
+    let commit = cache
+        .commit_by_root
+        .get(&f.root_comment_id)
+        .cloned()
+        .filter(|c| !c.is_empty())
+        .or_else(|| {
+            if cache.head_sha.is_empty() {
+                None
+            } else {
+                Some(cache.head_sha.clone())
+            }
+        });
+    let commit = match commit {
+        Some(c) => c,
+        None => return FixTaskDiff::Unavailable,
+    };
+    let files = match cache.files_for_commit(&commit) {
+        Some(files) => files,
+        None => return FixTaskDiff::Unavailable,
+    };
+    fix_task_diff_from_files(&files, &f.path, line, f.diff_side)
+}
+
+fn commit_ids_for_review_roots(
+    client: &Client,
+    repo: &RepoId,
+    pr_number: u64,
+) -> HashMap<u64, String> {
+    crate::github::pulls::list_review_comments(client, repo, pr_number, None)
+        .ok()
+        .map(|comments| {
+            comments
+                .into_iter()
+                .filter_map(|c| c.commit_id.map(|sha| (c.id, sha)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Whether this item's PR was already escalated by `note_review_stall`
 /// (so `handle_ci_green` must leave its needs-human label alone).
 pub(super) fn review_stall_notified(
@@ -1414,8 +1515,8 @@ pub(super) fn coderabbit_repair_or_gate(
     // remote/no credentials proceeds rather than blocking dispatch on it.
     let repo_and_client =
         RepoId::resolve_from_remote(std::path::Path::new(folder_path)).zip(Client::new().ok());
-    if let Some((repo, client)) = repo_and_client
-        && !claim_self_repair(&client, &repo, pr_number, &item.id, crate::claims::now())
+    if let Some((repo, client)) = repo_and_client.as_ref()
+        && !claim_self_repair(client, repo, pr_number, &item.id, crate::claims::now())
     {
         return SelfRepairOutcome::Deferred;
     }
@@ -1485,12 +1586,20 @@ pub(super) fn coderabbit_repair_or_gate(
         None,
     );
     let max_rounds = ReviewBotConfig::load(std::path::Path::new(folder_path)).max_rounds;
-    let task = render_fix_task(
-        &findings.iter().collect::<Vec<_>>(),
-        pr_number,
-        &item.id,
-        max_rounds,
-    );
+    let finding_refs: Vec<&BotFinding> = findings.iter().collect();
+    let task = if let Some((repo, client)) = repo_and_client.as_ref() {
+        let head = head_sha.unwrap_or("");
+        let cache = FixTaskDiffCache::new(
+            client,
+            repo,
+            pr_number,
+            head,
+            commit_ids_for_review_roots(client, repo, pr_number),
+        );
+        render_fix_task_with_diff(&finding_refs, pr_number, &item.id, max_rounds, Some(&cache))
+    } else {
+        render_fix_task(&finding_refs, pr_number, &item.id, max_rounds)
+    };
     // The PR gets the summary; the full task (finding bodies included) is
     // for the agent, on the item.
     let pr_message = format!(
