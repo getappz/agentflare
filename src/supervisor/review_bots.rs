@@ -63,6 +63,13 @@ pub(super) const CODERABBIT_REPAIR_ANNOUNCED_KEY: &str = "coderabbit_repair_anno
 pub(super) const CODERABBIT_REPAIR_SILENT_KEY: &str = "coderabbit_repair_silent_attempts";
 /// Fingerprint whose completion summary was already posted.
 pub(super) const CODERABBIT_REPAIR_COMPLETED_KEY: &str = "coderabbit_repair_completed_for";
+/// PR head sha recorded when a review-repair job was last dispatched — used to
+/// tell a successful run that never moved the remote head from a real fix.
+pub(super) const CODERABBIT_REPAIR_DISPATCH_HEAD_KEY: &str = "coderabbit_repair_dispatched_head";
+/// How many post-dispatch `WORK_SUCCESS` comments already consumed a void-repair
+/// cap slot (one slot per successful job that did not move the remote head).
+pub(super) const CODERABBIT_REPAIR_VOID_SUCCESS_CREDITS_KEY: &str =
+    "coderabbit_repair_void_success_credits";
 
 /// Marker on the item comment recording a thread escalated to a human.
 pub(super) const REVIEW_THREAD_ESCALATED_MARKER: &str = "## supervisor — review thread escalated";
@@ -166,6 +173,94 @@ fn cap_comment_fingerprint(body: &str) -> Option<String> {
         fingerprint.push_str(line);
     }
     Some(fingerprint)
+}
+
+fn record_coderabbit_repair_dispatch_head(mcp: &AgentflareMcp, item_id: &str, head: Option<&str>) {
+    update_metadata(mcp, item_id, |m| {
+        if let Some(h) = head.filter(|h| !h.is_empty()) {
+            m.insert(
+                CODERABBIT_REPAIR_DISPATCH_HEAD_KEY.into(),
+                serde_json::Value::String(h.into()),
+            );
+        } else {
+            m.remove(CODERABBIT_REPAIR_DISPATCH_HEAD_KEY);
+        }
+    });
+}
+
+fn coderabbit_void_success_count_after_dispatch(
+    comments: &[agentflare_backend::comment::ItemComment],
+) -> u32 {
+    let Some(last_dispatch) = comments
+        .iter()
+        .rposition(|c| c.body.starts_with(CODERABBIT_REPAIR_MARKER))
+    else {
+        return 0;
+    };
+    comments[last_dispatch..]
+        .iter()
+        .filter(|c| {
+            c.body
+                .starts_with(crate::dispatch_failure_ceiling::WORK_SUCCESS_MARKER)
+        })
+        .count() as u32
+}
+
+/// A repair job that exited cleanly without pushing a new head or resolving
+/// its threads still burned a cap slot — same as an errored attempt.
+pub(crate) fn maybe_credit_void_coderabbit_repair(
+    mcp: &AgentflareMcp,
+    item: &agentflare_backend::item::Item,
+    head_sha: Option<&str>,
+    in_flight: bool,
+    needs_redispatch: bool,
+    open_findings: &[BotFinding],
+) {
+    if in_flight || !needs_redispatch {
+        return;
+    }
+    let meta = current_metadata(mcp, item);
+    if !meta.contains_key(CODERABBIT_REPAIR_ANNOUNCED_KEY) {
+        return;
+    }
+    let announced = meta
+        .get(CODERABBIT_REPAIR_ANNOUNCED_KEY)
+        .and_then(|v| v.as_str());
+    let current_fp = coderabbit_findings_fingerprint(open_findings);
+    if announced != Some(current_fp.as_str()) {
+        return;
+    }
+    let Some(head) = head_sha.filter(|h| !h.is_empty()) else {
+        return;
+    };
+    if meta
+        .get(CODERABBIT_REPAIR_DISPATCH_HEAD_KEY)
+        .and_then(|v| v.as_str())
+        != Some(head)
+    {
+        return;
+    }
+    let comments = mcp
+        .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &item.id))
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    let success_count = coderabbit_void_success_count_after_dispatch(&comments);
+    let credited = meta
+        .get(CODERABBIT_REPAIR_VOID_SUCCESS_CREDITS_KEY)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as u32;
+    if success_count <= credited {
+        return;
+    }
+    // The dispatch marker already counts this enqueue; do not also bump
+    // silent_attempts or the cap sees two attempts for one job.
+    update_metadata(mcp, &item.id, |m| {
+        m.insert(
+            CODERABBIT_REPAIR_VOID_SUCCESS_CREDITS_KEY.into(),
+            serde_json::Value::from(success_count),
+        );
+    });
 }
 
 fn coderabbit_cap_announced_for(
@@ -549,6 +644,19 @@ pub(crate) fn sweep_review_threads(
     if let Some(head) = input.head_sha {
         nudge_paused_review(client, repo, mcp, item, input.number, head, cfg, &meta);
     }
+    let open_for_void: Vec<BotFinding> = findings
+        .iter()
+        .filter(|f| f.actionable() && f.blocks_merge())
+        .cloned()
+        .collect();
+    maybe_credit_void_coderabbit_repair(
+        mcp,
+        item,
+        input.head_sha,
+        in_flight,
+        state.dispatch_needed(),
+        &open_for_void,
+    );
     state
 }
 
@@ -999,6 +1107,7 @@ pub(super) fn coderabbit_repair_or_gate(
     labels: &[String],
     label_id_by_name: &std::collections::HashMap<String, String>,
     folder_path: &str,
+    head_sha: Option<&str>,
 ) -> SelfRepairOutcome {
     if serde_json::from_str::<serde_json::Value>(&item.metadata)
         .ok()
@@ -1188,6 +1297,7 @@ pub(super) fn coderabbit_repair_or_gate(
     let Some(info) = enqueue_work_job(queue, item, agent, Some(folder_path), Some(&reason)) else {
         return SelfRepairOutcome::Skipped;
     };
+    record_coderabbit_repair_dispatch_head(mcp, &item.id, head_sha);
     // The round each thread is now on, so `review_result` reports and the
     // next sweep's replies line up with this dispatch.
     update_metadata(mcp, &item.id, |m| {
