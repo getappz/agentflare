@@ -176,6 +176,7 @@ pub(super) fn post_github_review_block_pr_comment(
 }
 
 /// PR comment when unresolved review-bot threads hold merge (no repair dispatch this tick).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn post_review_threads_hold_pr_comment(
     mcp: &AgentflareMcp,
     item: &Item,
@@ -241,6 +242,38 @@ pub(super) fn format_repair_cap_pr_comment(
     ];
     let checklist = format_merge_block_comment(&why, &actions);
     format!("{cap_marker}\n\nfindings fingerprint: {fingerprint}\n\n{checklist}")
+}
+
+/// PR comment when CI self-repair did not run (skipped or deferred).
+pub(super) fn post_ci_self_repair_blocked_pr_comment(
+    mcp: &AgentflareMcp,
+    item: &Item,
+    folder_path: &str,
+    pr_number: u64,
+    failing_checks: &[String],
+    reason_key: &str,
+    why: &str,
+    actions: &[&str],
+    deferred: bool,
+) {
+    let checks = if failing_checks.is_empty() {
+        "(unknown)".to_string()
+    } else {
+        failing_checks.join(", ")
+    };
+    let lead = if deferred {
+        "CI self-repair is **deferred** this sweep"
+    } else {
+        "CI self-repair was **not dispatched**"
+    };
+    let full_why = format!(
+        "{lead}: {why}
+
+Failing checks: `{checks}`."
+    );
+    let fingerprint = format!("ci-repair-{reason_key}");
+    let body = format_merge_block_comment(&full_why, actions);
+    post_pr_merge_block_once(mcp, item, folder_path, pr_number, &fingerprint, &body);
 }
 
 #[cfg(test)]
