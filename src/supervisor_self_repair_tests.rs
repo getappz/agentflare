@@ -634,6 +634,7 @@ fn coderabbit_cap_and_ci_green_do_not_flip_flop_across_sweeps() {
             &[],
             &label_id_by_name,
             "/repo",
+            None,
         );
         assert!(matches!(outcome, SelfRepairOutcome::Skipped));
 
@@ -704,6 +705,7 @@ fn coderabbit_cap_and_ci_green_do_not_flip_flop_across_sweeps() {
                 },
                 &ungated,
                 "/repo",
+                None,
             );
             assert!(matches!(outcome, SelfRepairOutcome::Skipped));
         }
@@ -802,6 +804,7 @@ fn coderabbit_capped_unresolved_when_new_cap_fingerprint_differs_from_completed(
             &[],
             &seed_gate_label(&mcp),
             "/repo",
+            None,
         );
         assert!(matches!(outcome, SelfRepairOutcome::Skipped));
         let item = current_item(&mcp, &item_id);
@@ -884,6 +887,7 @@ fn coderabbit_cap_announced_requires_exact_fingerprint_not_substring() {
             &[],
             &label_id_by_name,
             "/repo",
+            None,
         );
         assert!(matches!(outcome, SelfRepairOutcome::Skipped));
 
@@ -1086,6 +1090,7 @@ fn unresolvable_agent_skips_without_a_claim_comment_or_job() {
             &[],
             &label_id_by_name,
             "/repo",
+            None,
         );
         TEST_FALLBACK_AGENT.with(|c| c.set(None));
         assert!(matches!(outcome, SelfRepairOutcome::Skipped));

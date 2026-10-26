@@ -1280,6 +1280,7 @@ fn coderabbit_repair_or_gate_records_the_dispatched_round_per_thread() {
         &[],
         &label_id_by_name,
         "/repo",
+        None,
     );
     assert!(matches!(outcome, SelfRepairOutcome::Dispatched));
     let meta = item_meta(&mcp, &item_id);
@@ -1300,7 +1301,6 @@ fn coderabbit_repair_or_gate_records_the_dispatched_round_per_thread() {
     assert!(dispatch.body.contains("round=\"2\""));
     assert!(dispatch.body.contains("action=\"review_result\""));
 }
-
 // --- merge gate ------------------------------------------------------------
 
 #[test]
