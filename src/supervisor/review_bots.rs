@@ -1319,6 +1319,10 @@ fn commit_ids_for_review_roots(
         .unwrap_or_default()
 }
 
+#[cfg(test)]
+#[path = "tests/fix_task_diff_cache_tests.rs"]
+mod fix_task_diff_cache_tests;
+
 /// Whether this item's PR was already escalated by `note_review_stall`
 /// (so `handle_ci_green` must leave its needs-human label alone).
 pub(super) fn review_stall_notified(
