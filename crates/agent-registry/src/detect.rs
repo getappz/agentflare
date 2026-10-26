@@ -33,16 +33,16 @@ pub fn find_binary(names: &[&str]) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
         for name in names {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
             #[cfg(windows)]
             for ext in [".exe", ".cmd", ".bat"] {
                 let candidate = dir.join(format!("{name}{ext}"));
                 if candidate.is_file() {
                     return Some(candidate);
                 }
+            }
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
             }
         }
     }
@@ -56,6 +56,16 @@ mod find_binary_tests {
     // PATH is process-global — serialize every test that mutates it against
     // the single shared `super::PATH_LOCK`, same pattern as
     // paths::test_support::GLOBAL_STATE_LOCK.
+
+    #[cfg(windows)]
+    #[test]
+    fn prefers_windows_launcher_to_extensionless_npm_shell_script() {
+        with_temp_path_dir(|dir| {
+            std::fs::write(dir.join("claude"), "#!/bin/sh\n").unwrap();
+            std::fs::write(dir.join("claude.cmd"), "@exit /b 0\r\n").unwrap();
+            assert_eq!(find_binary(&["claude"]), Some(dir.join("claude.cmd")));
+        });
+    }
 
     fn with_temp_path_dir(f: impl FnOnce(&Path)) {
         let _guard = super::PATH_LOCK
