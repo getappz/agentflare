@@ -490,3 +490,29 @@ fn item_done_errors_when_the_worktree_is_gone_but_the_branch_has_commits() {
     );
     assert_ne!(state_group(&s, &item_id), "completed");
 }
+
+// Item #407: a session that does not own the claim must never get a silent
+// no-op from `done` (finalize reads that as success). Another session's live
+// claim is an identity conflict: hard error, item untouched.
+#[test]
+fn item_done_errors_when_another_session_holds_a_live_claim() {
+    let missing = tempfile::tempdir().unwrap().path().join("gone.git");
+    let (_tmp, _repo_dir, _repo_root, s) = repo_with_origin(Some(&missing));
+    let item_id = claim_and_write_work(&s, "Test");
+
+    let err = crate::claims::with_owner_override("agent:other", || {
+        s.item(Parameters(ItemRequest {
+            action: "done".into(),
+            id: Some(item_id.clone()),
+            ..Default::default()
+        }))
+    })
+    .unwrap_err();
+
+    assert!(
+        err.message.contains("someone else's live claim"),
+        "{}",
+        err.message
+    );
+    assert_ne!(state_group(&s, &item_id), "completed");
+}
