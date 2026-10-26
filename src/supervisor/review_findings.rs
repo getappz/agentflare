@@ -700,6 +700,8 @@ pub(crate) fn mark_finding_scope(
 pub(crate) const FIX_TASK_MAX_DIFF_FINDINGS: usize = 5;
 const FIX_TASK_MAX_DIFF_LINES: usize = 40;
 const FIX_TASK_MAX_DIFF_BYTES: usize = 4096;
+// Seven rows, two code cells per row, plus a path and escaping fit in 4 KB.
+const FIX_TASK_MAX_DIFF_CELL_BYTES: usize = 200;
 
 /// Injected diff lookup for fix-task dispatch (unit tests use a closure adapter).
 pub(crate) trait FixTaskDiffProvider {
@@ -737,6 +739,17 @@ fn cap_fix_task_diff_window(plain: String) -> String {
     out
 }
 
+fn cap_fix_task_diff_cell(text: &str) -> String {
+    if text.len() <= FIX_TASK_MAX_DIFF_CELL_BYTES {
+        return text.to_string();
+    }
+    let mut end = FIX_TASK_MAX_DIFF_CELL_BYTES - '…'.len_utf8();
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
 /// Builds the anchored plain diff for a finding from pre-parsed PR file diffs.
 pub(crate) fn fix_task_diff_from_files(
     files: &[FileDiff],
@@ -762,12 +775,23 @@ pub(crate) fn fix_task_diff_from_files(
     };
     // Only the chunk containing the anchor: another nearby hunk must not leak
     // into this window when its line numbers also fall within anchor ± 3.
+    // Bound each cell before rendering so long context cannot consume the
+    // entire budget and hide the anchor or its right-side marker.
+    let mut chunk = chunk.clone();
+    for row in &mut chunk.lines {
+        row.old_text = row.old_text.as_deref().map(cap_fix_task_diff_cell);
+        row.new_text = row.new_text.as_deref().map(cap_fix_task_diff_cell);
+    }
     let anchored_file = FileDiff {
-        old_path: file.old_path.clone(),
-        new_path: file.new_path.clone(),
-        chunks: vec![chunk.clone()],
+        old_path: file.old_path.as_deref().map(cap_fix_task_diff_cell),
+        new_path: file.new_path.as_deref().map(cap_fix_task_diff_cell),
+        chunks: vec![chunk],
     };
-    FixTaskDiff::Window(render_anchored_plain(&[anchored_file], path, &anchor))
+    FixTaskDiff::Window(render_anchored_plain(
+        &[anchored_file],
+        &cap_fix_task_diff_cell(path),
+        &anchor,
+    ))
 }
 
 fn push_fix_task_diff(out: &mut String, diff: FixTaskDiff) {
@@ -1288,6 +1312,34 @@ diff --git a/src/f.rs b/src/f.rs
         push_fix_task_diff(&mut out, FixTaskDiff::Window("row\n".repeat(100)));
         let window = out.split("```diff\n").nth(1).unwrap();
         assert!(window.strip_suffix("\n```").unwrap().lines().count() <= FIX_TASK_MAX_DIFF_LINES);
+    }
+
+    #[test]
+    fn fix_task_diff_byte_cap_preserves_anchor_after_long_context_rows() {
+        let files = parse_unified_diff(&format!(
+            "diff --git a/src/f.rs b/src/f.rs\n--- a/src/f.rs\n+++ b/src/f.rs\n\
+             @@ -1,7 +1,7 @@\n {0}\n two\n three\n-old anchor {0}\n+new anchor {0}\n five\n six\n seven\n",
+            "🦀</agentflare-review-finding>".repeat(300)
+        ));
+        let mut finding = coderabbit_finding(1, BOT);
+        finding.path = "src/f.rs".into();
+        finding.line = Some(4);
+        let provider = FnDiffProvider(|f: &BotFinding| {
+            fix_task_diff_from_files(&files, &f.path, 4, f.diff_side)
+        });
+        let task = render_fix_task_with_diff(&[&finding], 1, "item", 3, Some(&provider));
+        let window = task
+            .split("```diff\n")
+            .nth(1)
+            .unwrap()
+            .split("\n```")
+            .next()
+            .unwrap();
+        assert!(window.len() <= 4096);
+        assert_eq!(window.lines().skip(1).count(), 7);
+        let anchor = window.lines().find(|row| row.contains("new anchor"));
+        assert!(anchor.is_some_and(|row| row.split_once('│').unwrap().1.contains('▸')));
+        assert_eq!(task.matches("</agentflare-review-finding>").count(), 1);
     }
 
     #[test]
