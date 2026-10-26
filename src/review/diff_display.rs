@@ -37,7 +37,7 @@ impl Anchor {
 /// Visible line range around an anchor (not yet clipped to a hunk).
 pub fn view_window(anchor: &Anchor) -> (u32, u32) {
     let start = anchor.line_start.saturating_sub(MAX_ADDED_VIEW_LINES);
-    let end = anchor.line_end + MAX_ADDED_VIEW_LINES;
+    let end = anchor.line_end.saturating_add(MAX_ADDED_VIEW_LINES);
     (start, end)
 }
 
@@ -304,7 +304,13 @@ fn push_ansi_span(out: &mut String, style: &AnsiStyle, text: &str) {
     if style.bold {
         out.push_str("\x1b[1m");
     }
-    out.push_str(text);
+    out.extend(text.chars().map(|c| {
+        if c.is_control() && c != '\t' {
+            '\u{fffd}'
+        } else {
+            c
+        }
+    }));
     out.push_str("\x1b[0m");
 }
 
@@ -340,12 +346,7 @@ fn clip_window_to_chunk(
     let mut chunk_lo = u32::MAX;
     let mut chunk_hi = 0u32;
     for line in &chunk.lines {
-        let n = anchor_line_number(line, anchor.side, false);
-        if let Some(n) = n {
-            chunk_lo = chunk_lo.min(n);
-            chunk_hi = chunk_hi.max(n);
-        }
-        if let Some(n) = line.new_line {
+        if let Some(n) = anchor_line_number(line, anchor.side) {
             chunk_lo = chunk_lo.min(n);
             chunk_hi = chunk_hi.max(n);
         }
@@ -364,12 +365,9 @@ fn rows_for_chunk(
     clip_start: u32,
     clip_end: u32,
 ) -> Vec<DisplayRow> {
-    let before_len = chunk.before_context().len();
-    let after_start = chunk.lines.len() - chunk.after_context().len();
     let mut rows = Vec::new();
-    for (i, line) in chunk.lines.iter().enumerate() {
-        let in_context = i < before_len || i >= after_start;
-        if !line_in_window(line, anchor, clip_start, clip_end, in_context) {
+    for line in &chunk.lines {
+        if !line_in_window(line, anchor, clip_start, clip_end) {
             continue;
         }
         rows.push(display_row_for_line(line, anchor));
@@ -377,25 +375,14 @@ fn rows_for_chunk(
     rows
 }
 
-fn line_in_window(
-    line: &DiffLine,
-    anchor: &Anchor,
-    view_start: u32,
-    view_end: u32,
-    in_context_run: bool,
-) -> bool {
-    let n = if in_context_run {
-        line.new_line.unwrap_or(0)
-    } else {
-        anchor_line_number(line, anchor.side, false).unwrap_or(0)
-    };
-    if n == 0 {
+fn line_in_window(line: &DiffLine, anchor: &Anchor, view_start: u32, view_end: u32) -> bool {
+    let Some(n) = anchor_line_number(line, anchor.side) else {
         return false;
-    }
+    };
     n >= view_start && n <= view_end
 }
 
-fn anchor_line_number(line: &DiffLine, side: AnchorSide, _in_context: bool) -> Option<u32> {
+fn anchor_line_number(line: &DiffLine, side: AnchorSide) -> Option<u32> {
     match side {
         AnchorSide::Left => line.old_line,
         AnchorSide::Right => line.new_line,
@@ -570,6 +557,75 @@ diff --git a/src/f.rs b/src/f.rs
                 panic!("span missing foreground: {chunk:?}");
             }
         }
+    }
+
+    #[test]
+    fn view_window_saturates_instead_of_overflowing_at_u32_max() {
+        let anchor = Anchor::single_line(u32::MAX, AnchorSide::Right);
+        assert_eq!(
+            view_window(&anchor),
+            (u32::MAX - MAX_ADDED_VIEW_LINES, u32::MAX)
+        );
+    }
+
+    #[test]
+    fn ansi_output_replaces_control_characters_from_patch_text() {
+        let diff = files(
+            "diff --git a/src/f.rs b/src/f.rs\n--- a/src/f.rs\n+++ b/src/f.rs\n@@ -1,1 +1,1 @@\n-a\n+b\u{1b}[2J\n",
+        );
+        let anchor = Anchor::single_line(1, AnchorSide::Right);
+        let ansi = render_anchored_ansi(&diff, "src/f.rs", &anchor);
+        assert!(
+            !ansi.contains("\u{1b}[2J"),
+            "raw escape from patch text reached the terminal: {ansi:?}"
+        );
+        assert!(
+            ansi.contains('\u{fffd}'),
+            "expected replacement char: {ansi:?}"
+        );
+    }
+
+    #[test]
+    fn left_anchor_counts_old_lines_when_an_earlier_hunk_shifts_new_numbers() {
+        let diff = files(
+            "\
+diff --git a/src/f.rs b/src/f.rs
+--- a/src/f.rs
++++ b/src/f.rs
+@@ -1,3 +1,8 @@
+ a
+ b
+ c
++d
++e
++f
++g
++h
+@@ -10,5 +15,5 @@
+ old10
+ line11
+-line12
++new12
+ line13
+ line14
+",
+        );
+        let anchor = Anchor::single_line(12, AnchorSide::Left);
+        let plain = render_anchored_plain(&diff, "src/f.rs", &anchor);
+        for expected in ["line11", "line12", "line13", "line14"] {
+            assert!(
+                plain.contains(expected),
+                "left anchor lost old-side context {expected}: {plain}"
+            );
+        }
+        let change_row = plain
+            .lines()
+            .find(|l| l.contains("line12"))
+            .expect("deleted line visible");
+        assert!(
+            change_row.starts_with("▸"),
+            "left anchor should mark the left side: {change_row}"
+        );
     }
 
     #[test]

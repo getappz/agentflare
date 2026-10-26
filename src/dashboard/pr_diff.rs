@@ -23,28 +23,41 @@ pub struct PrDiffContextQuery {
 }
 
 /// Anchored side-by-side diff excerpt for the read-only dashboard PR view.
+///
+/// The GitHub client and the paginated file fetch are blocking, so they run on
+/// `spawn_blocking` rather than on the async dashboard worker (same shape as
+/// `dashboard::artifacts::index`).
 pub async fn diff_context_handler(Query(q): Query<PrDiffContextQuery>) -> Response {
     let repo = crate::github::RepoId {
         owner: q.owner,
         repo: q.repo,
     };
-    let text = match crate::github::Client::new() {
-        Ok(client) => match crate::github::pulls::list_files(&client, &repo, q.number) {
+    let number = q.number;
+    let path = q.path;
+    let line = q.line;
+    let side = match q.side.as_deref() {
+        Some("left") | Some("LEFT") => crate::review::diff_display::AnchorSide::Left,
+        _ => crate::review::diff_display::AnchorSide::Right,
+    };
+    let fallback_path = path.clone();
+    let text = tokio::task::spawn_blocking(move || {
+        let client = match crate::github::Client::new() {
+            Ok(client) => client,
+            Err(_) => return format!("no context for {path}"),
+        };
+        match crate::github::pulls::list_files(&client, &repo, number) {
             Ok(files) => {
-                let side = match q.side.as_deref() {
-                    Some("left") | Some("LEFT") => crate::review::diff_display::AnchorSide::Left,
-                    _ => crate::review::diff_display::AnchorSide::Right,
-                };
                 let anchor = crate::review::diff_display::Anchor {
-                    line_start: q.line,
-                    line_end: q.line,
+                    line_start: line,
+                    line_end: line,
                     side,
                 };
-                crate::dashboard::data::pr_diff_context_plain(&files, &q.path, &anchor)
+                crate::dashboard::data::pr_diff_context_plain(&files, &path, &anchor)
             }
-            Err(e) => format!("no context for {} (fetch failed: {e})", q.path),
-        },
-        Err(_) => format!("no context for {}", q.path),
-    };
+            Err(e) => format!("no context for {path} (fetch failed: {e})"),
+        }
+    })
+    .await
+    .unwrap_or_else(|_| format!("no context for {fallback_path}"));
     ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response()
 }
