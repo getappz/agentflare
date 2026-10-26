@@ -36,6 +36,18 @@ pub fn branch_diverged(
     flare_git_core::worktree::branch_diverged(repo_root, &branch, target_branch)
 }
 
+/// Tip SHA of `origin/<item-task-branch>` when that remote ref exists.
+pub fn remote_task_branch_tip(
+    item: &agentflare_backend::item::Item,
+    repo_root: &Path,
+) -> Option<String> {
+    let branch = flare_git_core::worktree::resolve_item_task_branch(item, repo_root);
+    let remote_ref = format!("refs/remotes/origin/{branch}");
+    flare_git_core::shell::run_in_opt(repo_root, &["rev-parse", "--verify", remote_ref.as_str()])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 pub fn create_worktree(
     item: &agentflare_backend::item::Item,
     repo_root: &Path,
