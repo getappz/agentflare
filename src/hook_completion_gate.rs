@@ -500,6 +500,10 @@ pub fn post_tool_use(agent: &str) {
 
 /// Whether `f` (a freshness check) accepts the record against the cwd tree
 /// or the item's own worktree tree. Evidence for any other tree stays stale.
+/// Every tree that *can* be fingerprinted is compared before the timestamp
+/// fallback applies, so an unfingerprintable cwd can't vouch for evidence
+/// recorded in some third checkout; the fallback is only for the case where
+/// neither tree is available.
 fn fresh_in_either(
     record: &crate::optimize::SessionRecord,
     now: u64,
@@ -507,7 +511,13 @@ fn fresh_in_either(
     item_tree: Option<&str>,
     f: fn(&crate::optimize::SessionRecord, u64, Option<&str>) -> bool,
 ) -> bool {
-    f(record, now, cwd_tree) || item_tree.is_some_and(|t| f(record, now, Some(t)))
+    match (cwd_tree, item_tree) {
+        (None, None) => f(record, now, None),
+        _ => cwd_tree
+            .into_iter()
+            .chain(item_tree)
+            .any(|tree| f(record, now, Some(tree))),
+    }
 }
 
 /// Appends the directories and hashes the gate compared to a refusal.
@@ -543,14 +553,14 @@ pub(crate) fn completion_gate_denial(
     tool_input: Option<&serde_json::Value>,
     task_type: Option<&str>,
 ) -> Option<String> {
-    // Only item calls can hit the gate, so only they pay for the git hash.
+    // Only gated item calls can hit the gate, so only they pay for the
+    // database lookup and the git hashes.
     let is_item_call = tool_name == crate::hook_redirect::ITEM_TOOL_NAME || tool_name == "item";
-    let cwd_tree = is_item_call
-        .then(crate::optimize::tree_fingerprint)
-        .flatten();
-    let item_dir = is_item_call
-        .then(|| resolve_item_worktree(tool_input))
-        .flatten();
+    if !is_item_call || crate::hook_redirect::gated_item_action(tool_input).is_none() {
+        return None;
+    }
+    let cwd_tree = crate::optimize::tree_fingerprint();
+    let item_dir = resolve_item_worktree(tool_input);
     let item_tree = item_dir
         .as_deref()
         .and_then(crate::optimize::tree_fingerprint_in);
@@ -936,6 +946,29 @@ mod tests {
             None,
             crate::optimize::has_fresh_passing_verification
         ));
+    }
+
+    #[test]
+    fn unfingerprintable_cwd_does_not_fall_back_to_the_timestamp() {
+        let r = record_with_tree("A");
+        for f in [
+            crate::optimize::has_fresh_review as fn(&SessionRecord, u64, Option<&str>) -> bool,
+            crate::optimize::has_fresh_passing_verification,
+        ] {
+            assert!(!fresh_in_either(&r, 1010, None, Some("B"), f));
+            assert!(!fresh_in_either(&r, 1010, Some("B"), None, f));
+        }
+    }
+
+    #[test]
+    fn timestamp_fallback_applies_when_neither_tree_is_available() {
+        let r = record_with_tree("A");
+        for f in [
+            crate::optimize::has_fresh_review as fn(&SessionRecord, u64, Option<&str>) -> bool,
+            crate::optimize::has_fresh_passing_verification,
+        ] {
+            assert!(fresh_in_either(&r, 1010, None, None, f));
+        }
     }
 
     #[test]
