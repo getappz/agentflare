@@ -14,9 +14,11 @@ Plain `claude` passes all arguments to the real executable. Put the optional `--
 
 Use `--shell bash|zsh|fish|powershell` to select a shell and `--profile <path>` for a custom profile. Remove a custom-profile wrapper with the same flags. Existing unrelated profile content is preserved; conflicting Claude definitions and malformed managed blocks require manual resolution.
 
+`agentflare update` and `agentflare dev-install` refresh an installed PowerShell companion automatically. After replacing agentflare manually or through another package manager, re-run `agentflare wrap claude`. Existing sessions keep their current executable until they exit.
+
 ## HTTPS proxy
 
-Proxy launches require lean-ctx on PATH and Python 3.10+ with `cryptography` installed. They start the default lean-ctx proxy on port 4444 if needed, then reuse it across projects and terminals. No `proxy enable`, provider base URL wiring, shell-wide proxy exports or OS certificate installation is required.
+Proxy launches require lean-ctx on PATH. The HTTPS bridge is built into agentflare in Rust; no Python, cryptography package or OpenSSL command is needed. It starts the default lean-ctx proxy on port 4444 if needed, then reuses it across projects and terminals. No `proxy enable`, provider base URL wiring, shell-wide proxy exports or OS certificate installation is required.
 
 The route is Claude → temporary loopback CONNECT/TLS bridge → default lean-ctx proxy → Anthropic. Only `api.anthropic.com` is intercepted; other HTTPS destinations remain opaque tunnels. Claude's existing authentication is retained. Exiting Claude removes its temporary bridge and certificates; the shared optimizer keeps running and keeps its normal statistics.
 

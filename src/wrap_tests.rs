@@ -20,11 +20,30 @@ fn proxy_option_is_consumed_only_before_native_claude_arguments() {
         ),
         (vec!["--version"], false, vec!["--version"]),
     ] {
-        let input: Vec<String> = input.into_iter().map(str::to_owned).collect();
+        let input: Vec<OsString> = input.into_iter().map(OsString::from).collect();
         let (actual_proxy, args) = proxy_arguments(&input);
         assert_eq!(actual_proxy, proxy);
         assert_eq!(args, expected);
     }
+}
+
+#[test]
+fn companion_tracks_a_replaced_main_binary_without_creating_an_uninstalled_wrapper() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("agentflare");
+    let companion = dir.path().join("agentflare-claude");
+    let update = dir.path().join("update");
+    std::fs::write(&main, b"old").unwrap();
+    refresh_companion_at(&main, &companion).unwrap();
+    assert!(!companion.exists());
+    std::fs::hard_link(&main, &companion).unwrap();
+    std::fs::write(&update, b"new").unwrap();
+    crate::update::swap::replace_binary(&update, &main).unwrap();
+    assert_eq!(std::fs::read(&companion).unwrap(), b"old");
+    refresh_companion_at(&main, &companion).unwrap();
+    assert_eq!(std::fs::read(&companion).unwrap(), b"new");
+    refresh_companion_at(&main, &companion).unwrap();
+    assert_eq!(std::fs::read(&companion).unwrap(), b"new");
 }
 
 #[test]

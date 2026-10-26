@@ -1,10 +1,12 @@
 """Windows real-process checks with a fake npm Claude, never a provider prompt."""
+import http.client
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+from contextlib import closing
 from pathlib import Path
 
 if os.name != 'nt':
@@ -13,10 +15,26 @@ if os.name != 'nt':
 
 binary = Path(sys.argv[1]).resolve()
 
+proxy_cases = (False,)
+try:
+    if not shutil.which('lean-ctx'):
+        raise RuntimeError('lean-ctx is not on PATH')
+    # Cold startup is covered separately with an isolated port and state.
+    with closing(http.client.HTTPConnection('127.0.0.1', 4444, timeout=1)) as conn:
+        conn.request('GET', '/health')
+        response = conn.getresponse()
+        service = json.loads(response.read(4096))
+        if response.status != 200 or not isinstance(service, dict) or service.get('service') != 'lean-ctx-proxy':
+            raise RuntimeError('default port 4444 is not serving lean-ctx-proxy')
+except (ImportError, OSError, http.client.HTTPException, ValueError, RuntimeError) as error:
+    print(f'SKIP: proxy launcher fixtures require lean-ctx and a running default optimizer: {error}')
+else:
+    proxy_cases = (False, True)
+
 
 def run(args, env):
     return subprocess.run([str(a) for a in args], env=env, capture_output=True,
-                          text=True, timeout=30)
+                          text=True, encoding='utf-8', timeout=30)
 
 
 with tempfile.TemporaryDirectory(prefix="agentflare wrapper's $fixture ") as scratch:
@@ -45,7 +63,7 @@ with tempfile.TemporaryDirectory(prefix="agentflare wrapper's $fixture ") as scr
     ps_profile.write_text(original, encoding='utf-8')
     installed = run([binary, 'wrap', 'claude-code', '--shell', 'powershell', '--profile', ps_profile], env)
     assert installed.returncode == 0, installed.stderr
-    for proxy in (False, True):
+    for proxy in proxy_cases:
         arguments = (['--with-proxy'] if proxy else []) + native
         encoded = json.dumps(arguments).replace("'", "''")
         profile_literal = str(ps_profile).replace("'", "''")
@@ -67,7 +85,7 @@ with tempfile.TemporaryDirectory(prefix="agentflare wrapper's $fixture ") as scr
         installed = run([binary, 'wrap', 'claude', '--shell', 'bash', '--profile', bash_profile], env)
         assert installed.returncode == 0, installed.stderr
         quoted = "'" + bash_profile.as_posix().replace("'", "'\"'\"'") + "'"
-        for proxy in (False, True):
+        for proxy in proxy_cases:
             option = '--with-proxy ' if proxy else ''
             result = run([bash, '--noprofile', '--norc', '-c', f'source {quoted}; claude {option}--version'], env)
             assert result.returncode == 7, result.stdout + result.stderr
@@ -76,4 +94,4 @@ with tempfile.TemporaryDirectory(prefix="agentflare wrapper's $fixture ") as scr
         assert removed.returncode == 0, removed.stderr
         assert bash_profile.read_text(encoding='utf-8') == original
 
-print('PASS: Windows npm resolution, native argument escaping, PowerShell status, Bash/PowerShell opt-in proxy, unwrap; no provider call')
+print(f'PASS: Windows npm resolution, native argument escaping, PowerShell status, unwrap; proxy fixtures {"passed" if True in proxy_cases else "skipped"}; no provider call')

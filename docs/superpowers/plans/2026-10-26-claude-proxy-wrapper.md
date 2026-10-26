@@ -4,9 +4,9 @@
 
 **Goal:** Install a reversible Claude shell wrapper with opt-in shared-proxy support.
 
-**Architecture:** Register wrap/unwrap CLI commands, install managed shell wrappers using existing profile infrastructure, and dispatch through an internal launch flag. PowerShell uses a native alias; other shells use functions. Resolve Claude directly; proxy launches extract the embedded Python HTTPS bridge and reuse default lean-ctx state.
+**Architecture:** Register wrap/unwrap CLI commands, install managed shell wrappers using existing profile infrastructure, and dispatch through an internal launch flag. PowerShell uses a native alias; other shells use functions. Resolve Claude directly; proxy launches run a Rust HTTPS bridge in the agentflare process and reuse default lean-ctx state.
 
-**Tech Stack:** Existing Rust/clap/atomic writer/tempfile; Python standard library and installed cryptography.
+**Tech Stack:** Rust/clap/atomic writer/tempfile, Tokio/Hyper/rustls and rcgen. lean-ctx is the only external proxy runtime dependency.
 
 **Spec:** `docs/superpowers/specs/2026-10-26-claude-proxy-wrapper-design.md`
 
@@ -30,7 +30,7 @@
 
 **Files:** Create `src/wrap.rs`, `src/wrap_tests.rs`, `src/cli/wrap.rs`; modify `src/main.rs`, `src/cli/mod.rs`, `src/uninstall.rs`.
 
-**Interfaces:** `wrap::configure(shell, profile, executable, remove) -> Result<(), String>`; `wrap::launch(args: &[String]) -> Result<i32, String>`; `wrap::cleanup_profiles(dry_run: bool)`.
+**Interfaces:** `wrap::configure(shell, profile, executable, remove) -> Result<(), String>`; `wrap::launch(args: &[OsString]) -> Result<i32, String>`; `wrap::cleanup_profiles(dry_run: bool)`.
 
 - [x] Write failing tests for leading proxy flag boundaries, idempotent managed install/remove, conflicting definitions, malformed blocks and quoting.
 - [x] Run focused tests and confirm failure before implementing.
@@ -39,16 +39,19 @@
 
 ### Task 2: Embedded HTTPS transport and release verification
 
-**Files:** Create `assets/claude_https.py`, `tests/claude_https_test.py`, `docs/claude-proxy-wrapper.md`; consume `wrap::launch` from Task 1.
+**Files:** `src/wrap_https.rs`, `src/wrap_https_tests.rs`, `src/wrap_interrupt.rs`, `docs/claude-proxy-wrapper.md`; consume `wrap::launch` from Task 1. Remove the earlier Python bridge and its superseded test suite.
 
-**Interfaces:** Python entry point takes absolute agentflare and lean-ctx binary paths followed by unchanged Claude args. Native Rust embeds/extracts the script only on proxy launch; the bridge re-enters native Rust dispatch to launch Claude.
+**Interfaces:** `Bridge::start(lean_port, previous_ca)` owns a temporary CA directory and loopback listener; `shared_proxy(lean, port)` reuses the default optimizer or starts it detached. The waiting Rust launcher owns the runtime until native Claude exits. Ctrl-C remains Claude's decision; native OS arguments stay lossless.
 
 - [x] Write local-only TLS relay, shared optimizer reuse/lifetime, environment and opaque tunnel tests; verify red.
 - [x] Reuse the tested certificate/relay/shared-proxy behavior with production-only helpers, no fixture payloads or credential logging.
-- [x] Run Python tests, focused Rust checks, and both command aliases from outside the repository. Full Windows suite attempted but exceeded ten minutes.
+- [x] Run native TLS/stream/tunnel tests, focused Rust checks and the real-process fixtures, including a proxy launch with Python absent from PATH.
 - [x] Build/install the updated local binary and PowerShell wrapper; document reload/status/savings/removal commands. Global Bash installation declined an existing unmanaged Claude definition; no Bash profile changes made.
 
 ## Progress
+
+- User requested removing the Python runtime dependency during PR review. The Rust replacement uses the existing HTTP/TLS dependency tree plus rcgen for certificate generation; no external certificate command or process is required. Native regression tests replace the Python bridge suite.
+- Native replacement verified: 12 Rust checks, PowerShell/Git Bash/npm launcher fixtures, raw OS argument forwarding, terminal Ctrl-C survival, and a proxy launch with Python absent from PATH. Tests used fake Claude executables and loopback peers; no model/provider calls. Formatting, whitespace and generated dependency consistency checks passed.
 
 - Approved design captured; implementation method: inline. Working checkout has no tracked changes; preserve unrelated untracked files.
 - Branch: `codex/claude-proxy-wrap`, working in the existing checkout; unrelated untracked files preserved.

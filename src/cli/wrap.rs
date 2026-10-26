@@ -21,7 +21,7 @@ pub struct WrapArgs {
     #[arg(long, hide = true)]
     pub launch: bool,
     #[arg(last = true, hide = true)]
-    pub args: Vec<String>,
+    pub args: Vec<std::ffi::OsString>,
 }
 
 impl WrapArgs {

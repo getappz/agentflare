@@ -1,12 +1,19 @@
 use crate::shell::Shell;
+use std::ffi::OsString;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
+
+#[path = "wrap_interrupt.rs"]
+mod interrupt;
+
+#[path = "wrap_https.rs"]
+mod https;
 
 const START: &str = "# >>> agentflare wrap claude >>>";
 const END: &str = "# <<< agentflare wrap claude <<<";
 const NATIVE_ENTRY: &str = "__agentflare-claude-native";
 
-fn proxy_arguments(args: &[String]) -> (bool, &[String]) {
+fn proxy_arguments(args: &[OsString]) -> (bool, &[OsString]) {
     if args.first().is_some_and(|arg| arg == "--with-proxy") {
         (true, &args[1..])
     } else {
@@ -179,7 +186,8 @@ fn companion_path() -> Result<std::path::PathBuf, String> {
 
 fn install_companion(executable: &Path) -> Result<std::path::PathBuf, String> {
     let target = companion_path()?;
-    if same_file::is_same_file(executable, &target).unwrap_or(false) {
+    if target.exists() {
+        refresh_companion_at(executable, &target)?;
         return Ok(target);
     }
     let parent = target.parent().expect("companion has a parent directory");
@@ -195,6 +203,25 @@ fn install_companion(executable: &Path) -> Result<std::path::PathBuf, String> {
     Ok(target)
 }
 
+pub(crate) fn refresh_existing_companion(executable: &Path) -> Result<(), String> {
+    refresh_companion_at(executable, &companion_path()?)
+}
+
+fn refresh_companion_at(executable: &Path, target: &Path) -> Result<(), String> {
+    use crate::update::swap::{SwapOutcome, replace_binary, verify_installed};
+    if !target.exists() || verify_installed(executable, target).is_ok() {
+        return Ok(());
+    }
+    match replace_binary(executable, target)? {
+        SwapOutcome::Installed => verify_installed(executable, target),
+        #[cfg(windows)]
+        SwapOutcome::Deferred { log } => Err(format!(
+            "Claude wrapper update deferred; retry `agentflare wrap claude` after sessions exit (log: {})",
+            log.display()
+        )),
+    }
+}
+
 fn exit_code(status: ExitStatus) -> i32 {
     #[cfg(unix)]
     {
@@ -207,69 +234,79 @@ fn exit_code(status: ExitStatus) -> i32 {
     status.code().unwrap_or(1)
 }
 
-pub fn launch(args: &[String]) -> Result<i32, String> {
+pub fn launch(args: &[OsString]) -> Result<i32, String> {
+    let (proxy, args) = proxy_arguments(args);
+    if !proxy {
+        return launch_native(args);
+    }
+    if let Some(base) = std::env::var_os("ANTHROPIC_BASE_URL")
+        && !matches!(
+            base.to_str().map(|base| base.trim_end_matches('/')),
+            Some("" | "https://api.anthropic.com")
+        )
+    {
+        return Err("--with-proxy currently supports the default Anthropic HTTPS endpoint".into());
+    }
+    let lean = agent_registry::detect::find_binary(&["lean-ctx"])
+        .ok_or("--with-proxy requires lean-ctx on PATH")?;
+    let mut command = native_command(args)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    let previous_ca = std::env::var_os("NODE_EXTRA_CA_CERTS");
+    let bridge = runtime.block_on(async {
+        https::shared_proxy(&lean, https::PROXY_PORT).await?;
+        https::Bridge::start(https::PROXY_PORT, previous_ca.as_deref().map(Path::new)).await
+    })?;
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_str()
+            .is_some_and(|key| key.to_ascii_uppercase().ends_with("_PROXY"))
+        {
+            command.env_remove(key);
+        }
+    }
+    command
+        .env_remove("ANTHROPIC_BASE_URL")
+        .env("HTTPS_PROXY", bridge.url())
+        .env("NODE_EXTRA_CA_CERTS", bridge.ca_path())
+        .env("NO_PROXY", "127.0.0.1,localhost");
+    eprintln!(
+        "agentflare: HTTPS bridge -> shared lean-ctx on 127.0.0.1:{}\nMonitor: lean-ctx proxy status",
+        https::PROXY_PORT
+    );
+    wait_for_child(&mut command)
+}
+
+fn native_command(args: &[OsString]) -> Result<Command, String> {
     let claude = agent_registry::detect::find_binary(&["claude"])
         .ok_or("Claude executable not found on PATH")?;
-    let (proxy, args) = proxy_arguments(args);
-    let resources;
-    let mut command = if proxy {
-        let lean = agent_registry::detect::find_binary(&["lean-ctx"])
-            .ok_or("--with-proxy requires lean-ctx on PATH")?;
-        let names = if cfg!(windows) {
-            ["python", "python3"]
-        } else {
-            ["python3", "python"]
-        };
-        let python = agent_registry::detect::find_binary(&names)
-            .ok_or("--with-proxy requires Python 3.10+ with cryptography installed")?;
-        resources = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let check = Command::new(&python)
-            .args([
-                "-c",
-                "import sys; assert sys.version_info >= (3, 10); import cryptography",
-            ])
-            .current_dir(resources.path())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|error| error.to_string())?;
-        if !check.success() {
-            return Err(format!(
-                "--with-proxy requires Python 3.10+ with cryptography; install it using {} -m pip install cryptography",
-                python.display()
-            ));
-        }
-        let script = resources.path().join("claude_https.py");
-        std::fs::write(&script, include_str!("../assets/claude_https.py"))
-            .map_err(|error| error.to_string())?;
-        let mut command = Command::new(python);
-        command
-            .arg(script)
-            .arg(std::env::current_exe().map_err(|error| error.to_string())?)
-            .arg(lean);
-        command
-    } else {
-        Command::new(claude)
-    };
+    let mut command = Command::new(claude);
     command
         .args(args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    command
-        .status()
-        .map(exit_code)
-        .map_err(|error| format!("Cannot launch Claude: {error}"))
+    Ok(command)
 }
 
-fn launch_native(args: &[String]) -> Result<i32, String> {
-    let claude = agent_registry::detect::find_binary(&["claude"])
-        .ok_or("Claude executable not found on PATH")?;
-    Command::new(claude)
-        .args(args)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+fn launch_native(args: &[OsString]) -> Result<i32, String> {
+    let mut command = native_command(args)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        Err(format!("Cannot launch Claude: {}", command.exec()))
+    }
+    #[cfg(not(unix))]
+    wait_for_child(&mut command)
+}
+
+fn wait_for_child(command: &mut Command) -> Result<i32, String> {
+    // Claude handles terminal Ctrl-C; the waiting parent must outlive a cancelled turn.
+    let _interrupt = interrupt::Guard::install().map_err(|error| error.to_string())?;
+    command
         .status()
         .map(exit_code)
         .map_err(|error| format!("Cannot launch Claude: {error}"))
@@ -277,7 +314,7 @@ fn launch_native(args: &[String]) -> Result<i32, String> {
 
 pub fn handle_entrypoint() -> Option<Result<i32, String>> {
     let program = std::env::args_os().next()?;
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     if args.first().is_some_and(|arg| arg == NATIVE_ENTRY) {
         return Some(launch_native(&args[1..]));
     }
@@ -289,7 +326,7 @@ pub fn handle_entrypoint() -> Option<Result<i32, String>> {
     }
     if args.len() >= 4
         && args[0] == "wrap"
-        && matches!(args[1].as_str(), "claude" | "claude-code")
+        && matches!(args[1].to_str(), Some("claude" | "claude-code"))
         && args[2] == "--launch"
         && args[3] == "--"
     {
