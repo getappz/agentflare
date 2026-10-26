@@ -1662,6 +1662,7 @@ version = "0.1.0"
 dependencies = [
  "agent-detector",
  "agentflare-workspace-hack",
+ "libc",
  "sysinfo",
  "tempfile",
  "windows-sys 0.59.0",

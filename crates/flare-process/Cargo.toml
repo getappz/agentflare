@@ -15,10 +15,11 @@ agent-detector = { version = "0.2.1", default-features = false }
 agentflare-workspace-hack = { version = "0.1", path = "../../agentflare-workspace-hack" }
 
 [target.'cfg(unix)'.dependencies]
+libc = "0.2"
 sysinfo = { version = "0.34", default-features = false, features = ["system"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Pipes"] }
 
 [dev-dependencies]
 tempfile = "3"

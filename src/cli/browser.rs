@@ -273,7 +273,13 @@ fn exec_raw(
         crate::browser_install::ensure_agent_browser(auto_install)?
     };
     let argv = flare_browser::build_argv(session, action, positionals, extra)?;
-    flare_browser::run_blocking(&backend, &argv, &[], path_env.as_deref())
+    flare_browser::run_blocking(
+        &backend,
+        &argv,
+        &[],
+        path_env.as_deref(),
+        std::process::Stdio::inherit(),
+    )
 }
 
 fn print_status(session: &str) {

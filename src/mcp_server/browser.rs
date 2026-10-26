@@ -68,7 +68,13 @@ impl AgentflareMcp {
                         flare_browser::auto_install_enabled(),
                     )?;
                     // Fingerprint raw state: redaction must not hide a page change.
-                    flare_browser::run_blocking(&backend, &argv, &[], path_env.as_deref())
+                    flare_browser::run_blocking(
+                        &backend,
+                        &argv,
+                        &[],
+                        path_env.as_deref(),
+                        std::process::Stdio::null(),
+                    )
                 };
                 if planning {
                     crate::browser_decision::plan_with(
@@ -130,7 +136,13 @@ impl AgentflareMcp {
             move || -> Result<String, String> {
                 let (backend, path_env) =
                     crate::browser_install::ensure_agent_browser(auto_install)?;
-                flare_browser::run_blocking(&backend, &argv, &secrets, path_env.as_deref())
+                flare_browser::run_blocking(
+                    &backend,
+                    &argv,
+                    &secrets,
+                    path_env.as_deref(),
+                    std::process::Stdio::null(),
+                )
             }
         })
         .await
