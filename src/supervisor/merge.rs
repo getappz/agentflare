@@ -180,6 +180,7 @@ pub(super) fn handle_ci_green(
                     number,
                     PrApprovalBlocker::ApprovalLabel,
                 );
+                post_missing_approval_pr_comment(mcp, item, folder_path, number, PR_APPROVAL_LABEL);
             }
         }
         CiGreenMerge::BlockedOnReview {
@@ -194,6 +195,15 @@ pub(super) fn handle_ci_green(
                         changes_requested,
                         label_missing,
                     },
+                );
+                post_github_review_block_pr_comment(
+                    mcp,
+                    item,
+                    folder_path,
+                    number,
+                    changes_requested,
+                    label_missing,
+                    PR_APPROVAL_LABEL,
                 );
             }
         }
@@ -227,6 +237,7 @@ pub(super) fn handle_ci_green(
                      carries a dispatch gate label (needs-manual-dispatch / needs-human)."
                 ),
             );
+            post_item_dispatch_gate_pr_comment(mcp, item, folder_path, number);
         }
         result.skipped += 1;
     } else {
@@ -556,6 +567,16 @@ pub(super) fn merge_or_repair_findings(
         // coming; threads merely waiting on the bot or a push are not stalls.
         let held = !review.unknown && review.escalated > 0;
         note_review_stall(mcp, queue, item, number, labels, folder_path, held, false);
+        post_review_threads_hold_pr_comment(
+            mcp,
+            item,
+            folder_path,
+            number,
+            review.blocking,
+            review.escalated,
+            review.waiting_push,
+            review.unknown,
+        );
         return PassingPrOutcome::NotMerged;
     }
     note_review_stall(mcp, queue, item, number, labels, folder_path, false, false);

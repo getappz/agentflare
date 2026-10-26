@@ -2131,6 +2131,8 @@ fn job_in_flight(queue: &agentflare_jobs::Queue, item_id: &str) -> bool {
 /// keeps working unchanged.
 pub(crate) mod notify;
 pub(crate) use notify::*;
+mod pr_merge_gate;
+use pr_merge_gate::*;
 mod merge;
 pub(crate) use merge::*;
 mod auto_merge;
