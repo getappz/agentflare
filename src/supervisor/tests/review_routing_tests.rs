@@ -17,6 +17,108 @@ fn pr(branch: &str, title: &str, body: Option<&str>) -> PullRequest {
     .unwrap()
 }
 
+fn assert_mismatched_ci_repair_gates(trigger: RepairTrigger<'_>) {
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1900);
+    let labels = seed_gate_label(&mcp);
+    mcp.with_backend_db(|c| {
+        crate::mcp_server::merge_item_metadata(c, &id, |m| {
+            m.insert("pr".into(), serde_json::json!({"number": 870}));
+        })
+        .unwrap();
+    })
+    .unwrap();
+    let item = mcp
+        .with_backend_db(|c| agentflare_backend::item::get(c, &id).unwrap())
+        .unwrap();
+    let live_pr = pr(
+        &format!("task/{}-unrelated-failover", item.sequence_id),
+        "fix: unrelated failover",
+        None,
+    );
+    let auth = super::tests::test_auth_conn();
+    let silent_key = trigger.silent_key();
+    let announced_key = trigger.announced_key();
+    assert!(matches!(
+        self_repair_or_gate(
+            &mcp,
+            &queue,
+            &auth,
+            agentflare_resource_gate::Policy::Normal,
+            &item,
+            Some(&live_pr),
+            trigger,
+            &[],
+            &labels,
+            "/repo",
+        ),
+        SelfRepairOutcome::Skipped
+    ));
+    assert!(queue.list(None).unwrap().is_empty());
+    assert!(item_gated(&mcp, &item, &labels));
+    let comments = mcp
+        .with_backend_db(|c| agentflare_backend::comment::list_by_item(c, &id).unwrap())
+        .unwrap();
+    assert_eq!(comments.len(), 1, "only the mapping explanation is posted");
+    assert!(comments[0].body.contains("Verify the PR-to-item mapping"));
+    let current = mcp
+        .with_backend_db(|c| agentflare_backend::item::get(c, &id).unwrap())
+        .unwrap();
+    let meta = crate::mcp_server::metadata_object(&current.metadata);
+    assert!(!meta.contains_key(silent_key));
+    assert!(!meta.contains_key(announced_key));
+}
+
+#[test]
+fn item724_failing_ci_mismatch_gates_without_dispatching_or_charging() {
+    assert_mismatched_ci_repair_gates(RepairTrigger::FailingChecks(&["clippy".into()]));
+}
+
+#[test]
+fn item724_conflict_mismatch_gates_without_dispatching_or_charging() {
+    assert_mismatched_ci_repair_gates(RepairTrigger::MergeConflict);
+}
+
+#[test]
+fn item724_ci_and_conflict_repair_defer_without_live_pr_identity() {
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1900);
+    let item = mcp
+        .with_backend_db(|c| agentflare_backend::item::get(c, &id).unwrap())
+        .unwrap();
+    let labels = seed_gate_label(&mcp);
+    let auth = super::tests::test_auth_conn();
+    for trigger in [
+        RepairTrigger::FailingChecks(&["clippy".into()]),
+        RepairTrigger::MergeConflict,
+    ] {
+        assert!(matches!(
+            self_repair_or_gate(
+                &mcp,
+                &queue,
+                &auth,
+                agentflare_resource_gate::Policy::Normal,
+                &item,
+                None,
+                trigger,
+                &[],
+                &labels,
+                "/repo",
+            ),
+            SelfRepairOutcome::Deferred
+        ));
+    }
+    assert!(queue.list(None).unwrap().is_empty());
+    assert!(!item_gated(&mcp, &item, &labels));
+    assert!(
+        mcp.with_backend_db(|c| agentflare_backend::comment::list_by_item(c, &id).unwrap())
+            .unwrap()
+            .is_empty()
+    );
+}
+
 #[test]
 fn item724_checks_identity_without_breaking_renamed_stamped_tasks() {
     let mcp = test_mcp();

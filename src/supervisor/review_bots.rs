@@ -449,7 +449,7 @@ pub(super) fn validated_review_bot_state(
     state
 }
 
-fn gate_review_identity(
+pub(super) fn gate_review_identity(
     mcp: &AgentflareMcp,
     item: &agentflare_backend::item::Item,
     pr: &crate::github::models::PullRequest,

@@ -1860,7 +1860,7 @@ fn handle_pr_status(
                 auth_conn,
                 host_policy,
                 item,
-                number,
+                fetch_repair_pr(repo_root, number).as_ref(),
                 RepairTrigger::FailingChecks(&checks),
                 &labels,
                 label_id_by_name,
@@ -1938,7 +1938,7 @@ fn handle_pr_status(
                     auth_conn,
                     host_policy,
                     item,
-                    number,
+                    fetch_repair_pr(repo_root, number).as_ref(),
                     RepairTrigger::MergeConflict,
                     // No PR labels in hand here -- `Conflicting` is detected
                     // before the label fetch that `Failing`/`Passing` carry
@@ -2268,9 +2268,16 @@ fn notify_conflict_gate(item: &agentflare_backend::item::Item, folder_path: &str
     );
 }
 
-/// Dispatches a self-repair job for an item whose PR has failing CI checks,
-/// or -- once `quota::decide::SELF_REPAIR_CAP` prior attempts have been made
-/// with no green build -- gates it for a human instead of retrying forever.
+fn fetch_repair_pr(
+    repo_root: &std::path::Path,
+    number: u64,
+) -> Option<crate::github::models::PullRequest> {
+    let repo = crate::github::RepoId::resolve_from_remote(repo_root)?;
+    let client = crate::github::Client::new().ok()?;
+    crate::github::pulls::get(&client, &repo, number).ok()
+}
+
+/// Dispatches CI/conflict repair only after validating the live PR's task identity.
 #[allow(clippy::too_many_arguments)]
 fn self_repair_or_gate(
     mcp: &AgentflareMcp,
@@ -2278,12 +2285,19 @@ fn self_repair_or_gate(
     auth_conn: &rusqlite::Connection,
     host_policy: agentflare_resource_gate::Policy,
     item: &agentflare_backend::item::Item,
-    pr_number: u64,
+    pr: Option<&crate::github::models::PullRequest>,
     trigger: RepairTrigger<'_>,
     labels: &[String],
     label_id_by_name: &std::collections::HashMap<String, String>,
     folder_path: &str,
 ) -> SelfRepairOutcome {
+    let Some(pr) = pr else {
+        return SelfRepairOutcome::Deferred;
+    };
+    if gate_review_identity(mcp, item, pr, label_id_by_name) {
+        return SelfRepairOutcome::Skipped;
+    }
+    let pr_number = pr.number;
     let failing_checks = match trigger {
         RepairTrigger::FailingChecks(checks) => Some(checks),
         _ => None,
