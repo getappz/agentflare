@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>agentflare — run AI coding agents lean, and coordinate a crew of them</title>
-<meta name="description" content="One Rust binary that cuts the token bill of a single AI coding agent and coordinates more than one of them. No Node, no runtime deps. Works across Claude Code, Codex, Cursor, Windsurf, VS Code, Cline, Continue, and opencode." />
+<meta name="description" content="One Rust binary that cuts the token bill of a single AI coding agent and coordinates more than one of them. The core CLI needs no Node. Works across Claude Code, Codex, Cursor, Windsurf, VS Code (Copilot), Cline, Continue, and opencode." />
 <meta name="theme-color" content="#0B0D12" />
 <link rel="canonical" href="https://agentflare.dev/" />
 
@@ -12,7 +12,7 @@
 <meta property="og:type" content="website" />
 <meta property="og:url" content="https://agentflare.dev/" />
 <meta property="og:title" content="agentflare — run AI coding agents lean, coordinate a crew of them" />
-<meta property="og:description" content="One Rust binary. Cut the token bill of one agent; coordinate more than one. No Node, no runtime deps." />
+<meta property="og:description" content="One Rust binary. Cut the token bill of one agent; coordinate more than one. The core CLI needs no Node." />
 <meta name="twitter:card" content="summary_large_image" />
 <meta name="twitter:title" content="agentflare" />
 <meta name="twitter:description" content="Run AI coding agents efficiently, and coordinate more than one of them." />
@@ -298,9 +298,9 @@
   <section class="hero">
     <div class="wrap hero-grid">
       <div class="hero-copy">
-        <span class="eyebrow">Open source · Rust · MIT · Beta</span>
+        <span class="eyebrow">Open source · Rust · Apache-2.0 · Beta</span>
         <h1 class="title">Run coding agents<br><span class="flare-text">lean.</span> Coordinate a<br>whole crew of them.</h1>
-        <p class="lede">One Rust binary. It <b>cuts the token bill</b> of a single AI coding agent — and gives <b>more than one</b> of them a shared backlog, reviews, and clean handoffs. No Node, no runtime deps.</p>
+        <p class="lede">One Rust binary. It <b>cuts the token bill</b> of a single AI coding agent — and gives <b>more than one</b> of them a shared backlog, reviews, and clean handoffs. The core CLI needs no Node.</p>
 
         <div class="cta-row">
           <div class="cmd" role="group" aria-label="Install command">
@@ -319,7 +319,7 @@
           <span class="chip">Codex</span>
           <span class="chip">Cursor</span>
           <span class="chip">Windsurf</span>
-          <span class="chip">VS Code</span>
+          <span class="chip">VS Code (Copilot)</span>
           <span class="chip dim">Cline</span>
           <span class="chip dim">Continue</span>
           <span class="chip dim">opencode</span>
@@ -340,16 +340,6 @@
     </div>
   </section>
 
-  <!-- STATS -->
-  <section class="stats" aria-label="Headline numbers">
-    <div class="wrap"><div class="stats-in">
-      <div class="stat"><div class="n"><span class="flare-text">98.1%</span></div><div class="k">context compressed (lean-ctx, <span class="mono">map</span> mode)</div></div>
-      <div class="stat"><div class="n"><span class="flare-text">65%</span></div><div class="k">fewer output tokens (<span class="mono">optimize output</span>, avg)</div></div>
-      <div class="stat"><div class="n"><span class="flare-text">54%</span></div><div class="k">less code written (<span class="mono">optimize code</span>)</div></div>
-      <div class="stat"><div class="n"><span class="flare-text">34.2M</span></div><div class="k">tokens saved in one live project</div></div>
-    </div></div>
-  </section>
-
   <!-- WHAT IT IS / PILLARS -->
   <section class="band" id="optimize">
     <div class="wrap">
@@ -365,9 +355,9 @@
           <h3>Optimize</h3>
           <p>Cut the token and cost overhead of a single agent session — inside the session and across sessions.</p>
           <div class="feat">
-            <div class="feat-row"><span class="fk">lean-ctx</span><span class="fv">Companion tool that compresses tool I/O — reads, shell output, search — <b>up to 99%</b>, in-session.</span></div>
+            <div class="feat-row"><span class="fk">lean-ctx</span><span class="fv">Companion tool that compresses tool I/O — reads, shell output, search — <b>up to 98%</b>, in-session.</span></div>
             <div class="feat-row"><span class="fk">memory</span><span class="fv">Decisions, facts, and preferences that survive a session ending. Built in, SQLite-backed.</span></div>
-            <div class="feat-row"><span class="fk">optimize output</span><span class="fv">Conversation verbosity compression, <b>~65%</b> fewer tokens on average (formerly Caveman).</span></div>
+            <div class="feat-row"><span class="fk">optimize output</span><span class="fv">Rewrites a markdown file, such as a long rules or notes file, in a terser style so the agent reads fewer tokens each time it loads it. A language model does the rewrite.</span></div>
             <div class="feat-row"><span class="fk">optimize code</span><span class="fv">Cuts back on agents over-engineering the code they write (formerly Ponytail).</span></div>
             <div class="feat-row"><span class="fk">optimize context</span><span class="fv">Compacts long session transcripts so history stops eating your context window.</span></div>
             <div class="feat-row"><span class="fk">hygiene</span><span class="fv">Automatic runtime hygiene and model-routing nudges — the right model for the job, fewer wasted turns.</span></div>
@@ -385,7 +375,7 @@
             <div class="feat-row"><span class="fk">handoff</span><span class="fv">Pass addressed, threaded context when work moves between specific agents or runtimes.</span></div>
             <div class="feat-row"><span class="fk">coaching</span><span class="fv">Small persistent nudges surfaced to an agent, only when relevant.</span></div>
             <div class="feat-row"><span class="fk">agentflare work</span><span class="fv">Claim &rarr; worktree &rarr; headless agent &rarr; report-back — an autonomous run, hands-off.</span></div>
-            <div class="feat-row"><span class="fk">serve</span><span class="fv">An optional background daemon plus a read-only dashboard (<span class="mono">agentflare serve</span>) for what's running.</span></div>
+            <div class="feat-row"><span class="fk">serve</span><span class="fv">An optional background daemon plus a dashboard (<span class="mono">agentflare serve</span>) that shows what's running and can start queued work. It has no login.</span></div>
             <div class="feat-row"><span class="fk">search</span><span class="fv">One MCP tool, 17 sources — code, GitHub, web, memory, social, news, academic, datasets, and live data feeds.</span></div>
             <div class="feat-row"><span class="fk">branch-guard</span><span class="fv">A git-aware PATH shim that blocks direct writes to master/main across every agent's tool calls.</span></div>
             <div class="feat-row"><span class="fk">vault &amp; proxy</span><span class="fv">An encrypted auth-profile vault, plus flare-proxy — an Anthropic-to-OpenAI proxy for free model providers.</span></div>
@@ -407,35 +397,23 @@
       <div class="band-head reveal">
         <span class="eyebrow">No blended totals</span>
         <h2>Numbers we can actually back up.</h2>
-        <p>Each figure is the project's own published, reproducible benchmark — attributed, not merged into a fake combined total, and not taken on faith. Re-run them yourself.</p>
+        <p>Every figure here was measured by someone, on something specific. We list who ran it, what it measured and where it stops applying. We do not combine them, and none is a prediction for your project.</p>
       </div>
 
       <div class="metrics reveal">
         <div class="tscroll"><table>
-          <thead><tr><th>Tool</th><th>Published claim</th><th>Methodology</th><th>Confidence</th></tr></thead>
+          <thead><tr><th>What it measures</th><th>Result</th><th>Who measured it</th><th>Limits</th></tr></thead>
           <tbody>
             <tr>
-              <td><span class="tool">lean-ctx</span></td>
-              <td><span class="claim">98.1% compression (<span class="mono">map</span>), 96.7% (<span class="mono">signatures</span>), ~99.99% cached re-read</span></td>
-              <td><span class="method">CI-gated, reproducible via <span class="mono">lean-ctx benchmark report .</span> — 50-file repo, GPT-4o tokenizer</span></td>
-              <td><span class="conf">High</span></td>
-            </tr>
-            <tr>
-              <td><span class="tool">optimize output</span></td>
-              <td><span class="claim">65% avg output-token reduction (22&ndash;87%, 10 prompts)</span></td>
-              <td><span class="method">Committed evals; docs flag the failure mode — ~1&ndash;1.5k input-token overhead per turn can go net-negative on already-terse work</span></td>
-              <td><span class="conf">High</span></td>
-            </tr>
-            <tr>
-              <td><span class="tool">optimize code</span></td>
-              <td><span class="claim">~54% less code (94% ceiling), ~20% cheaper, ~27% faster, no regressions across the 4 tasks measured</span></td>
-              <td><span class="method">12 real feature tasks, FastAPI + React repo, Haiku 4.5, n=4 — self-corrected an earlier overgeneralized figure</span></td>
-              <td><span class="conf">High</span></td>
+              <td><span class="tool">Tool-output compression (lean-ctx)</span></td>
+              <td><span class="claim">98.1% fewer tokens on file reads in <span class="mono">map</span> mode, 96.7% in <span class="mono">signatures</span> mode; near-total reduction on repeat reads of an unchanged file</span></td>
+              <td><span class="method">lean-ctx's own benchmark (<span class="mono">lean-ctx benchmark report .</span>), 50-file repo, GPT-4o tokenizer. agentflare has not re-run it.</span></td>
+              <td><span class="method">File reads in those modes only. Other tool calls compress less.</span></td>
             </tr>
           </tbody>
         </table></div>
       </div>
-      <p class="note">$ lean-ctx gain &middot; agentflare optimize output &middot; agentflare optimize code &middot; agentflare memory context — check your own.</p>
+      <p class="note">$ lean-ctx gain &middot; agentflare cost &middot; agentflare memory context — check your own.</p>
     </div>
   </section>
 
@@ -445,7 +423,7 @@
       <div class="band-head reveal">
         <span class="eyebrow">One command, run once</span>
         <h2>Install the binary. Wire your agent. Done.</h2>
-        <p>A single static binary — the only runtime dependency is agentflare itself. Detection-first: already-satisfied pieces are skipped, nothing gets clobbered.</p>
+        <p>The core CLI needs no Node. Detection-first: already-satisfied pieces are skipped, nothing gets clobbered.</p>
       </div>
 
       <div class="reveal">
@@ -458,7 +436,7 @@
 
         <div class="panel" data-panel="curl" data-active="true">
           <div class="codeblock">
-            <div class="cb-head"><span>Linux / macOS — prebuilt, checksum-verified</span>
+            <div class="cb-head"><span>Linux / macOS — prebuilt, SHA-256 checked when sha256sum or shasum is available</span>
               <button class="copy" data-copy="curl -fsSL https://raw.githubusercontent.com/getappz/agentflare/master/install.sh | sh" aria-label="Copy"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg></button>
             </div>
             <pre><code><span class="cb-c1">curl</span> -fsSL https://raw.githubusercontent.com/getappz/agentflare/master/install.sh | <span class="cb-c1">sh</span></code></pre>
@@ -498,11 +476,11 @@
           <div class="cb-head"><span>Then set up your agent — the run is the consent</span>
             <button class="copy" data-copy="agentflare init --agent claude-code" aria-label="Copy"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg></button>
           </div>
-          <pre><code><span class="cb-c2"># writes hooks straight into the host's own settings — no marketplace</span>
+          <pre><code><span class="cb-c2"># writes rules, MCP config and, where the host supports it, hooks</span>
 <span class="cb-c1">agentflare</span> init --agent claude-code   <span class="cb-c2"># or: codex &middot; cursor &middot; windsurf &middot; vscode-copilot &middot; cline &middot; continue &middot; opencode</span>
 <span class="cb-c3">&#10003;</span> rules written &middot; lean-ctx installed &middot; hooks + MCP wired &middot; memory ready</code></pre>
         </div>
-        <p class="sub-cmd" style="margin-top:14px">Every host above reads hook config directly into its own settings — no plugin marketplace. Codex is the one exception: it needs its own plugin-loader step, which <b>init</b> also handles.</p>
+        <p class="sub-cmd" style="margin-top:14px">Hooks: <b>init</b> writes them for claude-code, cursor, codex and opencode. Windsurf, VS Code (Copilot) and Continue get rules and MCP config only; Cline gets hooks through a plugin. Codex needs only <b>init</b>.</p>
       </div>
     </div>
   </section>
@@ -525,7 +503,7 @@
           <a href="https://github.com/getappz/agentflare" target="_blank" rel="noopener">GitHub</a>
           <a href="https://github.com/getappz/agentflare/blob/master/STATUS.md" target="_blank" rel="noopener">Status: what's stable</a>
           <a href="https://github.com/getappz/agentflare/releases" target="_blank" rel="noopener">Releases</a>
-          <a href="https://github.com/getappz/agentflare/blob/master/LICENSE" target="_blank" rel="noopener">MIT License</a>
+          <a href="https://github.com/getappz/agentflare/blob/master/LICENSE" target="_blank" rel="noopener">Apache-2.0 License</a>
         </div>
         <div class="foot-col">
           <h4>Layers</h4>
@@ -537,8 +515,8 @@
       </div>
     </div>
     <div class="foot-base">
-      <span>&copy; 2026 agentflare &middot; MIT</span>
-      <span class="badge"><span class="g"></span> v1.4.0 &middot; beta &middot; local-first &middot; daemon optional</span>
+      <span>&copy; 2026 agentflare &middot; Apache-2.0</span>
+      <span class="badge"><span class="g"></span> beta &middot; local-first &middot; daemon optional</span>
     </div>
   </div>
 </footer>
@@ -613,7 +591,6 @@
     {c:'', d:200},
     {c:'<span class="t-prompt">$</span> <span class="t-cmd">agentflare memory context</span>', d:520},
     {c:'<span class="t-flare">lean-ctx</span>   <span class="t-num">34.2M</span> tokens saved   <span class="t-dim">92% compression</span>   <span class="t-num">$88.45</span> saved', d:360},
-    {c:'<span class="t-flare">output</span>     <span class="t-num">1.16M</span> tokens saved <span class="t-dim">(~65%, one session)</span>', d:300},
     {c:'<span class="t-flare">memory</span>    <span class="t-num">11</span> observations &middot; <span class="t-num">2</span> projects tracked', d:300},
     {c:'', d:180},
     {c:'<span class="t-dim"># not a demo — pulled live from a real project.</span>', d:200},

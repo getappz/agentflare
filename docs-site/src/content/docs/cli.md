@@ -25,9 +25,8 @@ agentflare init --agent cursor -y
 | `--agent` | Required. One of `claude-code`, `cursor`, `windsurf`, `vscode-copilot`, `cline`, `continue`, `codex`, `opencode`. |
 | `-y`, `--yes` | Skip confirmation prompts. |
 
-Codex needs its plugin installed first (`codex plugin marketplace add getappz/agentflare
-&& codex plugin install agentflare`) before `agentflare init --agent codex` — the hook
-wiring itself comes from the plugin manifest, not `init`. See
+`agentflare init --agent codex` is enough for Codex: it writes the rules, the hook
+config and the MCP registration. See
 [Getting started](/docs/getting-started/) for the full walkthrough.
 
 ### `agentflare hook <event>`
@@ -561,7 +560,7 @@ Commands: `start`, `stop`, `restart`, `status`, `enable`, `disable`.
 
 ### `agentflare serve`
 
-Read-only dashboard.
+Dashboard and execution host. It has no login.
 
 ```bash
 agentflare serve --port 35273 --open

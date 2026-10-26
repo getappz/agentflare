@@ -33,16 +33,9 @@ agentflare init --agent continue
 agentflare init --agent opencode
 ```
 
-**Codex** needs one extra step first, since its hook system only activates through its
-own plugin loader:
-
-```bash
-codex plugin marketplace add getappz/agentflare
-codex plugin install agentflare
-```
-
-Then run `agentflare init --agent codex` for the rules and lean-ctx setup — the hook
-wiring itself comes from the plugin manifest, not `init`.
+**Codex** needs only `agentflare init --agent codex`, which writes the rules, the hook
+config and the MCP registration. Don't also install the Codex plugin until double-firing
+has been ruled out.
 
 ## What each run does
 
