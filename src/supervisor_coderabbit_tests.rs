@@ -64,6 +64,7 @@ fn coderabbit_never_repairs_a_merged_pr() {
             &[],
             &seed_gate_label(&mcp),
             "/repo",
+            None,
         ),
         SelfRepairOutcome::Skipped
     ));
@@ -122,6 +123,7 @@ fn coderabbit_repair_or_gate_redispatches_a_round_whose_job_was_lost() {
         &[],
         &label_id_by_name,
         "/repo",
+        None,
     );
     assert!(matches!(outcome, SelfRepairOutcome::Dispatched));
     // Repair job finished without posting success (failed attempt) — cancel it
@@ -144,6 +146,7 @@ fn coderabbit_repair_or_gate_redispatches_a_round_whose_job_was_lost() {
         &[],
         &label_id_by_name,
         "/repo",
+        None,
     );
 
     assert!(
@@ -279,7 +282,7 @@ fn approved_green_pr_stalled_on_threads_is_surfaced_once() {
     assert!(get_meta().contains("review_stall_notified"));
     let cards = take_pr_stage_comments_for_test();
     assert_eq!(cards.len(), 1, "surfaced exactly once: {cards:?}");
-    assert!(cards[0].contains("stalled on review threads"));
+    assert!(cards[0].contains("held the merge for"));
     // Merely waiting on the bot is not a stall.
     let waiting = ReviewBotState {
         blocking: 1,
@@ -386,6 +389,7 @@ fn coderabbit_repair_posts_a_completion_summary_exactly_once() {
         &[],
         &label_id_by_name,
         "/repo",
+        None,
     );
     assert!(matches!(outcome, SelfRepairOutcome::Dispatched));
     // Repair run reports what it fixed. Drain its queued job first so the
@@ -418,6 +422,7 @@ fn coderabbit_repair_posts_a_completion_summary_exactly_once() {
             &[CODERABBIT_REPAIR_PR_LABEL.to_string()],
             &label_id_by_name,
             "/repo",
+            None,
         );
         assert!(matches!(outcome, SelfRepairOutcome::Skipped));
     }
@@ -435,6 +440,123 @@ fn coderabbit_repair_posts_a_completion_summary_exactly_once() {
         "summary must quote what the repair run reported: {}",
         summaries[0].body
     );
+}
+
+#[test]
+fn void_coderabbit_repair_that_exits_cleanly_counts_toward_the_cap() {
+    const HEAD: &str = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
+    let labels = vec![PR_APPROVAL_LABEL.to_string()];
+    let review = ReviewBotState::for_dispatch(vec![coderabbit_finding(1, "coderabbitai[bot]")]);
+    let label_id_by_name = seed_gate_label(&mcp);
+
+    assert!(matches!(
+        tick_with_head(&mcp, &queue, &item_id, &review, &labels, HEAD),
+        PassingPrOutcome::Repair(SelfRepairOutcome::Dispatched)
+    ));
+    queue.cancel_for_item(&item_id, |_| false).unwrap();
+    mcp.comment_impl(CommentRequest {
+        action: "create".into(),
+        item_id: Some(item_id.clone()),
+        body: Some(format!(
+            "{}
+
+No-op repair run.",
+            crate::dispatch_failure_ceiling::WORK_SUCCESS_MARKER
+        )),
+        ..Default::default()
+    })
+    .unwrap();
+
+    for round in 0..crate::quota::decide::SELF_REPAIR_CAP {
+        if round > 0 {
+            mcp.comment_impl(CommentRequest {
+                action: "create".into(),
+                item_id: Some(item_id.clone()),
+                body: Some(format!(
+                    "{}
+
+No-op repair run #{round}.",
+                    crate::dispatch_failure_ceiling::WORK_SUCCESS_MARKER
+                )),
+                ..Default::default()
+            })
+            .unwrap();
+            queue.cancel_for_item(&item_id, |_| false).unwrap();
+        }
+        let item = mcp
+            .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
+            .unwrap();
+        maybe_credit_void_coderabbit_repair(
+            &mcp,
+            &item,
+            Some(HEAD),
+            false,
+            true,
+            &review.to_dispatch,
+        );
+        if coderabbit_repair_capped_unresolved(&mcp, &item) {
+            break;
+        }
+        let _ = tick_with_head(&mcp, &queue, &item_id, &review, &labels, HEAD);
+    }
+    let item = mcp
+        .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
+        .unwrap();
+    let _ = coderabbit_repair_or_gate(
+        &mcp,
+        &queue,
+        &test_auth_conn(),
+        agentflare_resource_gate::Policy::Normal,
+        &item,
+        42,
+        &review.to_dispatch,
+        &labels,
+        &label_id_by_name,
+        "/repo",
+        Some(HEAD),
+    );
+    let item = mcp
+        .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
+        .unwrap();
+    assert!(coderabbit_repair_capped_unresolved(&mcp, &item));
+    let labels_on_item = mcp
+        .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id).unwrap())
+        .unwrap();
+    assert!(labels_on_item.contains(&label_id_by_name[NEEDS_HUMAN_GATE_LABEL]));
+}
+
+fn tick_with_head(
+    mcp: &AgentflareMcp,
+    queue: &agentflare_jobs::Queue,
+    item_id: &str,
+    review: &ReviewBotState,
+    labels: &[String],
+    head: &str,
+) -> PassingPrOutcome {
+    let item = mcp
+        .with_backend_db(|conn| agentflare_backend::item::get(conn, item_id).unwrap())
+        .unwrap();
+    let auto = crate::worktree::AutoMergeRef::default();
+    merge_or_repair_findings(
+        mcp,
+        queue,
+        &test_auth_conn(),
+        agentflare_resource_gate::Policy::Normal,
+        &item,
+        std::path::Path::new("/repo"),
+        42,
+        review,
+        labels,
+        &seed_gate_label(mcp),
+        "/repo",
+        CiGreenMerge::Allowed {
+            head_sha: Some(head),
+            auto_merge: &auto,
+        },
+    )
 }
 
 #[test]

@@ -5,6 +5,7 @@ mod data;
 mod gate;
 mod messages;
 mod orphan_reconcile;
+mod pr_diff;
 pub(crate) mod server;
 
 pub fn serve(host: &str, port: u16, open: bool, yes_expose: bool) {
