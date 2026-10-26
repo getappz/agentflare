@@ -133,13 +133,12 @@ pub fn load_session(source: &str, session_id: &str) -> Result<SessionBundle, Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
 
     /// Env-backed config (`CLAUDE_PROJECTS_DIR`) is process-global: serialize
     /// these tests so parallel tests can't observe a half-set environment.
     fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        &agent_registry::detect::PATH_LOCK
     }
 
     fn fixture_dir(tag: &str) -> tempfile::TempDir {

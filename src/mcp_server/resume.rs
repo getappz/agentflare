@@ -230,12 +230,11 @@ impl super::AgentflareMcp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
 
-    /// `AGENTFLARE_INSIGHTS_DB` is process-global: serialize env-mutating tests.
+    /// Share the env lock with foreign-store tests that also override source paths.
     fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        &agent_registry::detect::PATH_LOCK
     }
 
     /// RAII env override: restores the previous value on drop, including panics.
@@ -340,6 +339,37 @@ mod tests {
              {\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"on it\",\"model\":\"claude-opus-4\"},\"timestamp\":\"2026-09-25T10:01:00.000Z\"}\n",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn explicit_dry_run_reads_live_claude_session() {
+        let _lock = env_lock().lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let foreign = tmp.path().join(".claude/projects");
+        seed_foreign_session(&foreign);
+        let _claude = EnvGuard::set("CLAUDE_PROJECTS_DIR", &foreign);
+        let _db = EnvGuard::set(INSIGHTS_DB_ENV, &tmp.path().join("missing.db"));
+        let artifacts = tmp.path().join("artifacts");
+        let _art = EnvGuard::set(ARTIFACTS_DIR_ENV, &artifacts);
+        let server = crate::mcp_server::AgentflareMcp::default();
+
+        for from in [Some("claude_code".into()), None] {
+            let out = server
+                .resume_impl(crate::mcp_server::types::ResumeRequest {
+                    session: Some("ses-1".into()),
+                    from,
+                    dry_run: Some(true),
+                    ..Default::default()
+                })
+                .unwrap();
+            let out: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(out["status"], "preview");
+            assert_eq!(out["picked"]["session"], "ses-1");
+            assert_eq!(out["picked"]["source"], "claude_code");
+            assert!(out["preview"].as_str().unwrap().contains("fix login"));
+        }
+        assert!(!artifacts.exists(), "dry run must not publish artifacts");
+        assert!(!tmp.path().join("missing.db").exists());
     }
 
     #[test]

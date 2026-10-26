@@ -32,8 +32,11 @@ fn dirs_data_dir() -> PathBuf {
 }
 
 fn default_sources() -> HashMap<String, PathBuf> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let h = PathBuf::from(home);
+    // Native Windows processes usually have no HOME; resolve it through the OS.
+    let h = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| PathBuf::from("."));
     let mut m = HashMap::new();
     m.insert("claude_code".into(), h.join(".claude").join("projects"));
     m.insert("codex".into(), h.join(".codex").join("sessions"));
