@@ -1,6 +1,15 @@
 
 # Known Issues and Technical Debt
 
+> Historical audit; findings below have not been revalidated against the current
+> checkout. Several references have drifted: CLI dispatch is now in
+> `src/cli/mod.rs`, `src/agent_detect.rs` is no longer at that path, and the
+> repository has multiple CLI integration tests. Do not treat the dependency
+> freshness or test-coverage claims below as current verification. For the
+> 2026-10-26 source inspection, see [ARCHITECTURE.md](ARCHITECTURE.md), including
+> its [limitations](ARCHITECTURE.md#dependency-lifecycle-and-limitations) and
+> [confidence assessment](ARCHITECTURE.md#confidence-and-verification-boundaries).
+
 ## Table of Contents
 
 - [Known Bugs](#known-bugs)
