@@ -9,8 +9,9 @@
 # agentflare
 
 **Run AI coding agents efficiently, and coordinate more than one of them.**
-**A single Rust binary, no Node, no runtime dependencies — across Claude Code,
-Codex, Cursor, Windsurf, VS Code, Cline, and Continue.**
+**A Rust binary for Claude Code, Codex, Cursor, Windsurf, VS Code, Cline,
+and Continue. The core CLI needs no Node; integrations and optional capabilities
+use external tools.**
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![Status: Beta](https://img.shields.io/badge/status-beta-yellow.svg)](STATUS.md)
@@ -64,7 +65,7 @@ tools any MCP-capable agent can call:
 | **Handoff** (`handoff`) | Pass context to a specific agent/runtime, addressed and threaded, when work moves from one agent to another. |
 | **Coaching** (`coaching` CLI + hook) | Small persistent nudges surfaced to an agent — at session start, and via contextual triggers (BM25 relevance against the tool call/prompt) so a rule only shows up when it's actually relevant. |
 | **Daemon** (`daemon`) | Background lifecycle for the coordination layer — PID file, flock lock, Unix socket/Windows named-pipe IPC, launchd/systemd autostart, cached update checks. |
-| **Dashboard** (`serve`) | Read-only web dashboard over the same local-first store — boards, items, cost, claims — for a glance without an MCP client. |
+| **Dashboard** (`serve`) | Web dashboard and execution host — boards, items, cost, claims, job submission and controls, workflow recovery, workers and schedules. |
 | **Friction logging** (`vent`) | Append-only per-repo JSONL of tool/workflow friction as it happens; a classifier auto-files the actionable entries as backlog items. |
 | **GitHub ops** (`flare_git` MCP tool, `git` CLI) | PRs, issues, releases, and workflow runs against GitHub — including a bounded `pr_wait` poll — on top of the branch-protection/provenance git shim. |
 | **Skills** (`skill`) | Registry for `SKILL.md` playbooks — search (BM25), load, and eval, so an agent can pull in a project-specific procedure on demand. |
@@ -74,16 +75,19 @@ tools any MCP-capable agent can call:
 | **Git-aware PATH shim** | Impersonates `git`; branch-protection policy resolves against the *target file's own repo*, not the host process's cwd, so a stray write can't land on `master`/`main` from the wrong worktree. |
 | **Comments, labels, projects, webhooks, channel_send** | Threaded discussion on items, categorization, cross-project views, and outbound notifications (Telegram/Slack/Discord). |
 
-A companion crate, `flare-proxy`, runs an Anthropic-compatible HTTP proxy in
-front of alternate/free OpenAI-style providers — useful for routing an agent
-through a different backend without changing its client code; it isn't wired
-into `agentflare init` yet.
+A companion crate, `flare-proxy`, provides an Anthropic-compatible HTTP proxy in
+front of alternate/free OpenAI-style providers. The dashboard mounts it at
+`/proxy/v1/messages`; provider routing is configured separately from agent setup.
 
-Everything above is local-first (SQLite-backed) and reachable over the same
-stdio MCP transport agentflare already exposes for the optimization layer, with
-no daemon required. The `daemon` and `serve` dashboard are opt-in — background
-lifecycle and a read-only HTTP view over the same store, not requirements for
-MCP tool use.
+The coordination stores are local-first. Stdio MCP can access them without a
+daemon. The optional `daemon` / `serve` process hosts background execution:
+workers, workflow recovery, supervisor ticks and interval schedules. Starting
+`serve` can execute queued work; its HTTP surface includes write/control routes
+and has no general authentication. Keep its default loopback binding.
+See the [source-backed architecture and operator reference](ARCHITECTURE.md)
+for process boundaries, installation differences and verification limits.
+For user outcomes, entry points and prerequisites, see the
+[product feature and capability catalog](ARCHITECTURE.md#product-features-and-capabilities).
 
 lean-ctx and the built-in memory aren't substitutes for each other — one saves
 tokens inside a session, the other saves the re-explaining tax across sessions.
@@ -152,11 +156,11 @@ separately, the newest 100 skip rows (`skipped_missed`, `skipped_overlap`).
 Rows that are still queued, dispatching, or dispatched are never pruned to
 make room. Receipts are kept for the life of the database in this phase.
 
-**Why Rust, not Node:** Claude Code doesn't bundle or require Node.js — it's a
-standalone compiled binary. A plugin whose hooks shell out to `node` breaks on
-any machine that installed Claude Code without separately installing Node.
-agentflare is a single static binary; the only runtime dependency is agentflare
-itself.
+**Why Rust:** the core CLI and hooks run as a native binary without requiring
+Node. That does not bundle every integration: lean-ctx is separate, agent
+execution needs the selected agent and credentials, and browser automation can
+download mise, agent-browser and Chrome for Testing on first use. See
+[installation and first use](ARCHITECTURE.md#installation-and-first-use).
 
 **No plugin marketplace required for Claude Code, Codex, or Cursor** —
 `agentflare init --agent X` writes hooks into the target's own settings file
@@ -195,8 +199,9 @@ Check your own: `lean-ctx gain` · `agentflare cost` · `agentflare optimize cod
 
 ## Install the CLI
 
-**Linux/macOS** (downloads a prebuilt binary, checksum-verified; builds from
-source instead if run from inside a clone):
+**Linux/macOS** (downloads a prebuilt binary; verifies its checksum when
+`sha256sum` or `shasum` is available, otherwise warns and skips verification;
+builds from source instead if run from inside a clone):
 ```bash
 curl -fsSL https://raw.githubusercontent.com/getappz/agentflare/master/install.sh | sh
 ```
@@ -207,8 +212,7 @@ brew tap getappz/agentflare
 brew install agentflare
 ```
 
-**Windows, build from source** (no unsigned prebuilt binary to trip an AV
-heuristic):
+**Windows, build from source** (requires Rust and a working native linker):
 ```powershell
 git clone https://github.com/getappz/agentflare
 cd agentflare
@@ -237,7 +241,8 @@ curl -fsSL https://raw.githubusercontent.com/getappz/agentflare/master/install.s
 
 ## Verifying release binaries
 
-The install methods above verify SHA-256 checksums by default — enough to
+The Unix download installer verifies SHA-256 checksums when a checksum tool is
+available; source builds do not download a release binary. Checksums can
 catch a corrupted download, not a substituted one. For higher-assurance
 environments, verify the cryptographic signature and build provenance before
 running the binary.
@@ -299,8 +304,9 @@ the higher tier.
 
 ## Set up an agent
 
-One command per tool, run once. Running it is the consent — installs happen
-immediately, no separate confirm step.
+One command per tool. `init` checks existing components, installs missing ones,
+merges host configuration, and can prompt to refresh rules or configure optional
+integrations.
 
 ```bash
 agentflare init --agent claude-code    # writes ~/.claude/settings.json hooks directly, no marketplace
@@ -324,11 +330,10 @@ found no issues. For verification, run tests through `mcp__lean_ctx__ctx_shell`:
 Codex's native Bash hook omits the process exit status, so its result cannot
 prove that a test passed.
 
-Each run: writes rule files (if absent), installs lean-ctx (native `curl | sh`
-or Homebrew installer) if missing, wires hooks/MCP where the host supports
-it. Detection-first — already-satisfied components are skipped, nothing gets
-clobbered. Persistent memory ships in the binary itself — nothing to install
-for it.
+Each run checks rule files, installs lean-ctx if missing, and wires hooks/MCP
+where the host supports it. Already-satisfied components are skipped; managed
+rules and existing hook configuration may be refreshed or merged. Persistent
+memory ships in the binary itself — nothing to install for it.
 
 ## Inter-agent messaging
 
@@ -381,6 +386,10 @@ curl -sL https://raw.githubusercontent.com/getappz/agentflare/master/AGENTS.md >
 
 ## Architecture
 
+The comprehensive [architecture and operator reference](ARCHITECTURE.md)
+documents the inspected source snapshot, major subsystems, installation,
+command verification, storage, recovery and platform limitations with citations.
+
 ```
 src/
 ├── main.rs                  # clap CLI entrypoint, dispatch across the modules below
@@ -414,8 +423,8 @@ src/
 ├── core/                                # small shared primitives (codesigning helpers)
 ├── rule_text.rs              # shared rule copy (Exa, git, lean-ctx usage) — paths.rs/state.rs
 │                           # moved to crates/agentflare-bin-lib
-├── compact.rs                 # legacy FTS5/BM25 PreCompact scorer, superseded by
-│                             # optimize/context.rs but still wired into the hook path
+├── compact.rs                 # FTS5/BM25 scorer still used by coaching;
+│                             # the compatibility PreCompact hook is a no-op
 ├── claims.rs, review.rs        # work-item claiming, review/consensus core logic
 ├── artifacts.rs, channels.rs     # artifact publishing, outbound notifications core logic
 ├── auth.rs, auth_crypt.rs,
@@ -430,7 +439,8 @@ src/
 │                                         # wires hooks directly for claude-code/cursor
 └── hook.rs                                 # `agentflare hook session-start|prompt-submit|... --agent X`
 
-crates/                     # 28-member Cargo workspace: flare-code, flare-output, flare-search-kit,
+crates/                     # 32 packages including the root and agentflare-workspace-hack:
+                            # flare-code, flare-output, flare-search-kit,
                             # agentflare-store, agentflare-backend, agentflare-db-kit, agent-registry,
                             # skill-registry, gateway-registry, flare-docs, flare-git-core,
                             # flare-git-shim, agentflare-shim, agentflare-artifacts, agentflare-jobs,
@@ -442,8 +452,9 @@ install.sh, install.ps1      # installers (checksum-verified download / local bu
 .github/workflows/          # ci.yml (build+test), release.yml (cross-compile on tag)
 ```
 
-Adding a new managed component means adding one entry to `components.rs` — neither
-`init` nor `hook` hardcodes per-tool logic.
+For a new managed component, start with its check/apply entry in `components.rs`.
+New host support can also require explicit installation and hook wiring in
+`init.rs` and the hook handlers.
 
 ---
 
@@ -451,7 +462,8 @@ Adding a new managed component means adding one entry to `components.rs` — nei
 
 **Claude Code**: `~/.claude/rules/{exa,git,lean-ctx}.md`, `~/.claude/settings.json` hooks section, `~/.agentflare/` (includes the built-in memory database and the optimize layer's own state — no more separate `~/.config/{caveman,ponytail}/` now that both are built into the binary).
 
-**Codex**: project-local `AGENTS.md` (only if absent), `~/.agentflare/`.
+**Codex**: project-local `AGENTS.md` (only if absent), `~/.codex/hooks.json`,
+MCP registration, `~/.agentflare/`.
 
 **Cursor**: project-local `.cursor/rules/agentflare.mdc`, `.cursor/hooks.json`, `~/.cursor/mcp.json`, `~/.agentflare/`.
 
@@ -459,7 +471,8 @@ Adding a new managed component means adding one entry to `components.rs` — nei
 
 **Continue**: `.continue/mcpServers/agentflare.json`.
 
-Nothing is created if it already exists.
+Already-satisfied components are skipped; existing configuration can be merged
+and managed rules refreshed. See [the integration lifecycle](ARCHITECTURE.md#deep-dive-1-host-integration-and-hook-policy).
 
 ---
 
