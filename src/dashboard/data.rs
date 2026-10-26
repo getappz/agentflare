@@ -1,6 +1,16 @@
 use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
 
+/// Side-by-side diff excerpt for the read-only dashboard item/PR view.
+pub fn pr_diff_context_plain(
+    pull_files: &[crate::github::models::PullRequestFile],
+    path: &str,
+    anchor: &crate::review::diff_display::Anchor,
+) -> String {
+    let parsed = crate::review::diff_display::file_diffs_from_pull_files(pull_files);
+    crate::review::diff_display::render_anchored_plain(&parsed, path, anchor)
+}
+
 /// The ONLY way the dashboard opens a database — read-only, so a write can't slip in.
 pub fn open_readonly(path: &Path) -> rusqlite::Result<Connection> {
     Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)

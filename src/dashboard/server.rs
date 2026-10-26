@@ -23,7 +23,6 @@ async fn claims_handler() -> Response {
     )
         .into_response()
 }
-
 #[derive(Deserialize)]
 struct WorkspaceScope {
     workspace_id: String,
@@ -710,7 +709,7 @@ pub fn router(queue: Queue) -> Router {
         .route("/events", get(events_handler))
         .merge(super::chat::router())
         .merge(super::messages::router())
-        .merge(super::gate::router())
+        .merge(super::gate::router().merge(super::pr_diff::router()))
         .merge(super::controls::router())
         .merge(jobs_router(queue))
         .nest("/artifacts", super::artifacts::router())
