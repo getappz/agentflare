@@ -26,7 +26,8 @@ agentflare init --agent cursor -y
 | `-y`, `--yes` | Skip confirmation prompts. |
 
 `agentflare init --agent codex` is enough for Codex: it writes the rules, the hook
-config and the MCP registration. See
+config and the MCP registration. Use init or the Codex plugin, not both: installing
+both executes the same lifecycle hooks twice. See
 [Getting started](/docs/getting-started/) for the full walkthrough.
 
 ### `agentflare hook <event>`

@@ -70,7 +70,7 @@ committed.
 
 - **Everything** → served from `public/` via the `ASSETS` binding.
 - **`/install.sh`, `/install.ps1`** → proxied from
-  `raw.githubusercontent.com/getappz/agentflare/master`, edge-cached 5 min, so
+  the immutable release tag in `INSTALL_REF` in `src/worker.ts`, edge-cached 5 min, so
   `curl -fsSL https://agentflare.dev/install.sh | sh` works and the hero command
   resolves on the domain instead of exposing a raw GitHub URL.
 - **Unknown paths** → `public/404.html` (`not_found_handling: "404-page"`).

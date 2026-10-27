@@ -16,11 +16,11 @@ attacking a different source of waste:
 
 | Layer | What it compresses |
 |---|---|
-| **lean-ctx** (companion, separate install) | tool I/O within a session — reads, shell output, search — up to ~99% |
+| **lean-ctx** (companion, separate install) | focused views of reads, shell output and search, with references for recovering detail; measure your repository with `lean-ctx benchmark report .` |
 | **memory** (built-in) | knowledge across sessions — decisions, facts, preferences that would otherwise be re-explained every time |
 | **`agentflare optimize output`** (formerly Caveman) | compresses markdown files you give it (needs model access) |
 | **`agentflare optimize code`** (formerly Ponytail) | code-writing over-engineering |
-| **`agentflare optimize context`** | session transcript compaction (BM25) |
+| **`agentflare optimize context`** | on-demand transcript relevance scoring (`optimize context score`) |
 | **runtime** (automatic) | session hygiene and model-routing nudges |
 
 `flare-docs` — always-current package documentation, so your agent isn't writing code

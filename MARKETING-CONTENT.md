@@ -3,6 +3,8 @@
 Rebuilt 2026-10-26 against `master` at `765e13cf` (includes PR #970, which added `ARCHITECTURE.md` and corrected the README). `Cargo.toml` v1.8.1, CHANGELOG 1.8.1 released 2026-10-06.
 Scope: audit, evidence base, positioning, and final site copy for agentflare.dev. No product code was changed.
 
+Follow-up verification for item #780: upstream [lean-ctx README](https://github.com/yvgude/lean-ctx#benchmarks) and [BENCHMARKS.md](https://github.com/yvgude/lean-ctx/blob/main/BENCHMARKS.md) withdraw the historical read-mode figures from product copy. The final copy below supersedes the earlier compression-number recommendation. Prerequisite decisions and runtime hook counts are recorded in section 10.
+
 Sources of truth, in order of trust: the code; `ARCHITECTURE.md` (source-cited, 2026-10-26); `STATUS.md`; the README. The existing site and docs pages are treated as claims to verify.
 
 Contents:
@@ -65,8 +67,8 @@ Not found: any telemetry or analytics client (see P1). Resolved by #970 and no l
 
 | ID | Claim | Source | Conditions and limits | Public? | Wording to use |
 |---|---|---|---|---|---|
-| C1 | lean-ctx compresses tool output 98.1% (`map`), 96.7% (`signatures`), ~99.99% on cached re-reads | README Metrics; upstream lean-ctx (`lean-ctx benchmark report .`) | Third-party tool agentflare installs; not built here; not re-run. 50-file repo, GPT-4o tokenizer. File reads in those modes only. | Yes, attributed and qualified | "lean-ctx, the companion tool agentflare installs, reports up to 98% fewer tokens on file reads in its `map` mode (its own benchmark, 50-file repo)." |
-| C2 | "34.2M tokens saved, 92%, $88.45" | README "Real usage" | One maintainer, lifetime, one project, lean-ctx's own ledger and pricing. | Anecdote only; no dollars | Omit, or label "one maintainer's project". |
+| C1 | Historical lean-ctx read-mode percentages | [Upstream measurement status](https://github.com/yvgude/lean-ctx/blob/main/BENCHMARKS.md) | Withdrawn by upstream; not current evidence, even with attribution. | No | Describe focused reads, searches and shell output. Ask readers to measure their repository with `lean-ctx benchmark report .`. |
+| C2 | One maintainer's lean-ctx usage ledger | README "Real usage" | One maintainer and project; no controlled comparison or independently checked monetary result. | No | Omit the anecdotal savings figures. |
 | C3 | `optimize output`: 65% average output-token reduction (22–87%, 10 prompts) | README; upstream Caveman | The command compresses a file; the figure is about model output under a terse-style prompt. No evals in this repo. Upstream doc warns of ~1–1.5k input tokens of overhead per turn that can make it net-negative on terse work. | No | Do not quote. Describe the command. |
 | C4 | `optimize code`: ~54% less code, ~20% cheaper, ~27% faster | README; upstream Ponytail | 12 tasks, FastAPI + React repo, Haiku 4.5, n=4. Other models, languages, agents untested. Several `optimize code` subcommands print instructions for the agent; they do not themselves audit or measure (`ARCHITECTURE.md`). | With heavy qualifiers, secondary placement | "In the upstream project's benchmark (12 feature tasks, one FastAPI + React repo, Haiku 4.5), agents wrote about 54% less code. Your results will vary." |
 | C5 | Built-in memory persists decisions across sessions | `STATUS.md` (stable); `src/memory/`; `tests/memory_cli.rs` | Local SQLite (`memory/brain.db`). Keyword recall always works; hybrid (vector) recall needs a `semantic` build and the downloaded model. Hybrid weights 0.4 BM25 / 0.6 vector, 30-day decay, MMR 0.7 (`src/memory/search.rs`). No effectiveness benchmark. | Yes (capability only) | "Remembers decisions between sessions." |
@@ -252,7 +254,7 @@ The homepage stat band is removed. Its four figures mix four different measureme
 > **Intro:** These pieces work for a single agent. `agentflare init` sets up the first two for you.
 
 **Card 1 — Compressed tool output (lean-ctx)**
-Reads, searches and shell output are cached and reduced before they reach your model. agentflare installs lean-ctx, a separate open-source tool, and wires it into your agent. On file reads in its most aggressive mode, lean-ctx reports reductions of up to 98% in its own benchmark. See Numbers for conditions.
+Reads, searches and shell output can return focused views with references for recovering detail. agentflare installs lean-ctx, a separate open-source tool, and wires it into your agent. Measure your repository with `lean-ctx benchmark report .`; upstream has withdrawn its earlier read-mode figures.
 
 **Card 2 — Memory across sessions**
 Decisions, facts and preferences are saved to a local database and recalled in the next session, so you stop re-explaining the project. Search it with `agentflare memory search "<query>"`.
@@ -316,14 +318,13 @@ Adds a short set of instructions, delivered by hooks in Claude Code and Codex, t
 
 | What it measures | Result | Who measured it and how | Limits |
 |---|---|---|---|
-| **Tool-output compression** (lean-ctx) | 98.1% fewer tokens on file reads in `map` mode; 96.7% in `signatures` mode; near-total reduction on repeated reads of an unchanged file | lean-ctx's own benchmark (`lean-ctx benchmark report .`) on a 50-file repository with the GPT-4o tokenizer. Source: github.com/yvgude/lean-ctx | File reads in those modes only. Other tool calls compress less. |
-| **Generated code volume** (`optimize code`) | About 54% less code on average across 12 feature tasks; about 20% lower cost and 27% faster in the same runs | The Ponytail project's benchmark: FastAPI + React repository, Claude Haiku 4.5, 4 runs. *Source link to be supplied; see section 10.* | One repository, one model, small sample. It measures how much code was written, not whether it was better. |
+| **Generated code volume** (`optimize code`) | About 54% less code on average across 12 feature tasks; about 20% lower cost and 27% faster in the same runs | [The Ponytail project's benchmark](https://github.com/DietrichGebert/ponytail/blob/main/benchmarks/results/2026-06-18-agentic.md): FastAPI + React repository, Claude Haiku 4.5, 4 runs. | One repository, one model, small sample. It measures how much code was written, not whether it was better. |
 
 > **Not included on purpose:** an output-token figure for `optimize output`. The command compresses files you give it, and no measurement of that effect has been published.
 >
 > **Check your own:** `lean-ctx gain` · `agentflare cost` · `agentflare memory context`
 
-*(Optional, only with maintainer approval: "One maintainer's project has saved 34.2M tokens through lean-ctx over its lifetime. That is one data point, not a benchmark.")*
+lean-ctx percentages are omitted because [upstream withdrew the historical figures](https://github.com/yvgude/lean-ctx/blob/main/BENCHMARKS.md). Its local representation reports do not establish answer quality or monetary savings.
 
 ### 5.10 Local-first, and what leaves your machine
 
@@ -339,7 +340,7 @@ Adds a short set of instructions, delivered by hooks in Claude Code and Codex, t
 >
 > **Verify what you download.** The Unix installer checks the release's SHA-256 checksum when `sha256sum` or `shasum` is available, and stops if the checksum file is missing or does not match. Release binaries are signed with cosign and carry SLSA provenance; the steps are in the docs.
 >
-> We have not found analytics or telemetry code in the source. This describes what we searched for, not a guarantee.
+> Telemetry sentence omitted; see the decision in section 10.
 
 ### 5.11 Closing CTA
 
@@ -429,7 +430,7 @@ Derived from `src/init.rs` and `src/components.rs`, and cross-checked against `A
 | Agent | `init --agent` | Rules file | Hooks | MCP tools | Notes |
 |---|---|---|---|---|---|
 | Claude Code | `claude-code` | Yes | Yes | Yes | Most tested. The only agent with `agentflare cost`; all published benchmarks used it. |
-| Codex | `codex` | Yes | Yes (`~/.codex/hooks.json`, written by `init`) | Yes (`codex mcp add flare`) | `init` alone is enough. Do not also install the Codex plugin until double-firing is ruled out. Codex's native Bash hook omits the exit status, so it cannot prove a test passed. |
+| Codex | `codex` | Yes | Yes (`~/.codex/hooks.json`, written by `init`) | Yes (`codex mcp add flare`) | Use `init` or the plugin, not both: both setups execute the same hooks (measured below). Codex's native Bash hook omits the exit status, so it cannot prove a test passed. |
 | Cursor | `cursor` | Yes | Yes† (`.cursor/hooks.json`) | Yes | |
 | opencode | `opencode` | Yes | Yes† (plugin) | Yes | Rules wired through `opencode.jsonc`. |
 | Windsurf | `windsurf` | Yes | No | Yes | |
@@ -534,7 +535,7 @@ The getappz organization on GitHub. Source, issues and releases are public.
 | "v1.4.0 · beta · local-first · daemon optional" | Stale (1.8.1); "local-first" is unqualified | Drop version; keep "Beta" |
 | Stat band: 98.1% / 65% / 54% / 34.2M | Four measurements in one row; 65% mislabelled; 34.2M is one user | Remove; use the Numbers table |
 | "optimize output — Conversation verbosity compression, ~65% fewer tokens" | The command compresses markdown files | Card 5 (5.6) |
-| "Companion tool… up to 99%" | Rounded up from 98.1% | "up to 98% (map mode)" with source |
+| "Companion tool… up to 99%" | Historical read-mode figures were withdrawn by upstream | Capability description without a percentage; link the measurement status |
 | "Committed evals"; "Confidence: High" column | No such evals; self-assigned rating | "The upstream project's benchmark"; show Limits |
 | "A single static binary — the only runtime dependency is agentflare itself" | lean-ctx, browser downloads, ONNX model, agent and credentials | "The core CLI needs no Node" and 5.10 |
 | "Every host above reads hook config directly into its own settings" | Four of eight agents have no hook wiring | Compatibility matrix (6.4) |
@@ -553,14 +554,24 @@ The getappz organization on GitHub. Source, issues and releases are public.
 
 ---
 
-## 10. Open items before publishing
+## 10. Prerequisite decisions and remaining publication checks
 
-These need a maintainer; the code cannot settle them.
+The three prerequisites for item #780 are resolved before the site/docs fix round:
 
-1. **Codex double-firing.** Install Codex with `init` only, then with `init` plus the plugin, and count hook invocations. Until then the copy says "`init` alone".
-2. **Ponytail benchmark source URL.** Not in the repo. Needed for the Numbers row; CodeRabbit asked for the same.
-3. **Fix the one-liner.** Bump `INSTALL_REF` in `site/src/worker.ts`, then switch the hero command to `agentflare.dev/install.sh`.
-4. **Dashboard.** Decide whether `serve` should stay a combined dashboard and execution host or gain authentication; until then the copy states the risk plainly.
-5. **Telemetry sentence.** Approve or strike "We have not found analytics or telemetry code in the source."
-6. **Windows signing.** The copy discloses the unsigned binary; signing would let it drop that line.
-7. **Not run on a clean machine:** `init` for Cursor, opencode and Cline (†), the Homebrew and Scoop installs, and the cosign/SLSA verification steps.
+- **A — Codex double-firing confirmed.** Codex CLI 0.164.0 on Windows, isolated `AGENTFLARE_HOME_OVERRIDE` and `CODEX_HOME`, with actual `agentflare init --agent codex -y`. A temporary catalog in the [documented local-marketplace format](https://developers.openai.com/codex/plugins/build) installed copies of this checkout's `.codex-plugin/plugin.json` and `hooks/hooks.json`. Windows command overrides counted handler starts and delegated the original commands with unchanged stdin. The two cases ran sequentially in separate Codex processes, using a closed localhost model endpoint and `--dangerously-bypass-hook-trust` for the reviewed test hooks only. No model completion was needed. Assertions checked the runtime counts below. The site and setup docs therefore make init and the plugin exclusive; prefer init alone.
+
+  | Event | init alone | init + plugin |
+  |---|---|---|
+  | SessionStart | 2 handlers | 4 handlers (2 init + 2 plugin) |
+  | UserPromptSubmit | 2 handlers | 4 handlers (2 init + 2 plugin) |
+
+  Each source contributes the general agentflare handler and the optimize-code handler. These are executed starts, not configured-entry counts. Model connection failure was expected; the runtime probes were terminated after the counts were captured. Other lifecycle events and platforms were not exercised. Temporary files and the init-added Windows User PATH entry were removed.
+- **B — Strike the telemetry sentence.** Omit the optional claim from public copy, consistent with PR #975's recorded omission. This is a copy decision, not an additional source audit or guarantee.
+- **C — Ponytail source supplied.** [2026-06-18 agentic benchmark](https://github.com/DietrichGebert/ponytail/blob/main/benchmarks/results/2026-06-18-agentic.md): 12 feature tasks, FastAPI + React, Haiku 4.5, four runs per task/arm; about 54% less code, 20% lower cost, 27% faster. These remain upstream measurements, not an agentflare rerun.
+
+Remaining checks and product decisions:
+
+1. **One-liner.** `INSTALL_REF` is v1.8.1 (also returned by `gh release view`); the homepage uses `agentflare.dev/install.sh` throughout. Bump the pin on future releases.
+2. **Dashboard.** Decide whether `serve` should stay a combined dashboard and execution host or gain authentication; the current copy states the risk plainly.
+3. **Windows signing.** The copy discloses the unsigned binary; signing would let it drop that line.
+4. **Not run on a clean machine:** `init` for Cursor, opencode and Cline (†), the Homebrew and Scoop installs, and the cosign/SLSA verification steps.

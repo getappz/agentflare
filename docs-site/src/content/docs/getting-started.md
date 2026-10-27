@@ -5,15 +5,16 @@ description: Install agentflare and wire it into your AI coding agent.
 
 ## Install
 
-The quickest path on Linux/macOS downloads a prebuilt, checksum-verified binary (it
-builds from source instead if run from inside a clone):
+The quickest path on Linux/macOS downloads a prebuilt binary. It verifies SHA-256
+when `sha256sum` or `shasum` is available; otherwise it warns and continues. It builds
+from source instead if run from inside a clone:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/getappz/agentflare/master/install.sh | sh
+curl -fsSL https://agentflare.dev/install.sh | sh
 ```
 
-Homebrew, Scoop, `cargo install --git`, and build-from-source (the path for Windows,
-since there's no signed prebuilt binary there yet) are all supported too — see the
+Homebrew, Scoop (an unsigned Windows x86_64 binary), `cargo install --git`, and
+build-from-source are supported too — see the
 [README](https://github.com/getappz/agentflare#install-the-cli) for the full matrix and
 the [CLI reference](/docs/cli/) once it's installed.
 
@@ -34,17 +35,18 @@ agentflare init --agent opencode
 ```
 
 **Codex** needs only `agentflare init --agent codex`, which writes the rules, the hook
-config and the MCP registration. Don't also install the Codex plugin until double-firing
-has been ruled out.
+config and the MCP registration. Use init or the Codex plugin, not both: installing
+both executes the same lifecycle hooks twice.
 
 ## What each run does
 
 - Writes rule files, if not already present.
 - Installs lean-ctx if it's missing (native `curl | sh` or the Homebrew installer).
-- Wires hooks/MCP directly into the host's own config where it supports that — no plugin
-  marketplace involved, Codex's plugin-loader step above being the one exception.
+- Wires MCP and, where supported, hooks into the host's configuration. Codex needs
+  no plugin-loader step when using init.
 - Is detection-first and idempotent: components that are already satisfied are skipped,
-  and nothing that's already there gets clobbered. Safe to re-run after an upgrade.
+  and managed rules may be refreshed. See [Architecture](/docs/architecture/) for
+  integration and first-use details.
 
 ## What's next
 
