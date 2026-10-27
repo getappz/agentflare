@@ -41,9 +41,9 @@ agent session.
 
 | Layer | What it compresses | Tool |
 |---|---|---|
-| **lean-ctx** | tool I/O *within* a session — reads, shell output, search, up to 99% | [yvgude/lean-ctx](https://github.com/yvgude/lean-ctx) |
+| **lean-ctx** | focused views of tool I/O *within* a session — reads, shell output and search, with references for recovering detail | [yvgude/lean-ctx](https://github.com/yvgude/lean-ctx) |
 | **memory** (built-in) | knowledge *across* sessions — decisions, facts, preferences that survive a session ending | ships in the binary, SQLite + FTS5, no separate install |
-| **`agentflare optimize output`** (formerly Caveman) | opt-in markdown prose compression, ~65% in published Claude Code benchmarks | built into the binary |
+| **`agentflare optimize output`** (formerly Caveman) | compresses markdown files you give it, so the agent reads fewer tokens each time it loads them (needs model access) | built into the binary |
 | **`agentflare optimize code`** (formerly Ponytail) | code-writing minimalism, hooked into Claude Code and Codex | built into the binary |
 | **`agentflare optimize context`** | on-demand BM25/FTS5 relevance scoring over a session transcript (`optimize context score`). The `PreCompact` hook is wired for upgrade compatibility but inert: Claude Code's `PreCompact` accepts no injected context, so compaction survival is left to lean-ctx | built into the binary |
 | **`agentflare optimize retrieve`** | reversible-compression retrieve (CCR) — pulls back the original, full-fidelity content that output/context compression replaced, when an agent actually needs it | built into the binary |
@@ -165,20 +165,21 @@ download mise, agent-browser and Chrome for Testing on first use. See
 **No plugin marketplace required for Claude Code, Codex, or Cursor** —
 `agentflare init --agent X` writes hooks into the target's own settings file
 (`~/.claude/settings.json`, `~/.codex/hooks.json`, or `.cursor/hooks.json`).
+For Codex, use init or the plugin, not both: installing both duplicates lifecycle hooks.
 
 ## Metrics
 
-Numbers below are each project's own published, reproducible benchmarks — attributed,
-not blended into a fake combined total, and not accepted on faith. Where a claim had no
-supporting evidence in its own repo, it's flagged instead of repeated. These cover the
-**optimization layer** specifically — the coordination layer is too new for a
+The result below comes from the upstream project's benchmark, which agentflare has
+not re-run. It is not a prediction for your project. The coordination layer has no
 comparable benchmark suite yet (see [STATUS.md](STATUS.md)).
 
-| Tool | Published claim | Methodology | Confidence |
+| Tool | Reported result | Source and method | Limits |
 |---|---|---|---|
-| lean-ctx | 98.1% compression (`map` mode), 96.7% (`signatures`), ~99.99% cached re-read | CI-gated, reproducible via `lean-ctx benchmark report .`, measured on a 50-file repo with the GPT-4o tokenizer | High — real, reproducible, methodology named |
-| `agentflare optimize output` | 65% avg output-token reduction (range 22–87%, 10 prompts) | Committed in `benchmarks/`/`evals/` — and its own docs flag the failure mode: ~1–1.5k input-token overhead per turn can make it net-negative on already-terse workloads (`docs/HONEST-NUMBERS.md`) | High — reproducible, unusually transparent about limits |
-| `agentflare optimize code` | ~54% less code (94% ceiling on best task), ~20% cheaper, ~27% faster, 100% safe | 12 real feature tasks on a FastAPI+React repo, Haiku 4.5, n=4 — self-corrected an earlier overgeneralized single-shot figure | High — reproducible, self-corrected once already |
+| `agentflare optimize code` | About 54% less code, 20% lower cost and 27% faster | [Ponytail's agentic benchmark](https://github.com/DietrichGebert/ponytail/blob/main/benchmarks/results/2026-06-18-agentic.md): 12 feature tasks on one FastAPI + React repository, Haiku 4.5, four runs per task/arm | One repository and model, small sample. Code volume does not measure code quality. |
+
+lean-ctx's earlier read-mode figures are [withdrawn by upstream](https://github.com/yvgude/lean-ctx/blob/main/BENCHMARKS.md).
+Measure your repository with `lean-ctx benchmark report .`; local representation
+comparisons do not establish model quality or monetary savings.
 
 ### Real usage, one live project
 
@@ -186,8 +187,6 @@ Not a demo — pulled live from the maintainer's own project while building this
 for a sense of scale. Not a controlled benchmark; one data point, your mileage varies.
 
 ```text
-lean-ctx         34.2M tokens saved   92% compression   $88.45 saved   (lifetime; lean-ctx gain)
-optimize output  1.16M tokens saved (~65%)                              (single session; via `agentflare cost`)
 optimize code    code-minimalism markers logged, no token figure        (agentflare optimize code doesn't measure per-repo savings)
 memory           2 sessions, 11 observations tracked, across 2 projects (agentflare memory sessions/search)
 ```
@@ -411,7 +410,7 @@ src/
 │                             # search, sessions, relations, summaries
 ├── github/                     # GitHub API client backing `flare_git`/`git` — actions,
 │                             # issues, pulls, releases, identity, auth
-├── dashboard/                   # `agentflare serve` read-only dashboard backend
+├── dashboard/                   # `agentflare serve` dashboard and execution host backend
 │                             # (pairs with the top-level dashboard/web static frontend)
 ├── vent/                         # friction capture, auto-classification into backlog items
 ├── mentions/                      # @mention inline reference parsing/resolution (@I/@A/@search)

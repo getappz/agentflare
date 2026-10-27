@@ -36,6 +36,6 @@
   <text x="86" y="486" font-family="'Segoe UI', 'DejaVu Sans', sans-serif" font-size="27" fill="#C3C8D4">One Rust binary. Cut one agent's token bill; coordinate more than one.</text>
 
   <!-- footer chips row -->
-  <text x="84" y="566" font-family="Consolas, 'DejaVu Sans Mono', monospace" font-size="24" fill="#8A90A0">no Node&#160;&#160;·&#160;&#160;no runtime deps&#160;&#160;·&#160;&#160;MIT</text>
+  <text x="84" y="566" font-family="Consolas, 'DejaVu Sans Mono', monospace" font-size="24" fill="#8A90A0">core CLI needs no Node&#160;&#160;·&#160;&#160;Apache-2.0</text>
   <text x="1116" y="566" text-anchor="end" font-family="Consolas, 'DejaVu Sans Mono', monospace" font-size="26" font-weight="700" fill="url(#ftext)">agentflare.dev</text>
 </svg>
