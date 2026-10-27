@@ -202,7 +202,11 @@ fn parse_codex_jsonl(path: &std::path::Path) -> Option<(Session, Vec<Turn>, Vec<
 
     let project = cwd
         .as_deref()
-        .and_then(|c| PathBuf::from(c).file_name().map(|n| n.to_string_lossy().into_owned()))
+        .and_then(|c| {
+            PathBuf::from(c)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        })
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "codex".to_string());
 

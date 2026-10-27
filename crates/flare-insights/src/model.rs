@@ -176,7 +176,6 @@ pub struct ToolStats {
     pub failure_rate: Option<f64>,
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

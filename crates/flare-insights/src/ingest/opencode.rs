@@ -106,9 +106,10 @@ impl Adapter for OpenCodeAdapter {
 }
 
 fn try_session_table_dynamic(conn: &rusqlite::Connection) -> Vec<Session> {
-    let stmt = match conn.prepare(
-        "SELECT * FROM session ORDER BY time_updated DESC LIMIT 1000",
-    ).or_else(|_| conn.prepare("SELECT * FROM session LIMIT 1000")) {
+    let stmt = match conn
+        .prepare("SELECT * FROM session ORDER BY time_updated DESC LIMIT 1000")
+        .or_else(|_| conn.prepare("SELECT * FROM session LIMIT 1000"))
+    {
         Ok(s) => s,
         Err(_) => return vec![],
     };
@@ -134,9 +135,10 @@ fn try_session_table_dynamic(conn: &rusqlite::Connection) -> Vec<Session> {
     let time_updated_idx = find(&["time_updated", "updated_at", "timeUpdated"]);
     let time_created_idx = find(&["time_created", "created_at", "timeCreated"]);
 
-    let mut stmt2 = match conn.prepare(
-        "SELECT * FROM session ORDER BY time_updated DESC LIMIT 1000",
-    ).or_else(|_| conn.prepare("SELECT * FROM session LIMIT 1000")) {
+    let mut stmt2 = match conn
+        .prepare("SELECT * FROM session ORDER BY time_updated DESC LIMIT 1000")
+        .or_else(|_| conn.prepare("SELECT * FROM session LIMIT 1000"))
+    {
         Ok(s) => s,
         Err(_) => return vec![],
     };
@@ -227,10 +229,10 @@ fn try_session_table_dynamic(conn: &rusqlite::Connection) -> Vec<Session> {
                 }
             } else if let Some(dir) = &directory {
                 std::path::Path::new(dir)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or(dir)
-                        .to_string()
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(dir)
+                    .to_string()
             } else {
                 project_id_raw.clone()
             }
@@ -588,7 +590,6 @@ fn split_parts_into_steps(parts: &[serde_json::Value]) -> Vec<Vec<serde_json::Va
     }
     steps
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -266,26 +266,51 @@ mod tests {
         let _claude = EnvGuard::set("CLAUDE_PROJECTS_DIR", None);
         let _codex = EnvGuard::set("CODEX_SESSIONS_DIR", None);
         let _up = EnvGuard::set("USERPROFILE", Some(r"C:\Users\fixture"));
+        let home = PathBuf::from(r"C:\Users\fixture");
         let sources = default_sources();
+        // Join via PathBuf so Unix CI (mixed separators) matches production joins.
         assert_eq!(
             sources.get("claude_code"),
-            Some(&PathBuf::from(r"C:\Users\fixture\.claude\projects"))
+            Some(&home.join(".claude").join("projects"))
         );
         assert_eq!(
             sources.get("codex"),
-            Some(&PathBuf::from(r"C:\Users\fixture\.codex\sessions"))
+            Some(&home.join(".codex").join("sessions"))
         );
         assert_eq!(
             sources.get("opencode"),
-            Some(&PathBuf::from(
-                r"C:\Users\fixture\.local\share\opencode\opencode.db"
-            ))
+            Some(
+                &home
+                    .join(".local")
+                    .join("share")
+                    .join("opencode")
+                    .join("opencode.db")
+            )
         );
         assert_eq!(
             insights_db_path(),
-            PathBuf::from(
-                r"C:\Users\fixture\.local\share\agentflare\insights\observatory.db"
-            )
+            home.join(".local")
+                .join("share")
+                .join("agentflare")
+                .join("insights")
+                .join("observatory.db")
+        );
+    }
+
+    #[test]
+    fn resolve_home_skips_empty_home_for_userprofile() {
+        let _lock = env_lock().lock().unwrap();
+        let _home = EnvGuard::set("HOME", Some(""));
+        let _up = EnvGuard::set("USERPROFILE", Some(r"C:\Users\fixture"));
+        assert_eq!(resolve_home(), PathBuf::from(r"C:\Users\fixture"));
+        assert_eq!(
+            insights_db_path(),
+            PathBuf::from(r"C:\Users\fixture")
+                .join(".local")
+                .join("share")
+                .join("agentflare")
+                .join("insights")
+                .join("observatory.db")
         );
     }
 }
