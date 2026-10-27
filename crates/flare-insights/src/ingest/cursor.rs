@@ -45,11 +45,18 @@ impl Adapter for CursorAdapter {
         }
 
         // Single SQLite file — use the file-cursor skip cache like JSONL adapters.
+        // Bypass while state.vscdb-wal is non-empty: SQLite can land new composer
+        // rows in the WAL without changing the main DB mtime/size that file_cursor
+        // tracks, so a cached skip would miss live Cursor writes.
         let Some(cursor) = file_cursor(db_path) else {
             on_progress(0, 0);
             return Ok(IngestBundle::default());
         };
-        if cursors.get(db_path) == Some(&cursor) {
+        let wal_path = db_path.with_extension("vscdb-wal");
+        let wal_nonempty = std::fs::metadata(&wal_path)
+            .map(|metadata| metadata.len() > 0)
+            .unwrap_or(false);
+        if !wal_nonempty && cursors.get(db_path) == Some(&cursor) {
             on_progress(1, 1);
             return Ok(IngestBundle::default());
         }
@@ -99,14 +106,17 @@ fn ingest_from_conn(conn: &Connection) -> Result<IngestBundle, IngestError> {
         .prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%' ORDER BY key")
     {
         Ok(s) => s,
-        Err(_) => return Ok(bundle),
+        // Missing table = nothing to ingest; other prepare failures must propagate
+        // so scan() does not persist a file cursor as if the read succeeded.
+        Err(e) if is_missing_cursor_disk_kv(&e) => return Ok(bundle),
+        Err(e) => return Err(e.into()),
     };
     let rows = stmt.query_map([], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
     })?;
 
-    for row in rows.filter_map(|r| r.ok()) {
-        let (key, value_bytes) = row;
+    for row in rows {
+        let (key, value_bytes) = row?;
         let Some(composer_id) = key.strip_prefix("composerData:") else {
             continue;
         };
@@ -129,7 +139,7 @@ fn ingest_from_conn(conn: &Connection) -> Result<IngestBundle, IngestError> {
         if headers.is_empty() {
             continue;
         }
-        if let Some(session_bundle) = ingest_composer(conn, composer_id, &data, &headers) {
+        if let Some(session_bundle) = ingest_composer(conn, composer_id, &data, &headers)? {
             bundle.sessions.push(session_bundle.session);
             bundle.turns.extend(session_bundle.turns);
             bundle.tool_calls.extend(session_bundle.tools);
@@ -138,6 +148,13 @@ fn ingest_from_conn(conn: &Connection) -> Result<IngestBundle, IngestError> {
         }
     }
     Ok(bundle)
+}
+
+fn is_missing_cursor_disk_kv(err: &rusqlite::Error) -> bool {
+    match err {
+        rusqlite::Error::SqliteFailure(_, Some(msg)) => msg.contains("no such table"),
+        _ => err.to_string().contains("no such table"),
+    }
 }
 
 struct SessionParts {
@@ -153,7 +170,7 @@ fn ingest_composer(
     composer_id: &str,
     data: &Value,
     headers: &[Value],
-) -> Option<SessionParts> {
+) -> Result<Option<SessionParts>, IngestError> {
     let mut turns: Vec<Turn> = Vec::new();
     let mut tools: Vec<ToolCall> = Vec::new();
     let mut files: Vec<FileEvent> = Vec::new();
@@ -218,7 +235,7 @@ fn ingest_composer(
         let header_type = header.get("type").and_then(|v| v.as_i64()).unwrap_or(-1);
         let header_ts = header.get("createdAt").and_then(parse_timestamp);
 
-        let bubble = load_bubble(conn, composer_id, bubble_id).unwrap_or(Value::Null);
+        let bubble = load_bubble(conn, composer_id, bubble_id)?.unwrap_or(Value::Null);
         if let Some(tc) = bubble.get("tokenCount") {
             tokens.input += tc
                 .get("inputTokens")
@@ -347,7 +364,7 @@ fn ingest_composer(
     }
 
     if turns.is_empty() && tools.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let cwd = workspace_fs_path(data);
@@ -443,7 +460,7 @@ fn ingest_composer(
         None
     };
 
-    Some(SessionParts {
+    Ok(Some(SessionParts {
         session: Session {
             id: composer_id.to_string(),
             source: SessionSource::Cursor,
@@ -471,20 +488,29 @@ fn ingest_composer(
         tools,
         files,
         subagents,
-    })
+    }))
 }
 
-fn load_bubble(conn: &Connection, composer_id: &str, bubble_id: &str) -> Option<Value> {
+fn load_bubble(
+    conn: &Connection,
+    composer_id: &str,
+    bubble_id: &str,
+) -> Result<Option<Value>, IngestError> {
     let key = format!("bubbleId:{composer_id}:{bubble_id}");
-    let bytes: Vec<u8> = conn
-        .query_row(
-            "SELECT value FROM cursorDiskKV WHERE key = ?1",
-            [&key],
-            |r| r.get(0),
-        )
-        .ok()?;
-    let text = std::str::from_utf8(&bytes).ok()?;
-    serde_json::from_str(text).ok()
+    let bytes: Vec<u8> = match conn.query_row(
+        "SELECT value FROM cursorDiskKV WHERE key = ?1",
+        [&key],
+        |r| r.get(0),
+    ) {
+        Ok(bytes) => bytes,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(s) => s,
+        Err(_) => return Ok(None),
+    };
+    Ok(serde_json::from_str(text).ok())
 }
 
 fn bubble_created_at(bubble: &Value) -> Option<DateTime<Utc>> {
@@ -526,7 +552,15 @@ fn tool_from_bubble(
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("{composer_id}-{turn_seq}-{name}"));
+        .unwrap_or_else(|| {
+            // Multiple tool bubbles in one turn can share name+seq; include
+            // bubbleId so fallback IDs stay unique across the session.
+            let bid = bubble
+                .get("bubbleId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            format!("{composer_id}-{turn_seq}-{name}-{bid}")
+        });
     let input = parse_tool_input(tfd);
     let status = tfd
         .get("status")
@@ -854,5 +888,59 @@ mod tests {
         let bundle = CursorAdapter.scan(&cfg, &cursors, &mut |_, _| {}).unwrap();
         assert!(bundle.sessions.is_empty());
         assert!(bundle.file_cursors.is_empty());
+    }
+
+    #[test]
+    fn nonempty_wal_bypasses_file_cursor_skip() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("state.vscdb");
+        write_fixture(&db);
+        // Sibling WAL with bytes — main-file cursor is unchanged, but ingest must re-read.
+        std::fs::write(db.with_extension("vscdb-wal"), b"wal-bytes").unwrap();
+        let cfg = InsightsConfig {
+            sources: [("cursor".into(), db.clone())].into(),
+            ..Default::default()
+        };
+        let cursor = file_cursor(&db).unwrap();
+        let mut cursors = FileCursors::default();
+        cursors.insert(db, cursor);
+        let bundle = CursorAdapter.scan(&cfg, &cursors, &mut |_, _| {}).unwrap();
+        assert_eq!(bundle.sessions.len(), 1);
+        assert_eq!(bundle.file_cursors.len(), 1);
+    }
+
+    #[test]
+    fn missing_cursor_disk_kv_table_returns_empty_without_error() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("state.vscdb");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value BLOB);")
+            .unwrap();
+        drop(conn);
+        let cfg = InsightsConfig {
+            sources: [("cursor".into(), db)].into(),
+            ..Default::default()
+        };
+        let bundle = CursorAdapter
+            .scan(&cfg, &FileCursors::default(), &mut |_, _| {})
+            .unwrap();
+        assert!(bundle.sessions.is_empty());
+    }
+
+    #[test]
+    fn fallback_tool_call_id_includes_bubble_id() {
+        let bubble_a = serde_json::json!({
+            "bubbleId": "b-a",
+            "toolFormerData": {"name": "Read", "params": {"path": "a.rs"}}
+        });
+        let bubble_b = serde_json::json!({
+            "bubbleId": "b-b",
+            "toolFormerData": {"name": "Read", "params": {"path": "b.rs"}}
+        });
+        let a = tool_from_bubble("comp", 1, &bubble_a, None).unwrap();
+        let b = tool_from_bubble("comp", 1, &bubble_b, None).unwrap();
+        assert_eq!(a.id, "comp-1-Read-b-a");
+        assert_eq!(b.id, "comp-1-Read-b-b");
+        assert_ne!(a.id, b.id);
     }
 }
