@@ -837,7 +837,6 @@ fn wire_antigravity() {
 
     let manifest = json!({
         "name": "agentflare",
-        "version": env!("CARGO_PKG_VERSION"),
         "description": "agentflare workflow orchestration, session liveness, and team sync"
     });
     if let Err(e) = fs::write(
@@ -2256,6 +2255,12 @@ mod tests {
                     .exists()
             );
             assert!(plugin_dir.join("rules").join("AGENTS.md").exists());
+
+            let plugin_manifest: Value =
+                serde_json::from_str(&fs::read_to_string(plugin_dir.join("plugin.json")).unwrap())
+                    .unwrap();
+            assert_eq!(plugin_manifest["name"], "agentflare");
+            assert!(plugin_manifest.get("version").is_none());
 
             let hooks: Value =
                 serde_json::from_str(&fs::read_to_string(plugin_dir.join("hooks.json")).unwrap())

@@ -1006,19 +1006,12 @@ pub fn get_components(host: &str) -> Vec<Component> {
                         .and_then(|m| m.get("flare"))
                         .is_some(),
                     "antigravity" => {
-                        let ide = home().join(".gemini").join("antigravity").join("mcp_config.json");
-                        let cli = home().join(".gemini").join("antigravity-cli").join("mcp_config.json");
-                        let ide_ok = ide.exists()
-                            && json_at(&ide)
+                        let cfg = home().join(".gemini").join("config").join("mcp_config.json");
+                        cfg.exists()
+                            && json_at(&cfg)
                                 .get("mcpServers")
                                 .and_then(|m| m.get("flare"))
-                                .is_some();
-                        let cli_ok = cli.exists()
-                            && json_at(&cli)
-                                .get("mcpServers")
-                                .and_then(|m| m.get("flare"))
-                                .is_some();
-                        ide_ok || cli_ok
+                                .is_some()
                     }
                     _ => true,
                 })
@@ -1106,14 +1099,11 @@ pub fn get_components(host: &str) -> Vec<Component> {
                             }
                         }
                         "antigravity" => {
-                            let ide = home().join(".gemini").join("antigravity").join("mcp_config.json");
-                            let cli = home().join(".gemini").join("antigravity-cli").join("mcp_config.json");
-                            let m1 = merge_json(&ide, "mcpServers", "flare", entry.clone());
-                            let m2 = merge_json(&cli, "mcpServers", "flare", entry);
-                            if m1 || m2 {
-                                format!("{} and {} (flare registered)", ide.display(), cli.display())
+                            let path = home().join(".gemini").join("config").join("mcp_config.json");
+                            if merge_json(&path, "mcpServers", "flare", entry) {
+                                format!("{} (flare registered)", path.display())
                             } else {
-                                "failed to write antigravity mcp_config.json".to_string()
+                                format!("failed to write {}", path.display())
                             }
                         }
                         _ => format!("no agentflare MCP integration defined for host '{host}'"),
@@ -1541,22 +1531,12 @@ mod tests {
             (agentflare_mcp.apply)();
             assert!((agentflare_mcp.check)());
 
-            let ide = home()
+            let cfg = home()
                 .join(".gemini")
-                .join("antigravity")
-                .join("mcp_config.json");
-            let cli = home()
-                .join(".gemini")
-                .join("antigravity-cli")
+                .join("config")
                 .join("mcp_config.json");
             assert!(
-                json_at(&ide)
-                    .get("mcpServers")
-                    .and_then(|m| m.get("flare"))
-                    .is_some()
-            );
-            assert!(
-                json_at(&cli)
+                json_at(&cfg)
                     .get("mcpServers")
                     .and_then(|m| m.get("flare"))
                     .is_some()

@@ -262,6 +262,29 @@ struct PreToolUseInput {
     delay_seconds: Option<u64>,
 }
 
+pub(crate) fn parse_antigravity_tool_call(
+    tc: &serde_json::Value,
+) -> Option<(String, Option<serde_json::Value>)> {
+    let raw_name = tc.get("name").and_then(|n| n.as_str())?;
+    let name = match raw_name {
+        "write_to_file" | "write_file" => "Write".to_string(),
+        "replace_file_content" | "multi_replace_file_content" | "edit_file" => "Edit".to_string(),
+        other => other.to_string(),
+    };
+    let mut input = tc.get("args").cloned();
+    if let Some(obj) = input.as_mut().and_then(|v| v.as_object_mut())
+        && !obj.contains_key("file_path")
+        && let Some(target) = obj
+            .get("TargetFile")
+            .or_else(|| obj.get("Path"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    {
+        obj.insert("file_path".to_string(), serde_json::Value::String(target));
+    }
+    Some((name, input))
+}
+
 fn parse_pre_tool_use(input: &str) -> Option<PreToolUseInput> {
     let v: serde_json::Value = serde_json::from_str(input).ok()?;
     let session_id = v
@@ -271,9 +294,7 @@ fn parse_pre_tool_use(input: &str) -> Option<PreToolUseInput> {
         .and_then(|s| s.as_str())?
         .to_string();
     let (raw_tool_name, raw_tool_input) = if let Some(tc) = v.get("toolCall") {
-        let name = tc.get("name").and_then(|n| n.as_str())?.to_string();
-        let input = tc.get("args").cloned();
-        (name, input)
+        parse_antigravity_tool_call(tc)?
     } else {
         let name = v.get("tool_name")?.as_str()?.to_string();
         let input = v.get("tool_input").cloned();
@@ -462,6 +483,7 @@ fn shell_command_from_tool_input(tool_input: Option<&serde_json::Value>) -> Opti
         ti.get("command")
             .or_else(|| ti.get("cmd"))
             .or_else(|| ti.get("script"))
+            .or_else(|| ti.get("CommandLine"))
             .and_then(|v| v.as_str())
             .map(String::from)
     })
@@ -470,7 +492,7 @@ fn shell_command_from_tool_input(tool_input: Option<&serde_json::Value>) -> Opti
 fn is_verification_shell_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "Bash" | "bash" | "PowerShell" | "powershell" | "shell"
+        "Bash" | "bash" | "PowerShell" | "powershell" | "shell" | "run_command"
     ) || tool_name.ends_with("__ctx_shell")
 }
 
@@ -490,6 +512,32 @@ fn format_pre_tool_decision(agent: &str, decision: serde_json::Value) -> serde_j
         }
     } else {
         decision
+    }
+}
+
+fn format_pre_tool_allow(agent: &str, out: serde_json::Value) -> serde_json::Value {
+    if agent == "antigravity" {
+        let mut parts = Vec::new();
+        if let Some(sys) = out.get("systemMessage").and_then(|s| s.as_str()) {
+            parts.push(sys.to_string());
+        }
+        if let Some(ctx) = out
+            .get("hookSpecificOutput")
+            .and_then(|h| h.get("additionalContext"))
+            .and_then(|c| c.as_str())
+        {
+            parts.push(ctx.to_string());
+        }
+        if parts.is_empty() {
+            json!({ "decision": "allow" })
+        } else {
+            json!({
+                "decision": "allow",
+                "reason": parts.join("\n\n"),
+            })
+        }
+    } else {
+        out
     }
 }
 
@@ -598,7 +646,7 @@ pub fn pre_tool_use(agent: &str) {
                 "permissionDecisionReason": reason,
             }
         });
-        println!("{decision}");
+        println!("{}", format_pre_tool_decision(agent, decision));
         return;
     }
 
@@ -671,7 +719,7 @@ pub fn pre_tool_use(agent: &str) {
         crate::hook_messages::MailSurface::PreToolUse,
     );
     if let Some(out) = crate::hook_messages::pre_tool_use_output(&msgs, &nudges) {
-        println!("{out}");
+        println!("{}", format_pre_tool_allow(agent, out));
     } else if agent == "antigravity" {
         println!("{}", json!({ "decision": "allow" }));
     }
@@ -786,6 +834,7 @@ pub fn prompt_submit(agent: &str) {
         .and_then(|v| {
             v.get("session_id")
                 .or_else(|| v.get("conversation_id"))
+                .or_else(|| v.get("conversationId"))
                 .and_then(|s| s.as_str())
                 .map(String::from)
         });
@@ -890,26 +939,28 @@ pub fn prompt_submit(agent: &str) {
         first_turn = record.turn_count == 0;
         record.turn_count += 1;
 
-        let ctx = crate::optimize::RouteContext {
-            prompt: prompt.to_string(),
-            session_id: sid.clone(),
-            turn_count: record.turn_count,
-            recent_tool_calls: record.recent_tool_calls.clone(),
-            current_model: crate::agent_model::detect(agent, &input),
-        };
-        if jev_router {
-            jev_route_ctx = Some(ctx);
-        } else if let Some(router) = &router
-            && let Some(nudge) = router.route(&ctx)
-        {
-            session_bits.push(nudge);
+        if !prompt.is_empty() {
+            let ctx = crate::optimize::RouteContext {
+                prompt: prompt.to_string(),
+                session_id: sid.clone(),
+                turn_count: record.turn_count,
+                recent_tool_calls: record.recent_tool_calls.clone(),
+                current_model: crate::agent_model::detect(agent, &input),
+            };
+            if jev_router {
+                jev_route_ctx = Some(ctx);
+            } else if let Some(router) = &router
+                && let Some(nudge) = router.route(&ctx)
+            {
+                session_bits.push(nudge);
+            }
         }
 
         if let Some(nudge) = crate::optimize::session_hygiene_nudge(record, now) {
             session_bits.push(nudge);
         }
         crate::optimize::save_runtime(&runtime);
-    } else {
+    } else if !prompt.is_empty() {
         let ctx = crate::optimize::RouteContext {
             prompt: prompt.to_string(),
             session_id: String::new(),
@@ -944,7 +995,9 @@ pub fn prompt_submit(agent: &str) {
             bits.push(nudge);
         }
     }
-    if let Some(block) = crate::mentions::expand(prompt) {
+    if !prompt.is_empty()
+        && let Some(block) = crate::mentions::expand(prompt)
+    {
         bits.push(block);
     }
     let pending = components.iter().any(|c| c.needs_consent && !(c.check)());
@@ -958,80 +1011,84 @@ pub fn prompt_submit(agent: &str) {
             bits.push(nudge);
         }
     }
-    let intent = append_prompt_context(&mut bits, session_bits, prompt);
+    if prompt.is_empty() {
+        bits.extend(session_bits);
+    } else {
+        let intent = append_prompt_context(&mut bits, session_bits, prompt);
 
-    let mut skill_pick = None;
-    let mut pending_rerank = None;
-    if intent.confidence >= 0.5 {
-        let db_path = crate::paths::skills_db_path();
-        if db_path.exists()
-            && let Ok(mut registry) = skill_registry::Registry::open_default(&db_path)
-        {
-            let _ = registry.ensure_fresh(crate::components::detected_skill_agents);
-            let limit = crate::skill_rerank::fetch_limit(3);
-            if let Ok(skills) = crate::skill_detect::find_skills(
-                &intent,
-                &registry,
-                limit,
-                crate::memory::engine::embed_query,
-                crate::memory::engine::embed_doc,
-            ) {
-                // Re-ranking a wider pool can reorder the top picks, so the
-                // default 3-result set is fetched on its own as the baseline.
-                let baseline = if limit == 3 {
-                    skills.clone()
-                } else {
-                    crate::skill_detect::find_skills(
-                        &intent,
-                        &registry,
-                        3,
-                        crate::memory::engine::embed_query,
-                        crate::memory::engine::embed_doc,
-                    )
-                    .unwrap_or_else(|_| skills.iter().take(3).cloned().collect())
-                };
-                match crate::skill_rerank::prepare(prompt, skills, baseline, 3) {
-                    Ok(pending) => {
-                        pending_rerank = Some(pending);
+        let mut skill_pick = None;
+        let mut pending_rerank = None;
+        if intent.confidence >= 0.5 {
+            let db_path = crate::paths::skills_db_path();
+            if db_path.exists()
+                && let Ok(mut registry) = skill_registry::Registry::open_default(&db_path)
+            {
+                let _ = registry.ensure_fresh(crate::components::detected_skill_agents);
+                let limit = crate::skill_rerank::fetch_limit(3);
+                if let Ok(skills) = crate::skill_detect::find_skills(
+                    &intent,
+                    &registry,
+                    limit,
+                    crate::memory::engine::embed_query,
+                    crate::memory::engine::embed_doc,
+                ) {
+                    // Re-ranking a wider pool can reorder the top picks, so the
+                    // default 3-result set is fetched on its own as the baseline.
+                    let baseline = if limit == 3 {
+                        skills.clone()
+                    } else {
+                        crate::skill_detect::find_skills(
+                            &intent,
+                            &registry,
+                            3,
+                            crate::memory::engine::embed_query,
+                            crate::memory::engine::embed_doc,
+                        )
+                        .unwrap_or_else(|_| skills.iter().take(3).cloned().collect())
+                    };
+                    match crate::skill_rerank::prepare(prompt, skills, baseline, 3) {
+                        Ok(pending) => {
+                            pending_rerank = Some(pending);
+                        }
+                        Err(baseline) => skill_pick = Some(baseline),
                     }
-                    Err(baseline) => skill_pick = Some(baseline),
                 }
             }
         }
-    }
-    let decisions =
-        crate::hook_decide_batch::run(prompt, jev_route_ctx.as_ref(), pending_rerank.as_ref());
-    if let Some(nudge) = decisions.route_nudge {
-        bits.push(nudge);
-    }
-    if decisions.skill_pick.is_some() {
-        skill_pick = decisions.skill_pick;
-    }
-    if let Some(skills) = skill_pick
-        && let Some(injection) = crate::skill_detect::build_injection(&skills)
-    {
-        bits.push(injection);
-    }
-    // Detect "install <something> skill" patterns → suggest CLI command.
-    let q = prompt.to_lowercase();
-    if q.contains("install") && (q.contains("skill") || q.contains("skills")) {
-        let name = q
-            .replace("install", "")
-            .replace("skill", "")
-            .replace("the", "")
-            .replace("a", "")
-            .replace("please", "")
-            .trim()
-            .to_string();
-        if !name.is_empty() {
-            bits.push(format!(
-                "@skill-install: agentflare skill install \"{name}\" to search and install"
-            ));
-        } else {
-            bits.push(
-                "@skill-install: agentflare skill search <query> to find and install skills"
-                    .to_string(),
-            );
+        let decisions =
+            crate::hook_decide_batch::run(prompt, jev_route_ctx.as_ref(), pending_rerank.as_ref());
+        if let Some(nudge) = decisions.route_nudge {
+            bits.push(nudge);
+        }
+        if decisions.skill_pick.is_some() {
+            skill_pick = decisions.skill_pick;
+        }
+        if let Some(skills) = skill_pick
+            && let Some(injection) = crate::skill_detect::build_injection(&skills)
+        {
+            bits.push(injection);
+        }
+        // Detect "install <something> skill" patterns → suggest CLI command.
+        let q = prompt.to_lowercase();
+        if q.contains("install") && (q.contains("skill") || q.contains("skills")) {
+            let name = q
+                .replace("install", "")
+                .replace("skill", "")
+                .replace("the", "")
+                .replace("a", "")
+                .replace("please", "")
+                .trim()
+                .to_string();
+            if !name.is_empty() {
+                bits.push(format!(
+                    "@skill-install: agentflare skill install \"{name}\" to search and install"
+                ));
+            } else {
+                bits.push(
+                    "@skill-install: agentflare skill search <query> to find and install skills"
+                        .to_string(),
+                );
+            }
         }
     }
 
@@ -1047,8 +1104,12 @@ pub fn prompt_submit(agent: &str) {
         return;
     }
     if agent == "antigravity" {
-        let out = crate::hook_messages::context_output(agent, "PreInvocation", &context);
-        println!("{out}");
+        if context.trim().is_empty() {
+            println!("{{}}");
+        } else {
+            let out = crate::hook_messages::context_output(agent, "PreInvocation", &context);
+            println!("{out}");
+        }
         return;
     }
     let out = json!({
@@ -1121,6 +1182,16 @@ mod tests {
         assert_eq!(parsed.session_id, "ag-1");
         assert_eq!(parsed.tool_name, "run_command");
         assert_eq!(parsed.tool_input.unwrap()["CommandLine"], "npm test");
+
+        let write_input = r#"{"conversationId":"ag-1","toolCall":{"name":"write_to_file","args":{"TargetFile":"src/lib.rs"}}}"#;
+        let write_parsed = parse_pre_tool_use(write_input).unwrap();
+        assert_eq!(write_parsed.tool_name, "Write");
+        assert_eq!(write_parsed.tool_input.unwrap()["file_path"], "src/lib.rs");
+
+        let edit_input = r#"{"conversationId":"ag-1","toolCall":{"name":"replace_file_content","args":{"TargetFile":"src/lib.rs"}}}"#;
+        let edit_parsed = parse_pre_tool_use(edit_input).unwrap();
+        assert_eq!(edit_parsed.tool_name, "Edit");
+        assert_eq!(edit_parsed.tool_input.unwrap()["file_path"], "src/lib.rs");
     }
 
     #[test]
@@ -1141,6 +1212,13 @@ mod tests {
         let ag = format_pre_tool_decision("antigravity", claude);
         assert_eq!(ag["decision"], "deny");
         assert_eq!(ag["reason"], "Branch protected");
+
+        let allow = format_pre_tool_allow(
+            "antigravity",
+            json!({"systemMessage": "agentflare: batch calls"}),
+        );
+        assert_eq!(allow["decision"], "allow");
+        assert_eq!(allow["reason"], "agentflare: batch calls");
     }
 
     #[test]

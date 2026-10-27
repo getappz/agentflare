@@ -110,9 +110,7 @@ pub(crate) fn parse_post_tool_use(input: &str) -> Option<PostToolUseInput> {
         .and_then(|s| s.as_str())?
         .to_string();
     let (raw_tool_name, raw_tool_input) = if let Some(tc) = v.get("toolCall") {
-        let name = tc.get("name").and_then(|n| n.as_str())?.to_string();
-        let input = tc.get("args").cloned();
-        (name, input)
+        crate::hook::parse_antigravity_tool_call(tc)?
     } else {
         let name = v.get("tool_name")?.as_str()?.to_string();
         let input = v.get("tool_input").cloned();
@@ -161,10 +159,18 @@ pub(crate) fn parse_post_tool_use(input: &str) -> Option<PostToolUseInput> {
                 .and_then(Value::as_str)
                 .and_then(exit_code_from_text)
         });
+    let top_error = v.get("error").and_then(|e| match e {
+        Value::Null => None,
+        Value::String(s) if !s.trim().is_empty() => Some(s.as_str()),
+        Value::Bool(true) => Some("error"),
+        Value::Object(o) if !o.is_empty() => Some("error"),
+        _ => None,
+    });
     let is_error = response
         .and_then(|r| r.get("isError"))
         .and_then(Value::as_bool)
-        == Some(true);
+        == Some(true)
+        || top_error.is_some();
     let output_text = response
         .map(|r| {
             let stdout = r.get("stdout").and_then(Value::as_str).unwrap_or("");
@@ -190,6 +196,7 @@ pub(crate) fn parse_post_tool_use(input: &str) -> Option<PostToolUseInput> {
                 .unwrap_or_default()
                 .to_string()
         })
+        .or_else(|| top_error.map(str::to_string))
         .unwrap_or_default();
     let exit_code = exit_code
         .or_else(|| exit_code_from_text(&output_text))
@@ -198,7 +205,8 @@ pub(crate) fn parse_post_tool_use(input: &str) -> Option<PostToolUseInput> {
                 .ends_with("__ctx_shell")
                 .then(|| ctx_shell_exit_code(&output_text))
                 .flatten()
-        });
+        })
+        .or_else(|| top_error.map(|_| 1));
     let result_state = decoded_response
         .as_ref()
         .and_then(|r| r.get("state"))
@@ -518,6 +526,17 @@ mod tests {
         let parsed = parse_post_tool_use(input).unwrap();
         assert_eq!(parsed.session_id, "c1");
         assert_eq!(parsed.tool_name, "Shell");
+
+        let ag_fail = r#"{"conversationId":"ag-1","toolCall":{"name":"run_command","args":{"CommandLine":"npm test"}},"error":"exit status 1"}"#;
+        let ag_parsed = parse_post_tool_use(ag_fail).unwrap();
+        assert!(ag_parsed.is_error);
+        assert_eq!(ag_parsed.exit_code, Some(1));
+        assert!(!verification_passed_for_hook(
+            "antigravity",
+            &ag_parsed.tool_name,
+            ag_parsed.exit_code,
+            &ag_parsed.output_text
+        ));
     }
 
     #[test]

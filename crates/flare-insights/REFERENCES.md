@@ -38,7 +38,7 @@ All external OSS projects, docs, and APIs referenced to build `flare-insights` (
 | **Claude Code** | `~/.claude/projects/**/*.jsonl` | `type: user/human/assistant`, `message.usage {input_tokens, output_tokens, cache_read_input_tokens}`, `message.content[].type=="tool_use"` — our `ingest/claude.rs` handles both top-level and nested `message` |
 | **Codex CLI** | `~/.codex/sessions/2025/12/27/rollout-*.jsonl` | `type: session_meta/response_item`, `payload.role`, `payload.type=="function_call"` — `ingest/codex.rs` max_depth 5 |
 | **OpenCode** | `~/.local/share/opencode/opencode.db` (SQLite) | Tables `session`, `message`, `part` (not `sessions`) — dynamic `column_names()` map handles `project_id`/`projectID`, `opencode.rs` |
-| **Cursor** | `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb` (`cursorDiskKV`) — from `agent-lens` | Not yet ingested (stub) |
+| **Cursor** | `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb` (Win: `%APPDATA%/Cursor/...`) `cursorDiskKV` keys `composerData:*` / `bubbleId:*:*` — from `agent-lens` | Ingested by `ingest/cursor.rs` |
 | **Gemini CLI** | `~/.gemini` | 11-event hook system — future `ingest/gemini.rs` |
 | **Kimi / Antigravity / Qoder / Pi / Droid** | `~/.kimi`, `~/.gemini/antigravity`, etc. — from `agent-trail`/`agent-lens` | Reserved adapters |
 
@@ -87,7 +87,7 @@ https://github.com/wesm/agent-session-viewer  # predecessor of agentsview
 ## 6. How references map to `flare-insights` modules
 
 ```
-REFERENCES.md:1-2  → src/ingest/{claude,codex,opencode}.rs  (adapter per runtime)
+REFERENCES.md:1-2  → src/ingest/{claude,codex,opencode,cursor}.rs  (adapter per runtime)
          + watcher.rs (notify + poll, from agentsview/codedash)
        → src/store.rs (SQLite FTS5 trigram, from agentsview + agent-trail)
        → src/search.rs (FTS5 + trigram + hybrid via flare-search-kit)
@@ -97,7 +97,7 @@ REFERENCES.md:1-2  → src/ingest/{claude,codex,opencode}.rs  (adapter per runti
        → src/export.rs (DeepEval/OpenAI/HTML/Gist/tar.gz, from opensync)
        → src/api.rs (REST + WS, 127.0.0.1 only, from agent-trail/agentsview)
        → src/cli/insights.rs (sync/list/show/search/stats/export/handoff/serve)
-       → config.rs (env overrides CLAUDE_PROJECTS_DIR/CODEX_SESSIONS_DIR/OPENCODE_DIR, PricingTable)
+       → config.rs (env overrides CLAUDE_PROJECTS_DIR/CODEX_SESSIONS_DIR/OPENCODE_DIR/CURSOR_STATE_VSCDB, PricingTable)
 ```
 
 *Last updated: 2026-08-26 — flare-insights v0.1.0*

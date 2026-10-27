@@ -57,7 +57,7 @@ impl Adapter for AntigravityAdapter {
             if cursors.get(path) == Some(&cursor) {
                 continue;
             }
-            if let Some(b) = parse_antigravity_jsonl(path) {
+            if let Some(b) = parse_antigravity_jsonl(path, &config.pricing) {
                 bundle.sessions.extend(b.sessions);
                 bundle.turns.extend(b.turns);
                 bundle.tool_calls.extend(b.tool_calls);
@@ -71,33 +71,37 @@ impl Adapter for AntigravityAdapter {
     }
 }
 
-pub(crate) fn parse_antigravity_jsonl(path: &Path) -> Option<IngestBundle> {
+pub(crate) fn parse_antigravity_jsonl(path: &Path, pricing: &PricingTable) -> Option<IngestBundle> {
     let vals = crate::ingest::read_jsonl_sessions(path);
     if vals.is_empty() {
         return None;
     }
 
     // Antigravity logs are stored at <brain>/<conversation-id>/.system_generated/logs/transcript.jsonl
-    let id = path
-        .parent()
-        .and_then(|p| {
-            if p.file_name().and_then(|n| n.to_str()) == Some("logs") {
-                p.parent()
-            } else {
-                Some(p)
-            }
-        })
-        .and_then(|p| {
-            if p.file_name().and_then(|n| n.to_str()) == Some(".system_generated") {
-                p.parent()
-            } else {
-                Some(p)
-            }
-        })
-        .and_then(|p| p.file_name())
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown")
-        .to_string();
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let id = match file_name.strip_suffix(".transcript.jsonl") {
+        Some(stem) if !stem.is_empty() => stem.to_string(),
+        _ => path
+            .parent()
+            .and_then(|p| {
+                if p.file_name().and_then(|n| n.to_str()) == Some("logs") {
+                    p.parent()
+                } else {
+                    Some(p)
+                }
+            })
+            .and_then(|p| {
+                if p.file_name().and_then(|n| n.to_str()) == Some(".system_generated") {
+                    p.parent()
+                } else {
+                    Some(p)
+                }
+            })
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string(),
+    };
 
     let mut tokens = TokenUsage {
         input: 0,
@@ -174,17 +178,19 @@ pub(crate) fn parse_antigravity_jsonl(path: &Path) -> Option<IngestBundle> {
                 cost_usd: None,
             });
         } else if typ == "GENERIC" || typ == "TOOL_OUTPUT" {
-            // Attach output to preceding tool call if present
-            if let Some(last_tool) = tool_calls.last_mut() {
-                if last_tool.output.is_none() {
-                    let content = v.get("content").and_then(|c| c.as_str());
-                    if let Some(text) = content {
-                        last_tool.output = Some(text.to_string());
-                        if text.contains("Command exited with code")
-                            && !text.contains("Command exited with code 0")
-                        {
-                            last_tool.status = "failed".into();
-                        }
+            // Attach output to earliest pending tool call in current turn
+            if let Some(last_tool) = tool_calls
+                .iter_mut()
+                .filter(|t| t.turn_seq == seq)
+                .find(|t| t.output.is_none())
+            {
+                let content = v.get("content").and_then(|c| c.as_str());
+                if let Some(text) = content {
+                    last_tool.output = Some(text.to_string());
+                    if text.contains("Command exited with code")
+                        && !text.contains("Command exited with code 0")
+                    {
+                        last_tool.status = "failed".into();
                     }
                 }
             }
@@ -284,7 +290,6 @@ pub(crate) fn parse_antigravity_jsonl(path: &Path) -> Option<IngestBundle> {
 
     let model_str = model.unwrap_or_else(|| "gemini".to_string());
     let cost = {
-        let pricing = PricingTable::default();
         let c = pricing.cost_for(Some(&model_str), &tokens);
         if c.total_usd > 0.0 {
             Some(c)
@@ -413,7 +418,8 @@ mod tests {
             writeln!(file, "{}", line).unwrap();
         }
 
-        let bundle = parse_antigravity_jsonl(&transcript_path).expect("bundle parsed");
+        let bundle = parse_antigravity_jsonl(&transcript_path, &PricingTable::default())
+            .expect("bundle parsed");
         assert_eq!(bundle.sessions.len(), 1);
         let session = &bundle.sessions[0];
         assert_eq!(session.id, "conv-123");
@@ -432,5 +438,12 @@ mod tests {
         assert_eq!(bundle.subagents.len(), 1);
         assert_eq!(bundle.subagents[0].kind, "Reviewer");
         assert_eq!(bundle.subagents[0].task.as_deref(), Some("Review widget"));
+
+        // Verify *.transcript.jsonl stem derivation
+        let stem_path = log_dir.join("sub-conv-456.transcript.jsonl");
+        std::fs::copy(&transcript_path, &stem_path).unwrap();
+        let stem_bundle =
+            parse_antigravity_jsonl(&stem_path, &PricingTable::default()).expect("stem parsed");
+        assert_eq!(stem_bundle.sessions[0].id, "sub-conv-456");
     }
 }

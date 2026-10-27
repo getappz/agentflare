@@ -44,8 +44,11 @@ fn default_sources() -> HashMap<String, PathBuf> {
             .join("opencode")
             .join("opencode.db"),
     );
-    // Cursor has no ingest adapter yet (#321) — omit path mapping so `doctor`
-    // does not list a dead source. Gemini/Copilot stay as reserved path stubs.
+    m.insert(
+        "cursor".into(),
+        crate::ingest::cursor::default_state_vscdb_path(),
+    );
+    // Gemini/Copilot stay as reserved path stubs (no ingest adapter yet).
     m.insert("gemini".into(), h.join(".gemini"));
     m.insert("copilot".into(), h.join(".copilot"));
     let antigravity_brain = if h
@@ -64,6 +67,7 @@ fn default_sources() -> HashMap<String, PathBuf> {
         ("claude_code", "CLAUDE_PROJECTS_DIR"),
         ("codex", "CODEX_SESSIONS_DIR"),
         ("opencode", "OPENCODE_DIR"),
+        ("cursor", "CURSOR_STATE_VSCDB"),
         ("gemini", "GEMINI_DIR"),
         ("antigravity", "ANTIGRAVITY_BRAIN_DIR"),
     ] {
