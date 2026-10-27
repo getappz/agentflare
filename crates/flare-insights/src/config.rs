@@ -48,12 +48,24 @@ fn default_sources() -> HashMap<String, PathBuf> {
     // does not list a dead source. Gemini/Copilot stay as reserved path stubs.
     m.insert("gemini".into(), h.join(".gemini"));
     m.insert("copilot".into(), h.join(".copilot"));
+    let antigravity_brain = if h
+        .join(".gemini")
+        .join("antigravity-cli")
+        .join("brain")
+        .exists()
+    {
+        h.join(".gemini").join("antigravity-cli").join("brain")
+    } else {
+        h.join(".gemini").join("antigravity").join("brain")
+    };
+    m.insert("antigravity".into(), antigravity_brain);
     // env overrides
     for (key, env) in [
         ("claude_code", "CLAUDE_PROJECTS_DIR"),
         ("codex", "CODEX_SESSIONS_DIR"),
         ("opencode", "OPENCODE_DIR"),
         ("gemini", "GEMINI_DIR"),
+        ("antigravity", "ANTIGRAVITY_BRAIN_DIR"),
     ] {
         if let Ok(v) = std::env::var(env) {
             m.insert(key.into(), PathBuf::from(v));
