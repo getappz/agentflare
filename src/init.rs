@@ -824,7 +824,11 @@ fn wire_antigravity() {
     let bin = agentflare_binary();
     let home = home();
 
-    let plugin_dir = home.join(".gemini").join("config").join("plugins").join("agentflare");
+    let plugin_dir = home
+        .join(".gemini")
+        .join("config")
+        .join("plugins")
+        .join("agentflare");
     let hooks_dir = plugin_dir.join("hooks");
     if let Err(e) = fs::create_dir_all(&hooks_dir) {
         ui::error(&format!("creating plugin dir: {e}"));
@@ -905,13 +909,22 @@ fn register_antigravity_plugin(config_dir: &std::path::Path) {
         .filter(Value::is_object)
         .unwrap_or_else(|| json!({ "imports": [] }));
 
-    let Some(obj) = json.as_object_mut() else { return; };
-    let entry = obj.entry("imports".to_string()).or_insert_with(|| json!([]));
+    let Some(obj) = json.as_object_mut() else {
+        return;
+    };
+    let entry = obj
+        .entry("imports".to_string())
+        .or_insert_with(|| json!([]));
     if !entry.is_array() {
         *entry = json!([]);
     }
-    let Some(arr) = entry.as_array_mut() else { return; };
-    if arr.iter().any(|e| e.get("name").and_then(Value::as_str) == Some("agentflare")) {
+    let Some(arr) = entry.as_array_mut() else {
+        return;
+    };
+    if arr
+        .iter()
+        .any(|e| e.get("name").and_then(Value::as_str) == Some("agentflare"))
+    {
         return;
     }
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
@@ -2169,21 +2182,30 @@ mod tests {
         with_temp_home(|| {
             wire_antigravity();
 
-            let plugin_dir = home().join(".gemini").join("config").join("plugins").join("agentflare");
+            let plugin_dir = home()
+                .join(".gemini")
+                .join("config")
+                .join("plugins")
+                .join("agentflare");
             assert!(plugin_dir.join("plugin.json").exists());
             assert!(plugin_dir.join("mcp_config.json").exists());
             assert!(plugin_dir.join("hooks.json").exists());
             assert!(plugin_dir.join("hooks").join("hooks.json").exists());
 
-            let manifest_path = home().join(".gemini").join("config").join("import_manifest.json");
+            let manifest_path = home()
+                .join(".gemini")
+                .join("config")
+                .join("import_manifest.json");
             assert!(manifest_path.exists());
-            let manifest: Value = serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+            let manifest: Value =
+                serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
             let arr = manifest["imports"].as_array().unwrap();
             assert_eq!(arr.iter().filter(|e| e["name"] == "agentflare").count(), 1);
 
             // Idempotent re-run
             wire_antigravity();
-            let manifest2: Value = serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+            let manifest2: Value =
+                serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
             let arr2 = manifest2["imports"].as_array().unwrap();
             assert_eq!(arr2.iter().filter(|e| e["name"] == "agentflare").count(), 1);
         });

@@ -1370,7 +1370,14 @@ mod tests {
         // Hosts that concatenate rule_text::all() (cursor, codex, windsurf,
         // vscode-copilot, cline) should pick up FLARE_DOCS automatically
         // once it's added to all() -- no per-host wiring needed for those.
-        for host in ["cursor", "codex", "windsurf", "vscode-copilot", "cline", "antigravity"] {
+        for host in [
+            "cursor",
+            "codex",
+            "windsurf",
+            "vscode-copilot",
+            "cline",
+            "antigravity",
+        ] {
             let targets = rule_targets(host);
             assert!(
                 targets
@@ -1386,7 +1393,14 @@ mod tests {
         // Hosts that concatenate rule_text::all() (cursor, codex, windsurf,
         // vscode-copilot, cline, antigravity) should pick up BROWSER automatically once
         // it's added to all() -- no per-host wiring needed for those.
-        for host in ["cursor", "codex", "windsurf", "vscode-copilot", "cline", "antigravity"] {
+        for host in [
+            "cursor",
+            "codex",
+            "windsurf",
+            "vscode-copilot",
+            "cline",
+            "antigravity",
+        ] {
             let targets = rule_targets(host);
             assert!(
                 targets
@@ -1523,10 +1537,26 @@ mod tests {
             (agentflare_mcp.apply)();
             assert!((agentflare_mcp.check)());
 
-            let ide = home().join(".gemini").join("antigravity").join("mcp_config.json");
-            let cli = home().join(".gemini").join("antigravity-cli").join("mcp_config.json");
-            assert!(json_at(&ide).get("mcpServers").and_then(|m| m.get("flare")).is_some());
-            assert!(json_at(&cli).get("mcpServers").and_then(|m| m.get("flare")).is_some());
+            let ide = home()
+                .join(".gemini")
+                .join("antigravity")
+                .join("mcp_config.json");
+            let cli = home()
+                .join(".gemini")
+                .join("antigravity-cli")
+                .join("mcp_config.json");
+            assert!(
+                json_at(&ide)
+                    .get("mcpServers")
+                    .and_then(|m| m.get("flare"))
+                    .is_some()
+            );
+            assert!(
+                json_at(&cli)
+                    .get("mcpServers")
+                    .and_then(|m| m.get("flare"))
+                    .is_some()
+            );
         });
     }
 
