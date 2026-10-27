@@ -16,11 +16,11 @@ attacking a different source of waste:
 
 | Layer | What it compresses |
 |---|---|
-| **lean-ctx** (companion, separate install) | tool I/O within a session — reads, shell output, search — up to ~99% |
+| **lean-ctx** (companion, separate install) | focused views of reads, shell output and search, with references for recovering detail; measure your repository with `lean-ctx benchmark report .` |
 | **memory** (built-in) | knowledge across sessions — decisions, facts, preferences that would otherwise be re-explained every time |
-| **`agentflare optimize output`** (formerly Caveman) | conversation verbosity, ~65% |
+| **`agentflare optimize output`** (formerly Caveman) | compresses markdown files you give it (needs model access) |
 | **`agentflare optimize code`** (formerly Ponytail) | code-writing over-engineering |
-| **`agentflare optimize context`** | session transcript compaction (BM25) |
+| **`agentflare optimize context`** | on-demand transcript relevance scoring (`optimize context score`) |
 | **runtime** (automatic) | session hygiene and model-routing nudges |
 
 `flare-docs` — always-current package documentation, so your agent isn't writing code
@@ -44,7 +44,7 @@ agent can call directly:
 | `agentflare daemon` | Background process for the coordination layer's async pieces |
 | `agentflare work` | Autonomous execution: claim → worktree → headless agent → report back |
 | `vent` | Friction logging — capture what's slowing an agent down as structured data |
-| `agentflare serve` | Read-only dashboard over items, agents, and activity |
+| `agentflare serve` | Dashboard over items, agents, and activity; can start queued work, no login |
 | `search` | One MCP tool across 17 sources — store, memory, code, web, social, news, GitHub, academic, datasets, websites, weather, financial, crypto, FX, indicators, YouTube, Bluesky |
 | Git-aware PATH shim | Blocks direct writes to `master`/`main` across every agent using it |
 | Auth vault | Encrypted storage for provider credentials/profiles |

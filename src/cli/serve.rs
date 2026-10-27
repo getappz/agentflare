@@ -1,6 +1,6 @@
 use clap::Args;
 
-/// Serve the read-only agentflare dashboard.
+/// Serve the agentflare dashboard and execution host.
 #[derive(Args)]
 pub struct ServeArgs {
     /// TCP port. Default 35273 ("FLARE" on a phone keypad); 0 = auto-assign.

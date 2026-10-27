@@ -15,7 +15,7 @@ interface Env {
 // Pin the installer to an immutable release tag so a change on `master` can't
 // silently alter what users execute via `curl … | sh`. Bump on release when
 // install.sh / install.ps1 change.
-const INSTALL_REF = "v1.3.1";
+const INSTALL_REF = "v1.8.1";
 const RAW = `https://raw.githubusercontent.com/getappz/agentflare/${INSTALL_REF}`;
 
 // path on agentflare.dev -> file in the repo
