@@ -408,6 +408,7 @@ mod tests {
         // shared artifact store.
         let artifacts = tmp.path().join("artifacts");
         let _art = EnvGuard::set(ARTIFACTS_DIR_ENV, &artifacts);
+        let _claude = EnvGuard::set("CLAUDE_PROJECTS_DIR", &tmp.path().join(".claude/projects"));
         let server = crate::mcp_server::AgentflareMcp::default();
 
         // First call: zero writes, names the picked session.
