@@ -68,6 +68,7 @@ impl Agent {
 pub fn canonicalize(name: &str) -> String {
     match name.trim().to_ascii_lowercase().as_str() {
         "claude" | "claude code" | "claude-code-cli" => Agent::ClaudeCode.as_str().to_string(),
+        "agy" | "antigravity-cli" => Agent::Antigravity.as_str().to_string(),
         _ => name.to_string(),
     }
 }
@@ -234,7 +235,7 @@ pub static REGISTRY: &[AgentSpec] = &[
         id: Agent::Antigravity,
         display_name: "antigravity",
         tier: Tier::Cli,
-        binary_names: &["antigravity"],
+        binary_names: &["antigravity", "agy"],
         version_args: &["--version"],
         package_manager: None,
         package_name: None,
@@ -622,6 +623,8 @@ mod tests {
         assert_eq!(canonicalize("claude"), "claude-code");
         assert_eq!(canonicalize("Claude Code"), "claude-code");
         assert_eq!(canonicalize("  CLAUDE-CODE-CLI  "), "claude-code");
+        assert_eq!(canonicalize("agy"), "antigravity");
+        assert_eq!(canonicalize("antigravity-cli"), "antigravity");
         assert_eq!(canonicalize("codex"), "codex");
         assert_eq!(canonicalize("some-unknown-agent"), "some-unknown-agent");
     }
@@ -630,6 +633,8 @@ mod tests {
     fn agent_by_name_resolves_aliases_same_as_canonicalize() {
         assert_eq!(agent_by_name("claude"), Some(Agent::ClaudeCode));
         assert_eq!(agent_by_name("Claude Code"), Some(Agent::ClaudeCode));
+        assert_eq!(agent_by_name("agy"), Some(Agent::Antigravity));
+        assert_eq!(agent_by_name("antigravity-cli"), Some(Agent::Antigravity));
         assert_eq!(agent_by_name("codex"), Some(Agent::Codex));
         assert_eq!(agent_by_name("not-a-real-agent"), None);
     }

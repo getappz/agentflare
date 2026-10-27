@@ -43,7 +43,7 @@ const PROCESS_NAMES: &[(&str, &[&str])] = &[
     ("cursor", &["cursor"]),
     ("gemini", &["gemini"]),
     ("codex", &["codex"]),
-    ("antigravity", &["amp"]),
+    ("antigravity", &["antigravity", "agy"]),
     ("augment-cli", &["augment-cli"]),
     ("opencode", &["opencode"]),
     ("claude-code", &["claude"]),
