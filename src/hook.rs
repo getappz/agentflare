@@ -95,7 +95,8 @@ pub fn session_start(agent: &str) {
     // Claude/Codex: `systemMessage` is user-visible; nested
     // `additionalContext` reaches the model. Cursor: flat
     // `additional_context` only (no systemMessage / hookSpecificOutput).
-    if agent == "cursor" {
+    // Antigravity: `injectSteps` with `systemMessage`.
+    if agent == "cursor" || agent == "antigravity" {
         let out = crate::hook_messages::context_output(agent, "SessionStart", &context);
         println!("{out}");
     } else {
@@ -247,6 +248,7 @@ fn extract_prompt(input: &str) -> String {
             v.get("prompt")
                 .or_else(|| v.get("text"))
                 .or_else(|| v.get("message"))
+                .or_else(|| v.get("lastUserInput"))
                 .and_then(|p| p.as_str())
                 .map(str::to_lowercase)
         })
@@ -265,10 +267,18 @@ fn parse_pre_tool_use(input: &str) -> Option<PreToolUseInput> {
     let session_id = v
         .get("session_id")
         .or_else(|| v.get("conversation_id"))
+        .or_else(|| v.get("conversationId"))
         .and_then(|s| s.as_str())?
         .to_string();
-    let raw_tool_name = v.get("tool_name")?.as_str()?.to_string();
-    let raw_tool_input = v.get("tool_input").cloned();
+    let (raw_tool_name, raw_tool_input) = if let Some(tc) = v.get("toolCall") {
+        let name = tc.get("name").and_then(|n| n.as_str())?.to_string();
+        let input = tc.get("args").cloned();
+        (name, input)
+    } else {
+        let name = v.get("tool_name")?.as_str()?.to_string();
+        let input = v.get("tool_input").cloned();
+        (name, input)
+    };
     // Unwrap flare-gateway `action="execute"` calls to the real tool they
     // forward -- every classifier downstream (branch guard, completion
     // gate) needs to see the actual tool/args, not the gateway envelope
@@ -464,6 +474,25 @@ fn is_verification_shell_tool(tool_name: &str) -> bool {
     ) || tool_name.ends_with("__ctx_shell")
 }
 
+fn format_pre_tool_decision(agent: &str, decision: serde_json::Value) -> serde_json::Value {
+    if agent == "antigravity" {
+        if let Some(reason) = decision
+            .get("hookSpecificOutput")
+            .and_then(|h| h.get("permissionDecisionReason"))
+            .and_then(|r| r.as_str())
+        {
+            json!({
+                "decision": "deny",
+                "reason": reason,
+            })
+        } else {
+            decision
+        }
+    } else {
+        decision
+    }
+}
+
 pub fn pre_tool_use(agent: &str) {
     let Some(input) = read_stdin_or_skip("PreToolUse") else {
         return;
@@ -475,14 +504,14 @@ pub fn pre_tool_use(agent: &str) {
     if let Some(decision) =
         crate::hook_redirect::redirect_decision(&parsed.tool_name, parsed.tool_input.as_ref())
     {
-        println!("{decision}");
+        println!("{}", format_pre_tool_decision(agent, decision));
         return;
     }
 
     if let Some(decision) =
         crate::hook_claim_guard::claim_guard_decision(&parsed.tool_name, parsed.tool_input.as_ref())
     {
-        println!("{decision}");
+        println!("{}", format_pre_tool_decision(agent, decision));
         return;
     }
 
@@ -490,13 +519,20 @@ pub fn pre_tool_use(agent: &str) {
         &parsed.tool_name,
         parsed.tool_input.as_ref(),
     ) {
-        let decision = json!({
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": reason,
-            }
-        });
+        let decision = if agent == "antigravity" {
+            json!({
+                "decision": "deny",
+                "reason": reason,
+            })
+        } else {
+            json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": reason,
+                }
+            })
+        };
         println!("{decision}");
         return;
     }
@@ -636,6 +672,8 @@ pub fn pre_tool_use(agent: &str) {
     );
     if let Some(out) = crate::hook_messages::pre_tool_use_output(&msgs, &nudges) {
         println!("{out}");
+    } else if agent == "antigravity" {
+        println!("{}", json!({ "decision": "allow" }));
     }
 }
 
@@ -1008,6 +1046,11 @@ pub fn prompt_submit(agent: &str) {
     if agent == "cursor" {
         return;
     }
+    if agent == "antigravity" {
+        let out = crate::hook_messages::context_output(agent, "PreInvocation", &context);
+        println!("{out}");
+        return;
+    }
     let out = json!({
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
@@ -1069,6 +1112,35 @@ mod tests {
         let parsed = parse_pre_tool_use(input).unwrap();
         assert_eq!(parsed.session_id, "c1");
         assert_eq!(parsed.tool_name, "Shell");
+    }
+
+    #[test]
+    fn parse_pre_tool_use_accepts_antigravity_tool_call() {
+        let input = r#"{"conversationId":"ag-1","toolCall":{"name":"run_command","args":{"CommandLine":"npm test"}}}"#;
+        let parsed = parse_pre_tool_use(input).unwrap();
+        assert_eq!(parsed.session_id, "ag-1");
+        assert_eq!(parsed.tool_name, "run_command");
+        assert_eq!(parsed.tool_input.unwrap()["CommandLine"], "npm test");
+    }
+
+    #[test]
+    fn extract_prompt_reads_antigravity_last_user_input() {
+        let input = r#"{"lastUserInput":"Fix the broken test"}"#;
+        assert_eq!(extract_prompt(input), "fix the broken test");
+    }
+
+    #[test]
+    fn format_pre_tool_decision_formats_antigravity_deny() {
+        let claude = json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": "Branch protected",
+            }
+        });
+        let ag = format_pre_tool_decision("antigravity", claude);
+        assert_eq!(ag["decision"], "deny");
+        assert_eq!(ag["reason"], "Branch protected");
     }
 
     #[test]

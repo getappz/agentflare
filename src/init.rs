@@ -863,10 +863,25 @@ fn wire_antigravity() {
         "agentflare": {
             "SessionStart": [
                 {
+                    "type": "command",
+                    "command": format!("{hook_cmd} session-start --agent antigravity"),
+                    "timeout": 30
+                }
+            ],
+            "PreInvocation": [
+                {
+                    "type": "command",
+                    "command": format!("{hook_cmd} prompt-submit --agent antigravity"),
+                    "timeout": 15
+                }
+            ],
+            "PreToolUse": [
+                {
+                    "matcher": ".*",
                     "hooks": [{
                         "type": "command",
-                        "command": format!("{hook_cmd} session-start --agent antigravity"),
-                        "timeout": 30
+                        "command": format!("{hook_cmd} pre-tool-use --agent antigravity"),
+                        "timeout": 10
                     }]
                 }
             ],
@@ -882,11 +897,9 @@ fn wire_antigravity() {
             ],
             "Stop": [
                 {
-                    "hooks": [{
-                        "type": "command",
-                        "command": format!("{hook_cmd} stop --agent antigravity"),
-                        "timeout": 5
-                    }]
+                    "type": "command",
+                    "command": format!("{hook_cmd} stop --agent antigravity"),
+                    "timeout": 10
                 }
             ]
         }
@@ -894,6 +907,35 @@ fn wire_antigravity() {
     let hooks_pretty = serde_json::to_string_pretty(&hooks_json).unwrap_or_default();
     let _ = fs::write(plugin_dir.join("hooks.json"), &hooks_pretty);
     let _ = fs::write(hooks_dir.join("hooks.json"), &hooks_pretty);
+
+    // Bundle core flare skill inside plugin
+    let skill_dir = plugin_dir.join("skills").join("flare");
+    if fs::create_dir_all(&skill_dir).is_ok() {
+        let skill_md = r#"---
+name: flare
+description: Agentflare workflow commands, work-item orchestration, PR review, and multi-agent coordination.
+---
+# Agentflare Skill
+Use the `agentflare` CLI and MCP tools:
+- Work items: `agentflare item claim <id>`, `agentflare item done`
+- PR lifecycle: `agentflare pr open`, `agentflare pr adopt`
+- Cross-session memory: `agentflare memory search <query>`, `agentflare memory context`
+- Browser automation: `agentflare browser ...`
+"#;
+        let _ = fs::write(skill_dir.join("SKILL.md"), skill_md);
+    }
+
+    // Bundle global pairing rules inside plugin
+    let rules_dir = plugin_dir.join("rules");
+    if fs::create_dir_all(&rules_dir).is_ok() {
+        let rules_md = r#"# Agentflare Pairing Rules
+- Telegraph format: subject-verb-object, drop articles/prepositions
+- Symbolic vocabulary: → cause, ∵ because, ∴ therefore, ⊕ add, ⊖ remove, Δ change, ≈ similar, ≠ different, ∈ in/member, ∅ empty/none, ✓ ok, ✗ fail
+- Code minimalism & zero narration
+- Route code intelligence through lean-ctx when available
+"#;
+        let _ = fs::write(rules_dir.join("AGENTS.md"), rules_md);
+    }
 
     let config_dir = home.join(".gemini").join("config");
     register_antigravity_plugin(&config_dir);
@@ -2191,6 +2233,27 @@ mod tests {
             assert!(plugin_dir.join("mcp_config.json").exists());
             assert!(plugin_dir.join("hooks.json").exists());
             assert!(plugin_dir.join("hooks").join("hooks.json").exists());
+            assert!(
+                plugin_dir
+                    .join("skills")
+                    .join("flare")
+                    .join("SKILL.md")
+                    .exists()
+            );
+            assert!(plugin_dir.join("rules").join("AGENTS.md").exists());
+
+            let hooks: Value =
+                serde_json::from_str(&fs::read_to_string(plugin_dir.join("hooks.json")).unwrap())
+                    .unwrap();
+            let af_hooks = &hooks["agentflare"];
+            // Flat events
+            assert!(af_hooks["SessionStart"].is_array());
+            assert!(af_hooks["SessionStart"][0]["type"] == "command");
+            assert!(af_hooks["PreInvocation"].is_array());
+            assert!(af_hooks["Stop"].is_array());
+            // Grouped events
+            assert!(af_hooks["PreToolUse"][0]["matcher"] == ".*");
+            assert!(af_hooks["PostToolUse"][0]["matcher"] == ".*");
 
             let manifest_path = home()
                 .join(".gemini")

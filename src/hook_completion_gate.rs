@@ -106,10 +106,18 @@ pub(crate) fn parse_post_tool_use(input: &str) -> Option<PostToolUseInput> {
     let session_id = v
         .get("session_id")
         .or_else(|| v.get("conversation_id"))
+        .or_else(|| v.get("conversationId"))
         .and_then(|s| s.as_str())?
         .to_string();
-    let raw_tool_name = v.get("tool_name")?.as_str()?.to_string();
-    let raw_tool_input = v.get("tool_input").cloned();
+    let (raw_tool_name, raw_tool_input) = if let Some(tc) = v.get("toolCall") {
+        let name = tc.get("name").and_then(|n| n.as_str())?.to_string();
+        let input = tc.get("args").cloned();
+        (name, input)
+    } else {
+        let name = v.get("tool_name")?.as_str()?.to_string();
+        let input = v.get("tool_input").cloned();
+        (name, input)
+    };
     // Unwrap flare-gateway `action="execute"` calls (item #559) -- a
     // verification command run via `mcp__flare__tool(action="execute",
     // server="leanctx", tool="ctx_shell", args={"command": ...})` must be
@@ -124,6 +132,7 @@ pub(crate) fn parse_post_tool_use(input: &str) -> Option<PostToolUseInput> {
             ti.get("command")
                 .or_else(|| ti.get("cmd"))
                 .or_else(|| ti.get("script"))
+                .or_else(|| ti.get("CommandLine"))
         })
         .and_then(Value::as_str)
         .map(String::from);
