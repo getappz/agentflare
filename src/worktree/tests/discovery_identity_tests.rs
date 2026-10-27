@@ -82,6 +82,19 @@ fn item724_explicit_adoption_validates_an_unstamped_legacy_mapping() {
 }
 
 #[test]
+fn item724_renamed_unstamped_item_gets_actionable_adoption_guidance() {
+    let conn = agentflare_backend::db::open_in_memory().unwrap();
+    let (project, state) = test_project_with_in_review_state(&conn);
+    let mut item = create_owner_item(&conn, &project, &state);
+    let branch = flare_git_core::worktree::task_branch_name(&item);
+    let pr = unstamped_pr(&branch, &item.name);
+    item.name = "Renamed after cutting the branch".into();
+    let reason = super::super::pr_item_mismatch(&item, &pr).unwrap();
+    assert!(reason.contains("PR branch and title do not identify this task"));
+    assert!(reason.contains("agentflare pr adopt 870"));
+}
+
+#[test]
 fn item724_does_not_attach_an_unrelated_task_with_the_same_local_sequence() {
     let conn = agentflare_backend::db::open_in_memory().unwrap();
     let (project, state) = test_project_with_in_review_state(&conn);
@@ -152,6 +165,50 @@ fn item724_does_not_attach_an_unrelated_task_with_the_same_local_sequence() {
         comments[0]["body"]
             .as_str()
             .unwrap()
-            .contains("Verify the PR-to-item mapping")
+            .contains("agentflare pr adopt 870")
+    );
+}
+
+#[test]
+fn item724_second_pr_on_tracked_branch_has_no_discovery_side_effects() {
+    let conn = agentflare_backend::db::open_in_memory().unwrap();
+    let (project, state) = test_project_with_in_review_state(&conn);
+    let item = create_owner_item(&conn, &project, &state);
+    let branch = flare_git_core::worktree::task_branch_name(&item);
+    attach_pr_to_item(&conn, &item, 869, &branch);
+    let prs = serde_json::json!([{
+        "number": 870, "html_url": "u", "state": "open", "title": item.name,
+        "head": {"ref": branch}, "author_association": "OWNER"
+    }])
+    .to_string();
+    let server = MockServer::start_with(move |req| {
+        if req.method == "GET" && req.path.contains("/pulls?") {
+            MockResponse::json(200, &prs)
+        } else {
+            MockResponse::json(500, "unexpected discovery side effect")
+        }
+    });
+    assert_eq!(
+        discover_untracked_prs(
+            &conn,
+            &server.client(Some("tok")),
+            &RepoId {
+                owner: "o".into(),
+                repo: "r".into()
+            },
+            &project,
+            &state,
+            &std::collections::HashSet::new(),
+            "box-a",
+            &|_| true,
+        ),
+        0
+    );
+    let current = agentflare_backend::item::get(&conn, &item.id).unwrap();
+    assert_eq!(super::super::pr_number_from_metadata(&current), Some(869));
+    assert_eq!(
+        server.requests().len(),
+        1,
+        "no label, comment, or stamp requests"
     );
 }

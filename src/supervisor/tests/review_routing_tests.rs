@@ -61,7 +61,7 @@ fn assert_mismatched_ci_repair_gates(trigger: RepairTrigger<'_>) {
         .with_backend_db(|c| agentflare_backend::comment::list_by_item(c, &id).unwrap())
         .unwrap();
     assert_eq!(comments.len(), 1, "only the mapping explanation is posted");
-    assert!(comments[0].body.contains("Verify the PR-to-item mapping"));
+    assert!(comments[0].body.contains("agentflare pr adopt 870"));
     let current = mcp
         .with_backend_db(|c| agentflare_backend::item::get(c, &id).unwrap())
         .unwrap();
@@ -131,8 +131,13 @@ fn item724_checks_identity_without_breaking_renamed_stamped_tasks() {
     let branch = format!("task/{}-unrelated-failover", item.sequence_id);
     let mut pr = pr(&branch, "fix: failover thresholds", None);
     assert!(crate::worktree::pr_item_mismatch(&item, &pr).is_some());
-    pr.title = "fix: Repair worktree removal (#870)".into();
-    assert!(crate::worktree::pr_item_mismatch(&item, &pr).is_none());
+    for title in [
+        "fix: Repair worktree removal (#870)",
+        "Fix!: Repair worktree removal (#870)",
+    ] {
+        pr.title = title.into();
+        assert!(crate::worktree::pr_item_mismatch(&item, &pr).is_none());
+    }
     pr.title = "renamed task".into();
     pr.body = Some(pulls::item_id_tag(&item.id));
     assert!(crate::worktree::pr_item_mismatch(&item, &pr).is_none());
@@ -282,7 +287,7 @@ fn item724_mismatched_live_pr_gates_without_reading_threads_or_dispatching() {
         .with_backend_db(|c| agentflare_backend::comment::list_by_item(c, &id).unwrap())
         .unwrap();
     assert_eq!(comments.len(), 1, "mapping explanation is posted once");
-    assert!(comments[0].body.contains("Verify the PR-to-item mapping"));
+    assert!(comments[0].body.contains("agentflare pr adopt 870"));
     assert!(
         server
             .requests()
@@ -379,6 +384,58 @@ fn item724_fully_reported_noops_do_not_exhaust_the_repair_cap() {
             .unwrap(),
         &labels
     ));
+}
+
+#[test]
+fn item724_fresh_noop_threads_eventually_exhaust_the_repair_cap() {
+    let mcp = test_mcp();
+    let queue = test_queue();
+    let id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1900);
+    let labels = seed_gate_label(&mcp);
+    let auth = super::tests::test_auth_conn();
+    let cap = crate::quota::decide::SELF_REPAIR_CAP;
+    for n in 0..=2 * cap {
+        let item = mcp
+            .with_backend_db(|c| agentflare_backend::item::get(c, &id).unwrap())
+            .unwrap();
+        let finding = coderabbit_finding(n as u64, "coderabbitai[bot]");
+        let thread = finding.thread_id.clone();
+        let outcome = coderabbit_repair_or_gate(
+            &mcp,
+            &queue,
+            &auth,
+            agentflare_resource_gate::Policy::Normal,
+            &item,
+            870,
+            &[finding],
+            &[],
+            &labels,
+            "/repo",
+            None,
+        );
+        if n == 2 * cap {
+            assert!(matches!(outcome, SelfRepairOutcome::Skipped));
+            assert!(!job_in_flight(&queue, &id));
+            assert!(item_gated(&mcp, &item, &labels));
+            let meta = crate::mcp_server::metadata_object(&item.metadata);
+            assert_eq!(meta["coderabbit_repair_noop_credits"], 2 * cap);
+            break;
+        }
+        assert!(matches!(outcome, SelfRepairOutcome::Dispatched));
+        let jobs = queue.list(Some(agentflare_jobs::JobState::Queued)).unwrap();
+        crate::claims::with_owner_override(format!("claude-code:{}", jobs[0].id), || {
+            mcp.item_review_result(ItemRequest {
+                action: "review_result".into(),
+                id: Some(id.clone()),
+                thread_id: Some(thread),
+                outcome: Some("out_of_scope".into()),
+                note: Some("outside this PR diff".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        });
+        queue.cancel_for_item(&id, |_| false).unwrap();
+    }
 }
 
 #[test]

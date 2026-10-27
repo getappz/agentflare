@@ -362,13 +362,13 @@ pub(crate) fn discover_untracked_prs_with_clock(
         // same metadata. The `opened_by_agentflare` guard used to skip those
         // PRs outright, so the item never regained the number and an
         // approved, CI-green PR sat unmerged with nothing to show for it.
-        // The stamp is only a "this one is ours" marker; the branch
-        // ownership check below is what decides where it goes.
+        // Branch ownership identifies a candidate; PR identity decides whether to attach it.
         if let Some(owning) = item_owning_branch(&items, &branch, local_branch) {
             if let Some(reason) =
                 super::review_identity::pr_item_mismatch_for_instance(owning, &pr, owner)
             {
-                if crate::github::pulls::origin_allows(pr.body.as_deref(), owner)
+                if super::pr_number_from_metadata(owning).is_none()
+                    && crate::github::pulls::origin_allows(pr.body.as_deref(), owner)
                     && let Err(e) =
                         super::review_identity::flag_discovery_mismatch(client, repo, &pr, &reason)
                 {

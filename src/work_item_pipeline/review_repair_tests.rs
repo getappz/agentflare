@@ -27,6 +27,18 @@ async fn item724_finalize_parked_repairs_report_missing_threads_and_refund_only_
                 );
                 crate::supervisor::review_findings::set_thread_round(meta, "PRRT_1", 2);
                 crate::supervisor::review_findings::set_thread_round(meta, "PRRT_2", 3);
+                crate::supervisor::review_findings::insert_thread_result(
+                    meta,
+                    "PRRT_2",
+                    &crate::supervisor::review_findings::ReviewResult {
+                        round: 2,
+                        outcome: ReviewOutcome::OutOfScope,
+                        sha: None,
+                        note: "previous round".into(),
+                        test: None,
+                    },
+                    0,
+                );
             })
             .unwrap();
         })
@@ -83,10 +95,18 @@ async fn item724_finalize_parked_repairs_report_missing_threads_and_refund_only_
             for (thread, round) in [("PRRT_1", 2), ("PRRT_2", 3)] {
                 let result = thread_result(&meta, thread);
                 if owner == "codex:old-job" {
-                    assert!(
-                        result.is_none(),
-                        "stale finalizer must not report for a newer job"
-                    );
+                    if thread == "PRRT_2" {
+                        assert_eq!(
+                            result.unwrap().round,
+                            2,
+                            "stale finalizer preserves old results"
+                        );
+                    } else {
+                        assert!(
+                            result.is_none(),
+                            "stale finalizer must not report for a newer job"
+                        );
+                    }
                 } else {
                     let result = result.expect("every parked finding needs a replyable outcome");
                     assert_eq!(result.round, round);
@@ -101,4 +121,87 @@ async fn item724_finalize_parked_repairs_report_missing_threads_and_refund_only_
             }
         }
     }
+}
+
+#[test]
+fn item724_finalize_accounting_failure_still_releases_comments_and_notifies() {
+    crate::paths::test_support::with_temp_home(|| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for correction in [false, true] {
+                let owner = "codex:park-accounting-error";
+                let (mcp, _backend, _repo, item_id, _project, _worktree) =
+                    crate::claims::with_owner_override(owner, || {
+                        crate::mcp_server::tests::mcp_with_claimed_item("Accounting failure")
+                    });
+                let mcp = Arc::new(mcp);
+                mcp.with_backend_db(|conn| {
+                    conn.execute_batch(
+                        "CREATE TRIGGER fail_review_accounting BEFORE UPDATE OF metadata ON items
+                        BEGIN SELECT RAISE(FAIL, 'accounting unavailable'); END;",
+                    )
+                    .unwrap();
+                })
+                .unwrap();
+                assert!(mcp.item_review_parked(&item_id, "park").is_err());
+                let workflow = WorkflowDefinition::new(WORKFLOW_ID, "accounting error")
+                    .add_step(build_finalize_step(mcp.clone()));
+                let engine = WorkflowEngine::<WorkItemData, InMemoryStore<WorkItemData>>::new();
+                engine.register_workflow(workflow).unwrap();
+                let reason = "Await corrected PR target";
+                let data = WorkItemData {
+                    item_id: item_id.clone(),
+                    owner: owner.into(),
+                    notify_recipient: Some("accounting-test-recipient".into()),
+                    hold_reason: (!correction).then(|| reason.into()),
+                    pending_corrections: if correction {
+                        vec![reason.into()]
+                    } else {
+                        vec![]
+                    },
+                    ..Default::default()
+                };
+                let run = engine
+                    .start_workflow(WorkflowId::new(WORKFLOW_ID), data, String::new())
+                    .await
+                    .unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                loop {
+                    let status = engine.get_status(run).await.unwrap();
+                    if status.status == WorkflowStatus::Completed {
+                        break;
+                    }
+                    assert_ne!(status.status, WorkflowStatus::Failed, "{:?}", status.error);
+                    assert!(std::time::Instant::now() < deadline, "finalize timed out");
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                mcp.with_backend_db(|conn| {
+                    assert!(agentflare_backend::claim::current_owner(conn, &item_id).is_none());
+                    let comments =
+                        agentflare_backend::comment::list_by_item(conn, &item_id).unwrap();
+                    assert!(
+                        comments
+                            .iter()
+                            .any(|c| c.body.contains("on hold") && c.body.contains(reason))
+                    );
+                })
+                .unwrap();
+                let store =
+                    agentflare_artifacts::ArtifactStore::with_store(crate::store::open().unwrap());
+                let notices = store.list(Some("handoffs")).unwrap();
+                let notice = notices
+                    .iter()
+                    .find(|a| a.name == format!("item-{item_id}-result"))
+                    .unwrap();
+                assert_eq!(
+                    notice.recipient.as_deref(),
+                    Some("accounting-test-recipient")
+                );
+                assert!(store.get(&notice.id).unwrap().content.contains(reason));
+            }
+        });
+    });
 }

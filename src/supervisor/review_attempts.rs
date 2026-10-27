@@ -10,6 +10,7 @@ use super::review_findings::{
 
 const ATTEMPT: &str = "coderabbit_repair_attempt";
 const CREDITS: &str = "coderabbit_repair_noop_credits";
+const NOOP_CREDIT_CEILING: u32 = crate::quota::decide::SELF_REPAIR_CAP;
 
 #[derive(Deserialize, Serialize)]
 struct Attempt {
@@ -95,7 +96,7 @@ pub(crate) fn record_parked(meta: &mut Map<String, Value>, owner: &str, reason: 
     for (thread, round) in &attempt.threads {
         if attempt.outcomes.contains_key(thread)
             || thread_record(meta, thread).round != *round
-            || thread_result(meta, thread).is_some()
+            || thread_result(meta, thread).is_some_and(|r| r.round.max(1) == *round)
         {
             continue;
         }
@@ -123,6 +124,6 @@ pub(super) fn charged_attempts(meta: &Map<String, Value>, gross: u32) -> u32 {
         meta.get(CREDITS)
             .and_then(Value::as_u64)
             .unwrap_or(0)
-            .min(u32::MAX as u64) as u32,
+            .min(u64::from(NOOP_CREDIT_CEILING)) as u32,
     )
 }

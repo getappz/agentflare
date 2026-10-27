@@ -64,8 +64,8 @@ pub(super) fn pr_item_mismatch_for_instance(
         Some("PR branch and title do not identify this task")
     };
     reason.map(|r| format!(
-        "PR #{} ({branch}, {:?}) cannot be repaired as item #{} ({:?}): {r}. Verify the PR-to-item mapping.",
-        pr.number, pr.title, item.sequence_id, item.name
+        "PR #{} ({branch}, {:?}) cannot be repaired as item #{} ({:?}): {r}. If this PR is yours, run `agentflare pr adopt {}` to record its identity.",
+        pr.number, pr.title, item.sequence_id, item.name, pr.number
     ))
 }
 
@@ -109,9 +109,10 @@ fn title_key(title: &str) -> String {
                 .split('(')
                 .next()
                 .unwrap_or(prefix)
-                .trim_end_matches('!');
+                .trim_end_matches('!')
+                .to_ascii_lowercase();
             matches!(
-                kind,
+                kind.as_str(),
                 "feat"
                     | "fix"
                     | "docs"
