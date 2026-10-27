@@ -31,19 +31,43 @@ fn dirs_data_dir() -> PathBuf {
     }
 }
 
+/// Home for source discovery. Prefer `$HOME`, then `$USERPROFILE` (Windows),
+/// then `dirs::home_dir()` — never fall back to cwd `.`, which made Windows
+/// syncs miss `~\.local\share\opencode\opencode.db`.
+pub fn resolve_home() -> PathBuf {
+    std::env::var("HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("USERPROFILE").ok().filter(|s| !s.is_empty()))
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// OpenCode session DB path, mirroring opencode's own data-dir resolution.
+pub fn opencode_db_path(home: &std::path::Path) -> PathBuf {
+    if let Ok(dir) = std::env::var("OPENCODE_DATA_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir).join("opencode.db");
+        }
+    }
+    if let Ok(dir) = std::env::var("XDG_DATA_HOME") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir).join("opencode").join("opencode.db");
+        }
+    }
+    home.join(".local")
+        .join("share")
+        .join("opencode")
+        .join("opencode.db")
+}
+
 fn default_sources() -> HashMap<String, PathBuf> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let h = PathBuf::from(home);
+    let h = resolve_home();
     let mut m = HashMap::new();
     m.insert("claude_code".into(), h.join(".claude").join("projects"));
     m.insert("codex".into(), h.join(".codex").join("sessions"));
-    m.insert(
-        "opencode".into(),
-        h.join(".local")
-            .join("share")
-            .join("opencode")
-            .join("opencode.db"),
-    );
+    m.insert("opencode".into(), opencode_db_path(&h));
     // Cursor has no ingest adapter yet (#321) — omit path mapping so `doctor`
     // does not list a dead source. Gemini/Copilot stay as reserved path stubs.
     m.insert("gemini".into(), h.join(".gemini"));
@@ -174,5 +198,71 @@ impl PricingTable {
             cache_read_usd,
             cache_write_usd,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, val: Option<&str>) -> Self {
+            let prev = std::env::var(key).ok();
+            unsafe {
+                match val {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_home_prefers_userprofile_when_home_unset() {
+        let _lock = env_lock().lock().unwrap();
+        let _home = EnvGuard::set("HOME", None);
+        let _up = EnvGuard::set("USERPROFILE", Some(r"C:\Users\fixture"));
+        assert_eq!(resolve_home(), PathBuf::from(r"C:\Users\fixture"));
+    }
+
+    #[test]
+    fn default_opencode_source_uses_userprofile_local_share() {
+        let _lock = env_lock().lock().unwrap();
+        let _home = EnvGuard::set("HOME", None);
+        let _xdg = EnvGuard::set("XDG_DATA_HOME", None);
+        let _oc_data = EnvGuard::set("OPENCODE_DATA_DIR", None);
+        let _oc_dir = EnvGuard::set("OPENCODE_DIR", None);
+        let _up = EnvGuard::set("USERPROFILE", Some(r"C:\Users\fixture"));
+        let sources = default_sources();
+        assert_eq!(
+            sources.get("opencode").map(PathBuf::as_path),
+            Some(Path::new(
+                r"C:\Users\fixture\.local\share\opencode\opencode.db"
+            ))
+        );
     }
 }

@@ -131,7 +131,10 @@ pub struct DoctorArgs {
 impl InsightsArgs {
     pub fn run(self) {
         let db_path = self.db.unwrap_or_else(|| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            // Match handoff::default_insights_db: HOME, then USERPROFILE (Windows).
+            let home = std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .unwrap_or_else(|_| ".".to_string());
             PathBuf::from(home).join(".local/share/agentflare/insights/observatory.db")
         });
         let cmd = self.command.unwrap_or(InsightsCommands::List(ListArgs {

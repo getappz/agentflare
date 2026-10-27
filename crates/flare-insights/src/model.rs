@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 pub enum SessionSource {
     ClaudeCode,
     Codex,
+    /// Canonical wire name is `opencode` (matches `as_str`); accept legacy
+    /// `open_code` from earlier snake_case enum serialization.
+    #[serde(rename = "opencode", alias = "open_code")]
     OpenCode,
     Cursor,
     Gemini,
@@ -171,4 +174,24 @@ pub struct ToolStats {
     pub count: u64,
     pub avg_duration_ms: Option<f64>,
     pub failure_rate: Option<f64>,
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opencode_serializes_as_opencode_not_open_code() {
+        let raw = serde_json::to_string(&SessionSource::OpenCode).unwrap();
+        assert_eq!(raw, "\"opencode\"");
+        assert_eq!(
+            serde_json::from_str::<SessionSource>("\"opencode\"").unwrap(),
+            SessionSource::OpenCode
+        );
+        assert_eq!(
+            serde_json::from_str::<SessionSource>("\"open_code\"").unwrap(),
+            SessionSource::OpenCode
+        );
+    }
 }
