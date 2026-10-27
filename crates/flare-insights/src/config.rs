@@ -31,12 +31,28 @@ fn dirs_data_dir() -> PathBuf {
     }
 }
 
-fn default_sources() -> HashMap<String, PathBuf> {
-    // Native Windows processes usually have no HOME; resolve it through the OS.
-    let h = std::env::var_os("HOME")
+/// Home for foreign session stores (`~/.claude/projects`, …).
+///
+/// Prefer `$HOME` when it looks usable (tests + Unix). Native Windows MCP
+/// often has no `HOME` (or a Git-Bash path with no agent stores) — fall
+/// through to `dirs::home_dir()` (SHGetKnownFolderPath / USERPROFILE) so
+/// resume's live scan does not report `scanned 0 sessions`.
+fn foreign_store_home() -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .or_else(dirs::home_dir)
-        .unwrap_or_else(|| PathBuf::from("."));
+    {
+        let has_store = home.join(".claude").join("projects").is_dir()
+            || home.join(".codex").join("sessions").is_dir();
+        if has_store || !cfg!(windows) {
+            return home;
+        }
+    }
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn default_sources() -> HashMap<String, PathBuf> {
+    let h = foreign_store_home();
     let mut m = HashMap::new();
     m.insert("claude_code".into(), h.join(".claude").join("projects"));
     m.insert("codex".into(), h.join(".codex").join("sessions"));
