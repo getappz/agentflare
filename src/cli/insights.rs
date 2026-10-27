@@ -130,10 +130,7 @@ pub struct DoctorArgs {
 
 impl InsightsArgs {
     pub fn run(self) {
-        let db_path = self.db.unwrap_or_else(|| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            PathBuf::from(home).join(".local/share/agentflare/insights/observatory.db")
-        });
+        let db_path = self.db.unwrap_or_else(crate::handoff::default_insights_db);
         let cmd = self.command.unwrap_or(InsightsCommands::List(ListArgs {
             limit: 20,
             offset: 0,
