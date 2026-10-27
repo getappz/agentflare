@@ -153,7 +153,7 @@ pub enum Commands {
     Memory(memory::MemoryArgs),
     /// Message live agent sessions (send, list, inbox, watch).
     Message(message::MessageArgs),
-    /// Serve the read-only agentflare dashboard.
+    /// Serve the agentflare dashboard and execution host.
     Serve(serve::ServeArgs),
     /// Vent friction or feedback encountered during an agent session.
     Vent(vent::VentArgs),
