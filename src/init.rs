@@ -840,10 +840,13 @@ fn wire_antigravity() {
         "version": env!("CARGO_PKG_VERSION"),
         "description": "agentflare workflow orchestration, session liveness, and team sync"
     });
-    let _ = fs::write(
+    if let Err(e) = fs::write(
         plugin_dir.join("plugin.json"),
         serde_json::to_string_pretty(&manifest).unwrap_or_default(),
-    );
+    ) {
+        ui::error(&format!("writing plugin.json: {e}"));
+        return;
+    }
 
     let mcp_config = json!({
         "mcpServers": {
@@ -853,10 +856,13 @@ fn wire_antigravity() {
             }
         }
     });
-    let _ = fs::write(
+    if let Err(e) = fs::write(
         plugin_dir.join("mcp_config.json"),
         serde_json::to_string_pretty(&mcp_config).unwrap_or_default(),
-    );
+    ) {
+        ui::error(&format!("writing mcp_config.json: {e}"));
+        return;
+    }
 
     let hook_cmd = format!("\"{bin}\" hook");
     let hooks_json = json!({
@@ -905,8 +911,14 @@ fn wire_antigravity() {
         }
     });
     let hooks_pretty = serde_json::to_string_pretty(&hooks_json).unwrap_or_default();
-    let _ = fs::write(plugin_dir.join("hooks.json"), &hooks_pretty);
-    let _ = fs::write(hooks_dir.join("hooks.json"), &hooks_pretty);
+    if let Err(e) = fs::write(plugin_dir.join("hooks.json"), &hooks_pretty) {
+        ui::error(&format!("writing hooks.json: {e}"));
+        return;
+    }
+    if let Err(e) = fs::write(hooks_dir.join("hooks.json"), &hooks_pretty) {
+        ui::error(&format!("writing hooks/hooks.json: {e}"));
+        return;
+    }
 
     // Bundle core flare skill inside plugin
     let skill_dir = plugin_dir.join("skills").join("flare");
@@ -938,12 +950,15 @@ Use the `agentflare` CLI and MCP tools:
     }
 
     let config_dir = home.join(".gemini").join("config");
-    register_antigravity_plugin(&config_dir);
+    if let Err(e) = register_antigravity_plugin(&config_dir) {
+        ui::error(&format!("registering import_manifest.json: {e}"));
+        return;
+    }
 
     ui::success("~/.gemini/config/plugins/agentflare (plugin wired)");
 }
 
-fn register_antigravity_plugin(config_dir: &std::path::Path) {
+fn register_antigravity_plugin(config_dir: &std::path::Path) -> Result<(), String> {
     let manifest_path = config_dir.join("import_manifest.json");
     let mut json = fs::read_to_string(&manifest_path)
         .ok()
@@ -952,7 +967,7 @@ fn register_antigravity_plugin(config_dir: &std::path::Path) {
         .unwrap_or_else(|| json!({ "imports": [] }));
 
     let Some(obj) = json.as_object_mut() else {
-        return;
+        return Err("import_manifest.json is not an object".into());
     };
     let entry = obj
         .entry("imports".to_string())
@@ -961,13 +976,13 @@ fn register_antigravity_plugin(config_dir: &std::path::Path) {
         *entry = json!([]);
     }
     let Some(arr) = entry.as_array_mut() else {
-        return;
+        return Err("imports is not an array".into());
     };
     if arr
         .iter()
         .any(|e| e.get("name").and_then(Value::as_str) == Some("agentflare"))
     {
-        return;
+        return Ok(());
     }
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     arr.push(json!({
@@ -976,7 +991,7 @@ fn register_antigravity_plugin(config_dir: &std::path::Path) {
         "importedAt": now,
         "components": ["installed"]
     }));
-    let _ = write_json_pretty(&manifest_path, &json);
+    write_json_pretty(&manifest_path, &json).map_err(|e| format!("{e}"))
 }
 
 pub fn wire_optimize_hooks(agent: &str) {

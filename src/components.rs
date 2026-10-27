@@ -399,11 +399,15 @@ pub(crate) fn sync_now(host: &str) -> Result<String, String> {
 /// Returns Ok(()) if the file didn't exist or was successfully deleted.
 pub(crate) fn unsync_host(rule_id: &str, host: &str) -> Result<(), String> {
     use crate::paths::{claude_rules_dir, opencode_rules_dir};
+    if host == "codex" || host == "antigravity" {
+        // Rules are stored in AGENTS.md; re-sync to regenerate without the removed rule
+        let _ = sync_now(host);
+        return Ok(());
+    }
     let dir = match host {
         "claude-code" => claude_rules_dir(),
         "opencode" => opencode_rules_dir(),
         "cursor" => cwd().join(".cursor").join("rules"),
-        "codex" | "antigravity" => cwd().join("."),
         "windsurf" => cwd().join(".windsurf").join("rules"),
         "vscode-copilot" => cwd().join(".github"),
         "cline" => cwd().join(".clinerules"),
