@@ -37,6 +37,7 @@ export default defineConfig({
         {
           label: "Reference",
           items: [
+            { label: "Architecture", slug: "architecture" },
             { label: "CLI reference", slug: "cli" },
             { label: "MCP tools reference", slug: "mcp-tools" },
             { label: "flare-docs", slug: "flare-docs" },
