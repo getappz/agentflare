@@ -48,7 +48,14 @@ fn foreign_store_home() -> PathBuf {
             return home;
         }
     }
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+    if let Some(home) = dirs::home_dir() {
+        return home;
+    }
+    // dirs can fail in unusual Windows hosts; USERPROFILE is the usual profile root.
+    if let Some(home) = std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()) {
+        return PathBuf::from(home);
+    }
+    PathBuf::from(".")
 }
 
 fn default_sources() -> HashMap<String, PathBuf> {
