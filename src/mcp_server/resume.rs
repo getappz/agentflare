@@ -347,7 +347,7 @@ mod tests {
         let server = crate::mcp_server::AgentflareMcp::default();
         let err = server
             .resume_impl(crate::mcp_server::types::ResumeRequest {
-                from: Some("cursor".into()),
+                from: Some("windsurf".into()),
                 ..Default::default()
             })
             .unwrap_err();

@@ -1,6 +1,7 @@
 pub mod claude;
 pub mod codex;
 pub mod common;
+pub mod cursor;
 pub mod opencode;
 pub mod watcher;
 
@@ -66,6 +67,7 @@ impl IngestManager {
                 Box::new(claude::ClaudeAdapter),
                 Box::new(codex::CodexAdapter),
                 Box::new(opencode::OpenCodeAdapter),
+                Box::new(cursor::CursorAdapter),
             ],
         }
     }
