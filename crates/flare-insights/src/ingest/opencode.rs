@@ -217,12 +217,20 @@ fn try_session_table_dynamic(conn: &rusqlite::Connection) -> Vec<Session> {
                 if let Ok(name) = stmt.query_row([&project_id_raw], |r| r.get::<_, String>(0)) {
                     name
                 } else if let Some(dir) = &directory {
-                    dir.rsplit('/').next().unwrap_or(dir).to_string()
+                    std::path::Path::new(dir)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(dir)
+                        .to_string()
                 } else {
                     project_id_raw.clone()
                 }
             } else if let Some(dir) = &directory {
-                dir.rsplit('/').next().unwrap_or(dir).to_string()
+                std::path::Path::new(dir)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(dir)
+                        .to_string()
             } else {
                 project_id_raw.clone()
             }

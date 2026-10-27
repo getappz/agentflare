@@ -23,17 +23,9 @@ impl Default for InsightsConfig {
     }
 }
 
-fn dirs_data_dir() -> PathBuf {
-    if let Some(dir) = dirs::data_dir() {
-        dir.join("agentflare").join("insights")
-    } else {
-        PathBuf::from(".agentflare/insights")
-    }
-}
-
 /// Home for source discovery. Prefer `$HOME`, then `$USERPROFILE` (Windows),
 /// then `dirs::home_dir()` — never fall back to cwd `.`, which made Windows
-/// syncs miss `~\.local\share\opencode\opencode.db`.
+/// syncs miss every agent store under the real home directory.
 pub fn resolve_home() -> PathBuf {
     std::env::var("HOME")
         .ok()
@@ -42,6 +34,22 @@ pub fn resolve_home() -> PathBuf {
         .map(PathBuf::from)
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn dirs_data_dir() -> PathBuf {
+    // Keep the CLI/handoff canon (`~/.local/share/agentflare/insights`) so
+    // Windows does not silently fork to `%LOCALAPPDATA%\agentflare\insights`
+    // via dirs::data_dir() while doctor/sync still use the XDG-style path.
+    resolve_home()
+        .join(".local")
+        .join("share")
+        .join("agentflare")
+        .join("insights")
+}
+
+/// Default observatory DB path shared by the CLI, handoff, and resume.
+pub fn insights_db_path() -> PathBuf {
+    dirs_data_dir().join("observatory.db")
 }
 
 /// OpenCode session DB path, mirroring opencode's own data-dir resolution.
@@ -204,7 +212,6 @@ impl PricingTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
     use std::sync::{Mutex, OnceLock};
 
     fn env_lock() -> &'static Mutex<()> {
@@ -250,19 +257,35 @@ mod tests {
     }
 
     #[test]
-    fn default_opencode_source_uses_userprofile_local_share() {
+    fn default_ingest_sources_use_userprofile_when_home_unset() {
         let _lock = env_lock().lock().unwrap();
         let _home = EnvGuard::set("HOME", None);
         let _xdg = EnvGuard::set("XDG_DATA_HOME", None);
         let _oc_data = EnvGuard::set("OPENCODE_DATA_DIR", None);
         let _oc_dir = EnvGuard::set("OPENCODE_DIR", None);
+        let _claude = EnvGuard::set("CLAUDE_PROJECTS_DIR", None);
+        let _codex = EnvGuard::set("CODEX_SESSIONS_DIR", None);
         let _up = EnvGuard::set("USERPROFILE", Some(r"C:\Users\fixture"));
         let sources = default_sources();
         assert_eq!(
-            sources.get("opencode").map(PathBuf::as_path),
-            Some(Path::new(
+            sources.get("claude_code"),
+            Some(&PathBuf::from(r"C:\Users\fixture\.claude\projects"))
+        );
+        assert_eq!(
+            sources.get("codex"),
+            Some(&PathBuf::from(r"C:\Users\fixture\.codex\sessions"))
+        );
+        assert_eq!(
+            sources.get("opencode"),
+            Some(&PathBuf::from(
                 r"C:\Users\fixture\.local\share\opencode\opencode.db"
             ))
+        );
+        assert_eq!(
+            insights_db_path(),
+            PathBuf::from(
+                r"C:\Users\fixture\.local\share\agentflare\insights\observatory.db"
+            )
         );
     }
 }
