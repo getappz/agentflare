@@ -23,12 +23,51 @@ impl Default for InsightsConfig {
     }
 }
 
+/// Home for source discovery. Prefer `$HOME`, then `$USERPROFILE` (Windows),
+/// then `dirs::home_dir()` — never fall back to cwd `.`, which made Windows
+/// syncs miss every agent store under the real home directory.
+pub fn resolve_home() -> PathBuf {
+    std::env::var("HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("USERPROFILE").ok().filter(|s| !s.is_empty()))
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 fn dirs_data_dir() -> PathBuf {
-    if let Some(dir) = dirs::data_dir() {
-        dir.join("agentflare").join("insights")
-    } else {
-        PathBuf::from(".agentflare/insights")
+    // Keep the CLI/handoff canon (`~/.local/share/agentflare/insights`) so
+    // Windows does not silently fork to `%LOCALAPPDATA%\agentflare\insights`
+    // via dirs::data_dir() while doctor/sync still use the XDG-style path.
+    resolve_home()
+        .join(".local")
+        .join("share")
+        .join("agentflare")
+        .join("insights")
+}
+
+/// Default observatory DB path shared by the CLI, handoff, and resume.
+pub fn insights_db_path() -> PathBuf {
+    dirs_data_dir().join("observatory.db")
+}
+
+/// OpenCode session DB path, mirroring opencode's own data-dir resolution.
+pub fn opencode_db_path(home: &std::path::Path) -> PathBuf {
+    if let Ok(dir) = std::env::var("OPENCODE_DATA_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir).join("opencode.db");
+        }
     }
+    if let Ok(dir) = std::env::var("XDG_DATA_HOME") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir).join("opencode").join("opencode.db");
+        }
+    }
+    home.join(".local")
+        .join("share")
+        .join("opencode")
+        .join("opencode.db")
 }
 
 /// Home for foreign session stores (`~/.claude/projects`, …).
@@ -48,14 +87,11 @@ fn foreign_store_home() -> PathBuf {
             return home;
         }
     }
-    if let Some(home) = dirs::home_dir() {
-        return home;
-    }
-    // dirs can fail in unusual Windows hosts; USERPROFILE is the usual profile root.
+    // USERPROFILE is the Windows profile root; dirs covers hosts without it.
     if let Some(home) = std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()) {
         return PathBuf::from(home);
     }
-    PathBuf::from(".")
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn default_sources() -> HashMap<String, PathBuf> {
@@ -63,13 +99,7 @@ fn default_sources() -> HashMap<String, PathBuf> {
     let mut m = HashMap::new();
     m.insert("claude_code".into(), h.join(".claude").join("projects"));
     m.insert("codex".into(), h.join(".codex").join("sessions"));
-    m.insert(
-        "opencode".into(),
-        h.join(".local")
-            .join("share")
-            .join("opencode")
-            .join("opencode.db"),
-    );
+    m.insert("opencode".into(), opencode_db_path(&h));
     m.insert(
         "cursor".into(),
         crate::ingest::cursor::default_state_vscdb_path(),
@@ -216,5 +246,111 @@ impl PricingTable {
             cache_read_usd,
             cache_write_usd,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, val: Option<&str>) -> Self {
+            let prev = std::env::var(key).ok();
+            unsafe {
+                match val {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_home_prefers_userprofile_when_home_unset() {
+        let _lock = env_lock().lock().unwrap();
+        let _home = EnvGuard::set("HOME", None);
+        let _up = EnvGuard::set("USERPROFILE", Some(r"C:\Users\fixture"));
+        assert_eq!(resolve_home(), PathBuf::from(r"C:\Users\fixture"));
+    }
+
+    #[test]
+    fn default_ingest_sources_use_userprofile_when_home_unset() {
+        let _lock = env_lock().lock().unwrap();
+        let _home = EnvGuard::set("HOME", None);
+        let _xdg = EnvGuard::set("XDG_DATA_HOME", None);
+        let _oc_data = EnvGuard::set("OPENCODE_DATA_DIR", None);
+        let _oc_dir = EnvGuard::set("OPENCODE_DIR", None);
+        let _claude = EnvGuard::set("CLAUDE_PROJECTS_DIR", None);
+        let _codex = EnvGuard::set("CODEX_SESSIONS_DIR", None);
+        let _up = EnvGuard::set("USERPROFILE", Some(r"C:\Users\fixture"));
+        let home = PathBuf::from(r"C:\Users\fixture");
+        let sources = default_sources();
+        // Join via PathBuf so Unix CI (mixed separators) matches production joins.
+        assert_eq!(
+            sources.get("claude_code"),
+            Some(&home.join(".claude").join("projects"))
+        );
+        assert_eq!(
+            sources.get("codex"),
+            Some(&home.join(".codex").join("sessions"))
+        );
+        assert_eq!(
+            sources.get("opencode"),
+            Some(
+                &home
+                    .join(".local")
+                    .join("share")
+                    .join("opencode")
+                    .join("opencode.db")
+            )
+        );
+        assert_eq!(
+            insights_db_path(),
+            home.join(".local")
+                .join("share")
+                .join("agentflare")
+                .join("insights")
+                .join("observatory.db")
+        );
+    }
+
+    #[test]
+    fn resolve_home_skips_empty_home_for_userprofile() {
+        let _lock = env_lock().lock().unwrap();
+        let _home = EnvGuard::set("HOME", Some(""));
+        let _up = EnvGuard::set("USERPROFILE", Some(r"C:\Users\fixture"));
+        assert_eq!(resolve_home(), PathBuf::from(r"C:\Users\fixture"));
+        assert_eq!(
+            insights_db_path(),
+            PathBuf::from(r"C:\Users\fixture")
+                .join(".local")
+                .join("share")
+                .join("agentflare")
+                .join("insights")
+                .join("observatory.db")
+        );
     }
 }

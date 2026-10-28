@@ -102,8 +102,8 @@ fn parse_claude_jsonl(path: &Path) -> Option<IngestBundle> {
     let mut seq: u32 = 0;
 
     for v in &vals {
-        if let Some(cwd) = v.get("cwd").and_then(|c| c.as_str()) {
-            if let Some(last) = cwd.rsplit('/').next() {
+        if let Some(cwd_val) = v.get("cwd").and_then(|c| c.as_str()) {
+            if let Some(last) = Path::new(cwd_val).file_name().and_then(|n| n.to_str()) {
                 if !last.is_empty() {
                     project = last.to_string();
                 }

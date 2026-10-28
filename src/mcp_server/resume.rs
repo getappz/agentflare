@@ -105,9 +105,14 @@ impl super::AgentflareMcp {
                         Some(id) => &s.id != id,
                         None => s.source.as_str() != target_canon,
                     })
-                    .find(|s| match (&project, &s.cwd) {
-                        (Some(p), Some(c)) => std::path::Path::new(c).starts_with(p),
-                        _ => false,
+                    .find(|s| {
+                        // OpenCode fills project_path/directory but historically
+                        // left cwd null — accept either for project scoping.
+                        let root = s.cwd.as_ref().or(s.project_path.as_ref());
+                        match (&project, root) {
+                            (Some(p), Some(c)) => std::path::Path::new(c).starts_with(p),
+                            _ => false,
+                        }
                     });
                 if found.is_some() || page_len < 50 {
                     break found;
@@ -517,6 +522,61 @@ mod tests {
             })
             .unwrap();
         assert!(out.contains("ses-old-claude"), "{out}");
+    }
+
+    #[test]
+    fn auto_pick_uses_project_path_when_cwd_missing() {
+        let _lock = env_lock().lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("observatory.db");
+        let store = flare_insights::store::InsightsStore::open(&db).unwrap();
+        let cwd = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let now = chrono::Utc::now();
+        let session = flare_insights::model::Session {
+            id: "ses-oc-path".into(),
+            source: flare_insights::model::SessionSource::OpenCode,
+            project: "demo".into(),
+            project_path: Some(cwd),
+            title: Some("opencode path".into()),
+            model: None,
+            status: flare_insights::model::SessionStatus::Abandoned,
+            awaiting_reason: None,
+            started_at: None,
+            updated_at: now,
+            ended_at: None,
+            duration_secs: None,
+            tokens: flare_insights::model::TokenUsage {
+                input: 0,
+                output: 0,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            cost: None,
+            turn_count: 1,
+            tool_call_count: 0,
+            subagent_count: 0,
+            tags: vec![],
+            starred: false,
+            pid: None,
+            cwd: None,
+        };
+        store.upsert_session(&session).unwrap();
+        assert_eq!(session.source.as_str(), "opencode");
+        let _db = EnvGuard::set(INSIGHTS_DB_ENV, &db);
+        let server = crate::mcp_server::AgentflareMcp::default();
+        let out = server
+            .resume_impl(crate::mcp_server::types::ResumeRequest {
+                from: Some("opencode".into()),
+                to: Some("claude_code".into()),
+                dry_run: Some(true),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(out.contains("ses-oc-path"), "{out}");
     }
 
     #[test]
