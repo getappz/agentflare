@@ -11,7 +11,7 @@ use flare_insights::ingest::Adapter;
 use flare_insights::model::{FileEvent, Session, ToolCall, Turn};
 
 /// Sources with a reusable ingest adapter, in auto-detect order.
-pub const SUPPORTED: &[&str] = &["claude_code", "codex", "opencode"];
+pub const SUPPORTED: &[&str] = &["claude_code", "codex", "opencode", "cursor"];
 
 /// One foreign session with its parts, ready for [`super::body::build`].
 #[derive(Debug)]
@@ -30,6 +30,7 @@ pub struct SessionBundle {
 /// canon is underscores (matching `flare_insights` adapters).
 /// `gemini` names a valid failover *target* (recipient); it has no ingest
 /// adapter yet, so it never appears in [`SUPPORTED`] scan order.
+/// `cursor` is both an ingest source and a valid recipient.
 pub fn normalize_source(input: &str) -> Result<String, String> {
     match input {
         "claude_code" | "claude" | "cc" | "claude-code" | "claude-code-cli" => {
@@ -38,13 +39,8 @@ pub fn normalize_source(input: &str) -> Result<String, String> {
         "codex" => Ok("codex".into()),
         "opencode" | "oc" => Ok("opencode".into()),
         "gemini" | "gemini-cli" => Ok("gemini".into()),
+        "cursor" | "cursor-agent" | "cursor-cli" => Ok("cursor".into()),
         "auto" => Ok("auto".into()),
-        // No CursorAdapter yet (#321); fail closed with an explicit message
-        // so CLI/docs scrub stays honest until a consumer asks for one.
-        "cursor" | "cursor-agent" | "cursor-cli" => Err(format!(
-            "unsupported source 'cursor' — no ingest adapter yet; use one of: auto, {}",
-            SUPPORTED.join(", ")
-        )),
         other => Err(format!(
             "unsupported source '{other}' — use one of: auto, {}",
             SUPPORTED.join(", ")
@@ -66,6 +62,7 @@ fn scan_source(
         "opencode" => {
             flare_insights::ingest::opencode::OpenCodeAdapter.scan(config, &cursors, &mut noop)
         }
+        "cursor" => flare_insights::ingest::cursor::CursorAdapter.scan(config, &cursors, &mut noop),
         other => return Err(format!("unsupported source '{other}'")),
     };
     res.map_err(|e| format!("scan {source} failed (schema drift? degrade to manual handoff): {e}"))
@@ -136,13 +133,12 @@ pub fn load_session(source: &str, session_id: &str) -> Result<SessionBundle, Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
 
     /// Env-backed config (`CLAUDE_PROJECTS_DIR`) is process-global: serialize
     /// these tests so parallel tests can't observe a half-set environment.
     fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        &agent_registry::detect::PATH_LOCK
     }
 
     fn fixture_dir(tag: &str) -> tempfile::TempDir {
@@ -167,13 +163,9 @@ mod tests {
         assert_eq!(normalize_source("gemini").unwrap(), "gemini");
         assert_eq!(normalize_source("gemini-cli").unwrap(), "gemini");
         assert_eq!(normalize_source("claude-code").unwrap(), "claude_code");
-        let cursor_err = normalize_source("cursor").unwrap_err();
-        assert!(
-            cursor_err.contains("unsupported source 'cursor'")
-                && cursor_err.contains("no ingest adapter yet"),
-            "{cursor_err}"
-        );
-        assert!(normalize_source("cursor-agent").is_err());
+        assert_eq!(normalize_source("cursor").unwrap(), "cursor");
+        assert_eq!(normalize_source("cursor-agent").unwrap(), "cursor");
+        assert_eq!(normalize_source("cursor-cli").unwrap(), "cursor");
     }
 
     #[test]

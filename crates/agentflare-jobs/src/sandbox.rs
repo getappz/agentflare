@@ -119,10 +119,11 @@ const GEMINI_STATE: &[AgentStateMount] = &[mount(".gemini")];
 const AIDER_STATE: &[AgentStateMount] = &[mount(".aider")];
 const GROK_STATE: &[AgentStateMount] = &[mount(".grok")];
 const KIMI_STATE: &[AgentStateMount] = &[mount(".kimi-code")];
+const ANTIGRAVITY_STATE: &[AgentStateMount] = &[mount(".gemini")];
 
 /// Every coding-agent CLI agentflare knows a `$HOME` state-dir convention
 /// for, matched against `agent-registry`'s `binary_names`. An agent not
-/// listed here (e.g. windsurf, copilot, cody, goose, amp, kiro, antigravity,
+/// listed here (e.g. windsurf, copilot, cody, goose, amp, kiro,
 /// openclaw, droid) simply gets no agent-specific mount -- not a bug, just
 /// nothing has hit the failure mode yet that would tell us what it needs.
 const AGENT_PROFILES: &[AgentProfile] = &[
@@ -157,6 +158,14 @@ const AGENT_PROFILES: &[AgentProfile] = &[
     AgentProfile {
         binary_name: "kimi",
         state_mounts: KIMI_STATE,
+    },
+    AgentProfile {
+        binary_name: "antigravity",
+        state_mounts: ANTIGRAVITY_STATE,
+    },
+    AgentProfile {
+        binary_name: "agy",
+        state_mounts: ANTIGRAVITY_STATE,
     },
 ];
 

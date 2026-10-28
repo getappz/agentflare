@@ -70,22 +70,62 @@ pub fn opencode_db_path(home: &std::path::Path) -> PathBuf {
         .join("opencode.db")
 }
 
+/// Home for foreign session stores (`~/.claude/projects`, …).
+///
+/// Prefer `$HOME` when it looks usable (tests + Unix). Native Windows MCP
+/// often has no `HOME` (or a Git-Bash path with no agent stores) — fall
+/// through to `dirs::home_dir()` (SHGetKnownFolderPath / USERPROFILE) so
+/// resume's live scan does not report `scanned 0 sessions`.
+fn foreign_store_home() -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+    {
+        let has_store = home.join(".claude").join("projects").is_dir()
+            || home.join(".codex").join("sessions").is_dir();
+        if has_store || !cfg!(windows) {
+            return home;
+        }
+    }
+    // USERPROFILE is the Windows profile root; dirs covers hosts without it.
+    if let Some(home) = std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()) {
+        return PathBuf::from(home);
+    }
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+}
+
 fn default_sources() -> HashMap<String, PathBuf> {
-    let h = resolve_home();
+    let h = foreign_store_home();
     let mut m = HashMap::new();
     m.insert("claude_code".into(), h.join(".claude").join("projects"));
     m.insert("codex".into(), h.join(".codex").join("sessions"));
     m.insert("opencode".into(), opencode_db_path(&h));
-    // Cursor has no ingest adapter yet (#321) — omit path mapping so `doctor`
-    // does not list a dead source. Gemini/Copilot stay as reserved path stubs.
+    m.insert(
+        "cursor".into(),
+        crate::ingest::cursor::default_state_vscdb_path(),
+    );
+    // Gemini/Copilot stay as reserved path stubs (no ingest adapter yet).
     m.insert("gemini".into(), h.join(".gemini"));
     m.insert("copilot".into(), h.join(".copilot"));
+    let antigravity_brain = if h
+        .join(".gemini")
+        .join("antigravity-cli")
+        .join("brain")
+        .exists()
+    {
+        h.join(".gemini").join("antigravity-cli").join("brain")
+    } else {
+        h.join(".gemini").join("antigravity").join("brain")
+    };
+    m.insert("antigravity".into(), antigravity_brain);
     // env overrides
     for (key, env) in [
         ("claude_code", "CLAUDE_PROJECTS_DIR"),
         ("codex", "CODEX_SESSIONS_DIR"),
         ("opencode", "OPENCODE_DIR"),
+        ("cursor", "CURSOR_STATE_VSCDB"),
         ("gemini", "GEMINI_DIR"),
+        ("antigravity", "ANTIGRAVITY_BRAIN_DIR"),
     ] {
         if let Ok(v) = std::env::var(env) {
             m.insert(key.into(), PathBuf::from(v));

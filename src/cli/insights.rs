@@ -30,7 +30,7 @@ pub enum InsightsCommands {
     Serve(ServeArgs),
     /// Watch sources and re-sync on change (live)
     Watch(WatchArgs),
-    /// Check health of insights DB and sources (claude/codex/opencode)
+    /// Check health of insights DB and sources (claude/codex/opencode/cursor)
     Doctor(DoctorArgs),
 }
 
@@ -130,9 +130,7 @@ pub struct DoctorArgs {
 
 impl InsightsArgs {
     pub fn run(self) {
-        let db_path = self
-            .db
-            .unwrap_or_else(flare_insights::config::insights_db_path);
+        let db_path = self.db.unwrap_or_else(crate::handoff::default_insights_db);
         let cmd = self.command.unwrap_or(InsightsCommands::List(ListArgs {
             limit: 20,
             offset: 0,
@@ -513,12 +511,17 @@ fn run_serve(db: PathBuf, args: ServeArgs) {
 fn run_doctor(db: PathBuf, args: DoctorArgs) {
     let config = flare_insights::config::InsightsConfig::default();
     let db_ok = flare_insights::store::InsightsStore::open(&db).is_ok();
-    // Doctor documents Claude/Codex/OpenCode only; omit reserved path stubs
+    // Doctor documents ingest-capable sources; omit reserved path stubs
     // (gemini/copilot) that have no ingest adapter yet.
     let mut sources: Vec<(String, bool)> = config
         .sources
         .iter()
-        .filter(|(name, _)| matches!(name.as_str(), "claude_code" | "codex" | "opencode"))
+        .filter(|(name, _)| {
+            matches!(
+                name.as_str(),
+                "claude_code" | "codex" | "opencode" | "cursor"
+            )
+        })
         .map(|(name, path)| (name.clone(), path.exists()))
         .collect();
     sources.sort_by(|a, b| a.0.cmp(&b.0));

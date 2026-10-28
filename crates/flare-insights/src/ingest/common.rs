@@ -77,11 +77,13 @@ pub fn extract_tokens(v: &Value) -> TokenUsage {
         .unwrap_or(0);
     t.cache_read = v
         .get("cache_read_input_tokens")
+        .or_else(|| v.get("cache_read_tokens"))
         .or_else(|| v.get("cache").and_then(|c| c.get("read")))
         .and_then(|n| n.as_u64())
         .unwrap_or(0);
     t.cache_write = v
         .get("cache_creation_input_tokens")
+        .or_else(|| v.get("cache_write_tokens"))
         .or_else(|| v.get("cache").and_then(|c| c.get("write")))
         .and_then(|n| n.as_u64())
         .unwrap_or(0);
@@ -134,8 +136,16 @@ pub fn get_nested_str<'a>(v: &'a Value, path: &[&str]) -> Option<&'a str> {
 
 /// DRY: extract file path from tool input for file_events
 pub fn extract_file_path(tool: &str, input: &serde_json::Value) -> Option<String> {
-    // Claude/Codex and OpenCode share similar arg names
-    for key in ["file_path", "path", "file", "filepath", "filename"] {
+    // Claude/Codex/OpenCode/Antigravity arg names
+    for key in [
+        "file_path",
+        "path",
+        "file",
+        "filepath",
+        "filename",
+        "Path",
+        "filePath",
+    ] {
         if let Some(s) = input.get(key).and_then(|v| v.as_str()) {
             return Some(s.to_string());
         }
@@ -157,10 +167,15 @@ pub fn extract_file_path(tool: &str, input: &serde_json::Value) -> Option<String
     }
     // fallback: for read/write/edit tools, try to find any string containing '/'
     // tool names vary by case across sources (Claude Code uses "Read"/"Write"/...)
-    if matches!(
-        tool.to_lowercase().as_str(),
-        "read" | "write" | "edit" | "glob" | "grep" | "bash"
-    ) {
+    let lower = tool.to_lowercase();
+    if lower.contains("read")
+        || lower.contains("write")
+        || lower.contains("edit")
+        || lower.contains("glob")
+        || lower.contains("grep")
+        || lower.contains("bash")
+        || lower.contains("shell")
+    {
         if let Some(s) = input.as_str() {
             return Some(s.to_string());
         }
@@ -169,11 +184,16 @@ pub fn extract_file_path(tool: &str, input: &serde_json::Value) -> Option<String
 }
 
 pub fn file_kind_for_tool(tool: &str) -> &'static str {
-    match tool.to_lowercase().as_str() {
-        "read" | "glob" | "grep" => "read",
-        "write" => "write",
-        "edit" => "edit",
-        "bash" => "bash",
-        _ => "tool",
+    let lower = tool.to_lowercase();
+    if lower.contains("read") || lower.contains("glob") || lower.contains("grep") {
+        "read"
+    } else if lower.contains("write") {
+        "write"
+    } else if lower.contains("edit") || lower.contains("patch") {
+        "edit"
+    } else if lower.contains("bash") || lower.contains("command") || lower.contains("shell") {
+        "bash"
+    } else {
+        "tool"
     }
 }
