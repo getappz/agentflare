@@ -31,9 +31,35 @@ fn dirs_data_dir() -> PathBuf {
     }
 }
 
+/// Home for foreign session stores (`~/.claude/projects`, …).
+///
+/// Prefer `$HOME` when it looks usable (tests + Unix). Native Windows MCP
+/// often has no `HOME` (or a Git-Bash path with no agent stores) — fall
+/// through to `dirs::home_dir()` (SHGetKnownFolderPath / USERPROFILE) so
+/// resume's live scan does not report `scanned 0 sessions`.
+fn foreign_store_home() -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+    {
+        let has_store = home.join(".claude").join("projects").is_dir()
+            || home.join(".codex").join("sessions").is_dir();
+        if has_store || !cfg!(windows) {
+            return home;
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        return home;
+    }
+    // dirs can fail in unusual Windows hosts; USERPROFILE is the usual profile root.
+    if let Some(home) = std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()) {
+        return PathBuf::from(home);
+    }
+    PathBuf::from(".")
+}
+
 fn default_sources() -> HashMap<String, PathBuf> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let h = PathBuf::from(home);
+    let h = foreign_store_home();
     let mut m = HashMap::new();
     m.insert("claude_code".into(), h.join(".claude").join("projects"));
     m.insert("codex".into(), h.join(".codex").join("sessions"));
