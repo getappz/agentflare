@@ -222,15 +222,18 @@ fn no_console_window(cmd: &mut Command) {
     flare_process::no_window(cmd);
 }
 
-/// Runs `git` in `repo_root`; `Ok(stdout)` trimmed on success, `Err(stderr)`
-/// trimmed on a non-zero exit, or a process-spawn error message (git
-/// missing, etc) if it couldn't even run.
-pub fn run_in(repo_root: &Path, args: &[&str]) -> Result<String, String> {
+/// Build Git with the standard path/environment filtering and window policy.
+pub fn command_in(repo_root: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new(git_binary());
     cmd.args(args).current_dir(repo_root);
     no_console_window(&mut cmd);
     apply_filtered_path(&mut cmd);
-    let out = cmd
+    cmd
+}
+
+/// Run Git; return trimmed stdout on success or stderr/spawn error on failure.
+pub fn run_in(repo_root: &Path, args: &[&str]) -> Result<String, String> {
+    let out = command_in(repo_root, args)
         .output()
         .map_err(|e| format!("git not available: {e}"))?;
     if !out.status.success() {
