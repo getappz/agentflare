@@ -248,14 +248,19 @@ const TREE_FINGERPRINT_GIT_TIMEOUT_SECS: u64 = 2;
 /// Known gap: uncommitted edits inside initialized submodules are not
 /// reflected (the superproject tree stores submodule commit IDs only).
 pub fn tree_fingerprint() -> Option<String> {
-    let cwd = std::env::current_dir().ok()?;
+    tree_fingerprint_in(&std::env::current_dir().ok()?)
+}
+
+/// [`tree_fingerprint`] for an explicit directory (e.g. an item's task
+/// worktree) instead of the process cwd.
+pub fn tree_fingerprint_in(cwd: &std::path::Path) -> Option<String> {
     let run = |args: &[&str], index: Option<&std::path::Path>| -> Option<String> {
         let extra_env: &[(&str, &std::ffi::OsStr)] = match index {
             Some(i) => &[("GIT_INDEX_FILE", i.as_os_str())],
             None => &[],
         };
         flare_git_core::worktree::run_git_opt_timeout(
-            &cwd,
+            cwd,
             args,
             TREE_FINGERPRINT_GIT_TIMEOUT_SECS,
             extra_env,
@@ -1401,5 +1406,37 @@ mod tests {
         let r = router_by_name("length");
         let nudge = r.route(&ctx("hi")).unwrap();
         assert!(nudge.contains("haiku"));
+    }
+}
+
+#[cfg(test)]
+mod tree_fingerprint_in_tests {
+    use super::tree_fingerprint_in;
+
+    #[test]
+    fn fingerprint_follows_the_given_dir_not_cwd() {
+        let git = |d: &std::path::Path, a: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(a)
+                    .current_dir(d)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        for d in [a.path(), b.path()] {
+            git(d, &["init", "-q"]);
+        }
+        std::fs::write(a.path().join("f"), "1").unwrap();
+        std::fs::write(b.path().join("f"), "2").unwrap();
+        for d in [a.path(), b.path()] {
+            git(d, &["add", "-A"]); // creates the index the fingerprint copies
+        }
+        let (ta, tb) = (tree_fingerprint_in(a.path()), tree_fingerprint_in(b.path()));
+        assert!(ta.is_some() && tb.is_some());
+        assert_ne!(ta, tb);
+        assert_eq!(ta, tree_fingerprint_in(a.path()));
     }
 }

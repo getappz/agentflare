@@ -281,6 +281,15 @@ pub(crate) const ITEM_TOOL_NAME: &str = "mcp__flare__item";
 /// completion-claim moment the verification gate protects (item #169).
 pub(crate) const GATED_ITEM_ACTIONS: &[&str] = &["done", "check_merge"];
 
+/// The gated item action named by `tool_input`, or `None` when the call is
+/// not one of [`GATED_ITEM_ACTIONS`]. Shared by the decision core and by
+/// `hook_completion_gate::completion_gate_denial` so the latter can skip its
+/// database, git and fingerprint work for every call the gate ignores.
+pub(crate) fn gated_item_action(tool_input: Option<&Value>) -> Option<&str> {
+    let action = tool_input?.get("action")?.as_str()?;
+    GATED_ITEM_ACTIONS.contains(&action).then_some(action)
+}
+
 /// Blocks `item done` / `item check_merge` until this session has a fresh,
 /// passing verification-evidence record (`crate::optimize::VerificationEvidence`,
 /// captured by the `PostToolUse` success hook when a test/build/lint command
@@ -327,10 +336,7 @@ pub(crate) fn completion_gate_reason(
     if tool_name != ITEM_TOOL_NAME && tool_name != "item" {
         return None;
     }
-    let action = tool_input?.get("action")?.as_str()?;
-    if !GATED_ITEM_ACTIONS.contains(&action) {
-        return None;
-    }
+    let action = gated_item_action(tool_input)?;
     if !has_fresh_verification {
         return Some(format!(
             "no fresh, passing verification evidence for this session -- run this project's test/build/lint command (e.g. `cargo test`, `npm test`, `pytest`) via a Bash-family tool (Bash, or ctx_shell through the flare gateway) before calling `item` action={action}; a failed run doesn't count, and a passing run only counts while the working tree is unchanged since it (or, if the tree can't be fingerprinted, for {}m).",
