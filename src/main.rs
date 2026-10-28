@@ -90,11 +90,21 @@ mod vent;
 mod work_item_pipeline;
 mod workflow;
 mod worktree;
+mod wrap;
 
 use clap::Parser;
 
 fn main() {
     color_eyre::install().expect("color_eyre::install failed");
+    if let Some(result) = wrap::handle_entrypoint() {
+        match result {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                ui::error(&error);
+                std::process::exit(1);
+            }
+        }
+    }
     mise_install::init_mise_path();
     let cli = cli::Cli::parse();
     match cli.command {

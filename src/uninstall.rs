@@ -12,6 +12,7 @@ pub fn run(dry_run: bool, keep_config: bool, keep_binary: bool) {
     }
 
     if !keep_config {
+        crate::wrap::cleanup_profiles(dry_run);
         clean_claude_code(dry_run);
         clean_opencode(dry_run);
         clean_cursor(dry_run);

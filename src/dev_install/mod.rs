@@ -119,6 +119,12 @@ pub fn run(release: bool, dry_run: bool) {
         ));
         std::process::exit(1);
     }
+    if let Err(e) = crate::wrap::refresh_existing_companion(&target) {
+        crate::ui::error(&format!(
+            "agentflare installed, but Claude wrapper refresh failed: {e}"
+        ));
+        std::process::exit(1);
+    }
     crate::ui::success(&format!("installed to {}", target.display()));
     crate::ui::info("run `agentflare --version` to confirm");
 
