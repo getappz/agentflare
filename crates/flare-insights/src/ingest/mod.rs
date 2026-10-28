@@ -1,3 +1,4 @@
+pub mod antigravity;
 pub mod claude;
 pub mod codex;
 pub mod common;
@@ -68,6 +69,7 @@ impl IngestManager {
                 Box::new(codex::CodexAdapter),
                 Box::new(opencode::OpenCodeAdapter),
                 Box::new(cursor::CursorAdapter),
+                Box::new(antigravity::AntigravityAdapter),
             ],
         }
     }
