@@ -564,11 +564,9 @@ pub(super) fn merge_or_repair_findings(
         return PassingPrOutcome::Repair(outcome);
     }
     if review.blocks_merge() {
-        // Threads escalated past `max_rounds` or blocking threads with no repair
-        // in flight or dispatching hold the merge; if this persists across
-        // `REVIEW_STALL_TICK_LIMIT` sweeps, note_review_stall surfaces it.
-        let held = !review.unknown
-            && (review.escalated > 0 || (review.waiting_push == 0 && !review.dispatch_needed()));
+        // Threads escalated past `max_rounds` hold the merge with no job ever
+        // coming; threads merely waiting on the bot or a push are not stalls.
+        let held = !review.unknown && review.escalated > 0;
         note_review_stall(mcp, queue, item, number, labels, folder_path, held, false);
         if review.escalated == 0 {
             post_review_threads_hold_pr_comment(
