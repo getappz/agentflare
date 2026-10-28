@@ -43,6 +43,7 @@ mod vent;
 pub(crate) mod work;
 mod workflow;
 mod workflow_schedule;
+mod wrap;
 
 use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Parser, Subcommand};
@@ -114,6 +115,10 @@ pub enum Commands {
     Run(run::RunArgs),
     /// Manage shell aliases installed for agentflare commands.
     Alias(alias::AliasArgs),
+    /// Install a Claude shell wrapper with opt-in --with-proxy support.
+    Wrap(wrap::WrapArgs),
+    /// Remove agentflare's Claude shell wrapper from a shell profile.
+    Unwrap(wrap::WrapArgs),
     /// Update agentflare to the latest release.
     Update(update::UpdateArgs),
     /// Remove agentflare's hooks, config, and installed files.
@@ -207,6 +212,8 @@ impl Commands {
             Self::Agents(cmd) => cmd.run(),
             Self::Run(cmd) => cmd.run(),
             Self::Alias(cmd) => cmd.run(),
+            Self::Wrap(cmd) => cmd.run(false),
+            Self::Unwrap(cmd) => cmd.run(true),
             Self::Update(cmd) => cmd.run(),
             Self::Uninstall(cmd) => cmd.run(),
             Self::Vault(cmd) => cmd.run(),
