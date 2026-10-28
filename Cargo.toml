@@ -83,6 +83,11 @@ agentflare-backend = { package = "agentflare-backend", path = "crates/agentflare
 db_kit = { package = "agentflare-db-kit", path = "crates/agentflare-db-kit" }
 flare-search-kit = { path = "crates/flare-search-kit" }
 axum = "0.8"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rcgen = "0.14"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 fs2 = "0.4"
 rust-embed = "8"
 tokio-stream = { version = "0.1", features = ["sync"] }
@@ -137,7 +142,6 @@ flare-vault = { path = "crates/flare-vault", features = ["insecure-fast-kdf"] }
 agentflare-bin-lib = { path = "crates/agentflare-bin-lib", features = ["test-support"] }
 insta = { version = "1", features = ["json"] }
 pretty_assertions = "1"
-reqwest = { version = "0.12", default-features = false, features = ["stream", "json"] }
 tokio = { version = "1", features = ["test-util"] }
 
 [lints.rust]
