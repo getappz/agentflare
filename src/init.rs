@@ -132,6 +132,9 @@ pub fn run(agent: &str, yes: bool) {
             wire_opencode();
             wire_optimize_opencode();
         }
+        "antigravity" => {
+            wire_antigravity();
+        }
         _ => {}
     }
 
@@ -817,6 +820,179 @@ pub(crate) fn wire_opencode_instructions() {
     }
 }
 
+fn wire_antigravity() {
+    let bin = agentflare_binary();
+    let home = home();
+
+    let plugin_dir = home
+        .join(".gemini")
+        .join("config")
+        .join("plugins")
+        .join("agentflare");
+    let hooks_dir = plugin_dir.join("hooks");
+    if let Err(e) = fs::create_dir_all(&hooks_dir) {
+        ui::error(&format!("creating plugin dir: {e}"));
+        return;
+    }
+
+    let manifest = json!({
+        "name": "agentflare",
+        "description": "agentflare workflow orchestration, session liveness, and team sync"
+    });
+    if let Err(e) = fs::write(
+        plugin_dir.join("plugin.json"),
+        serde_json::to_string_pretty(&manifest).unwrap_or_default(),
+    ) {
+        ui::error(&format!("writing plugin.json: {e}"));
+        return;
+    }
+
+    let mcp_config = json!({
+        "mcpServers": {
+            "flare": {
+                "command": bin,
+                "args": ["mcp"]
+            }
+        }
+    });
+    if let Err(e) = fs::write(
+        plugin_dir.join("mcp_config.json"),
+        serde_json::to_string_pretty(&mcp_config).unwrap_or_default(),
+    ) {
+        ui::error(&format!("writing mcp_config.json: {e}"));
+        return;
+    }
+
+    let hook_cmd = format!("\"{bin}\" hook");
+    let hooks_json = json!({
+        "agentflare": {
+            "SessionStart": [
+                {
+                    "type": "command",
+                    "command": format!("{hook_cmd} session-start --agent antigravity"),
+                    "timeout": 30
+                }
+            ],
+            "PreInvocation": [
+                {
+                    "type": "command",
+                    "command": format!("{hook_cmd} prompt-submit --agent antigravity"),
+                    "timeout": 15
+                }
+            ],
+            "PreToolUse": [
+                {
+                    "matcher": ".*",
+                    "hooks": [{
+                        "type": "command",
+                        "command": format!("{hook_cmd} pre-tool-use --agent antigravity"),
+                        "timeout": 10
+                    }]
+                }
+            ],
+            "PostToolUse": [
+                {
+                    "matcher": ".*",
+                    "hooks": [{
+                        "type": "command",
+                        "command": format!("{hook_cmd} post-tool-use --agent antigravity"),
+                        "timeout": 10
+                    }]
+                }
+            ],
+            "Stop": [
+                {
+                    "type": "command",
+                    "command": format!("{hook_cmd} stop --agent antigravity"),
+                    "timeout": 10
+                }
+            ]
+        }
+    });
+    let hooks_pretty = serde_json::to_string_pretty(&hooks_json).unwrap_or_default();
+    if let Err(e) = fs::write(plugin_dir.join("hooks.json"), &hooks_pretty) {
+        ui::error(&format!("writing hooks.json: {e}"));
+        return;
+    }
+    if let Err(e) = fs::write(hooks_dir.join("hooks.json"), &hooks_pretty) {
+        ui::error(&format!("writing hooks/hooks.json: {e}"));
+        return;
+    }
+
+    // Bundle core flare skill inside plugin
+    let skill_dir = plugin_dir.join("skills").join("flare");
+    if fs::create_dir_all(&skill_dir).is_ok() {
+        let skill_md = r#"---
+name: flare
+description: Agentflare workflow commands, work-item orchestration, PR review, and multi-agent coordination.
+---
+# Agentflare Skill
+Use the `agentflare` CLI and MCP tools:
+- Work items: `agentflare item claim <id>`, `agentflare item done`
+- PR lifecycle: `agentflare pr open`, `agentflare pr adopt`
+- Cross-session memory: `agentflare memory search <query>`, `agentflare memory context`
+- Browser automation: `agentflare browser ...`
+"#;
+        let _ = fs::write(skill_dir.join("SKILL.md"), skill_md);
+    }
+
+    // Bundle global pairing rules inside plugin
+    let rules_dir = plugin_dir.join("rules");
+    if fs::create_dir_all(&rules_dir).is_ok() {
+        let rules_md = r#"# Agentflare Pairing Rules
+- Telegraph format: subject-verb-object, drop articles/prepositions
+- Symbolic vocabulary: → cause, ∵ because, ∴ therefore, ⊕ add, ⊖ remove, Δ change, ≈ similar, ≠ different, ∈ in/member, ∅ empty/none, ✓ ok, ✗ fail
+- Code minimalism & zero narration
+- Route code intelligence through lean-ctx when available
+"#;
+        let _ = fs::write(rules_dir.join("AGENTS.md"), rules_md);
+    }
+
+    let config_dir = home.join(".gemini").join("config");
+    if let Err(e) = register_antigravity_plugin(&config_dir) {
+        ui::error(&format!("registering import_manifest.json: {e}"));
+        return;
+    }
+
+    ui::success("~/.gemini/config/plugins/agentflare (plugin wired)");
+}
+
+fn register_antigravity_plugin(config_dir: &std::path::Path) -> Result<(), String> {
+    let manifest_path = config_dir.join("import_manifest.json");
+    let mut json = fs::read_to_string(&manifest_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({ "imports": [] }));
+
+    let Some(obj) = json.as_object_mut() else {
+        return Err("import_manifest.json is not an object".into());
+    };
+    let entry = obj
+        .entry("imports".to_string())
+        .or_insert_with(|| json!([]));
+    if !entry.is_array() {
+        *entry = json!([]);
+    }
+    let Some(arr) = entry.as_array_mut() else {
+        return Err("imports is not an array".into());
+    };
+    if arr
+        .iter()
+        .any(|e| e.get("name").and_then(Value::as_str) == Some("agentflare"))
+    {
+        return Ok(());
+    }
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    arr.push(json!({
+        "name": "agentflare",
+        "source": "local-install",
+        "importedAt": now,
+        "components": ["installed"]
+    }));
+    write_json_pretty(&manifest_path, &json).map_err(|e| format!("{e}"))
+}
+
 pub fn wire_optimize_hooks(agent: &str) {
     match agent {
         "claude-code" | "cowork" => wire_optimize_claude_code(),
@@ -992,6 +1168,7 @@ fn scan_agent_configs(agent: &str, markers: &[&str]) -> Option<String> {
         "claude-code" | "cowork" => &[".claude/settings.json"],
         "cursor" | "cursor-cli" => &[".cursor/hooks.json"],
         "opencode" => &[".config/opencode/opencode.jsonc"],
+        "antigravity" => &[".gemini/config/plugins/agentflare/hooks.json"],
         _ => return None,
     };
 
@@ -2053,6 +2230,67 @@ mod tests {
                 !content.contains(&stale_rule_path),
                 "dangling coaching rule entry should be pruned: {content}"
             );
+        });
+    }
+
+    #[test]
+    fn wire_antigravity_creates_plugin_bundle_and_manifest() {
+        with_temp_home(|| {
+            wire_antigravity();
+
+            let plugin_dir = home()
+                .join(".gemini")
+                .join("config")
+                .join("plugins")
+                .join("agentflare");
+            assert!(plugin_dir.join("plugin.json").exists());
+            assert!(plugin_dir.join("mcp_config.json").exists());
+            assert!(plugin_dir.join("hooks.json").exists());
+            assert!(plugin_dir.join("hooks").join("hooks.json").exists());
+            assert!(
+                plugin_dir
+                    .join("skills")
+                    .join("flare")
+                    .join("SKILL.md")
+                    .exists()
+            );
+            assert!(plugin_dir.join("rules").join("AGENTS.md").exists());
+
+            let plugin_manifest: Value =
+                serde_json::from_str(&fs::read_to_string(plugin_dir.join("plugin.json")).unwrap())
+                    .unwrap();
+            assert_eq!(plugin_manifest["name"], "agentflare");
+            assert!(plugin_manifest.get("version").is_none());
+
+            let hooks: Value =
+                serde_json::from_str(&fs::read_to_string(plugin_dir.join("hooks.json")).unwrap())
+                    .unwrap();
+            let af_hooks = &hooks["agentflare"];
+            // Flat events
+            assert!(af_hooks["SessionStart"].is_array());
+            assert!(af_hooks["SessionStart"][0]["type"] == "command");
+            assert!(af_hooks["PreInvocation"].is_array());
+            assert!(af_hooks["Stop"].is_array());
+            // Grouped events
+            assert!(af_hooks["PreToolUse"][0]["matcher"] == ".*");
+            assert!(af_hooks["PostToolUse"][0]["matcher"] == ".*");
+
+            let manifest_path = home()
+                .join(".gemini")
+                .join("config")
+                .join("import_manifest.json");
+            assert!(manifest_path.exists());
+            let manifest: Value =
+                serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+            let arr = manifest["imports"].as_array().unwrap();
+            assert_eq!(arr.iter().filter(|e| e["name"] == "agentflare").count(), 1);
+
+            // Idempotent re-run
+            wire_antigravity();
+            let manifest2: Value =
+                serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+            let arr2 = manifest2["imports"].as_array().unwrap();
+            assert_eq!(arr2.iter().filter(|e| e["name"] == "agentflare").count(), 1);
         });
     }
 }
