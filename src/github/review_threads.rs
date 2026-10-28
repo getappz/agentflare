@@ -204,11 +204,7 @@ pub fn commit_info(client: &Client, repo: &RepoId, sha: &str) -> Result<CommitIn
         .as_str()
         .map(str::to_string);
     let parent_count = json["parents"].as_array().map_or(0, |p| p.len());
-    let message = json["commit"]["message"].as_str().unwrap_or_default();
-    let is_merge = parent_count > 1
-        || message.starts_with("Merge branch ")
-        || message.starts_with("Merge remote-tracking branch ")
-        || message.starts_with("Merge pull request ");
+    let is_merge = parent_count > 1;
     Ok(CommitInfo { date, is_merge })
 }
 
