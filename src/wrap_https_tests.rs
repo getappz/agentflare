@@ -115,7 +115,7 @@ async fn plaintext_and_oversized_requests_never_reach_the_optimizer() {
     assert_eq!(
         client(&bridge)
             .post("https://api.anthropic.com/v1/messages")
-            .body(vec![b'x'; 2_000_001])
+            .body(vec![b'x'; super::BODY_LIMIT + 1])
             .send()
             .await
             .unwrap()

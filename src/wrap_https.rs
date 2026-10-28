@@ -1,4 +1,4 @@
-//! Experimental HTTP/1.1 bridge; shortcut: 2 MB requests, no WebSocket/Remote Control support.
+//! Experimental HTTP/1.1 bridge; shortcut: 32 MiB requests, no WebSocket/Remote Control support.
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderMap, HeaderName, Method, Request, Response, StatusCode};
 use hyper::{body::Incoming, server::conn::http1, service::service_fn};
@@ -14,7 +14,9 @@ use tokio_rustls::{TlsAcceptor, rustls};
 
 const HOST: &str = "api.anthropic.com";
 pub(super) const PROXY_PORT: u16 = 4444;
-const BODY_LIMIT: usize = 2_000_000;
+// Requests are buffered in memory; sized to the Messages API request ceiling so long sessions
+// (large tool output, pasted images, 1M-context) are not rejected by the bridge.
+const BODY_LIMIT: usize = 32 * 1024 * 1024;
 
 pub(super) struct Bridge {
     directory: tempfile::TempDir,
@@ -334,14 +336,21 @@ pub(super) async fn shared_proxy(lean: &Path, port: u16) -> Result<(), String> {
         .spawn()
         .map_err(|error| format!("Cannot start lean-ctx proxy: {error}"))?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    // A racing launcher's starter may exit non-zero (address in use) just before the winner's
+    // proxy answers /health, so a failed starter only errors after a short grace period.
+    let mut failed_at: Option<tokio::time::Instant> = None;
     loop {
-        let ready = proxy_ready(&client, port).await?;
-        match starter.try_wait().map_err(|error| error.to_string())? {
-            Some(status) if !status.success() && !ready => {
-                return Err(format!("lean-ctx proxy start failed: {status}"));
+        if proxy_ready(&client, port).await? {
+            return Ok(());
+        }
+        if failed_at.is_none() {
+            let exited = starter.try_wait().map_err(|error| error.to_string())?;
+            if exited.is_some_and(|status| !status.success()) {
+                failed_at = Some(tokio::time::Instant::now());
             }
-            Some(_) if ready => return Ok(()),
-            _ => {}
+        }
+        if failed_at.is_some_and(|at| at.elapsed() > Duration::from_secs(3)) {
+            return Err("lean-ctx proxy start failed and the default proxy is not ready".into());
         }
         if tokio::time::Instant::now() >= deadline {
             // Only stop our startup helper; never stop the shared optimizer.
