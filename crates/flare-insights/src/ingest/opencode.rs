@@ -106,7 +106,10 @@ impl Adapter for OpenCodeAdapter {
 }
 
 fn try_session_table_dynamic(conn: &rusqlite::Connection) -> Vec<Session> {
-    let stmt = match conn.prepare("SELECT * FROM session LIMIT 1000") {
+    let stmt = match conn
+        .prepare("SELECT * FROM session ORDER BY time_updated DESC LIMIT 1000")
+        .or_else(|_| conn.prepare("SELECT * FROM session LIMIT 1000"))
+    {
         Ok(s) => s,
         Err(_) => return vec![],
     };
@@ -132,7 +135,10 @@ fn try_session_table_dynamic(conn: &rusqlite::Connection) -> Vec<Session> {
     let time_updated_idx = find(&["time_updated", "updated_at", "timeUpdated"]);
     let time_created_idx = find(&["time_created", "created_at", "timeCreated"]);
 
-    let mut stmt2 = match conn.prepare("SELECT * FROM session LIMIT 1000") {
+    let mut stmt2 = match conn
+        .prepare("SELECT * FROM session ORDER BY time_updated DESC LIMIT 1000")
+        .or_else(|_| conn.prepare("SELECT * FROM session LIMIT 1000"))
+    {
         Ok(s) => s,
         Err(_) => return vec![],
     };
@@ -213,12 +219,20 @@ fn try_session_table_dynamic(conn: &rusqlite::Connection) -> Vec<Session> {
                 if let Ok(name) = stmt.query_row([&project_id_raw], |r| r.get::<_, String>(0)) {
                     name
                 } else if let Some(dir) = &directory {
-                    dir.rsplit('/').next().unwrap_or(dir).to_string()
+                    std::path::Path::new(dir)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(dir)
+                        .to_string()
                 } else {
                     project_id_raw.clone()
                 }
             } else if let Some(dir) = &directory {
-                dir.rsplit('/').next().unwrap_or(dir).to_string()
+                std::path::Path::new(dir)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(dir)
+                    .to_string()
             } else {
                 project_id_raw.clone()
             }
@@ -263,7 +277,9 @@ fn try_session_table_dynamic(conn: &rusqlite::Connection) -> Vec<Session> {
             tags: vec![],
             starred: false,
             pid: None,
-            cwd: None,
+            // Resume auto-pick scopes by cwd; OpenCode stores the project dir
+            // in `directory` (no separate cwd column).
+            cwd: directory.clone(),
         });
     }
     out
@@ -573,4 +589,71 @@ fn split_parts_into_steps(parts: &[serde_json::Value]) -> Vec<Vec<serde_json::Va
         }
     }
     steps
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ingest::Adapter;
+    use std::collections::HashMap;
+
+    fn fixture_db(path: &std::path::Path) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE session (
+              id TEXT PRIMARY KEY,
+              project_id TEXT,
+              directory TEXT,
+              title TEXT,
+              time_created INTEGER,
+              time_updated INTEGER
+            );
+            CREATE TABLE message (
+              id TEXT PRIMARY KEY,
+              session_id TEXT,
+              time_created INTEGER,
+              data TEXT
+            );
+            CREATE TABLE part (
+              id TEXT PRIMARY KEY,
+              message_id TEXT,
+              session_id TEXT,
+              data TEXT
+            );
+            INSERT INTO session(id, project_id, directory, title, time_created, time_updated)
+            VALUES
+              ('ses-old', 'p1', 'C:/Users/fixture/old-proj', 'old', 1000, 1000),
+              ('ses-new', 'p1', 'C:/Users/fixture/new-proj', 'new', 2000, 9000);
+            "#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn scan_orders_newest_first_and_sets_cwd_from_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("opencode.db");
+        fixture_db(&db);
+        let mut sources = HashMap::new();
+        sources.insert("opencode".into(), db);
+        let config = InsightsConfig {
+            data_dir: tmp.path().to_path_buf(),
+            db_path: tmp.path().join("observatory.db"),
+            retention_days: 30,
+            sources,
+            pricing: PricingTable::default(),
+        };
+        let mut progress = |_: usize, _: usize| {};
+        let bundle = OpenCodeAdapter
+            .scan(&config, &Default::default(), &mut progress)
+            .unwrap();
+        assert_eq!(bundle.sessions.len(), 2);
+        assert_eq!(bundle.sessions[0].id, "ses-new");
+        assert_eq!(
+            bundle.sessions[0].cwd.as_deref(),
+            Some("C:/Users/fixture/new-proj")
+        );
+        assert_eq!(bundle.sessions[0].source.as_str(), "opencode");
+    }
 }

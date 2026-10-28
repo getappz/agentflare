@@ -891,6 +891,33 @@ pub(crate) fn set_thread_escalated(meta: &mut Meta, thread_id: &str) {
     thread_entry(meta, thread_id).insert("escalated".into(), true.into());
 }
 
+pub(crate) fn thread_bot_wait(meta: &Meta, thread_id: &str) -> (Option<String>, u64) {
+    let Some(rec) = meta.get(REVIEW_THREADS_KEY).and_then(|v| v.get(thread_id)) else {
+        return (None, 0);
+    };
+    let head = rec
+        .get("bot_wait_head")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let ticks = rec
+        .get("bot_wait_ticks")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    (head, ticks)
+}
+
+pub(crate) fn note_thread_bot_wait(meta: &mut Meta, thread_id: &str, head: &str, ticks: u64) {
+    let entry = thread_entry(meta, thread_id);
+    entry.insert("bot_wait_head".into(), head.into());
+    entry.insert("bot_wait_ticks".into(), ticks.into());
+}
+
+pub(crate) fn clear_thread_bot_wait(meta: &mut Meta, thread_id: &str) {
+    let entry = thread_entry(meta, thread_id);
+    entry.remove("bot_wait_head");
+    entry.remove("bot_wait_ticks");
+}
+
 pub(crate) fn thread_result(meta: &Meta, thread_id: &str) -> Option<ReviewResult> {
     let r = meta.get(REVIEW_RESULTS_KEY)?.get(thread_id)?;
     let text = |k: &str| r.get(k).and_then(|v| v.as_str()).map(str::to_string);

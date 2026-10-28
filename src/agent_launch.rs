@@ -640,18 +640,28 @@ fn final_json_object(stdout: &str) -> Option<serde_json::Value> {
 fn reply_from_result_event(value: &serde_json::Value, raw: &str) -> HeadlessReply {
     use serde_json::Value;
     let is_result_event = value.get("type").and_then(Value::as_str) == Some("result")
-        || value.get("session_id").is_some();
-    let text = match value.get("result").and_then(Value::as_str) {
+        || value.get("session_id").is_some()
+        || value.get("conversation_id").is_some();
+    let text = match value
+        .get("result")
+        .or_else(|| value.get("response"))
+        .and_then(Value::as_str)
+    {
         Some(result) => result.to_string(),
         None if is_result_event => String::new(),
         None => raw.to_string(),
     };
     let usage = value.get("usage");
-    let tokens = |key: &str| usage.and_then(|u| u.get(key)).and_then(Value::as_u64);
+    let tokens = |key: &str| {
+        usage
+            .and_then(|u| u.get(key))
+            .or_else(|| value.get(key))
+            .and_then(Value::as_u64)
+    };
     let input_tokens = match (
         tokens("input_tokens"),
         tokens("cache_creation_input_tokens"),
-        tokens("cache_read_input_tokens"),
+        tokens("cache_read_input_tokens").or_else(|| tokens("cache_read_tokens")),
     ) {
         (None, None, None) => None,
         (fresh, created, read) => {
@@ -662,6 +672,7 @@ fn reply_from_result_event(value: &serde_json::Value, raw: &str) -> HeadlessRepl
         text,
         session_id: value
             .get("session_id")
+            .or_else(|| value.get("conversation_id"))
             .and_then(Value::as_str)
             .map(str::to_string),
         cost_usd: value.get("total_cost_usd").and_then(Value::as_f64),

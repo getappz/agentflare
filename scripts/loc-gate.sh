@@ -28,6 +28,9 @@ FROZEN_LIMIT=2750
 ALLOWLIST=(
   src/mcp_server.rs
   src/components.rs
+  # Already 1499 lines before Antigravity hook integration touched it;
+  # freeze at <= FROZEN_LIMIT until a separate split.
+  src/hook.rs
   # Already 1546 lines before the Codex session-resume error fix touched it;
   # freeze this pre-existing debt at FROZEN_LIMIT until a separate split.
   src/work_item_pipeline.rs
@@ -35,6 +38,12 @@ ALLOWLIST=(
   # debt, not something a security patch should take on splitting. Frozen
   # at <= FROZEN_LIMIT like the others; a real split is separate work.
   src/github/bridge/tick.rs
+  # Merging item #724's review-repair routing (PR #965) with the review-bot
+  # stall handling from PR #983 -- both edit this file -- put it at 1524. A
+  # merge of two independently-sized changes shouldn't be blocked on a
+  # split; the detached-result helpers are the obvious seam. Frozen at
+  # <= FROZEN_LIMIT; a real split is separate work.
+  src/supervisor/review_bots.rs
   # Already 1554 lines on master before item #87's comment-thread-cap fix
   # touched it -- same situation as tick.rs above: pre-existing debt a
   # small, unrelated fix shouldn't be blocked on splitting. Frozen at
