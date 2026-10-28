@@ -13,8 +13,13 @@ fn ingest_real_claude_and_opencode_if_present() {
         .get("opencode")
         .map(|p| p.exists())
         .unwrap_or(false);
-    if !has_claude && !has_opencode {
-        eprintln!("skipping real_data test - no claude/opencode data");
+    let has_antigravity = config
+        .sources
+        .get("antigravity")
+        .map(|p| p.exists())
+        .unwrap_or(false);
+    if !has_claude && !has_opencode && !has_antigravity {
+        eprintln!("skipping real_data test - no claude/opencode/antigravity data");
         return;
     }
 

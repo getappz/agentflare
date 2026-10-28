@@ -28,6 +28,9 @@ FROZEN_LIMIT=2750
 ALLOWLIST=(
   src/mcp_server.rs
   src/components.rs
+  # Already 1499 lines before Antigravity hook integration touched it;
+  # freeze at <= FROZEN_LIMIT until a separate split.
+  src/hook.rs
   # Already 1546 lines before the Codex session-resume error fix touched it;
   # freeze this pre-existing debt at FROZEN_LIMIT until a separate split.
   src/work_item_pipeline.rs

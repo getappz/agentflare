@@ -68,6 +68,7 @@ impl Agent {
 pub fn canonicalize(name: &str) -> String {
     match name.trim().to_ascii_lowercase().as_str() {
         "claude" | "claude code" | "claude-code-cli" => Agent::ClaudeCode.as_str().to_string(),
+        "agy" | "antigravity-cli" => Agent::Antigravity.as_str().to_string(),
         _ => name.to_string(),
     }
 }
@@ -234,7 +235,7 @@ pub static REGISTRY: &[AgentSpec] = &[
         id: Agent::Antigravity,
         display_name: "antigravity",
         tier: Tier::Cli,
-        binary_names: &["antigravity"],
+        binary_names: &["antigravity", "agy"],
         version_args: &["--version"],
         package_manager: None,
         package_name: None,
@@ -330,7 +331,8 @@ pub fn headless_args(agent: Agent) -> Option<&'static [&'static str]> {
     match agent {
         // `cursor-agent -p`: "Print responses to console (for scripts or
         // non-interactive use)" — confirmed via `cursor-agent --help`.
-        Agent::ClaudeCode | Agent::GeminiCli | Agent::Cursor => Some(&["-p"]),
+        // `agy -p`: "Run a single prompt non-interactively and print the response"
+        Agent::ClaudeCode | Agent::GeminiCli | Agent::Cursor | Agent::Antigravity => Some(&["-p"]),
         Agent::Codex => Some(&["exec"]),
         Agent::Opencode => Some(&["run"]),
         // No subcommand needed: `cline` starts in act mode with auto-approve
@@ -353,7 +355,7 @@ pub fn headless_args(agent: Agent) -> Option<&'static [&'static str]> {
 #[must_use]
 pub fn autonomous_args(agent: Agent) -> Option<&'static [&'static str]> {
     match agent {
-        Agent::ClaudeCode => Some(&["--dangerously-skip-permissions"]),
+        Agent::ClaudeCode | Agent::Antigravity => Some(&["--dangerously-skip-permissions"]),
         // Keep Codex's sandbox even when bwrap is unavailable (including
         // Windows/macOS). Explicit exec options replace `--full-auto` without
         // granting unrestricted host access or waiting for approval prompts.
@@ -427,7 +429,9 @@ pub fn clinepass_model_for_claude(model: &str) -> Option<&'static str> {
 #[must_use]
 pub fn json_output_args(agent: Agent) -> Option<&'static [&'static str]> {
     match agent {
-        Agent::ClaudeCode | Agent::Cursor => Some(&["--output-format", "json"]),
+        Agent::ClaudeCode | Agent::Cursor | Agent::Antigravity => {
+            Some(&["--output-format", "json"])
+        }
         Agent::Codex => Some(&["--json"]),
         _ => None,
     }
@@ -453,6 +457,7 @@ pub fn mode_flag(agent: Agent) -> &'static str {
 pub fn resume_arg(agent: Agent) -> Option<&'static str> {
     match agent {
         Agent::ClaudeCode | Agent::Cursor => Some("--resume"),
+        Agent::Antigravity => Some("--conversation"),
         Agent::Codex => Some("resume"),
         _ => None,
     }
@@ -521,6 +526,7 @@ mod tests {
         assert_eq!(headless_args(Agent::GeminiCli), Some(&["-p"][..]));
         assert_eq!(headless_args(Agent::Opencode), Some(&["run"][..]));
         assert_eq!(headless_args(Agent::Cursor), Some(&["-p"][..]));
+        assert_eq!(headless_args(Agent::Antigravity), Some(&["-p"][..]));
         assert_eq!(headless_args(Agent::Cline), Some(&[][..]));
     }
 
@@ -536,6 +542,10 @@ mod tests {
         assert_eq!(
             autonomous_args(Agent::Cursor),
             Some(&["--force", "--trust", "--approve-mcps"][..])
+        );
+        assert_eq!(
+            autonomous_args(Agent::Antigravity),
+            Some(&["--dangerously-skip-permissions"][..])
         );
     }
 
@@ -598,6 +608,10 @@ mod tests {
             json_output_args(Agent::Cursor),
             Some(&["--output-format", "json"][..])
         );
+        assert_eq!(
+            json_output_args(Agent::Antigravity),
+            Some(&["--output-format", "json"][..])
+        );
         assert_eq!(json_output_args(Agent::Opencode), None);
         assert_eq!(json_output_args(Agent::Codex), Some(&["--json"][..]));
     }
@@ -613,6 +627,7 @@ mod tests {
     fn resume_arg_maps_supported_cli_modes() {
         assert_eq!(resume_arg(Agent::ClaudeCode), Some("--resume"));
         assert_eq!(resume_arg(Agent::Cursor), Some("--resume"));
+        assert_eq!(resume_arg(Agent::Antigravity), Some("--conversation"));
         assert_eq!(resume_arg(Agent::Opencode), None);
         assert_eq!(resume_arg(Agent::Codex), Some("resume"));
     }
@@ -622,6 +637,8 @@ mod tests {
         assert_eq!(canonicalize("claude"), "claude-code");
         assert_eq!(canonicalize("Claude Code"), "claude-code");
         assert_eq!(canonicalize("  CLAUDE-CODE-CLI  "), "claude-code");
+        assert_eq!(canonicalize("agy"), "antigravity");
+        assert_eq!(canonicalize("antigravity-cli"), "antigravity");
         assert_eq!(canonicalize("codex"), "codex");
         assert_eq!(canonicalize("some-unknown-agent"), "some-unknown-agent");
     }
@@ -630,6 +647,8 @@ mod tests {
     fn agent_by_name_resolves_aliases_same_as_canonicalize() {
         assert_eq!(agent_by_name("claude"), Some(Agent::ClaudeCode));
         assert_eq!(agent_by_name("Claude Code"), Some(Agent::ClaudeCode));
+        assert_eq!(agent_by_name("agy"), Some(Agent::Antigravity));
+        assert_eq!(agent_by_name("antigravity-cli"), Some(Agent::Antigravity));
         assert_eq!(agent_by_name("codex"), Some(Agent::Codex));
         assert_eq!(agent_by_name("not-a-real-agent"), None);
     }

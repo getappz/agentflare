@@ -361,6 +361,10 @@ pub(crate) fn rule_targets(host: &str) -> Vec<(PathBuf, String)> {
             );
             v
         }
+        "antigravity" => {
+            let content = format!("# Rules (agentflare)\n\n{}\n", append_joined(joined()));
+            vec![(cwd().join("AGENTS.md"), content)]
+        }
         _ => vec![], // "continue" — no dedicated rules convention found
     }
 }
@@ -395,11 +399,15 @@ pub(crate) fn sync_now(host: &str) -> Result<String, String> {
 /// Returns Ok(()) if the file didn't exist or was successfully deleted.
 pub(crate) fn unsync_host(rule_id: &str, host: &str) -> Result<(), String> {
     use crate::paths::{claude_rules_dir, opencode_rules_dir};
+    if host == "codex" || host == "antigravity" {
+        // Rules are stored in AGENTS.md; re-sync to regenerate without the removed rule
+        let _ = sync_now(host);
+        return Ok(());
+    }
     let dir = match host {
         "claude-code" => claude_rules_dir(),
         "opencode" => opencode_rules_dir(),
         "cursor" => cwd().join(".cursor").join("rules"),
-        "codex" => cwd().join("."),
         "windsurf" => cwd().join(".windsurf").join("rules"),
         "vscode-copilot" => cwd().join(".github"),
         "cline" => cwd().join(".clinerules"),
@@ -961,7 +969,7 @@ pub fn get_components(host: &str) -> Vec<Component> {
                 "agentflare MCP server (skill_search/skill_load) — claude mcp add flare -- agentflare mcp".to_string()
             } else if host_owned == "codex" {
                 "agentflare MCP server (skill_search/skill_load) — codex mcp add flare -- agentflare mcp".to_string()
-            } else if matches!(host_owned.as_str(), "cline" | "continue" | "opencode" | "cursor" | "windsurf" | "vscode-copilot") {
+            } else if matches!(host_owned.as_str(), "cline" | "continue" | "opencode" | "cursor" | "windsurf" | "vscode-copilot" | "antigravity") {
                 format!("agentflare MCP server (skill_search/skill_load) — manual MCP registration for {host_owned}")
             } else {
                 "agentflare MCP server — not yet supported for this host".to_string()
@@ -997,6 +1005,14 @@ pub fn get_components(host: &str) -> Vec<Component> {
                         .get("mcp")
                         .and_then(|m| m.get("flare"))
                         .is_some(),
+                    "antigravity" => {
+                        let cfg = home().join(".gemini").join("config").join("mcp_config.json");
+                        cfg.exists()
+                            && json_at(&cfg)
+                                .get("mcpServers")
+                                .and_then(|m| m.get("flare"))
+                                .is_some()
+                    }
                     _ => true,
                 })
             },
@@ -1077,6 +1093,14 @@ pub fn get_components(host: &str) -> Vec<Component> {
                         "opencode" => {
                             let path = opencode_config_path();
                             if merge_opencode_mcp(&path, "flare", entry) {
+                                format!("{} (flare registered)", path.display())
+                            } else {
+                                format!("failed to write {}", path.display())
+                            }
+                        }
+                        "antigravity" => {
+                            let path = home().join(".gemini").join("config").join("mcp_config.json");
+                            if merge_json(&path, "mcpServers", "flare", entry) {
                                 format!("{} (flare registered)", path.display())
                             } else {
                                 format!("failed to write {}", path.display())
@@ -1217,6 +1241,7 @@ mod tests {
         "cline",
         "continue",
         "opencode",
+        "antigravity",
     ];
 
     #[test]
@@ -1296,6 +1321,7 @@ mod tests {
             ("windsurf", ".windsurf"),
             ("vscode-copilot", ".github"),
             ("cline", ".clinerules"),
+            ("antigravity", "AGENTS.md"),
         ];
         for (host, marker) in expectations {
             let targets = rule_targets(host);
@@ -1338,7 +1364,14 @@ mod tests {
         // Hosts that concatenate rule_text::all() (cursor, codex, windsurf,
         // vscode-copilot, cline) should pick up FLARE_DOCS automatically
         // once it's added to all() -- no per-host wiring needed for those.
-        for host in ["cursor", "codex", "windsurf", "vscode-copilot", "cline"] {
+        for host in [
+            "cursor",
+            "codex",
+            "windsurf",
+            "vscode-copilot",
+            "cline",
+            "antigravity",
+        ] {
             let targets = rule_targets(host);
             assert!(
                 targets
@@ -1352,9 +1385,16 @@ mod tests {
     #[test]
     fn browser_rule_is_included_in_joined_hosts() {
         // Hosts that concatenate rule_text::all() (cursor, codex, windsurf,
-        // vscode-copilot, cline) should pick up BROWSER automatically once
+        // vscode-copilot, cline, antigravity) should pick up BROWSER automatically once
         // it's added to all() -- no per-host wiring needed for those.
-        for host in ["cursor", "codex", "windsurf", "vscode-copilot", "cline"] {
+        for host in [
+            "cursor",
+            "codex",
+            "windsurf",
+            "vscode-copilot",
+            "cline",
+            "antigravity",
+        ] {
             let targets = rule_targets(host);
             assert!(
                 targets
@@ -1476,6 +1516,31 @@ mod tests {
             assert!(!(agentflare_mcp.check)());
             (agentflare_mcp.apply)();
             assert!((agentflare_mcp.check)());
+        });
+    }
+
+    #[test]
+    fn agentflare_mcp_antigravity_check_then_apply_then_check() {
+        crate::paths::test_support::with_temp_home(|| {
+            let components = get_components("antigravity");
+            let agentflare_mcp = components
+                .iter()
+                .find(|c| c.id == "agentflare-mcp")
+                .unwrap();
+            assert!(!(agentflare_mcp.check)());
+            (agentflare_mcp.apply)();
+            assert!((agentflare_mcp.check)());
+
+            let cfg = home()
+                .join(".gemini")
+                .join("config")
+                .join("mcp_config.json");
+            assert!(
+                json_at(&cfg)
+                    .get("mcpServers")
+                    .and_then(|m| m.get("flare"))
+                    .is_some()
+            );
         });
     }
 
