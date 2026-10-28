@@ -18,10 +18,7 @@ use std::path::{Path, PathBuf};
 
 /// Default insights DB, mirroring `src/cli/insights.rs`.
 pub fn default_insights_db() -> PathBuf {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".local/share/agentflare/insights/observatory.db")
+    flare_insights::config::insights_db_path()
 }
 
 fn parse_verbosity(s: &str) -> Verbosity {
