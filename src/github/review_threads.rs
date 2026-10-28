@@ -189,18 +189,42 @@ pub fn pr_commit_shas(
         .collect())
 }
 
+/// Details of a PR head commit, used to decide whether a push after a bot review
+/// requires waiting for a new bot review or should be dispatched for repair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitInfo {
+    pub date: Option<String>,
+    pub is_merge: bool,
+}
+
+pub fn commit_info(
+    client: &Client,
+    repo: &RepoId,
+    sha: &str,
+) -> Result<CommitInfo, GitHubError> {
+    let path = format!("/repos/{}/{}/commits/{sha}", repo.owner, repo.repo);
+    let json = client.request("GET", &path, None)?;
+    let date = json["commit"]["committer"]["date"]
+        .as_str()
+        .map(str::to_string);
+    let parent_count = json["parents"].as_array().map_or(0, |p| p.len());
+    let message = json["commit"]["message"].as_str().unwrap_or_default();
+    let is_merge = parent_count > 1
+        || message.starts_with("Merge branch ")
+        || message.starts_with("Merge remote-tracking branch ")
+        || message.starts_with("Merge pull request ");
+    Ok(CommitInfo { date, is_merge })
+}
+
 /// Committer time of the PR head, for detecting a push after a bot review.
 /// ponytail: committer time approximates push time; use push events if old-dated rebases matter.
+#[allow(dead_code)]
 pub fn commit_date(
     client: &Client,
     repo: &RepoId,
     sha: &str,
 ) -> Result<Option<String>, GitHubError> {
-    let path = format!("/repos/{}/{}/commits/{sha}", repo.owner, repo.repo);
-    let json = client.request("GET", &path, None)?;
-    Ok(json["commit"]["committer"]["date"]
-        .as_str()
-        .map(str::to_string))
+    commit_info(client, repo, sha).map(|i| i.date)
 }
 
 /// A legacy commit status with its human-readable description kept --
@@ -383,5 +407,27 @@ mod tests {
             server.requests()[0].path,
             "/repos/o/r/commits/abc/status?per_page=100"
         );
+    }
+
+    #[test]
+    fn commit_info_identifies_regular_and_merge_commits() {
+        let server = MockServer::start(vec![
+            MockResponse::json(
+                200,
+                r#"{"commit":{"committer":{"date":"2026-10-27T08:00:00Z"},"message":"fix: typo"},"parents":[{"sha":"1"}]}"#,
+            ),
+            MockResponse::json(
+                200,
+                r#"{"commit":{"committer":{"date":"2026-10-27T09:00:00Z"},"message":"Merge branch 'master'"},"parents":[{"sha":"1"},{"sha":"2"}]}"#,
+            ),
+        ]);
+        let client = server.client(None);
+        let regular = commit_info(&client, &repo(), "c1").unwrap();
+        assert_eq!(regular.date.as_deref(), Some("2026-10-27T08:00:00Z"));
+        assert!(!regular.is_merge);
+
+        let merge = commit_info(&client, &repo(), "c2").unwrap();
+        assert_eq!(merge.date.as_deref(), Some("2026-10-27T09:00:00Z"));
+        assert!(merge.is_merge);
     }
 }
