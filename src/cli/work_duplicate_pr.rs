@@ -22,6 +22,58 @@ const STALE_DUPLICATE_DAYS: i64 = 3;
 /// already use. Prefers a merged match over a still-open one (sorted first)
 /// so `handle_duplicate_pr` reports the stronger evidence, on the rare
 /// chance both exist.
+/// Maximum clock skew between GitHub's server time and the local machine's
+/// clock when comparing PR creation/merge timestamps to an item's created_at.
+pub const CLOCK_SKEW_TOLERANCE_SECS: i64 = 120;
+
+/// Returns true if the PR's lifecycle timestamps (`merged_at`, `closed_at`,
+/// or `created_at`) indicate it was completed or created strictly before
+/// `item_created_at` (accounting for clock skew). A PR predating an item's
+/// creation cannot be a duplicate for that item; matching on sequence number
+/// alone in that case is a false positive from sequence ID reuse across
+/// deleted/recreated items (item #973).
+pub fn pr_predates_item(pr: &crate::github::models::PullRequest, item_created_at: i64) -> bool {
+    if item_created_at <= 0 {
+        return false;
+    }
+    let threshold = item_created_at.saturating_sub(CLOCK_SKEW_TOLERANCE_SECS);
+
+    let parse_ts = |ts: Option<&str>| -> Option<i64> {
+        chrono::DateTime::parse_from_rfc3339(ts?).ok().map(|dt| dt.timestamp())
+    };
+
+    if let Some(merged_at) = parse_ts(pr.merged_at.as_deref())
+        && merged_at < threshold
+    {
+        return true;
+    }
+    if let Some(closed_at) = parse_ts(pr.closed_at.as_deref())
+        && closed_at < threshold
+    {
+        return true;
+    }
+    if let Some(created_at) = parse_ts(pr.created_at.as_deref())
+        && created_at < threshold
+    {
+        return true;
+    }
+    false
+}
+
+/// Reads any PR numbers explicitly dismissed by a human operator from
+/// `item.metadata.dismissed_duplicate_prs`.
+pub(crate) fn dismissed_duplicate_prs_from_metadata(
+    item: &agentflare_backend::item::Item,
+) -> Vec<u64> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&item.metadata) else {
+        return vec![];
+    };
+    v.get("dismissed_duplicate_prs")
+        .and_then(|arr| arr.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_u64()).collect())
+        .unwrap_or_default()
+}
+
 fn find_duplicate_pr(
     item: &agentflare_backend::item::Item,
     repo_root: &std::path::Path,
@@ -31,10 +83,13 @@ fn find_duplicate_pr(
     let prs =
         crate::github::pulls::find_by_item_marker(&client, &repo, item.sequence_id, &item.id)
             .ok()?;
+    let dismissed = dismissed_duplicate_prs_from_metadata(item);
     let pr = pick_duplicate_pr(
         prs,
         flare_git_core::branch::current_branch(repo_root).as_deref(),
         crate::worktree::pr_number_from_metadata(item),
+        Some(item.created_at),
+        &dismissed,
     )?;
     if pr.merged_at.is_none() {
         let ci_failing = matches!(
@@ -110,7 +165,13 @@ fn pick_duplicate_pr(
     mut prs: Vec<crate::github::models::PullRequest>,
     current_branch: Option<&str>,
     own_pr_number: Option<u64>,
+    item_created_at: Option<i64>,
+    dismissed_prs: &[u64],
 ) -> Option<crate::github::models::PullRequest> {
+    prs.retain(|pr| !dismissed_prs.contains(&pr.number));
+    if let Some(created_at) = item_created_at {
+        prs.retain(|pr| !pr_predates_item(pr, created_at));
+    }
     prs.retain(|pr| pr.merged_at.is_some() || pr.state == "open");
     prs.retain(|pr| {
         pr.merged_at.is_some()
@@ -158,10 +219,11 @@ fn handle_duplicate_pr(
         );
         format!(
             "## agentflare work — needs human review\n\nPR #{} ({}) is already merged and \
-             carries this item's `for item #{}` marker, so dispatch was skipped. The marker \
-             alone can't prove the PR covers this item's scope; confirm it does, then complete \
-             the item by hand.",
-            pr.number, pr.html_url, item.sequence_id
+             carries this item's `for item #{}` marker, so dispatch was skipped. If this PR \
+             is an unrelated false positive (e.g. from reused sequence IDs), dismiss it with:\n\
+             ```bash\nagentflare item dismiss-duplicate-pr {} --pr {}\n```\n\
+             Otherwise confirm it covers this item's scope, then complete the item by hand.",
+            pr.number, pr.html_url, item.sequence_id, item.sequence_id, pr.number
         )
     } else {
         let _ = writeln!(
