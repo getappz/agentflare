@@ -43,7 +43,7 @@ static AGENTS: &[AgentEntry] = &[
     },
     AgentEntry {
         name: "antigravity",
-        process_names: &["amp"],
+        process_names: &["antigravity", "agy"],
         env_vars: &["ANTIGRAVITY_AGENT"],
     },
     AgentEntry {

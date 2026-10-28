@@ -70,6 +70,7 @@ pub(crate) fn parse_session(input: &str) -> HookSession {
     };
     let cwd = s("cwd").or_else(|| {
         v.get("workspace_roots")
+            .or_else(|| v.get("workspacePaths"))
             .and_then(Value::as_array)
             .and_then(|roots| roots.first())
             .and_then(Value::as_str)
@@ -77,7 +78,9 @@ pub(crate) fn parse_session(input: &str) -> HookSession {
             .filter(|s| !s.is_empty())
     });
     HookSession {
-        session_id: s("session_id").or_else(|| s("conversation_id")),
+        session_id: s("session_id")
+            .or_else(|| s("conversation_id"))
+            .or_else(|| s("conversationId")),
         cwd,
         reason: s("reason"),
     }
@@ -208,10 +211,29 @@ pub(crate) fn sync_with_take(
 
 /// Model-visible context JSON for a host. Claude/Codex use nested
 /// `hookSpecificOutput.additionalContext`; Cursor uses flat
-/// `additional_context` (cursor.com/docs/hooks).
+/// `additional_context` (cursor.com/docs/hooks); Antigravity uses
+/// `injectSteps` with `systemMessage` or `ephemeralMessage`.
 pub(crate) fn context_output(agent: &str, event: &str, context: &str) -> Value {
     if agent == "cursor" {
         json!({ "additional_context": context })
+    } else if agent == "antigravity" {
+        if event == "PreInvocation" {
+            json!({
+                "injectSteps": [
+                    { "ephemeralMessage": context }
+                ]
+            })
+        } else {
+            json!({
+                "injectSteps": [
+                    {
+                        "systemMessage": {
+                            "systemMessage": context
+                        }
+                    }
+                ]
+            })
+        }
     } else {
         json!({
             "hookSpecificOutput": {
@@ -291,6 +313,11 @@ pub(crate) fn stop_output(agent: &str, msgs: &[Message]) -> Option<Value> {
         let text = messages::format_delivery(msgs);
         if agent == "cursor" {
             json!({ "followup_message": text })
+        } else if agent == "antigravity" {
+            json!({
+                "decision": "continue",
+                "reason": text,
+            })
         } else {
             json!({
                 "decision": "block",
@@ -362,6 +389,8 @@ pub fn stop(agent: &str) {
         }
         let out = if agent == "cursor" {
             json!({ "followup_message": crate::memory_nudge::STOP_INSTRUCTION })
+        } else if agent == "antigravity" {
+            json!({ "decision": "continue", "reason": crate::memory_nudge::STOP_INSTRUCTION })
         } else {
             json!({ "decision": "block", "reason": crate::memory_nudge::STOP_INSTRUCTION })
         };
@@ -576,6 +605,34 @@ mod tests {
         assert_eq!(
             (s.session_id.as_deref(), s.cwd.as_deref()),
             (Some("c1"), Some("/repo"))
+        );
+    }
+
+    #[test]
+    fn antigravity_stop_output_uses_continue_decision() {
+        assert!(stop_output("antigravity", &[]).is_none());
+        let out = stop_output("antigravity", &[msg(3)]).unwrap();
+        assert_eq!(out["decision"], "continue");
+        assert!(out["reason"].as_str().unwrap().contains("id=3"));
+    }
+
+    #[test]
+    fn antigravity_context_output_uses_inject_steps() {
+        let start = context_output("antigravity", "SessionStart", "hello");
+        assert_eq!(
+            start["injectSteps"][0]["systemMessage"]["systemMessage"],
+            "hello"
+        );
+        let pre_inv = context_output("antigravity", "PreInvocation", "nudge");
+        assert_eq!(pre_inv["injectSteps"][0]["ephemeralMessage"], "nudge");
+    }
+
+    #[test]
+    fn parse_session_reads_antigravity_conversation_id_and_workspace_paths() {
+        let s = parse_session(r#"{"conversationId":"ag-123","workspacePaths":["/my/project"]}"#);
+        assert_eq!(
+            (s.session_id.as_deref(), s.cwd.as_deref()),
+            (Some("ag-123"), Some("/my/project"))
         );
     }
 

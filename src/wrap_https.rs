@@ -336,13 +336,12 @@ pub(super) async fn shared_proxy(lean: &Path, port: u16) -> Result<(), String> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
         let ready = proxy_ready(&client, port).await?;
-        if starter
-            .try_wait()
-            .map_err(|error| error.to_string())?
-            .is_some()
-            && ready
-        {
-            return Ok(());
+        match starter.try_wait().map_err(|error| error.to_string())? {
+            Some(status) if !status.success() && !ready => {
+                return Err(format!("lean-ctx proxy start failed: {status}"));
+            }
+            Some(_) if ready => return Ok(()),
+            _ => {}
         }
         if tokio::time::Instant::now() >= deadline {
             // Only stop our startup helper; never stop the shared optimizer.

@@ -49,6 +49,9 @@ const REVIEW_STALL_NOTIFIED_KEY: &str = "review_stall_notified";
 /// Sweep ticks an approved, CI-green PR may sit held on review-bot threads
 /// with no repair job running before it is surfaced to a human.
 pub(super) const REVIEW_STALL_TICK_LIMIT: u64 = 10;
+/// Sweep ticks an unreviewed non-merge push is given to receive a bot evaluation
+/// before the sweep assumes the bot is idle/silent and dispatches a repair job.
+pub(super) const REVIEW_BOT_WAIT_TICK_LIMIT: u64 = 10;
 
 /// Item-metadata key recording which findings fingerprint already received a
 /// cap-reached announcement (PR #829 idempotency).
@@ -461,7 +464,7 @@ pub(crate) fn sweep_review_threads(
     let findings = classify_threads(&threads, cfg, &meta);
     let in_flight = job_in_flight(queue, &item.id);
     let mut commits: Option<Vec<String>> = None;
-    let mut head_commit_date: Option<Option<String>> = None;
+    let mut head_commit_info: Option<Option<review_threads::CommitInfo>> = None;
 
     // A restart between a fix's reply and its resolve leaves the thread
     // open with our marker as its last word: finish the resolve, never
@@ -594,21 +597,42 @@ pub(crate) fn sweep_review_threads(
                 .map(|c| c.created_at.as_str())
             && !reviewed_at.is_empty()
         {
-            let committed_at = head_commit_date.get_or_insert_with(|| {
-                review_threads::commit_date(client, repo, head).unwrap_or_else(|e| {
-                    eprintln!(
-                        "agentflare-supervisor: could not check head commit date of PR #{}: {}",
-                        input.number,
-                        e.log_safe()
-                    );
-                    None
-                })
+            let commit_info = head_commit_info.get_or_insert_with(|| {
+                review_threads::commit_info(client, repo, head)
+                    .inspect_err(|e| {
+                        eprintln!(
+                            "agentflare-supervisor: could not check head commit info of PR #{}: {}",
+                            input.number,
+                            e.log_safe()
+                        );
+                    })
+                    .ok()
             });
-            if committed_at
-                .as_deref()
-                .is_some_and(|date| date > reviewed_at)
-            {
-                continue;
+            if let Some(info) = commit_info.as_ref() {
+                // Merge commits (e.g. syncing with master) do not address review
+                // findings and review bots ignore them. Only non-merge commits
+                // pushed after the review pause dispatch to await bot evaluation.
+                if !info.is_merge
+                    && let Some(committed_at) = info.date.as_deref()
+                    && committed_at > reviewed_at
+                {
+                    let (wait_head, prev_ticks) = thread_bot_wait(&meta, &f.thread_id);
+                    let ticks = if wait_head.as_deref() == Some(head) {
+                        prev_ticks + 1
+                    } else {
+                        1
+                    };
+                    update_metadata(mcp, &item.id, |m| {
+                        note_thread_bot_wait(m, &f.thread_id, head, ticks);
+                    });
+                    if ticks < REVIEW_BOT_WAIT_TICK_LIMIT {
+                        continue;
+                    }
+                } else {
+                    update_metadata(mcp, &item.id, |m| {
+                        clear_thread_bot_wait(m, &f.thread_id);
+                    });
+                }
             }
         }
         state.to_dispatch.push(f.clone());
