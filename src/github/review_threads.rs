@@ -204,23 +204,10 @@ pub fn commit_info(client: &Client, repo: &RepoId, sha: &str) -> Result<CommitIn
         .as_str()
         .map(str::to_string);
     let parent_count = json["parents"].as_array().map_or(0, |p| p.len());
-    let message = json["commit"]["message"].as_str().unwrap_or_default();
-    let is_merge = parent_count > 1
-        || message.starts_with("Merge branch ")
-        || message.starts_with("Merge remote-tracking branch ")
-        || message.starts_with("Merge pull request ");
-    Ok(CommitInfo { date, is_merge })
-}
-
-/// Committer time of the PR head, for detecting a push after a bot review.
-/// ponytail: committer time approximates push time; use push events if old-dated rebases matter.
-#[allow(dead_code)]
-pub fn commit_date(
-    client: &Client,
-    repo: &RepoId,
-    sha: &str,
-) -> Result<Option<String>, GitHubError> {
-    commit_info(client, repo, sha).map(|i| i.date)
+    Ok(CommitInfo {
+        date,
+        is_merge: parent_count > 1,
+    })
 }
 
 /// A legacy commit status with its human-readable description kept --
@@ -425,5 +412,15 @@ mod tests {
         let merge = commit_info(&client, &repo(), "c2").unwrap();
         assert_eq!(merge.date.as_deref(), Some("2026-10-27T09:00:00Z"));
         assert!(merge.is_merge);
+    }
+
+    #[test]
+    fn commit_info_ignores_merge_prefixed_message_on_single_parent() {
+        let server = MockServer::start(vec![MockResponse::json(
+            200,
+            r#"{"commit":{"committer":{"date":"2026-10-27T08:00:00Z"},"message":"Merge pull request #1 from x/y"},"parents":[{"sha":"1"}]}"#,
+        )]);
+        let client = server.client(None);
+        assert!(!commit_info(&client, &repo(), "c1").unwrap().is_merge);
     }
 }
