@@ -1,5 +1,17 @@
 use super::*;
 
+pub(super) fn repair_pr(
+    item: &agentflare_backend::item::Item,
+    number: u64,
+) -> crate::github::models::PullRequest {
+    serde_json::from_value(serde_json::json!({
+        "number": number, "html_url": "u", "state": "open", "title": item.name,
+        "body": crate::github::pulls::item_id_tag(&item.id),
+        "head": {"ref": flare_git_core::worktree::task_branch_name(item)}
+    }))
+    .unwrap()
+}
+
 #[path = "supervisor_project_scope_tests.rs"]
 mod project_scope_tests;
 #[path = "supervisor_telegram_tests.rs"]
@@ -1640,7 +1652,7 @@ fn self_repair_or_gate_dispatches_a_job_and_posts_a_marker_comment() {
         &auth_conn,
         agentflare_resource_gate::Policy::Normal,
         &item,
-        1,
+        Some(&repair_pr(&item, 1)),
         RepairTrigger::FailingChecks(&["clippy".to_string()]),
         &[],
         &label_id_by_name,
@@ -1706,7 +1718,7 @@ fn self_repair_or_gate_gates_instead_of_dispatching_once_the_cap_is_reached() {
             &auth_conn,
             agentflare_resource_gate::Policy::Normal,
             &item,
-            1,
+            Some(&repair_pr(&item, 1)),
             RepairTrigger::FailingChecks(&["clippy".to_string()]),
             &[],
             &label_id_by_name,
@@ -1746,7 +1758,7 @@ fn self_repair_or_gate_stays_quiet_once_already_gated() {
         &auth_conn,
         agentflare_resource_gate::Policy::Normal,
         &item,
-        1,
+        Some(&repair_pr(&item, 1)),
         RepairTrigger::FailingChecks(&["clippy".to_string()]),
         &[],
         &label_id_by_name,
@@ -1782,7 +1794,7 @@ fn self_repair_or_gate_still_skips_gracefully_when_unassigned_and_no_router_rule
             &auth_conn,
             agentflare_resource_gate::Policy::Normal,
             &item,
-            1,
+            Some(&repair_pr(&item, 1)),
             RepairTrigger::FailingChecks(&["clippy".to_string()]),
             &[],
             &label_id_by_name,
@@ -1815,7 +1827,7 @@ fn self_repair_or_gate_does_not_double_dispatch_while_a_job_is_already_in_flight
         &auth_conn,
         agentflare_resource_gate::Policy::Normal,
         &item,
-        1,
+        Some(&repair_pr(&item, 1)),
         RepairTrigger::FailingChecks(&["clippy".to_string()]),
         &[],
         &label_id_by_name,
@@ -1852,7 +1864,7 @@ fn self_repair_or_gate_defers_instead_of_dispatching_into_a_still_live_claim() {
         &auth_conn,
         agentflare_resource_gate::Policy::Normal,
         &item,
-        1,
+        Some(&repair_pr(&item, 1)),
         RepairTrigger::FailingChecks(&["clippy".to_string()]),
         &[],
         &label_id_by_name,
@@ -1910,6 +1922,7 @@ pub(crate) fn coderabbit_finding(id: u64, login: &str) -> BotFinding {
         path: "src/lib.rs".to_string(),
         line: Some(42),
         is_outdated: false,
+        outside_diff: false,
         parsed: parse_finding_body(&body),
         body,
         status: ThreadStatus::Actionable { next_round: 1 },
@@ -2176,7 +2189,7 @@ fn self_repair_or_gate_dispatches_for_a_merge_conflict_trigger() {
         &auth_conn,
         agentflare_resource_gate::Policy::Normal,
         &item,
-        1,
+        Some(&repair_pr(&item, 1)),
         RepairTrigger::MergeConflict,
         &[],
         &label_id_by_name,
@@ -2231,7 +2244,7 @@ fn self_repair_or_gate_caps_conflict_and_ci_repair_attempts_independently() {
         &auth_conn,
         agentflare_resource_gate::Policy::Normal,
         &item,
-        1,
+        Some(&repair_pr(&item, 1)),
         RepairTrigger::MergeConflict,
         &[],
         &label_id_by_name,

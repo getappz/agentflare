@@ -506,6 +506,7 @@ pub(crate) struct BotFinding {
     pub path: String,
     pub line: Option<u64>,
     pub is_outdated: bool,
+    pub outside_diff: bool,
     /// The root comment, verbatim (untrusted).
     pub body: String,
     pub parsed: ParsedFinding,
@@ -640,6 +641,7 @@ pub(crate) fn classify_threads(
                 path: t.path.clone(),
                 line: t.line,
                 is_outdated: t.is_outdated,
+                outside_diff: false,
                 body: root.body.clone(),
                 parsed: parse_finding_body(&root.body),
                 status,
@@ -678,8 +680,20 @@ pub(crate) fn escape_untrusted(body: &str) -> String {
     TAG.replace_all(body, "&lt;$1").into_owned()
 }
 
-/// The structured fix task the item's agent is given: how to work and
-/// report, then one escaped envelope per finding.
+/// A rename's old path still belongs to the PR.
+pub(crate) fn mark_finding_scope(
+    findings: &mut [BotFinding],
+    files: &[crate::github::models::PullRequestFile],
+) {
+    for finding in findings {
+        finding.outside_diff = !files.iter().any(|file| {
+            file.filename == finding.path
+                || file.previous_filename.as_deref() == Some(&finding.path)
+        });
+    }
+}
+
+/// The structured fix task: reporting instructions and escaped findings.
 pub(crate) fn render_fix_task(
     findings: &[&BotFinding],
     pr_number: u64,
@@ -697,8 +711,8 @@ pub(crate) fn render_fix_task(
          outcome=\"fixed\"|\"not_valid\"|\"out_of_scope\"|\"skipped\", \
          sha=\"<full commit sha>\" (fixed only), note=\"<what changed, or why it stays>\", \
          test=\"<test name>\" (fixed only)). Findings marked optional may be skipped with \
-         outcome=\"skipped\" and a one-line reason; every other finding needs fixed, \
-         not_valid or out_of_scope with a reason.\n\
+         outcome=\"skipped\" and a one-line reason. If blocked or parking the run, still \
+         report every unfinished finding as skipped with the blocking reason before stopping.\n\
          Do NOT reply on the GitHub threads yourself: the supervisor replies on each thread \
          and resolves the fixed ones once your push is confirmed on the remote. A thread that \
          keeps coming back is escalated to a human after {max_rounds} rounds.\n\n\
@@ -708,6 +722,9 @@ pub(crate) fn render_fix_task(
         findings.len()
     );
     for f in findings {
+        if f.outside_diff {
+            out.push_str("\n\nScope: the following finding's path is outside this PR diff. Do not edit it; report this thread as out_of_scope with a reason.");
+        }
         out.push_str(&format!(
             "\n\n<agentflare-review-finding thread=\"{}\" location=\"{}\" severity=\"{}\" \
              optional=\"{}\" round=\"{}\"{}>",
