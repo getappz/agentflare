@@ -197,11 +197,7 @@ pub struct CommitInfo {
     pub is_merge: bool,
 }
 
-pub fn commit_info(
-    client: &Client,
-    repo: &RepoId,
-    sha: &str,
-) -> Result<CommitInfo, GitHubError> {
+pub fn commit_info(client: &Client, repo: &RepoId, sha: &str) -> Result<CommitInfo, GitHubError> {
     let path = format!("/repos/{}/{}/commits/{sha}", repo.owner, repo.repo);
     let json = client.request("GET", &path, None)?;
     let date = json["commit"]["committer"]["date"]

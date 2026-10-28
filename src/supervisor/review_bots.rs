@@ -599,13 +599,12 @@ pub(crate) fn sweep_review_threads(
         {
             let commit_info = head_commit_info.get_or_insert_with(|| {
                 review_threads::commit_info(client, repo, head)
-                    .map_err(|e| {
+                    .inspect_err(|e| {
                         eprintln!(
                             "agentflare-supervisor: could not check head commit info of PR #{}: {}",
                             input.number,
                             e.log_safe()
                         );
-                        e
                     })
                     .ok()
             });

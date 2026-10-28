@@ -1,6 +1,8 @@
-//! Autonomous deadlock & stall tests for review bots:
+//! Autonomous deadlock & stall tests for review bots.
+//!
 //! - merge commits newer than review bot comments do not suppress repair dispatch
 //! - unreviewed commits newer than review bot comments timeout after LIMIT ticks
+//!
 //! Split from `review_bots_tests.rs` to stay under the repo LOC gate.
 
 use super::review_bots_tests::*;
