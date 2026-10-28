@@ -597,7 +597,11 @@ pub(crate) fn completion_gate_denial(
     // when sufficient or when cwd == item_dir, computing tree_fingerprint_in only
     // when cwd evidence is insufficient and directories differ.
     let (item_tree, fresh_passing, fresh_review) = if cwd_passing && cwd_review {
-        (if is_same_dir { cwd_tree.clone() } else { None }, true, true)
+        (
+            if is_same_dir { cwd_tree.clone() } else { None },
+            true,
+            true,
+        )
     } else if is_same_dir {
         (
             cwd_tree.clone(),
