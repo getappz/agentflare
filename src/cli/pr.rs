@@ -187,17 +187,27 @@ fn adopt(number: u64, ttl_hours: i64, force: bool) {
         let project = mcp.resolve_project(conn)?;
         let items = agentflare_backend::item::list_by_project(conn, &project.id)
             .map_err(crate::mcp_server::types::map_backend_err)?;
-        if crate::worktree::tracked_pr_numbers(&items).contains(&number) {
-            return Ok(false);
-        }
+        let existing = items
+            .into_iter()
+            .find(|item| crate::worktree::pr_number_from_metadata(item) == Some(number));
         let states = agentflare_backend::state::list_by_project(conn, &project.id)
             .map_err(crate::mcp_server::types::map_backend_err)?;
         let Some(state) = states.iter().find(|s| s.group_name == "in_review") else {
             return Ok(false);
         };
-        crate::worktree::create_tracking_item(conn, &project.id, &state.id, &pr, &branch)
-            .map_err(crate::mcp_server::types::map_backend_err)?;
-        Ok::<_, rmcp::ErrorData>(true)
+        let created = existing.is_none();
+        let item = match existing {
+            Some(item) => item,
+            None => {
+                crate::worktree::create_tracking_item(conn, &project.id, &state.id, &pr, &branch)
+                    .map_err(crate::mcp_server::types::map_backend_err)?
+            }
+        };
+        crate::mcp_server::merge_item_metadata(conn, &item.id, |meta| {
+            crate::worktree::record_adopted_identity(meta, &pr);
+        })
+        .map_err(crate::mcp_server::types::map_backend_err)?;
+        Ok::<_, rmcp::ErrorData>(created)
     });
     match tracked {
         Ok(Ok(true)) => println!("adopted PR #{number}; now tracked locally"),

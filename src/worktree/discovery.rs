@@ -32,6 +32,7 @@ fn item_owning_branch<'a>(
 
 /// Records `number`/`branch` as `item`'s PR when it has none yet, so the next
 /// sweep tracks it by number like any PR opened through `item done`.
+/// The caller must validate the PR's task identity before attaching it.
 fn attach_pr_to_item(
     conn: &rusqlite::Connection,
     item: &agentflare_backend::item::Item,
@@ -44,7 +45,7 @@ fn attach_pr_to_item(
     let result = crate::mcp_server::merge_item_metadata(conn, &item.id, |map| {
         map.insert(
             "pr".into(),
-            serde_json::json!({"number": number, "branch": branch}),
+            serde_json::json!({"number": number, "branch": branch, "identity_validated": true}),
         );
     });
     if let Err(e) = result {
@@ -203,7 +204,9 @@ pub(crate) fn create_tracking_item(
         .body
         .clone()
         .unwrap_or_else(|| format!("Auto-tracked PR: {}", pr.html_url));
-    let metadata = serde_json::json!({"pr": {"number": pr.number, "branch": branch}});
+    let metadata = serde_json::json!({"pr": {
+        "number": pr.number, "branch": branch, "identity_validated": true
+    }});
     let input = agentflare_backend::item::CreateItem {
         project_id: project_id.to_string(),
         state_id: in_review_state_id.to_string(),
@@ -359,9 +362,20 @@ pub(crate) fn discover_untracked_prs_with_clock(
         // same metadata. The `opened_by_agentflare` guard used to skip those
         // PRs outright, so the item never regained the number and an
         // approved, CI-green PR sat unmerged with nothing to show for it.
-        // The stamp is only a "this one is ours" marker; the branch
-        // ownership check below is what decides where it goes.
+        // Branch ownership identifies a candidate; PR identity decides whether to attach it.
         if let Some(owning) = item_owning_branch(&items, &branch, local_branch) {
+            if let Some(reason) =
+                super::review_identity::pr_item_mismatch_for_instance(owning, &pr, owner)
+            {
+                if super::pr_number_from_metadata(owning).is_none()
+                    && crate::github::pulls::origin_allows(pr.body.as_deref(), owner)
+                    && let Err(e) =
+                        super::review_identity::flag_discovery_mismatch(client, repo, &pr, &reason)
+                {
+                    eprintln!("worktree: could not flag PR #{}: {reason} {e}", pr.number);
+                }
+                continue;
+            }
             attach_pr_to_item(conn, owning, pr.number, &branch);
             stamp_pr(client, repo, &pr, owning, &branch);
             continue;
@@ -420,6 +434,10 @@ pub(crate) fn discover_untracked_prs_with_clock(
 }
 
 #[cfg(test)]
+#[path = "tests/discovery_identity_tests.rs"]
+mod identity_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -449,7 +467,9 @@ mod tests {
         }
     }
 
-    fn test_project_with_in_review_state(conn: &rusqlite::Connection) -> (String, String) {
+    pub(super) fn test_project_with_in_review_state(
+        conn: &rusqlite::Connection,
+    ) -> (String, String) {
         let ws = agentflare_backend::workspace::create(
             conn,
             agentflare_backend::workspace::CreateWorkspace {
@@ -875,7 +895,7 @@ mod tests {
         );
     }
 
-    fn create_owner_item(
+    pub(super) fn create_owner_item(
         conn: &rusqlite::Connection,
         project_id: &str,
         state_id: &str,

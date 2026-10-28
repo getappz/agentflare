@@ -346,6 +346,13 @@ pub fn item_id_tag(item_id: &str) -> String {
     format!("{ITEM_ID_TAG_PREFIX}{item_id} -->")
 }
 
+/// A single, non-conflicting UUID identity, when a legacy PR has no origin stamp.
+pub(crate) fn item_id_of(body: Option<&str>) -> Option<&str> {
+    let (_, rest) = body?.split_once(ITEM_ID_TAG_PREFIX)?;
+    let (id, _) = rest.split_once(" -->")?;
+    (!id.is_empty() && tag_allows(body, id)).then_some(id)
+}
+
 /// False when `body` carries *any* identity tag that is malformed (no closing
 /// ` -->`) or names a *different* item than `item_id` -- every occurrence is
 /// checked, so a matching tag can't launder a conflicting one after it. A body

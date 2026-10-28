@@ -28,8 +28,7 @@ pub(crate) use super::review_findings::*;
 /// Marker prefix on a review-repair-dispatch comment -- counted the same
 /// way `CI_SELF_REPAIR_MARKER` is, against the same
 /// `quota::decide::SELF_REPAIR_CAP`, so a PR a bot keeps flagging doesn't
-/// retry-dispatch forever either. The wording predates configurable bots
-/// and stays: it is what earlier dispatches on live items already carry.
+/// retry-dispatch forever. Keep the marker compatible with earlier live dispatches.
 pub(super) const CODERABBIT_REPAIR_MARKER: &str =
     "## supervisor — CodeRabbit review repair dispatched";
 
@@ -83,6 +82,8 @@ pub(super) const REVIEW_THREAD_ESCALATED_MARKER: &str = "## supervisor — revie
 /// bot's pushback re-announces, and the body's first line so an edited
 /// finding does.
 pub(super) fn coderabbit_findings_fingerprint(findings: &[BotFinding]) -> String {
+    use sha2::{Digest, Sha256};
+
     let mut rows: Vec<String> = findings
         .iter()
         .map(|f| {
@@ -91,19 +92,37 @@ pub(super) fn coderabbit_findings_fingerprint(findings: &[BotFinding]) -> String
         })
         .collect();
     rows.sort();
-    rows.join("\n").chars().take(2000).collect()
+    let mut foreign: Vec<_> = findings
+        .iter()
+        .filter(|f| f.outside_diff)
+        .map(|f| f.thread_id.as_str())
+        .collect();
+    foreign.sort_unstable();
+    // Scope must survive truncation, even for late findings or a long bot comment.
+    let scope = if foreign.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "outside_diff:{:x}\n",
+            Sha256::digest(foreign.join("\0").as_bytes())
+        )
+    };
+    format!("{scope}{}", rows.join("\n"))
+        .chars()
+        .take(2000)
+        .collect()
 }
 
 fn coderabbit_repair_prior_attempts(
     mcp: &AgentflareMcp,
     item: &agentflare_backend::item::Item,
 ) -> u32 {
-    let (_, silent_attempts, _) = repair_track(
-        item,
-        CODERABBIT_REPAIR_ANNOUNCED_KEY,
-        CODERABBIT_REPAIR_SILENT_KEY,
-        CODERABBIT_REPAIR_COMPLETED_KEY,
-    );
+    let meta = current_metadata(mcp, item);
+    let silent_attempts = meta
+        .get(CODERABBIT_REPAIR_SILENT_KEY)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        .min(u32::MAX as u64) as u32;
     let prior_markers = mcp
         .with_backend_db(|conn| agentflare_backend::comment::list_by_item(conn, &item.id))
         .ok()
@@ -115,7 +134,7 @@ fn coderabbit_repair_prior_attempts(
                 .count() as u32
         })
         .unwrap_or(0);
-    prior_markers + silent_attempts
+    super::review_attempts::charged_attempts(&meta, prior_markers.saturating_add(silent_attempts))
 }
 
 /// Whether CodeRabbit review repair has exhausted `SELF_REPAIR_CAP` while the
@@ -368,10 +387,7 @@ pub(crate) struct ReviewSweepInput<'a> {
     pub folder_path: &'a str,
 }
 
-/// Resolves the repo and a live client, then runs `sweep_review_threads`.
-/// Soft-fails to an empty state (nothing to dispatch, nothing blocking) on
-/// any lookup failure, same as every other GitHub-touching helper in the
-/// sweep: the caller's fallback is to skip this tick and try again.
+/// Validate the live PR before any review replies or repair dispatches.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn fetch_review_bot_state(
     mcp: &AgentflareMcp,
@@ -390,13 +406,12 @@ pub(super) fn fetch_review_bot_state(
     let Ok(client) = Client::new() else {
         return ReviewBotState::unknown();
     };
-    let cfg = ReviewBotConfig::load(repo_root);
-    sweep_review_threads(
+    validated_review_bot_state(
         &client,
         &repo,
         mcp,
         queue,
-        &cfg,
+        &ReviewBotConfig::load(repo_root),
         ReviewSweepInput {
             item,
             number,
@@ -406,6 +421,62 @@ pub(super) fn fetch_review_bot_state(
             folder_path,
         },
     )
+}
+
+pub(super) fn validated_review_bot_state(
+    client: &Client,
+    repo: &RepoId,
+    mcp: &AgentflareMcp,
+    queue: &agentflare_jobs::Queue,
+    cfg: &ReviewBotConfig,
+    input: ReviewSweepInput<'_>,
+) -> ReviewBotState {
+    let Ok(pr) = crate::github::pulls::get(client, repo, input.number) else {
+        return ReviewBotState::unknown();
+    };
+    if gate_review_identity(mcp, input.item, &pr, input.label_id_by_name) {
+        return ReviewBotState::unknown();
+    }
+    let Ok(files) = crate::github::pulls::list_files(client, repo, input.number) else {
+        return ReviewBotState::unknown();
+    };
+    if pr.changed_files.is_some_and(|n| n != files.len() as u64) {
+        return ReviewBotState::unknown();
+    }
+    sweep_review_threads(client, repo, mcp, queue, cfg, input, &files)
+}
+
+pub(super) fn gate_review_identity(
+    mcp: &AgentflareMcp,
+    item: &agentflare_backend::item::Item,
+    pr: &crate::github::models::PullRequest,
+    label_id_by_name: &std::collections::HashMap<String, String>,
+) -> bool {
+    let Some(reason) = crate::worktree::pr_item_mismatch(item, pr) else {
+        return false;
+    };
+    ensure_needs_human_item_gate(mcp, item, label_id_by_name);
+    const KEY: &str = "review_repair_identity_mismatch";
+    if current_metadata(mcp, item)
+        .get(KEY)
+        .and_then(|v| v.as_str())
+        != Some(&reason)
+        && mcp
+            .comment_impl(CommentRequest {
+                action: "create".into(),
+                item_id: Some(item.id.clone()),
+                body: Some(format!(
+                    "## supervisor — review repair needs human mapping\n\n{reason}"
+                )),
+                ..Default::default()
+            })
+            .is_ok()
+    {
+        update_metadata(mcp, &item.id, |m| {
+            m.insert(KEY.into(), reason.into());
+        });
+    }
+    true
 }
 
 fn current_metadata(
@@ -435,7 +506,8 @@ fn update_metadata(
 }
 
 /// One sweep of `input.number`'s bot threads (see the module doc). Takes the
-/// client so tests can point it at a mock server.
+/// client so tests can point it at a mock server. `files` must be validated
+/// against the live PR before any stored result is applied.
 pub(crate) fn sweep_review_threads(
     client: &Client,
     repo: &RepoId,
@@ -443,6 +515,7 @@ pub(crate) fn sweep_review_threads(
     queue: &agentflare_jobs::Queue,
     cfg: &ReviewBotConfig,
     input: ReviewSweepInput<'_>,
+    files: &[crate::github::models::PullRequestFile],
 ) -> ReviewBotState {
     let item = input.item;
     let mut state = ReviewBotState::default();
@@ -460,8 +533,53 @@ pub(crate) fn sweep_review_threads(
     };
     let by_id: std::collections::HashMap<&str, &ReviewThread> =
         threads.iter().map(|t| (t.id.as_str(), t)).collect();
-    let meta = current_metadata(mcp, item);
-    let findings = classify_threads(&threads, cfg, &meta);
+    let mut meta = current_metadata(mcp, item);
+    let mut findings = classify_threads(&threads, cfg, &meta);
+    mark_finding_scope(&mut findings, files);
+    for f in findings.iter_mut().filter(|f| !f.outside_diff) {
+        // A later commit can bring a previously foreign path into this PR.
+        let marker = by_id
+            .get(f.thread_id.as_str())
+            .and_then(|t| {
+                t.comments.iter().rev().find_map(|c| {
+                    ReplyMarker::parse(&c.body).filter(|m| marker_trusted(m, &t.id, &meta))
+                })
+            })
+            .filter(|m| m.outcome == ReviewOutcome::OutOfScope);
+        if !f.actionable()
+            && let Some(marker) = &marker
+        {
+            f.status = ThreadStatus::Actionable {
+                next_round: marker.round.saturating_add(1),
+            };
+        }
+        let stale_scope = |m: &serde_json::Map<String, serde_json::Value>| {
+            thread_result(m, &f.thread_id).is_some_and(|r| {
+                r.outcome == ReviewOutcome::OutOfScope && r.round.max(1) <= f.round()
+            })
+        };
+        if stale_scope(&meta) {
+            update_metadata(mcp, &item.id, |m| {
+                if stale_scope(m) {
+                    // Keep a posted reply trusted when its pending result is the only proof.
+                    if let Some(marker) = &marker {
+                        let replied = thread_record(m, &f.thread_id)
+                            .replied_round
+                            .max(marker.round);
+                        set_thread_replied(m, &f.thread_id, replied);
+                    }
+                    remove_thread_result(m, &f.thread_id);
+                }
+            });
+            if let Some(marker) = marker {
+                let replied = thread_record(&meta, &f.thread_id)
+                    .replied_round
+                    .max(marker.round);
+                set_thread_replied(&mut meta, &f.thread_id, replied);
+            }
+            remove_thread_result(&mut meta, &f.thread_id);
+        }
+    }
     let in_flight = job_in_flight(queue, &item.id);
     let mut commits: Option<Vec<String>> = None;
     let mut head_commit_info: Option<Option<review_threads::CommitInfo>> = None;
@@ -1328,6 +1446,7 @@ pub(super) fn coderabbit_repair_or_gate(
         for f in findings {
             set_thread_round(m, &f.thread_id, f.round());
         }
+        super::review_attempts::begin_attempt(m, &info.id, findings);
     });
     if announced_for.as_deref() == Some(fingerprint.as_str()) {
         // Same findings already announced — re-dispatch the retry silently
