@@ -55,6 +55,8 @@ pub struct PullRequest {
     // enough to stop blocking redispatch.
     #[serde(default)]
     pub created_at: Option<String>,
+    #[serde(default)]
+    pub closed_at: Option<String>,
     // Last activity of any kind (commit, comment, label); `pr_owner` uses it
     // as the owner-liveness signal for `pr adopt`.
     #[serde(default)]

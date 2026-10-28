@@ -79,6 +79,14 @@ pub enum ItemCommands {
         #[arg(long)]
         agent: Option<String>,
     },
+    /// Dismiss a duplicate PR false-positive so redispatch is unblocked
+    DismissDuplicatePr {
+        /// Item id (#1 or UUID)
+        id: String,
+        /// The PR number to dismiss (if omitted, dismisses the PR currently matching this item)
+        #[arg(long)]
+        pr: Option<u64>,
+    },
 }
 
 /// Runs one operator control through `job_controls::item_action` and prints
@@ -333,6 +341,88 @@ impl ItemArgs {
                     Ok(Ok(json)) => println!("{json}"),
                     Ok(Err(e)) => crate::ui::error(&e.to_string()),
                     Err(e) => crate::ui::error(&e.to_string()),
+                }
+            }
+            ItemCommands::DismissDuplicatePr { id, pr } => {
+                let mcp = crate::mcp_server::AgentflareMcp::default();
+                let res = mcp.with_backend_db(|conn| {
+                    let item_id = mcp.resolve_item_id(conn, &id)?;
+                    let item = agentflare_backend::item::get(conn, &item_id)
+                        .map_err(crate::mcp_server::types::map_backend_err)?;
+                    let pr_number = match pr {
+                        Some(num) => num,
+                        None => {
+                            let repo_root = std::env::current_dir().unwrap_or_default();
+                            let repo = crate::github::RepoId::resolve_from_remote(&repo_root)
+                                .ok_or_else(|| {
+                                    rmcp::model::ErrorData::new(
+                                        rmcp::model::ErrorCode::INVALID_PARAMS,
+                                        "cannot resolve git remote; specify --pr <number>",
+                                        None,
+                                    )
+                                })?;
+                            let client = crate::github::Client::new().map_err(|e| {
+                                rmcp::model::ErrorData::new(
+                                    rmcp::model::ErrorCode::INTERNAL_ERROR,
+                                    e.to_string(),
+                                    None,
+                                )
+                            })?;
+                            let prs = crate::github::pulls::find_by_item_marker(
+                                &client,
+                                &repo,
+                                item.sequence_id,
+                                &item.id,
+                            )
+                            .map_err(|e| {
+                                rmcp::model::ErrorData::new(
+                                    rmcp::model::ErrorCode::INTERNAL_ERROR,
+                                    e.to_string(),
+                                    None,
+                                )
+                            })?;
+                            prs.first()
+                                .map(|p| p.number)
+                                .ok_or_else(|| {
+                                    rmcp::model::ErrorData::new(
+                                        rmcp::model::ErrorCode::INVALID_PARAMS,
+                                        "no duplicate PR found for this item; specify --pr <number>",
+                                        None,
+                                    )
+                                })?
+                        }
+                    };
+                    crate::mcp_server::merge_item_metadata(conn, &item.id, |meta| {
+                        let arr = meta
+                            .entry("dismissed_duplicate_prs".to_string())
+                            .or_insert_with(|| serde_json::json!([]));
+                        if let Some(list) = arr.as_array_mut()
+                            && !list.iter().any(|v| v.as_u64() == Some(pr_number))
+                        {
+                            list.push(serde_json::json!(pr_number));
+                        }
+                    })
+                    .map_err(crate::mcp_server::types::map_backend_err)?;
+                    let out = serde_json::json!({
+                        "status": "ok",
+                        "item_id": format!("#{}", item.sequence_id),
+                        "pr_number": pr_number,
+                        "message": format!("dismissed duplicate PR #{} for item #{}", pr_number, item.sequence_id),
+                    });
+                    Ok::<_, rmcp::model::ErrorData>(
+                        serde_json::to_string_pretty(&out).unwrap_or_default(),
+                    )
+                });
+                match res {
+                    Ok(Ok(json)) => println!("{json}"),
+                    Ok(Err(e)) => {
+                        crate::ui::error(&e.to_string());
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        crate::ui::error(&e.to_string());
+                        std::process::exit(1);
+                    }
                 }
             }
         }
