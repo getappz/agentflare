@@ -560,20 +560,75 @@ pub(crate) fn completion_gate_denial(
         return None;
     }
     let cwd_tree = crate::optimize::tree_fingerprint();
-    let item_dir = resolve_item_worktree(tool_input);
-    let item_tree = item_dir
+    let cwd_passing = cwd_tree
         .as_deref()
-        .and_then(crate::optimize::tree_fingerprint_in);
-    let fresh = |f| fresh_in_either(record, now, cwd_tree.as_deref(), item_tree.as_deref(), f);
+        .is_some_and(|h| crate::optimize::has_fresh_passing_verification(record, now, Some(h)));
+    let cwd_review = cwd_tree
+        .as_deref()
+        .is_some_and(|h| crate::optimize::has_fresh_review(record, now, Some(h)));
+
+    let item_dir = resolve_item_worktree(tool_input);
+    let cwd_path = std::env::current_dir().ok();
+    let is_same_dir = match (&cwd_path, &item_dir) {
+        (Some(c), Some(i)) => {
+            std::fs::canonicalize(c).ok().as_deref() == std::fs::canonicalize(i).ok().as_deref()
+        }
+        _ => false,
+    };
+
+    // Bound git fingerprint work within hook budget: reuse fresh cwd evidence
+    // when sufficient or when cwd == item_dir, computing tree_fingerprint_in only
+    // when cwd evidence is insufficient and directories differ.
+    let (item_tree, fresh_passing, fresh_review) = if cwd_passing && cwd_review {
+        (if is_same_dir { cwd_tree.clone() } else { None }, true, true)
+    } else if is_same_dir {
+        (
+            cwd_tree.clone(),
+            fresh_in_either(
+                record,
+                now,
+                cwd_tree.as_deref(),
+                cwd_tree.as_deref(),
+                crate::optimize::has_fresh_passing_verification,
+            ),
+            fresh_in_either(
+                record,
+                now,
+                cwd_tree.as_deref(),
+                cwd_tree.as_deref(),
+                crate::optimize::has_fresh_review,
+            ),
+        )
+    } else {
+        let item_tree = item_dir
+            .as_deref()
+            .and_then(crate::optimize::tree_fingerprint_in);
+        let fresh_passing = fresh_in_either(
+            record,
+            now,
+            cwd_tree.as_deref(),
+            item_tree.as_deref(),
+            crate::optimize::has_fresh_passing_verification,
+        );
+        let fresh_review = fresh_in_either(
+            record,
+            now,
+            cwd_tree.as_deref(),
+            item_tree.as_deref(),
+            crate::optimize::has_fresh_review,
+        );
+        (item_tree, fresh_passing, fresh_review)
+    };
+
     let mut reason = crate::hook_redirect::completion_gate_reason(
         tool_name,
         tool_input,
-        fresh(crate::optimize::has_fresh_passing_verification),
-        fresh(crate::optimize::has_fresh_review),
+        fresh_passing,
+        fresh_review,
         crate::optimize::has_fresh_diagnosis_evidence(record),
         task_type,
     )?;
-    let cwd = std::env::current_dir()
+    let cwd = cwd_path
         .map(|d| d.display().to_string())
         .unwrap_or_default();
     let item_dir = item_dir.map(|d| d.display().to_string());
