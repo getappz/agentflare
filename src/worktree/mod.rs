@@ -148,6 +148,8 @@ pub(crate) fn pr_number_from_metadata(item: &agentflare_backend::item::Item) -> 
 
 mod discovery;
 pub(crate) use discovery::{create_tracking_item, discover_untracked_prs, tracked_pr_numbers};
+mod review_identity;
+pub(crate) use review_identity::{pr_item_mismatch, record_adopted_identity};
 mod draft;
 pub(crate) use draft::{mark_pr_ready, pr_marked_ready};
 

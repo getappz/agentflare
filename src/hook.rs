@@ -627,16 +627,11 @@ pub fn pre_tool_use(agent: &str) {
     // hook_redirect::completion_gate_reason's doc comment.
     let task_type = resolve_item_task_type(&parsed.tool_name, parsed.tool_input.as_ref());
     // Only item calls can hit the gate, so only they pay for the git hash.
-    let current_tree = (parsed.tool_name == crate::hook_redirect::ITEM_TOOL_NAME
-        || parsed.tool_name == "item")
-        .then(crate::optimize::tree_fingerprint)
-        .flatten();
-    if let Some(reason) = crate::hook_redirect::completion_gate_reason(
+    if let Some(reason) = crate::hook_completion_gate::completion_gate_denial(
+        record,
+        now,
         &parsed.tool_name,
         parsed.tool_input.as_ref(),
-        crate::optimize::has_fresh_passing_verification(record, now, current_tree.as_deref()),
-        crate::optimize::has_fresh_review(record, now, current_tree.as_deref()),
-        crate::optimize::has_fresh_diagnosis_evidence(record),
         task_type.as_deref(),
     ) {
         let decision = json!({

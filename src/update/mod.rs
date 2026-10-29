@@ -97,6 +97,11 @@ pub fn run(version: Option<String>, check_only: bool, quiet: bool) {
         std::process::exit(1);
     }
 
+    if let Err(e) = crate::wrap::refresh_existing_companion(&current) {
+        eprintln!("agentflare updated, but Claude wrapper refresh failed: {e}");
+        std::process::exit(1);
+    }
+
     if !quiet {
         println!("updated to {target_version}");
         report_other_instances();
