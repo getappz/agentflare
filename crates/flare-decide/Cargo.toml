@@ -1,0 +1,14 @@
+[package]
+name = "flare-decide"
+version = "0.1.0"
+edition = "2024"
+description = "Local offline typed decision engine (Choice, Score, Noul) reusing workspace ONNX and lexical primitives"
+
+[dependencies]
+agentflare-store = { path = "../agentflare-store", default-features = false, features = ["embeddings"] }
+flare-search-kit = { path = "../flare-search-kit" }
+agentflare-workspace-hack = { version = "0.1", path = "../../agentflare-workspace-hack" }
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"

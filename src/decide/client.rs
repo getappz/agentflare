@@ -1,6 +1,6 @@
 use super::breaker;
-use super::provider::{Config, DecideError, parse_response};
-use super::types::{Question, Response};
+use super::provider::{Config, DecideError, Provider, parse_response};
+use super::types::{Answer, Question, Response, Usage};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -170,6 +170,10 @@ pub fn ask_with(
     state: &Value,
     questions: &BTreeMap<String, Question>,
 ) -> Result<Outcome, DecideError> {
+    // In-process engine: no remote to trip the breaker over.
+    if matches!(cfg.provider, Provider::Local) {
+        return send_local(state, questions);
+    }
     let path = breaker_path();
     if !breaker::allow(&path, breaker::current_time(), cfg.timeout) {
         return Err(DecideError::Unavailable);
@@ -227,6 +231,72 @@ fn send(
     Ok(Outcome {
         response,
         elapsed_ms,
+    })
+}
+
+/// Run the offline engine. Questions share a wire shape (serde round trip);
+/// answers do not (flare-decide's are untagged, Score probabilities are a
+/// positional `Vec`), so they are converted explicitly.
+fn send_local(
+    state: &Value,
+    questions: &BTreeMap<String, Question>,
+) -> Result<Outcome, DecideError> {
+    use flare_decide::Answer as Local;
+    let local_err = |e: &dyn std::fmt::Display| DecideError::Local(e.to_string());
+    let qs = serde_json::to_value(questions)
+        .and_then(serde_json::from_value)
+        .map_err(|e| local_err(&e))?;
+    let out = flare_decide::ask(state, &qs).map_err(|e| local_err(&e))?;
+    let answers = out
+        .response
+        .answers
+        .into_iter()
+        .map(|(id, a)| {
+            let a = match a {
+                Local::Choice {
+                    choice,
+                    confidence,
+                    probabilities,
+                } => Answer::Choice {
+                    choice,
+                    confidence,
+                    probabilities,
+                },
+                Local::Score {
+                    score,
+                    confidence,
+                    probabilities,
+                } => Answer::Score {
+                    score,
+                    confidence,
+                    // 1-based level index, matching the rubric order.
+                    probabilities: probabilities
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, p)| ((i + 1).to_string(), p))
+                        .collect(),
+                },
+                Local::Noul { noul } => Answer::Noul { noul },
+            };
+            (id, a)
+        })
+        .collect();
+    let u = out.response.usage;
+    let response = Response {
+        answers,
+        model: out.response.model,
+        usage: Usage {
+            input_tokens: u.input_tokens.unwrap_or(0),
+            output_tokens: u.output_tokens.unwrap_or(0),
+            cost: u.cost,
+        },
+    };
+    response
+        .validate(questions)
+        .map_err(DecideError::Malformed)?;
+    Ok(Outcome {
+        response,
+        elapsed_ms: out.elapsed_ms,
     })
 }
 
@@ -428,6 +498,19 @@ mod tests {
         );
         assert_eq!(get("OPENROUTER_API_KEY").as_deref(), Some("from-dotenv"));
         assert_eq!(get("AGENTFLARE_JEV").as_deref(), Some("1")); // non-credential: no vault call
+    }
+
+    #[test]
+    fn local_provider_answers_without_network_or_credentials() {
+        let get = |k: &str| match k {
+            "AGENTFLARE_JEV" => Some("1".to_string()),
+            "AGENTFLARE_JEV_PROVIDER" => Some("local".to_string()),
+            _ => None,
+        };
+        let cfg = Config::from_lookup(&get).ok().unwrap();
+        let out = ask_with(&cfg, &serde_json::json!("fix typo in README"), &questions())
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(!out.response.answers.is_empty());
     }
 
     #[test]

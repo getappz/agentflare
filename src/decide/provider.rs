@@ -29,11 +29,15 @@ pub enum DecideError {
     InvalidBaseUrl,
     #[error("decision backend temporarily unavailable (circuit breaker open)")]
     Unavailable,
+    #[error("local decision engine failed: {0}")]
+    Local(String),
     #[error("decision budget exhausted: {0}")]
     Budget(&'static str),
 }
 
 pub enum Provider {
+    /// Offline `flare-decide` engine: no credentials, no network.
+    Local,
     OpenRouter {
         key: String,
     },
@@ -88,6 +92,7 @@ impl Config {
         let provider = match val("AGENTFLARE_JEV_PROVIDER").as_deref() {
             Some("openrouter") => openrouter(),
             Some("cloudflare") => cloudflare(),
+            Some("local") => Some(Provider::Local),
             Some(_) => None,
             None => openrouter().or_else(cloudflare),
         }
@@ -111,6 +116,7 @@ impl Config {
                 .unwrap_or_else(|| default.to_string())
         };
         match &self.provider {
+            Provider::Local => unreachable!("local provider makes no HTTP request"),
             Provider::OpenRouter { key } => HttpRequest {
                 url: self
                     .url_override
