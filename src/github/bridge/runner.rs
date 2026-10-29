@@ -121,14 +121,10 @@ fn open_items_db() -> Option<rusqlite::Connection> {
 
 fn run_forever(config: BridgeConfig) {
     let interval = std::time::Duration::from_secs(config.interval_secs);
-    let Some(conn) = open_items_db() else { return };
-    let client = match crate::github::Client::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("github bridge: no usable credential ({e}); not starting");
-            return;
-        }
-    };
+    eprintln!(
+        "github bridge: started poll loop (every {}s)",
+        config.interval_secs
+    );
 
     // Soft errors repeat every tick by nature, so log a CHANGE per repo
     // rather than each occurrence: 1440 identical lines a day would bury the
@@ -137,7 +133,39 @@ fn run_forever(config: BridgeConfig) {
     // one daemon now polls several independently.
     let mut last_soft: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut had_targets = true; // forces the "nothing registered" message on the first empty tick
+    let mut logged_no_db = false;
+    let mut logged_no_client = false;
+
     loop {
+        let conn = match open_items_db() {
+            Some(c) => {
+                logged_no_db = false;
+                c
+            }
+            None => {
+                if !logged_no_db {
+                    eprintln!("github bridge: waiting for item database to become available...");
+                    logged_no_db = true;
+                }
+                std::thread::sleep(interval);
+                continue;
+            }
+        };
+
+        let client = match crate::github::Client::new() {
+            Ok(c) => {
+                logged_no_client = false;
+                c
+            }
+            Err(e) => {
+                if !logged_no_client {
+                    eprintln!("github bridge: waiting for usable credential ({e})...");
+                    logged_no_client = true;
+                }
+                std::thread::sleep(interval);
+                continue;
+            }
+        };
         let targets = bridge_targets(&conn);
         if targets.is_empty() {
             if had_targets {
