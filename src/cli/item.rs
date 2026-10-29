@@ -79,7 +79,7 @@ pub enum ItemCommands {
         #[arg(long)]
         agent: Option<String>,
     },
-    /// Dismiss a duplicate PR false-positive so redispatch is unblocked
+    /// Dismiss a duplicate PR false-positive so redispatch is unblocked (human-only; refuses under an AI agent)
     DismissDuplicatePr {
         /// Item id (#1 or UUID)
         id: String,
@@ -116,6 +116,21 @@ fn approve_plan_denial(agent: Option<&str>) -> Option<String> {
              human's approval on the Telegram card, so an agent running it would defeat the \
              plan gate (detected this process is running under the {agent} AI agent). Ask a \
              human to run it."
+        )
+    })
+}
+
+/// `Some(message)` when the caller is an AI agent. `dismiss-duplicate-pr` is
+/// a human-only command — it resolves a duplicate-PR review block, so an agent
+/// running it would defeat the human review gate (detected this process is
+/// running under the {agent} AI agent). Ask a human to run it.
+fn dismiss_duplicate_pr_denial(agent: Option<&str>) -> Option<String> {
+    agent.map(|agent| {
+        format!(
+            "`agentflare item dismiss-duplicate-pr` is a human-only command — it resolves a \
+             duplicate-PR review block, so an agent running it would defeat the human review \
+             gate (detected this process is running under the {agent} AI agent). Ask a human to \
+             run it."
         )
     })
 }
@@ -344,6 +359,12 @@ impl ItemArgs {
                 }
             }
             ItemCommands::DismissDuplicatePr { id, pr } => {
+                if let Some(msg) =
+                    dismiss_duplicate_pr_denial(flare_process::agent_name().as_deref())
+                {
+                    crate::ui::error(&msg);
+                    std::process::exit(1);
+                }
                 let mcp = crate::mcp_server::AgentflareMcp::default();
                 let res = mcp.with_backend_db(|conn| {
                     let item_id = mcp.resolve_item_id(conn, &id)?;
@@ -353,35 +374,7 @@ impl ItemArgs {
                         Some(num) => num,
                         None => {
                             let repo_root = std::env::current_dir().unwrap_or_default();
-                            let repo = crate::github::RepoId::resolve_from_remote(&repo_root)
-                                .ok_or_else(|| {
-                                    rmcp::model::ErrorData::new(
-                                        rmcp::model::ErrorCode::INVALID_PARAMS,
-                                        "cannot resolve git remote; specify --pr <number>",
-                                        None,
-                                    )
-                                })?;
-                            let client = crate::github::Client::new().map_err(|e| {
-                                rmcp::model::ErrorData::new(
-                                    rmcp::model::ErrorCode::INTERNAL_ERROR,
-                                    e.to_string(),
-                                    None,
-                                )
-                            })?;
-                            let prs = crate::github::pulls::find_by_item_marker(
-                                &client,
-                                &repo,
-                                item.sequence_id,
-                                &item.id,
-                            )
-                            .map_err(|e| {
-                                rmcp::model::ErrorData::new(
-                                    rmcp::model::ErrorCode::INTERNAL_ERROR,
-                                    e.to_string(),
-                                    None,
-                                )
-                            })?;
-                            prs.first()
+                            crate::cli::work::find_duplicate_pr(&item, &repo_root)
                                 .map(|p| p.number)
                                 .ok_or_else(|| {
                                     rmcp::model::ErrorData::new(
@@ -431,7 +424,7 @@ impl ItemArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::approve_plan_denial;
+    use super::{approve_plan_denial, dismiss_duplicate_pr_denial};
 
     #[test]
     fn approve_plan_is_denied_under_an_ai_agent() {
@@ -445,5 +438,19 @@ mod tests {
     #[test]
     fn approve_plan_is_allowed_for_a_human() {
         assert_eq!(approve_plan_denial(None), None);
+    }
+
+    #[test]
+    fn dismiss_duplicate_pr_is_denied_under_an_ai_agent() {
+        let msg = dismiss_duplicate_pr_denial(Some("claude-code")).expect("agent must be denied");
+        assert!(
+            msg.contains("human-only") && msg.contains("claude-code"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn dismiss_duplicate_pr_is_allowed_for_a_human() {
+        assert_eq!(dismiss_duplicate_pr_denial(None), None);
     }
 }

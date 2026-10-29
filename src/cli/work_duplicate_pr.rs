@@ -74,7 +74,7 @@ pub(crate) fn dismissed_duplicate_prs_from_metadata(
         .unwrap_or_default()
 }
 
-fn find_duplicate_pr(
+pub(crate) fn find_duplicate_pr(
     item: &agentflare_backend::item::Item,
     repo_root: &std::path::Path,
 ) -> Option<crate::github::models::PullRequest> {
