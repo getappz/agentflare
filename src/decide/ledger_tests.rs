@@ -176,10 +176,65 @@ fn statuses_distinguish_fail_open_reasons() {
         (DecideError::Unavailable, "breaker-open"),
         (DecideError::Status(402, String::new()), "402"),
         (DecideError::Transport("timed out".into()), "timeout"),
+        (DecideError::Transport("request TIMEOUT".into()), "timeout"),
+        (
+            DecideError::Transport("runtime failure".into()),
+            "fail-open",
+        ),
+        (
+            DecideError::Transport("estimate unavailable".into()),
+            "fail-open",
+        ),
         (DecideError::Malformed("bad".into()), "fail-open"),
     ] {
         assert_eq!(tracking::status(&e), expected);
     }
+}
+
+#[test]
+fn failed_envelopes_only_classify_explicit_timeout_messages() {
+    for (message, expected) in [
+        ("runtime failure", "fail-open"),
+        ("estimate unavailable", "fail-open"),
+        ("request TIMED OUT", "timeout"),
+        ("request TIMEOUT", "timeout"),
+    ] {
+        assert_eq!(
+            Row::failed("s", "p", "a", message)
+                .details
+                .status
+                .as_deref(),
+            Some(expected)
+        );
+    }
+}
+
+#[test]
+fn breaker_open_rows_do_not_change_agreement_or_failure_rates() {
+    let mut rows = vec![
+        Row::answered("router", "p", "a", "a", None, 10, None),
+        Row::answered("router", "p", "a", "b", None, 20, None),
+        Row::failed("router", "p", "a", "timeout"),
+    ];
+    rows.extend((0..100).map(|_| Row::failed("router", "p", "a", "circuit breaker open")));
+    let r = report::replay(&rows, &[], None);
+    for metrics in std::iter::once(&r.all)
+        .chain(r.sites.values())
+        .chain(r.models.values().flat_map(|models| models.values()))
+        .chain(r.days.values())
+    {
+        let json = serde_json::to_value(metrics).unwrap();
+        assert_eq!(metrics.decisions, 103);
+        assert_eq!(metrics.agreement_rate, Some(0.5));
+        assert_eq!(json["failed"], 1);
+        assert_eq!(json["breaker_open"], 100);
+        assert_eq!(json["failure_rate"], serde_json::json!(1.0 / 3.0));
+    }
+    assert!(report::render(&r).contains("breaker-open 100"));
+    let only_breakers = report::replay(&rows[3..], &[], None);
+    let json = serde_json::to_value(&only_breakers.all).unwrap();
+    assert!(json["failure_rate"].is_null());
+    assert!(only_breakers.all.agreement_rate.is_none());
 }
 
 #[test]

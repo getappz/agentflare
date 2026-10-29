@@ -11,6 +11,9 @@ use std::path::Path;
 #[derive(Debug, Default, Serialize, PartialEq)]
 pub struct Metrics {
     pub decisions: usize,
+    pub breaker_open: usize,
+    pub failed: usize,
+    pub failure_rate: Option<f64>,
     pub answered: usize,
     pub agreements: usize,
     pub applied: usize,
@@ -163,19 +166,21 @@ fn summarize(
     };
     let mut latency = Vec::new();
     for r in rows {
+        let status = r
+            .details
+            .status
+            .clone()
+            .unwrap_or_else(|| if r.error.is_some() { "fail-open" } else { "ok" }.into());
+        *s.statuses.entry(status.clone()).or_default() += 1;
+        if status == "breaker-open" {
+            s.breaker_open += 1;
+            continue;
+        }
         s.applied += usize::from(r.details.applied);
         s.cost += r.cost.unwrap_or_default();
         s.input_tokens += r.details.input_tokens;
         s.output_tokens += r.details.output_tokens;
         latency.extend(r.latency_ms);
-        *s.statuses
-            .entry(
-                r.details
-                    .status
-                    .clone()
-                    .unwrap_or_else(|| if r.error.is_some() { "fail-open" } else { "ok" }.into()),
-            )
-            .or_default() += 1;
         let outcome = r.decision_id.as_deref().and_then(|id| outcomes.get(id));
         s.overrides += usize::from(
             r.decision_id
@@ -183,6 +188,7 @@ fn summarize(
                 .is_some_and(|id| overrides.contains(id)),
         );
         let Some(jev) = r.jev.as_ref().filter(|_| r.error.is_none()) else {
+            s.failed += 1;
             continue;
         };
         s.answered += 1;
@@ -221,7 +227,9 @@ fn summarize(
         .get((latency.len() * 95).div_ceil(100).saturating_sub(1))
         .copied();
     s.agreement_rate = (s.answered > 0).then(|| s.agreements as f64 / s.answered as f64);
-    s.override_rate = (s.decisions > 0).then(|| s.overrides as f64 / s.decisions as f64);
+    let attempted = s.decisions - s.breaker_open;
+    s.failure_rate = (attempted > 0).then(|| s.failed as f64 / attempted as f64);
+    s.override_rate = (attempted > 0).then(|| s.overrides as f64 / attempted as f64);
     s
 }
 
@@ -256,7 +264,13 @@ pub fn render(report: &Report) -> String {
     for (name, s) in std::iter::once(("all sites", &report.all))
         .chain(report.sites.iter().map(|(n, s)| (n.as_str(), s)))
     {
-        text.push_str(&format!("{name}: agreement {}/{}, labeled Jev right {}/{}, baseline right {}/{}, overrides {}/{}, applied {}, latency p50/p95 {:?}/{:?} ms, tokens {}/{}, cost ${:.6}\n", s.agreements, s.answered, s.jev_right, s.labeled, s.baseline_right, s.labeled, s.overrides, s.decisions, s.applied, s.median_ms, s.p95_ms, s.input_tokens, s.output_tokens, s.cost));
+        text.push_str(&format!(
+            "{name}: failed {}/{}, breaker-open {}\n",
+            s.failed,
+            s.decisions - s.breaker_open,
+            s.breaker_open
+        ));
+        text.push_str(&format!("{name}: agreement {}/{}, labeled Jev right {}/{}, baseline right {}/{}, overrides {}/{}, applied {}, latency p50/p95 {:?}/{:?} ms, tokens {}/{}, cost ${:.6}\n", s.agreements, s.answered, s.jev_right, s.labeled, s.baseline_right, s.labeled, s.overrides, s.decisions - s.breaker_open, s.applied, s.median_ms, s.p95_ms, s.input_tokens, s.output_tokens, s.cost));
         for (bin, b) in &s.calibration {
             text.push_str(&format!(
                 "  confidence {bin}: mean {:.3}, accuracy {:.3} ({}/{})\n",

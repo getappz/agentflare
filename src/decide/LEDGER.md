@@ -12,6 +12,9 @@ The result is unchanged, including failures. Disabled calls create no record or
 writer. Consumers with a semantic decision made from multiple answers (router,
 skill ranking, judge) use `tracking::finish` and supply their actual comparison
 label and whether they applied it. Batch billing is apportioned once across sites.
+Batch `elapsed_ms` is the full shared request duration at each participating
+site, suitable for per-site latency percentiles. It is not additive across sites:
+report and bench consumers must not sum those durations into a cross-site total.
 Question IDs must be program-generated identifiers, never prompt text.
 
 Generic comparison labels are JSON objects mapping question IDs to choice keys,
@@ -36,6 +39,10 @@ override counts once per decision even if superseded. Calibration uses only
 answered decisions with an outcome; it never substitutes baseline agreement for
 ground truth. Reports expose per-site, per-model, and UTC-day cohorts, failures,
 disagreements, overrides, usage, latency, storage, and drops for the bench harness.
+`decisions` includes breaker-open rows so every decision stays accounted for.
+`breaker_open` and the status histogram show those short circuits separately;
+they do not enter failure, agreement, override, or latency denominators. Failure
+rate is `failed / (decisions - breaker_open)` and is unknown with no attempted calls.
 
 Questions/instructions and input features are written only when
 `AGENTFLARE_DECIDE_CAPTURE=1`, using the existing redaction and size bounds.
@@ -72,3 +79,11 @@ recording helper after startup (including ID/hash, sanitization, enqueue and
 the helper's receipt acknowledgement) and bytes for
 1,000 representative decisions. It asserts p95 < 2 ms and < 1 MB/1k without
 captured inputs. Rotation bounds disk growth even when capture is enabled.
+
+Measured on Windows x86_64, 2026-10-29, with
+`cargo test -p agentflare --bin agentflare decide:: -- --nocapture`:
+record + receipt p95 **467 us (0.467 ms)**; **445,984 bytes per 1,000 decisions**.
+The decision suite passed 102 tests, including the real-process exit test
+(8 decisions and 8 joined capture rows survived a timed-out flush). These are
+warm recording measurements; helper startup and end-to-end hook latency are
+not included.

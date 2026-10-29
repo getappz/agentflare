@@ -169,9 +169,14 @@ pub fn status(error: &DecideError) -> &'static str {
     match error {
         DecideError::Unavailable => "breaker-open",
         DecideError::Status(402, _) => "402",
-        DecideError::Transport(s) if s.to_ascii_lowercase().contains("tim") => "timeout",
+        DecideError::Transport(s) if is_timeout(s) => "timeout",
         _ => "fail-open",
     }
+}
+
+pub(super) fn is_timeout(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("timed out") || message.contains("timeout")
 }
 
 pub fn failure(

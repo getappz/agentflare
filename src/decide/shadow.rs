@@ -79,7 +79,7 @@ impl Row {
     pub fn failed(site: &str, input: &str, baseline: &str, error: &str) -> Self {
         let status = if error.contains("402") {
             "402"
-        } else if error.to_ascii_lowercase().contains("tim") {
+        } else if super::tracking::is_timeout(error) {
             "timeout"
         } else if error.contains("circuit breaker") {
             "breaker-open"
