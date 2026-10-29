@@ -320,24 +320,29 @@ impl AgentflareMcp {
         let root = root.to_string_lossy();
 
         // Semantic first so a sentence finds code by meaning; the exact-text
-        // form is the fallback when lean-ctx can't serve a semantic search.
-        let found = match self
+        // form is the fallback when it errors or yields nothing (lean-ctx
+        // reports index-building and no-hit as plain text, not as an error).
+        let semantic = self
             .gateway_execute(
                 "leanctx",
                 "ctx_search",
                 code_search_args(q, &root, limit, true),
             )
-            .await
-        {
-            Ok(val) => Ok(val),
-            Err(_) => {
-                self.gateway_execute(
+            .await;
+        let found = match semantic {
+            Ok(val) if has_semantic_hits(&val) => Ok(val),
+            other => match self
+                .gateway_execute(
                     "leanctx",
                     "ctx_search",
                     code_search_args(q, &root, limit, false),
                 )
                 .await
-            }
+            {
+                Ok(val) => Ok(val),
+                // Keep the semantic reply (e.g. "No results found") over a fallback error.
+                Err(e) => other.or(Err(e)),
+            },
         };
 
         match found {
@@ -850,9 +855,29 @@ fn code_search_args(q: &str, root: &str, limit: usize, semantic: bool) -> serde_
     }
 }
 
+/// A semantic `ctx_search` reply carries one `--- Result N` block per hit;
+/// without any it was an error, an index-building notice or zero hits.
+fn has_semantic_hits(reply: &serde_json::Value) -> bool {
+    reply.to_string().contains("--- Result ")
+}
+
 #[cfg(test)]
 mod helper_tests {
     use super::*;
+
+    #[test]
+    fn semantic_reply_without_result_blocks_is_not_a_hit() {
+        let hit = serde_json::json!(
+            "Semantic search (Hybrid): \"q\" (1 results)\n\n--- Result 1 (rrf: 0.1) ---\nsrc/a.rs :: f [Function] (L1-2)"
+        );
+        assert!(has_semantic_hits(&hit));
+        for miss in [
+            "ERR: index building, retry shortly",
+            "Semantic search (Hybrid): \"q\" (0 results)\nNo results found.",
+        ] {
+            assert!(!has_semantic_hits(&serde_json::json!(miss)));
+        }
+    }
 
     #[test]
     fn code_search_args_are_semantic_by_default_and_text_as_fallback() {
