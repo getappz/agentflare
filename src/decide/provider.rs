@@ -104,12 +104,16 @@ impl Config {
         })
     }
 
+    pub(crate) fn model(&self) -> String {
+        self.model_override
+            .clone()
+            .unwrap_or_else(|| match self.provider {
+                Provider::OpenRouter { .. } => OPENROUTER_MODEL.into(),
+                Provider::Cloudflare { .. } => CLOUDFLARE_MODEL.into(),
+            })
+    }
+
     pub fn request(&self, state: &Value, questions: &BTreeMap<String, Question>) -> HttpRequest {
-        let model = |default: &str| {
-            self.model_override
-                .clone()
-                .unwrap_or_else(|| default.to_string())
-        };
         match &self.provider {
             Provider::OpenRouter { key } => HttpRequest {
                 url: self
@@ -118,7 +122,7 @@ impl Config {
                     .unwrap_or_else(|| OPENROUTER_URL.to_string()),
                 headers: vec![("Authorization", format!("Bearer {key}"))],
                 body: json!({
-                    "model": model(OPENROUTER_MODEL),
+                    "model": self.model(),
                     "state": state,
                     "questions": questions,
                 }),
@@ -138,7 +142,7 @@ impl Config {
                     }),
                     headers,
                     body: json!({
-                        "model": model(CLOUDFLARE_MODEL),
+                        "model": self.model(),
                         "input": { "state": state, "questions": questions },
                     }),
                 }

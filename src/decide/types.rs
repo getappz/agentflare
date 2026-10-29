@@ -56,7 +56,7 @@ impl Question {
 /// One typed answer. `confidence` is optional on the wire (providers differ,
 /// and noul has none): a missing confidence means "not confident enough to
 /// act", never zero.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Answer {
     Choice {
@@ -99,7 +99,7 @@ impl Answer {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
     #[serde(default)]
     pub input_tokens: u64,
