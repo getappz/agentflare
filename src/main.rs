@@ -111,4 +111,5 @@ fn main() {
         Some(command) => command.run(),
         None => crate::about::run(crate::about::AboutArgs {}),
     }
+    let _ = decide::flush(std::time::Duration::from_millis(1));
 }

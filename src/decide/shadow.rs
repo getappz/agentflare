@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -14,6 +15,10 @@ const MAX_BYTES: u64 = 5 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Row {
+    #[serde(default)]
+    pub decision_id: Option<String>,
+    #[serde(flatten)]
+    pub details: super::tracking::Details,
     pub ts: i64,
     pub site: String,
     pub input_sha: String,
@@ -35,11 +40,16 @@ pub struct Row {
 impl Row {
     fn base(site: &str, input: &str, baseline: &str) -> Self {
         Self {
+            decision_id: Some(super::tracking::decision_id()),
+            details: super::tracking::Details {
+                schema: 1,
+                ..Default::default()
+            },
             ts: chrono::Utc::now().timestamp(),
             site: site.to_string(),
             input_sha: hex::encode(&Sha256::digest(input.as_bytes())[..6]),
             input_len: input.len(),
-            baseline: baseline.to_string(),
+            baseline: crate::mcp_server::secret_scan::redact(baseline),
             jev: None,
             confidence: None,
             latency_ms: None,
@@ -58,7 +68,7 @@ impl Row {
         cost: Option<f64>,
     ) -> Self {
         Self {
-            jev: Some(jev.to_string()),
+            jev: Some(crate::mcp_server::secret_scan::redact(jev)),
             confidence,
             latency_ms: Some(latency_ms),
             cost,
@@ -67,8 +77,27 @@ impl Row {
     }
 
     pub fn failed(site: &str, input: &str, baseline: &str, error: &str) -> Self {
+        let status = if error.contains("402") {
+            "402"
+        } else if error.to_ascii_lowercase().contains("tim") {
+            "timeout"
+        } else if error.contains("circuit breaker") {
+            "breaker-open"
+        } else {
+            "fail-open"
+        };
         Self {
-            error: Some(error.chars().take(80).collect()),
+            details: super::tracking::Details {
+                schema: 1,
+                status: Some(status.into()),
+                ..Default::default()
+            },
+            error: Some(
+                crate::mcp_server::secret_scan::redact(error)
+                    .chars()
+                    .take(80)
+                    .collect(),
+            ),
             ..Self::base(site, input, baseline)
         }
     }
@@ -82,34 +111,16 @@ pub fn log_path() -> PathBuf {
 
 /// Best-effort append to the default log; errors are deliberately ignored.
 pub fn record(row: &Row) {
-    let _ = append(&log_path(), row);
+    super::storage::record(row.clone());
 }
 
 fn append(path: &Path, row: &Row) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    if std::fs::metadata(path).is_ok_and(|m| m.len() > MAX_BYTES) {
-        let old = path.with_extension("jsonl.1");
-        let _ = std::fs::remove_file(&old); // rename won't overwrite on Windows
-        std::fs::rename(path, old)?;
-    }
-    let mut line = serde_json::to_string(row).map_err(std::io::Error::other)?;
-    line.push('\n');
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?
-        .write_all(line.as_bytes())
+    super::storage::append(path, row, MAX_BYTES)
 }
 
 /// Read every parseable row; a missing file or a damaged line is skipped.
 pub fn load(path: &Path) -> Vec<Row> {
-    std::fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect()
+    super::storage::load(path)
 }
 
 #[derive(Debug, Default, PartialEq)]

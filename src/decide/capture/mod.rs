@@ -5,14 +5,14 @@
 //! user prompt text; it stays on this machine, is size-capped, and is removed
 //! with `agentflare decide dataset clear`. Writing is best-effort.
 mod features;
-mod norm;
+pub(crate) mod norm;
 mod stats;
 #[cfg(test)]
 mod tests;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub use features::{judge_features, rerank_features, router_features};
@@ -24,6 +24,12 @@ pub const SCHEMA: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Row {
+    #[serde(default)]
+    pub decision_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<Value>,
     pub schema: u32,
     pub ts: i64,
     pub site: String,
@@ -70,6 +76,9 @@ fn rotated(path: &Path) -> PathBuf {
 
 pub fn build_row(i: Input<'_>) -> Row {
     Row {
+        decision_id: None,
+        question: None,
+        answer: None,
         schema: SCHEMA,
         ts: chrono::Utc::now().timestamp(),
         site: i.site.to_string(),
@@ -85,11 +94,16 @@ pub fn build_row(i: Input<'_>) -> Row {
 /// No-op unless opted in; errors are deliberately ignored.
 pub fn record(i: Input<'_>) {
     if enabled() {
-        let _ = append(&dataset_path(), &build_row(i), MAX_BYTES);
+        super::storage::capture(build_row(i));
     }
 }
 
-pub(crate) fn append(path: &Path, row: &Row, max_bytes: u64) -> std::io::Result<()> {
+pub(crate) fn append(path: &Path, row: &impl Serialize, max_bytes: u64) -> std::io::Result<()> {
+    let mut line = serde_json::to_string(row).map_err(std::io::Error::other)?;
+    line.push('\n');
+    if line.len() > 64 * 1024 {
+        return Err(std::io::Error::other("decision record exceeds 64 KiB"));
+    }
     if let Some(parent) = path.parent() {
         let mut b = std::fs::DirBuilder::new();
         b.recursive(true);
@@ -98,17 +112,30 @@ pub(crate) fn append(path: &Path, row: &Row, max_bytes: u64) -> std::io::Result<
         b.create(parent)?;
         restrict(parent, path)?;
     }
-    if std::fs::metadata(path).is_ok_and(|m| m.len() > max_bytes) {
-        // rename replaces the target; a lost race or locked file must not drop the row.
-        let _ = std::fs::rename(path, rotated(path));
-    }
-    let mut line = serde_json::to_string(row).map_err(std::io::Error::other)?;
-    line.push('\n');
     let mut opts = std::fs::OpenOptions::new();
-    opts.create(true).append(true);
+    opts.create(true).write(true).read(true).truncate(false);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
-    opts.open(path)?.write_all(line.as_bytes())
+    let mut file = opts.open(path)?;
+    // Never wait for another process; contention is counted as a dropped write.
+    fs2::FileExt::try_lock_exclusive(&file)?;
+    if file.metadata()?.len() + line.len() as u64 > max_bytes {
+        // Windows permits neither replacing nor renaming an open locked file.
+        // Keep the lock inode stable: copy the bounded old bytes, then truncate.
+        file.seek(SeekFrom::Start(0))?;
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut file)
+            .take(max_bytes)
+            .read_to_end(&mut bytes)?;
+        let mut backup = std::fs::OpenOptions::new();
+        backup.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut backup, 0o600);
+        backup.open(rotated(path))?.write_all(&bytes)?;
+        file.set_len(0)?;
+    }
+    file.seek(SeekFrom::End(0))?;
+    file.write_all(line.as_bytes())
 }
 
 /// Unix: dir 0o700, any pre-existing dataset/rotated file 0o600. Errors
