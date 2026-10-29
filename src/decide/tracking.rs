@@ -271,7 +271,8 @@ pub fn ask_with(
             )
         }
         Err(error) => {
-            let mut row = shadow::Row::failed(site, &input, baseline, status(error));
+            // Keep the cause (redacted and capped by `failed`); the status label is set below.
+            let mut row = shadow::Row::failed(site, &input, baseline, &error.to_string());
             row.details.status = Some(status(error).into());
             row.latency_ms = Some(start.elapsed().as_millis() as u64);
             failure(
