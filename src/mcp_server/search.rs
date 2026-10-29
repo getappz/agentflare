@@ -855,10 +855,25 @@ fn code_search_args(q: &str, root: &str, limit: usize, semantic: bool) -> serde_
     }
 }
 
-/// A semantic `ctx_search` reply carries one `--- Result N` block per hit;
-/// without any it was an error, an index-building notice or zero hits.
+/// A semantic `ctx_search` reply has one `--- Result N` block per hit, or in
+/// compact mode a header reporting `(N results from ...)`; with neither it was
+/// an error, an index-building notice or zero hits.
 fn has_semantic_hits(reply: &serde_json::Value) -> bool {
-    reply.to_string().contains("--- Result ")
+    let text = reply.to_string();
+    let header_count = text.find(" results from ").map(|i| {
+        let digits: String = text[..i]
+            .chars()
+            .rev()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits
+            .chars()
+            .rev()
+            .collect::<String>()
+            .parse::<u32>()
+            .unwrap_or(0)
+    });
+    text.contains("--- Result ") || header_count.is_some_and(|n| n > 0)
 }
 
 #[cfg(test)]
@@ -871,9 +886,13 @@ mod helper_tests {
             "Semantic search (Hybrid): \"q\" (1 results)\n\n--- Result 1 (rrf: 0.1) ---\nsrc/a.rs :: f [Function] (L1-2)"
         );
         assert!(has_semantic_hits(&hit));
+        let compact = serde_json::json!(
+            "Semantic search (Hybrid): \"q\" (2 results from 900 indexed chunks in /r)\n12|fn a\n40|fn b"
+        );
+        assert!(has_semantic_hits(&compact));
         for miss in [
             "ERR: index building, retry shortly",
-            "Semantic search (Hybrid): \"q\" (0 results)\nNo results found.",
+            "Semantic search (Hybrid): \"q\" (0 results from 900 indexed chunks in /r)\nNo results found.",
         ] {
             assert!(!has_semantic_hits(&serde_json::json!(miss)));
         }
