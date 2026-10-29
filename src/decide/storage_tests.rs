@@ -37,6 +37,7 @@ fn ledger_enqueue_p95_and_growth_per_thousand() {
             None,
             &|row| w.enqueue(Work::Decision(Box::new(row.clone()))),
         );
+        assert!(w.receipt(Duration::from_secs(1)));
         micros.push(start.elapsed().as_micros());
         if i % 16 == 15 {
             assert!(w.flush(Duration::from_secs(5)));
@@ -45,9 +46,9 @@ fn ledger_enqueue_p95_and_growth_per_thousand() {
     assert!(w.flush(Duration::from_secs(5)));
     micros.sort_unstable();
     assert_eq!(shadow::load(&path).len(), 1000);
-    assert_eq!(w.dropped.load(Ordering::Relaxed), 0);
+    assert_eq!(w.pending_drops(), 0);
     eprintln!(
-        "ledger record p95={} us; bytes/1k={}",
+        "ledger record + receipt p95={} us; bytes/1k={}",
         micros[949],
         bytes(&path)
     );
@@ -64,11 +65,11 @@ fn failed_writes_are_counted_and_reported_after_recovery() {
     let w = Writer::new(path.clone(), parent.join("dataset.jsonl")).unwrap();
     w.enqueue(Work::Decision(Box::new(row())));
     assert!(w.flush(Duration::from_secs(5)));
-    assert_eq!(w.dropped.load(Ordering::Relaxed), 1);
+    assert_eq!(w.pending_drops(), 1);
     std::fs::remove_file(&parent).unwrap();
     w.enqueue(Work::Decision(Box::new(row())));
     assert!(w.flush(Duration::from_secs(5)));
-    assert_eq!(w.dropped.load(Ordering::Relaxed), 0);
+    assert_eq!(w.pending_drops(), 0);
     let report = super::super::report::load(&path, &parent.join("dataset.jsonl"), None);
     assert_eq!(report.dropped_writes, 1);
     assert_eq!(report.all.decisions, 1);
@@ -98,15 +99,101 @@ fn contention_and_rotation_never_wait_or_exceed_two_caps() {
 }
 
 #[test]
-fn saturated_queue_drops_without_waiting() {
-    let (tx, _rx) = mpsc::sync_channel(1);
-    let w = Writer {
-        tx,
-        dropped: Arc::new(AtomicU64::new(0)),
+fn backpressure_and_partial_frames_are_accounted_after_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shadow.jsonl");
+    let w = Writer::constrained(path.clone(), dir.path().join("dataset.jsonl"), 20).unwrap();
+    for _ in 0..100 {
+        let mut row = row();
+        row.jev = Some("a".repeat(50_000));
+        let start = Instant::now();
+        w.enqueue(Work::Decision(Box::new(row)));
+        assert!(start.elapsed() < Duration::from_millis(100));
+    }
+    w.shutdown();
+    drop(w);
+    let report = super::super::report::load(&path, &dir.path().join("dataset.jsonl"), None);
+    assert!(report.dropped_writes > 0);
+    assert_eq!(report.all.decisions as u64 + report.dropped_writes, 100);
+}
+
+#[test]
+#[ignore = "subprocess entrypoint"]
+fn writer_child() {
+    if let Ok(args) = std::env::var("AGENTFLARE_TEST_WRITER") {
+        let (address, token) = args.split_once(' ').unwrap();
+        super::super::writer_process::run(address, token).unwrap();
+    }
+}
+
+#[test]
+#[ignore = "subprocess entrypoint"]
+fn short_lived_parent() {
+    let Ok(root) = std::env::var("AGENTFLARE_TEST_WRITER_PARENT") else {
+        return;
     };
-    w.enqueue(Work::Decision(Box::new(row())));
+    let root = PathBuf::from(root);
+    let w = Writer::delayed(root.join("shadow.jsonl"), root.join("dataset.jsonl"), 80).unwrap();
+    for _ in 0..8 {
+        let row = row();
+        let mut capture = super::super::capture::build_row(super::super::capture::Input {
+            site: "bench",
+            features: serde_json::json!({}),
+            norm_input: "state",
+            label: serde_json::json!({"summary":"b"}),
+            confidence: Some(0.9),
+            baseline: "a",
+            source_model: None,
+        });
+        capture.decision_id = row.decision_id.clone();
+        w.enqueue(Work::Decision(Box::new(row)));
+        w.enqueue(Work::Capture(Box::new(capture)));
+    }
+    assert!(!w.flush(Duration::from_millis(1)));
     let start = Instant::now();
-    w.enqueue(Work::Decision(Box::new(row())));
-    assert!(start.elapsed() < Duration::from_millis(100));
-    assert_eq!(w.dropped.load(Ordering::Relaxed), 1);
+    w.shutdown();
+    assert!(start.elapsed() < Duration::from_millis(50));
+    std::process::exit(0);
+}
+
+#[test]
+fn normal_process_exit_preserves_delayed_decisions_and_capture_joins() {
+    let dir = tempfile::tempdir().unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "decide::storage::tests::short_lived_parent",
+            "--ignored",
+        ])
+        .env("AGENTFLARE_TEST_WRITER_PARENT", dir.path())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let path = dir.path().join("shadow.jsonl");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let events: Vec<serde_json::Value> = load(&path);
+        if events
+            .iter()
+            .any(|e| e["record_type"] == "test_writer_closed")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "helper did not finish accepted records after caller exit"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let rows = shadow::load(&path);
+    let captured = super::super::capture::load(&dir.path().join("dataset.jsonl"));
+    assert_eq!(rows.len(), 8);
+    assert_eq!(captured.len(), 8);
+    assert!(
+        captured
+            .iter()
+            .all(|c| rows.iter().any(|r| r.decision_id == c.decision_id))
+    );
+    let report = super::super::report::load(&path, &dir.path().join("dataset.jsonl"), None);
+    assert_eq!(report.dropped_writes, 0);
 }

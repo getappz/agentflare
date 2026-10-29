@@ -44,17 +44,31 @@ and metadata. It contains no state or instruction text. Reports include both
 retained segments. `decide clear` deletes decisions, outcomes, drops, and capture;
 `decide dataset clear` retains its existing capture-only scope.
 
-Hook writes use a bounded 256-entry queue and never wait for file locks or disk.
-The writer uses nonblocking cross-process locks and the existing two-segment
+Hook writes use nonblocking, authenticated loopback IPC to a local helper
+process, prepared before the backend request. A reader independent of disk owns
+received frames and queues at most 256 for writing. Shutdown confirms receipt
+with a bounded (20 ms maximum) IPC handshake, then closes IPC without waiting
+for disk. Socket buffers, that queue, and one partial frame bound memory.
+A separate control
+stream reports sender drops even when the record stream is full; unfinished
+record frames are counted by the helper at EOF. Barrier acknowledgements have
+their own stream so a timed-out reader cannot reset pending record delivery.
+The helper uses nonblocking cross-process file locks and the existing two-segment
 rotation (5 MiB ledger, 10 MiB capture per segment; 64 KiB per record maximum).
-Queue saturation and write failures are counted and persisted in the ledger
-when storage recovers. Callers can `decide::flush` before exit; the CLI allows
-1 ms at shutdown so logging cannot hold up a hook. Abrupt process termination
-can lose queued rows and unpersisted drop counts: this is a best-effort local
-ledger, not a durable transaction log. Failed requests with no provider response
-have unknown model version and billing rather than invented usage.
+Backpressure and write failures are counted and persisted in the ledger when
+storage recovers. Consumers needing a read-after-write barrier can explicitly
+call `decide::flush`; normal exit uses `decide::shutdown` instead. A crashed or
+forcibly killed helper, failed IPC startup, or permanently unwritable storage
+can still lose records: this is a best-effort local ledger, not a transaction log.
+
+Every configured request retains `requested_model` on the calling thread until
+its consumer records the decision. `reported_model` is the provider's optional
+response model; `source_model` uses that when present, otherwise the requested
+model, including timeout/402/breaker/fail-open paths. Configuration failures
+before a model is selected remain unknown. Billing is never invented on failures.
 
 `storage_tests::ledger_enqueue_p95_and_growth_per_thousand` measures the full
-recording helper (including ID/hash, sanitization, and enqueue) and bytes for
+recording helper after startup (including ID/hash, sanitization, enqueue and
+the helper's receipt acknowledgement) and bytes for
 1,000 representative decisions. It asserts p95 < 2 ms and < 1 MB/1k without
 captured inputs. Rotation bounds disk growth even when capture is enabled.

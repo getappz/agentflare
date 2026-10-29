@@ -19,6 +19,9 @@ pub mod capture;
 mod client;
 #[cfg(test)]
 mod ledger_tests;
+mod model_identity;
+#[cfg(test)]
+mod model_identity_tests;
 pub mod model_routing;
 mod provider;
 pub mod report;
@@ -26,9 +29,12 @@ pub mod shadow;
 mod storage;
 pub mod tracking;
 mod types;
+mod writer_process;
 
 pub use budget::{Budget, Limits};
 pub use client::{Batch, Outcome, Source, ask, ask_with, ask_within, credential_sources};
 pub use provider::{Config, DecideError};
 pub use storage::flush;
+pub use storage::shutdown;
 pub use types::{Answer, Question, Response, Usage};
+pub use writer_process::worker_entrypoint;

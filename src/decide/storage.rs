@@ -1,11 +1,11 @@
-//! Bounded best-effort writer: hooks only try_send, never wait for disk or a lock.
+//! Best-effort local writer; accepted IPC bytes outlive the caller process.
+use super::writer_process::Writer;
 use super::{capture, shadow};
 use serde::{Serialize, de::DeserializeOwned};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, OnceLock,
+    OnceLock,
     atomic::{AtomicU64, Ordering},
-    mpsc,
 };
 use std::time::Duration;
 
@@ -13,75 +13,15 @@ pub const LEDGER_CAP: u64 = 5 * 1024 * 1024;
 static WRITER: OnceLock<Option<Writer>> = OnceLock::new();
 static START_FAILURES: AtomicU64 = AtomicU64::new(0);
 
-enum Work {
+pub(super) enum Work {
     Decision(Box<shadow::Row>),
     Capture(Box<capture::Row>),
-    Flush(mpsc::SyncSender<()>),
-}
-
-struct Writer {
-    tx: mpsc::SyncSender<Work>,
-    dropped: Arc<AtomicU64>,
-}
-
-impl Writer {
-    fn new(ledger: PathBuf, dataset: PathBuf) -> std::io::Result<Self> {
-        let (tx, rx) = mpsc::sync_channel(256);
-        let dropped = Arc::new(AtomicU64::new(0));
-        let pending = dropped.clone();
-        std::thread::Builder::new()
-            .name("decide-ledger".into())
-            .spawn(move || {
-                for work in rx {
-                    let result = match work {
-                        Work::Decision(row) => append(&ledger, &*row, LEDGER_CAP),
-                        Work::Capture(row) => append(&dataset, &*row, 10 * 1024 * 1024),
-                        Work::Flush(ack) => {
-                            persist_drops(&ledger, &pending);
-                            let _ = ack.try_send(());
-                            continue;
-                        }
-                    };
-                    if result.is_err() {
-                        pending.fetch_add(1, Ordering::Relaxed);
-                    }
-                    persist_drops(&ledger, &pending);
-                }
-                persist_drops(&ledger, &pending);
-            })?;
-        Ok(Self { tx, dropped })
-    }
-
-    fn enqueue(&self, work: Work) {
-        if self.tx.try_send(work).is_err() {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    fn flush(&self, timeout: Duration) -> bool {
-        let (ack, rx) = mpsc::sync_channel(1);
-        self.tx.try_send(Work::Flush(ack)).is_ok() && rx.recv_timeout(timeout).is_ok()
-    }
 }
 
 fn writer() -> Option<&'static Writer> {
     WRITER
         .get_or_init(|| Writer::new(shadow::log_path(), capture::dataset_path()).ok())
         .as_ref()
-}
-
-fn persist_drops(path: &Path, dropped: &AtomicU64) {
-    let count = dropped.swap(0, Ordering::Relaxed);
-    if count > 0
-        && append(
-            path,
-            &serde_json::json!({"record_type":"dropped", "count":count}),
-            LEDGER_CAP,
-        )
-        .is_err()
-    {
-        dropped.fetch_add(count, Ordering::Relaxed);
-    }
 }
 
 fn enqueue(work: Work) {
@@ -106,16 +46,22 @@ pub fn pending_drops() -> u64 {
         + WRITER
             .get()
             .and_then(Option::as_ref)
-            .map_or(0, |w| w.dropped.load(Ordering::Relaxed))
+            .map_or(0, Writer::pending_drops)
 }
 
-/// No worker is created with all flags off. Hooks get at most 1 ms at shutdown;
-/// callers outside hooks may explicitly flush longer before reporting/exiting.
+/// Explicit read-after-write barrier for consumers, never used for hook exit.
 pub fn flush(timeout: Duration) -> bool {
     WRITER
         .get()
         .and_then(Option::as_ref)
         .is_none_or(|w| w.flush(timeout))
+}
+
+/// Closing IPC hands EOF to the helper; no disk wait on the hook's exit path.
+pub fn shutdown() {
+    if let Some(w) = WRITER.get().and_then(Option::as_ref) {
+        w.shutdown();
+    }
 }
 
 pub(crate) fn append(path: &Path, value: &impl Serialize, cap: u64) -> std::io::Result<()> {

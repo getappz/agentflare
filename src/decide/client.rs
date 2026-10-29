@@ -192,6 +192,7 @@ fn ask_configured(
     questions: &BTreeMap<String, Question>,
     cap: Option<std::time::Duration>,
 ) -> Result<Outcome, DecideError> {
+    super::model_identity::begin(None);
     let mut cfg = Config::from_lookup(get)?;
     if let Some(cap) = cap {
         cfg.timeout = cfg.timeout.min(cap);
@@ -204,6 +205,7 @@ pub fn ask_with(
     state: &Value,
     questions: &BTreeMap<String, Question>,
 ) -> Result<Outcome, DecideError> {
+    super::model_identity::begin(Some(cfg.model()));
     super::storage::prepare();
     let path = breaker_path();
     if !breaker::allow(&path, breaker::current_time(), cfg.timeout) {

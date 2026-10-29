@@ -14,6 +14,10 @@ pub struct Details {
     #[serde(default)]
     pub source_model: Option<String>,
     #[serde(default)]
+    pub requested_model: Option<String>,
+    #[serde(default)]
+    pub reported_model: Option<String>,
+    #[serde(default)]
     pub applied: bool,
     #[serde(default)]
     pub status: Option<String>,
@@ -103,7 +107,13 @@ pub fn finish(
     record: &dyn Fn(&shadow::Row),
 ) -> String {
     row.details.schema = schema();
-    row.details.source_model = context.source_model.map(str::to_string);
+    row.details.requested_model = super::model_identity::requested();
+    row.details.reported_model = context.source_model.map(str::to_string);
+    row.details.source_model = row
+        .details
+        .reported_model
+        .clone()
+        .or_else(|| row.details.requested_model.clone());
     row.details.applied = context.applied;
     if row.details.status.is_none() {
         row.details.status = Some(
@@ -148,6 +158,7 @@ pub(crate) fn captured(
     answers: &BTreeMap<String, Answer>,
 ) -> capture::Row {
     let mut row = capture::build_row(input);
+    row.source_model = row.source_model.or_else(super::model_identity::requested);
     row.decision_id = Some(id.into());
     row.question = Some(capture::norm::sanitize_features(json!(questions)));
     row.answer = Some(capture::norm::sanitize_features(json!(answers)));
@@ -202,6 +213,7 @@ pub fn ask_with(
     questions: &BTreeMap<String, Question>,
     ask: impl FnOnce() -> Result<Outcome, DecideError>,
 ) -> Tracked {
+    super::model_identity::begin(None);
     let start = Instant::now();
     let result = ask();
     if matches!(result, Err(DecideError::Disabled)) {

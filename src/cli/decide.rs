@@ -178,7 +178,7 @@ fn ping() {
         }
         Err(e) => {
             eprintln!("{e}");
-            let _ = decide::flush(std::time::Duration::from_millis(1));
+            decide::shutdown();
             std::process::exit(1);
         }
     }
