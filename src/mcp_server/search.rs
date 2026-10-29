@@ -317,13 +317,30 @@ impl AgentflareMcp {
         let limit = req.limit.unwrap_or(50);
         let root = Self::repo_root();
 
-        let args = serde_json::json!({
-            "pattern": q,
-            "path": root.to_string_lossy(),
-            "max_results": limit,
-        });
+        let root = root.to_string_lossy();
 
-        match self.gateway_execute("leanctx", "ctx_search", args).await {
+        // Semantic first so a sentence finds code by meaning; the exact-text
+        // form is the fallback when lean-ctx can't serve a semantic search.
+        let found = match self
+            .gateway_execute(
+                "leanctx",
+                "ctx_search",
+                code_search_args(q, &root, limit, true),
+            )
+            .await
+        {
+            Ok(val) => Ok(val),
+            Err(_) => {
+                self.gateway_execute(
+                    "leanctx",
+                    "ctx_search",
+                    code_search_args(q, &root, limit, false),
+                )
+                .await
+            }
+        };
+
+        match found {
             Ok(val) => Ok(serde_json::json!({"source": "code", "query": q, "results": val}).to_string()),
             Err(e) => Ok(serde_json::json!({"source": "code", "query": q, "error": format!("leanctx ctx_search failed: {e}"), "results": []}).to_string()),
         }
@@ -817,9 +834,39 @@ fn extract_youtube_id(input: &str) -> Option<&str> {
     None
 }
 
+/// `ctx_search` arguments for a `type=code` query. `semantic` ranks by meaning
+/// (hybrid BM25 + dense); otherwise `q` is an exact-text `pattern`.
+fn code_search_args(q: &str, root: &str, limit: usize, semantic: bool) -> serde_json::Value {
+    if semantic {
+        serde_json::json!({
+            "action": "semantic",
+            "query": q,
+            "mode": "hybrid",
+            "top_k": limit,
+            "path": root,
+        })
+    } else {
+        serde_json::json!({"pattern": q, "path": root, "max_results": limit})
+    }
+}
+
 #[cfg(test)]
 mod helper_tests {
     use super::*;
+
+    #[test]
+    fn code_search_args_are_semantic_by_default_and_text_as_fallback() {
+        let sem = code_search_args("where is auth handled", "/r", 7, true);
+        assert_eq!(sem["action"], "semantic");
+        assert_eq!(sem["query"], "where is auth handled");
+        assert_eq!(sem["top_k"], 7);
+        assert!(sem.get("pattern").is_none());
+
+        let text = code_search_args("fn auth", "/r", 7, false);
+        assert_eq!(text["pattern"], "fn auth");
+        assert_eq!(text["max_results"], 7);
+        assert!(text.get("action").is_none());
+    }
 
     #[test]
     fn urlencoding_percent_encodes_reserved_bytes() {
