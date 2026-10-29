@@ -128,42 +128,54 @@ fn run_forever(config: BridgeConfig) {
     // one daemon now polls several independently.
     let mut last_soft: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut had_targets = true; // forces the "nothing registered" message on the first empty tick
+    // Handles are opened once and kept across ticks; a failure to (re)acquire
+    // one backs off exponentially (interval -> 16x interval) instead of
+    // hammering every interval, and resets on success.
+    let mut conn: Option<rusqlite::Connection> = None;
+    let mut client: Option<crate::github::Client> = None;
+    let mut failures: u32 = 0;
     let mut last_db_err: Option<String> = None;
     let mut logged_no_client = false;
+    let backoff = |failures: u32| interval * 2u32.pow(failures.min(4));
 
     loop {
-        let conn = match open_items_db() {
-            Ok(c) => {
-                last_db_err = None;
-                c
-            }
-            Err(e) => {
-                // Log on change, not once: a lock error followed by a
-                // schema-ahead error needs its rebuild instructions shown.
-                if last_db_err.as_deref() != Some(e.as_str()) {
-                    eprintln!("github bridge: {e}; waiting for it to become available...");
-                    last_db_err = Some(e);
+        if conn.is_none() {
+            match open_items_db() {
+                Ok(c) => {
+                    last_db_err = None;
+                    conn = Some(c);
                 }
-                std::thread::sleep(interval);
-                continue;
-            }
-        };
-
-        let client = match crate::github::Client::new() {
-            Ok(c) => {
-                logged_no_client = false;
-                c
-            }
-            Err(e) => {
-                if !logged_no_client {
-                    eprintln!("github bridge: waiting for usable credential ({e})...");
-                    logged_no_client = true;
+                Err(e) => {
+                    // Log on change, not once: a lock error followed by a
+                    // schema-ahead error needs its rebuild instructions shown.
+                    if last_db_err.as_deref() != Some(e.as_str()) {
+                        eprintln!("github bridge: {e}; waiting for it to become available...");
+                        last_db_err = Some(e);
+                    }
                 }
-                std::thread::sleep(interval);
-                continue;
             }
+        }
+        if conn.is_some() && client.is_none() {
+            match crate::github::Client::new() {
+                Ok(c) => {
+                    logged_no_client = false;
+                    client = Some(c);
+                }
+                Err(e) => {
+                    if !logged_no_client {
+                        eprintln!("github bridge: waiting for usable credential ({e})...");
+                        logged_no_client = true;
+                    }
+                }
+            }
+        }
+        let (Some(conn), Some(client)) = (conn.as_ref(), client.as_ref()) else {
+            std::thread::sleep(backoff(failures));
+            failures = failures.saturating_add(1);
+            continue;
         };
-        let targets = bridge_targets(&conn);
+        failures = 0;
+        let targets = bridge_targets(conn);
         if targets.is_empty() {
             if had_targets {
                 eprintln!(
@@ -205,7 +217,7 @@ fn run_forever(config: BridgeConfig) {
             };
             let now = crate::claims::now();
             let repo_key = ctx.repo.to_string();
-            match run_once(&ctx, &conn, now) {
+            match run_once(&ctx, conn, now) {
                 Ok(report) => {
                     if !report.claimed.is_empty() || !report.ceded.is_empty() {
                         eprintln!(

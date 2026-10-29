@@ -58,7 +58,6 @@ fn is_transient_lock_error(err: &Error) -> bool {
             e.extended_code == 1546
                 || e.code == rusqlite::ErrorCode::DatabaseBusy
                 || e.code == rusqlite::ErrorCode::DatabaseLocked
-                || e.code == rusqlite::ErrorCode::CannotOpen
                 || e.code == rusqlite::ErrorCode::SystemIoFailure
         }
         Error::Migration(rusqlite_migration::Error::RusqliteError {
@@ -180,6 +179,41 @@ mod tests {
             .unwrap();
         assert_eq!(auto_vacuum, 2, "expected INCREMENTAL");
         assert_eq!(synchronous, 1, "expected NORMAL");
+    }
+
+    fn sqlite_failure(code: i32) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None)
+    }
+
+    #[test]
+    fn lock_errors_are_transient_and_others_are_not() {
+        for code in [
+            1546,
+            rusqlite::ffi::SQLITE_BUSY,
+            rusqlite::ffi::SQLITE_LOCKED,
+        ] {
+            assert!(
+                is_transient_lock_error(&Error::Sqlite(sqlite_failure(code))),
+                "{code}"
+            );
+        }
+        for code in [
+            rusqlite::ffi::SQLITE_CANTOPEN,
+            rusqlite::ffi::SQLITE_READONLY,
+        ] {
+            assert!(
+                !is_transient_lock_error(&Error::Sqlite(sqlite_failure(code))),
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_parent_fails_fast_without_retrying() {
+        let start = std::time::Instant::now();
+        let err = open_file(Path::new("/proc/nope/t.db"), &migrations());
+        assert!(err.is_err());
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]
