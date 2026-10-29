@@ -15,11 +15,13 @@ pub struct Metrics {
     pub failed: usize,
     pub failure_rate: Option<f64>,
     pub answered: usize,
+    pub compared: usize,
     pub agreements: usize,
     pub applied: usize,
     pub labeled: usize,
     pub jev_right: usize,
     pub baseline_right: usize,
+    pub baseline_labeled: usize,
     pub overrides: usize,
     pub override_rate: Option<f64>,
     pub agreement_rate: Option<f64>,
@@ -70,6 +72,13 @@ pub struct Report {
     pub orphan_outcomes: usize,
 }
 
+fn has_baseline(row: &shadow::Row) -> bool {
+    !matches!(
+        (row.site.as_str(), row.baseline.as_str()),
+        ("model_routing", "native-default") | ("review_triage", "unjudged") | ("ping", "none")
+    )
+}
+
 pub fn replay(rows: &[shadow::Row], outcomes: &[GroundTruth], site: Option<&str>) -> Report {
     let latest: BTreeMap<_, _> = outcomes
         .iter()
@@ -110,7 +119,7 @@ pub fn replay(rows: &[shadow::Row], outcomes: &[GroundTruth], site: Option<&str>
         if let Some(jev) = r
             .jev
             .as_ref()
-            .filter(|j| r.error.is_none() && !equivalent(j, &r.baseline))
+            .filter(|j| r.error.is_none() && has_baseline(r) && !equivalent(j, &r.baseline))
         {
             let outcome = r.decision_id.as_deref().and_then(|id| latest.get(id));
             disagreements.push(Disagreement {
@@ -192,12 +201,18 @@ fn summarize(
             continue;
         };
         s.answered += 1;
-        s.agreements += usize::from(equivalent(jev, &r.baseline));
+        if has_baseline(r) {
+            s.compared += 1;
+            s.agreements += usize::from(equivalent(jev, &r.baseline));
+        }
         if let Some(o) = outcome {
             let right = equivalent(&o.answer, jev);
             s.labeled += 1;
             s.jev_right += usize::from(right);
-            s.baseline_right += usize::from(equivalent(&o.answer, &r.baseline));
+            if has_baseline(r) {
+                s.baseline_labeled += 1;
+                s.baseline_right += usize::from(equivalent(&o.answer, &r.baseline));
+            }
             if let Some(c) = r
                 .confidence
                 .filter(|c| c.is_finite() && (0.0..=1.0).contains(c))
@@ -226,7 +241,7 @@ fn summarize(
     s.p95_ms = latency
         .get((latency.len() * 95).div_ceil(100).saturating_sub(1))
         .copied();
-    s.agreement_rate = (s.answered > 0).then(|| s.agreements as f64 / s.answered as f64);
+    s.agreement_rate = (s.compared > 0).then(|| s.agreements as f64 / s.compared as f64);
     let attempted = s.decisions - s.breaker_open;
     s.failure_rate = (attempted > 0).then(|| s.failed as f64 / attempted as f64);
     s.override_rate = (attempted > 0).then(|| s.overrides as f64 / attempted as f64);
@@ -238,11 +253,46 @@ pub fn load(path: &Path, capture_path: &Path, site: Option<&str>) -> Report {
     let outcomes = storage::load(path);
     let mut report = replay(&rows, &outcomes, site);
     let events: Vec<serde_json::Value> = storage::load(path);
-    report.dropped_writes = events
+    let decisions: std::collections::BTreeSet<_> = rows
         .iter()
-        .filter(|v| v["record_type"] == "dropped")
-        .filter_map(|v| v["count"].as_u64())
-        .sum::<u64>()
+        .filter_map(|r| r.decision_id.as_deref())
+        .collect();
+    let captured: Vec<super::capture::Row> = storage::load(capture_path);
+    let captures: std::collections::BTreeSet<_> = captured
+        .iter()
+        .filter_map(|r| r.decision_id.as_deref())
+        .collect();
+    let (mut pending_decisions, mut pending_captures) = (
+        std::collections::BTreeSet::new(),
+        std::collections::BTreeSet::new(),
+    );
+    // A timed-out append can finish late; count each missing identified write once.
+    for event in events.iter().filter(|v| v["record_type"] == "dropped") {
+        let ids = |name: &str| -> Vec<String> {
+            event[name]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        };
+        let decision_ids = ids("decision_ids");
+        let capture_ids = ids("capture_ids");
+        report.dropped_writes += event["count"]
+            .as_u64()
+            .unwrap_or_default()
+            .saturating_sub((decision_ids.len() + capture_ids.len()) as u64);
+        pending_decisions.extend(decision_ids);
+        pending_captures.extend(capture_ids);
+    }
+    report.dropped_writes += pending_decisions
+        .iter()
+        .filter(|id| !decisions.contains(id.as_str()))
+        .count() as u64
+        + pending_captures
+            .iter()
+            .filter(|id| !captures.contains(id.as_str()))
+            .count() as u64
         + storage::pending_drops();
     report.ledger_bytes = storage::bytes(path);
     report.capture_bytes = storage::bytes(capture_path);
@@ -270,7 +320,7 @@ pub fn render(report: &Report) -> String {
             s.decisions - s.breaker_open,
             s.breaker_open
         ));
-        text.push_str(&format!("{name}: agreement {}/{}, labeled Jev right {}/{}, baseline right {}/{}, overrides {}/{}, applied {}, latency p50/p95 {:?}/{:?} ms, tokens {}/{}, cost ${:.6}\n", s.agreements, s.answered, s.jev_right, s.labeled, s.baseline_right, s.labeled, s.overrides, s.decisions - s.breaker_open, s.applied, s.median_ms, s.p95_ms, s.input_tokens, s.output_tokens, s.cost));
+        text.push_str(&format!("{name}: agreement {}/{}, labeled Jev right {}/{}, baseline right {}/{}, overrides {}/{}, applied {}, latency p50/p95 {:?}/{:?} ms, tokens {}/{}, cost ${:.6}\n", s.agreements, s.compared, s.jev_right, s.labeled, s.baseline_right, s.baseline_labeled, s.overrides, s.decisions - s.breaker_open, s.applied, s.median_ms, s.p95_ms, s.input_tokens, s.output_tokens, s.cost));
         for (bin, b) in &s.calibration {
             text.push_str(&format!(
                 "  confidence {bin}: mean {:.3}, accuracy {:.3} ({}/{})\n",
@@ -280,11 +330,11 @@ pub fn render(report: &Report) -> String {
     }
     for (site, models) in &report.models {
         for (model, s) in models {
-            text.push_str(&format!("model {site}/{model}: {} decisions, agreement {}/{}, right {}/{}, p95 {:?} ms, tokens {}/{}, cost ${:.6}\n", s.decisions, s.agreements, s.answered, s.jev_right, s.labeled, s.p95_ms, s.input_tokens, s.output_tokens, s.cost));
+            text.push_str(&format!("model {site}/{model}: {} decisions, agreement {}/{}, right {}/{}, p95 {:?} ms, tokens {}/{}, cost ${:.6}\n", s.decisions, s.agreements, s.compared, s.jev_right, s.labeled, s.p95_ms, s.input_tokens, s.output_tokens, s.cost));
         }
     }
     for (day, s) in &report.days {
-        text.push_str(&format!("day {day}: {} decisions, agreement {}/{}, right {}/{}, p95 {:?} ms, tokens {}/{}, cost ${:.6}\n", s.decisions, s.agreements, s.answered, s.jev_right, s.labeled, s.p95_ms, s.input_tokens, s.output_tokens, s.cost));
+        text.push_str(&format!("day {day}: {} decisions, agreement {}/{}, right {}/{}, p95 {:?} ms, tokens {}/{}, cost ${:.6}\n", s.decisions, s.agreements, s.compared, s.jev_right, s.labeled, s.p95_ms, s.input_tokens, s.output_tokens, s.cost));
     }
     for d in &report.disagreements {
         text.push_str(&format!("disagree {} {}: baseline={}, Jev={}, outcome={:?}, Jev right={:?}, baseline right={:?}\n", d.decision_id.as_deref().unwrap_or("legacy"), d.site, d.baseline, d.jev, d.outcome, d.jev_right, d.baseline_right));

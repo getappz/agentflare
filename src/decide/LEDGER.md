@@ -23,6 +23,10 @@ the typed answer rather than affecting agreement. Existing sites retain their
 labels (router target, skill ordering, judge action). Use that same domain for
 outcomes; `native-default`, `unjudged`, and ping's `none` explicitly denote the
 absence of a baseline model selection, review decision, or answer.
+Those three site-specific placeholders do not enter agreement or disagreement
+metrics. `compared` is the agreement denominator; `answered` still counts all
+answers. Outcomes still calibrate Jev without a baseline, while
+`baseline_labeled` counts only outcomes with an available baseline.
 
 Append ground truth later with `tracking::outcome_add`, or:
 
@@ -51,22 +55,35 @@ and metadata. It contains no state or instruction text. Reports include both
 retained segments. `decide clear` deletes decisions, outcomes, drops, and capture;
 `decide dataset clear` retains its existing capture-only scope.
 
-Hook writes use nonblocking, authenticated loopback IPC to a local helper
-process, prepared before the backend request. A reader independent of disk owns
-received frames and queues at most 256 for writing. Shutdown confirms receipt
-with a bounded (20 ms maximum) IPC handshake, then closes IPC without waiting
-for disk. Socket buffers, that queue, and one partial frame bound memory.
-A separate control
-stream reports sender drops even when the record stream is full; unfinished
-record frames are counted by the helper at EOF. Barrier acknowledgements have
-their own stream so a timed-out reader cannot reset pending record delivery.
-The helper uses nonblocking cross-process file locks and the existing two-segment
-rotation (5 MiB ledger, 10 MiB capture per segment; 64 KiB per record maximum).
-Backpressure and write failures are counted and persisted in the ledger when
-storage recovers. Consumers needing a read-after-write barrier can explicitly
-call `decide::flush`; normal exit uses `decide::shutdown` instead. A crashed or
-forcibly killed helper, failed IPC startup, or permanently unwritable storage
-can still lose records: this is a best-effort local ledger, not a transaction log.
+Normal writes use a bounded background thread: 256 queued records plus at most
+256 in its current batch, each limited to 64 KiB when encoded. File I/O never
+holds the queue bookkeeping lock. Batches reuse one nonblocking cross-process
+file lock and retain two-segment rotation (5 MiB ledger, 10 MiB capture per
+segment). Appends repair an interrupted trailing JSON fragment and preserve
+complete historical rows without a final newline.
+
+Normal return calls `decide::shutdown`; decision-producing direct exits use
+`decide::exit`. Both give the writer a 50 ms grace period. When work remains or
+drops need saving, a one-shot recovery process receives a bounded 30 KiB
+environment payload. The caller performs no filesystem I/O during shutdown and
+does not wait for recovery startup or disk completion; process creation and
+payload preparation are additional to the 50 ms grace period. Recovery is not
+started on the normal recording path. Its marker prevents writer re-entry.
+
+Recovery replays pending rows that fit its payload, deduplicating decision IDs
+under the file lock. It persists counts and IDs for all pending writes, including
+those too large to replay. A failed replay becomes a counted drop; ledger
+accounting is retried independently for up to five seconds, with a watchdog.
+Reports count only identified writes still missing from the retained decision
+and capture segments, so a late or recovered row is not also counted as dropped.
+Historical dropped records without ID lists retain their original count.
+Startup failures and queue backpressure are counted even without a live writer.
+
+Consumers needing a read-after-write barrier can call `decide::flush`; this
+explicit operation can perform synchronous drop-accounting I/O. Recovery after
+exit is eventually visible to other processes. Failed recovery spawning, forced
+termination, host restrictions on child lifetimes, or a ledger that remains
+unwritable can still lose data or accounting. This is a best-effort local ledger.
 
 Every configured request retains `requested_model` on the calling thread until
 its consumer records the decision. `reported_model` is the provider's optional
@@ -74,16 +91,25 @@ response model; `source_model` uses that when present, otherwise the requested
 model, including timeout/402/breaker/fail-open paths. Configuration failures
 before a model is selected remain unknown. Billing is never invented on failures.
 
-`storage_tests::ledger_enqueue_p95_and_growth_per_thousand` measures the full
-recording helper after startup (including ID/hash, sanitization, enqueue and
-the helper's receipt acknowledgement) and bytes for
-1,000 representative decisions. It asserts p95 < 2 ms and < 1 MB/1k without
-captured inputs. Rotation bounds disk growth even when capture is enabled.
+Benchmarks cover warm recording (ID/hash, sanitization and enqueue), cold writer
+construction plus first enqueue, and first recording in fresh processes. The
+first two assert p95 < 2 ms. Fresh-process envelope creation includes first-use
+hashing and redaction and is reported separately rather than hidden by warm-up.
+Storage asserts < 1 MB/1k without captured inputs; rotation bounds growth with
+capture enabled too.
 
-Measured on Windows x86_64, 2026-10-29, with
-`cargo test -p agentflare --bin agentflare decide:: -- --nocapture`:
-record + receipt p95 **467 us (0.467 ms)**; **445,984 bytes per 1,000 decisions**.
-The decision suite passed 102 tests, including the real-process exit test
-(8 decisions and 8 joined capture rows survived a timed-out flush). These are
-warm recording measurements; helper startup and end-to-end hook latency are
-not included.
+Measured on Windows x86_64, 2026-10-29, with unoptimized tests (root debuginfo
+disabled to fit local disk), using
+`cargo test -p agentflare --bin agentflare --config profile.test.package.agentflare.debug=0 decide:: -- --nocapture`:
+
+| Measurement | p50 | p95 |
+| --- | ---: | ---: |
+| Warm recording helper | — | 0.504 ms |
+| Cold writer construction + enqueue | 0.205 ms | 0.361 ms |
+| Fresh-process envelope creation + record | 24.857 ms | 50.093 ms |
+| Fresh-process shutdown | 3.594 ms | 15.198 ms |
+
+Storage was **445,984 bytes per 1,000 decisions**. All 113 focused tests passed,
+including real-process exit with 8 decisions and 8 joined capture rows,
+failed startup, in-flight file-lock delay, oversized recovery payloads,
+independently failed capture recovery, and interrupted JSON tails.

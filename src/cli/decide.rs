@@ -178,8 +178,7 @@ fn ping() {
         }
         Err(e) => {
             eprintln!("{e}");
-            decide::shutdown();
-            std::process::exit(1);
+            decide::exit(1);
         }
     }
 }

@@ -73,14 +73,14 @@ impl RunArgs {
                     "--print does not support {} yet (interactive `run` only) — drop it or omit --print",
                     conflicts.join(", ")
                 ));
-                std::process::exit(1);
+                crate::decide::exit(1);
             }
             let code = crate::agents::cli_run_headless(
                 &self.agent,
                 prompt,
                 std::time::Duration::from_secs(self.timeout),
             );
-            std::process::exit(code);
+            crate::decide::exit(code);
         }
         crate::agents::cli_run(
             &self.agent,

@@ -136,6 +136,21 @@ fn manual_outcomes_validate_id_and_clear_covers_both_segments() {
 }
 
 #[test]
+fn outcome_add_waits_for_a_row_another_writer_is_still_appending() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shadow.jsonl");
+    let row = Row::answered("s", "p", "a", "b", Some(1.0), 1, None);
+    let id = row.decision_id.clone().unwrap();
+    let late = path.clone();
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        storage::append(&late, &row, 1000).unwrap();
+    });
+    tracking::outcome_add(&path, &id, OutcomeKind::IncidentConfirmed, "neither").unwrap();
+    writer.join().unwrap();
+}
+
+#[test]
 fn batch_usage_is_allocated_once_including_integer_remainders() {
     use super::{Answer, Outcome, Response, Usage};
     use std::collections::BTreeMap;
@@ -406,4 +421,60 @@ fn report_excludes_unknown_outcomes_and_retains_model_and_failure_trends() {
     assert_eq!(r.all.statuses["402"], 1);
     assert_eq!(r.models["a"]["v2"].labeled, 0);
     assert!(r.disagreements[0].outcome.is_none());
+}
+
+#[test]
+fn missing_baselines_do_not_change_comparison_rates_or_ground_truth_accuracy() {
+    let rows = vec![
+        Row::answered("router", "p", "a", "a", Some(0.9), 1, None),
+        Row::answered("router", "p", "a", "b", Some(0.9), 1, None),
+        Row::answered("router", "p", "none", "none", Some(0.9), 1, None),
+        Row::answered(
+            "model_routing",
+            "p",
+            "native-default",
+            "b",
+            Some(0.9),
+            1,
+            None,
+        ),
+        Row::answered("review_triage", "p", "unjudged", "b", Some(0.9), 1, None),
+        Row::answered("ping", "p", "none", "b", Some(0.9), 1, None),
+    ];
+    let outcomes: Vec<_> = rows
+        .iter()
+        .map(|r| GroundTruth {
+            record_type: "outcome".into(),
+            decision_id: r.decision_id.clone().unwrap(),
+            ts: r.ts,
+            kind: OutcomeKind::PrReviewResult,
+            answer: r.jev.clone().unwrap(),
+        })
+        .collect();
+    let r = report::replay(&rows, &outcomes, None);
+    let metrics = serde_json::to_value(&r.all).unwrap();
+    assert_eq!(
+        (
+            r.all.decisions,
+            r.all.answered,
+            r.all.labeled,
+            r.all.jev_right
+        ),
+        (6, 6, 6, 6)
+    );
+    assert_eq!(r.all.agreements, 2);
+    assert_eq!(metrics["compared"], 3);
+    assert_eq!(metrics["baseline_labeled"], 3);
+    assert_eq!(r.all.baseline_right, 2);
+    assert_eq!(r.all.agreement_rate, Some(2.0 / 3.0));
+    assert_eq!(r.disagreements.len(), 1);
+    for site in ["model_routing", "review_triage", "ping"] {
+        assert_eq!(r.sites[site].answered, 1);
+        assert_eq!(r.sites[site].jev_right, 1);
+        assert!(r.sites[site].agreement_rate.is_none());
+        assert_eq!(
+            serde_json::to_value(&r.sites[site]).unwrap()["baseline_labeled"],
+            0
+        );
+    }
 }

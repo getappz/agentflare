@@ -37,7 +37,6 @@ fn ledger_enqueue_p95_and_growth_per_thousand() {
             None,
             &|row| w.enqueue(Work::Decision(Box::new(row.clone()))),
         );
-        assert!(w.receipt(Duration::from_secs(1)));
         micros.push(start.elapsed().as_micros());
         if i % 16 == 15 {
             assert!(w.flush(Duration::from_secs(5)));
@@ -48,12 +47,34 @@ fn ledger_enqueue_p95_and_growth_per_thousand() {
     assert_eq!(shadow::load(&path).len(), 1000);
     assert_eq!(w.pending_drops(), 0);
     eprintln!(
-        "ledger record + receipt p95={} us; bytes/1k={}",
+        "ledger record p95={} us; bytes/1k={}",
         micros[949],
         bytes(&path)
     );
     assert!(micros[949] < 2000);
     assert!(bytes(&path) < 1_000_000);
+}
+
+#[test]
+fn cold_writer_start_and_enqueue_p95() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shadow.jsonl");
+    let mut micros = Vec::new();
+    for _ in 0..100 {
+        let row = row();
+        let start = Instant::now();
+        let w = Writer::new(path.clone(), dir.path().join("dataset.jsonl")).unwrap();
+        w.enqueue(Work::Decision(Box::new(row)));
+        micros.push(start.elapsed().as_micros());
+        assert!(w.flush(Duration::from_secs(5)));
+    }
+    micros.sort_unstable();
+    eprintln!(
+        "cold writer start + enqueue p50={} us; p95={} us",
+        micros[49], micros[94]
+    );
+    assert!(micros[94] < 2000);
+    assert_eq!(shadow::load(&path).len(), 100);
 }
 
 #[test]
@@ -99,7 +120,46 @@ fn contention_and_rotation_never_wait_or_exceed_two_caps() {
 }
 
 #[test]
-fn backpressure_and_partial_frames_are_accounted_after_shutdown() {
+fn queued_batch_rotates_under_one_lock_and_keeps_each_line_readable() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shadow.jsonl");
+    let rows: Vec<_> = (0..20).map(|_| row()).collect();
+    let mut written = Vec::new();
+    capture::append_many(
+        &path,
+        rows.iter().enumerate().map(|(i, row)| (i as u64, row)),
+        1500,
+        |_| true,
+        |ticket| written.push(ticket),
+        false,
+    )
+    .unwrap();
+    assert_eq!(written, (0..20).collect::<Vec<_>>());
+    assert!(path.with_extension("jsonl.1").exists());
+    assert!(bytes(&path) <= 3000);
+    let retained = shadow::load(&path);
+    assert!(retained.len() > 1);
+    assert_eq!(
+        retained.last().unwrap().decision_id,
+        rows.last().unwrap().decision_id
+    );
+}
+
+#[test]
+fn appending_preserves_a_complete_legacy_row_without_a_trailing_newline() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shadow.jsonl");
+    let mut old = row();
+    old.decision_id = None;
+    std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+    append(&path, &row(), LEDGER_CAP).unwrap();
+    let rows = shadow::load(&path);
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0].decision_id.is_none());
+}
+
+#[test]
+fn backpressure_is_accounted_after_shutdown() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("shadow.jsonl");
     let w = Writer::constrained(path.clone(), dir.path().join("dataset.jsonl"), 20).unwrap();
@@ -118,82 +178,41 @@ fn backpressure_and_partial_frames_are_accounted_after_shutdown() {
 }
 
 #[test]
-#[ignore = "subprocess entrypoint"]
-fn writer_child() {
-    if let Ok(args) = std::env::var("AGENTFLARE_TEST_WRITER") {
-        let (address, token) = args.split_once(' ').unwrap();
-        super::super::writer_process::run(address, token).unwrap();
-    }
-}
-
-#[test]
-#[ignore = "subprocess entrypoint"]
-fn short_lived_parent() {
-    let Ok(root) = std::env::var("AGENTFLARE_TEST_WRITER_PARENT") else {
-        return;
-    };
-    let root = PathBuf::from(root);
-    let w = Writer::delayed(root.join("shadow.jsonl"), root.join("dataset.jsonl"), 80).unwrap();
-    for _ in 0..8 {
-        let row = row();
-        let mut capture = super::super::capture::build_row(super::super::capture::Input {
-            site: "bench",
-            features: serde_json::json!({}),
-            norm_input: "state",
-            label: serde_json::json!({"summary":"b"}),
-            confidence: Some(0.9),
-            baseline: "a",
-            source_model: None,
-        });
-        capture.decision_id = row.decision_id.clone();
-        w.enqueue(Work::Decision(Box::new(row)));
-        w.enqueue(Work::Capture(Box::new(capture)));
-    }
-    assert!(!w.flush(Duration::from_millis(1)));
-    let start = Instant::now();
-    w.shutdown();
-    assert!(start.elapsed() < Duration::from_millis(50));
-    std::process::exit(0);
-}
-
-#[test]
-fn normal_process_exit_preserves_delayed_decisions_and_capture_joins() {
+fn drop_replay_resolves_late_rows_and_deduplicates_identified_notifications() {
     let dir = tempfile::tempdir().unwrap();
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "decide::storage::tests::short_lived_parent",
-            "--ignored",
-        ])
-        .env("AGENTFLARE_TEST_WRITER_PARENT", dir.path())
-        .status()
-        .unwrap();
-    assert!(status.success());
     let path = dir.path().join("shadow.jsonl");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let events: Vec<serde_json::Value> = load(&path);
-        if events
-            .iter()
-            .any(|e| e["record_type"] == "test_writer_closed")
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "helper did not finish accepted records after caller exit"
-        );
-        std::thread::sleep(Duration::from_millis(10));
+    let dataset = dir.path().join("dataset.jsonl");
+    let mut decision = row();
+    decision.decision_id = Some("late".into());
+    append(&path, &decision, LEDGER_CAP).unwrap();
+    let mut supplement = capture::build_row(capture::Input {
+        site: "bench",
+        features: serde_json::json!({}),
+        norm_input: "input",
+        label: serde_json::json!({}),
+        confidence: None,
+        baseline: "a",
+        source_model: None,
+    });
+    supplement.decision_id = Some("late".into());
+    append(&dataset, &supplement, LEDGER_CAP).unwrap();
+    for count in [5, 4] {
+        append(
+            &path,
+            &serde_json::json!({"record_type":"dropped", "count":count,
+            "decision_ids":["late", "missing-decision"],
+            "capture_ids":["late", "missing-capture"]}),
+            LEDGER_CAP,
+        )
+        .unwrap();
     }
-    let rows = shadow::load(&path);
-    let captured = super::super::capture::load(&dir.path().join("dataset.jsonl"));
-    assert_eq!(rows.len(), 8);
-    assert_eq!(captured.len(), 8);
-    assert!(
-        captured
-            .iter()
-            .all(|c| rows.iter().any(|r| r.decision_id == c.decision_id))
-    );
-    let report = super::super::report::load(&path, &dir.path().join("dataset.jsonl"), None);
-    assert_eq!(report.dropped_writes, 0);
+    append(
+        &path,
+        &serde_json::json!({"record_type":"dropped", "count":2}),
+        LEDGER_CAP,
+    )
+    .unwrap();
+    let report = super::super::report::load(&path, &dataset, None);
+    assert_eq!(report.all.decisions, 1);
+    assert_eq!(report.dropped_writes, 5); // two missing IDs, one anonymous write, two legacy drops
 }

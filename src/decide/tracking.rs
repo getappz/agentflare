@@ -319,11 +319,16 @@ pub fn outcome_add(
     if !super::storage::flush(std::time::Duration::from_secs(1)) {
         return Err("decision writes are pending; retry labeling".into());
     }
-    if !shadow::load(path)
+    // An earlier hook's writer may still be appending the row we label.
+    let deadline = Instant::now() + std::time::Duration::from_secs(1);
+    while !shadow::load(path)
         .iter()
         .any(|r| r.decision_id.as_deref() == Some(id))
     {
-        return Err("decision id not found in retained ledger".into());
+        if Instant::now() >= deadline {
+            return Err("decision id not found in retained ledger".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
     let outcome = GroundTruth {
         record_type: "outcome".into(),

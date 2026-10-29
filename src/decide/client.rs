@@ -206,7 +206,6 @@ pub fn ask_with(
     questions: &BTreeMap<String, Question>,
 ) -> Result<Outcome, DecideError> {
     super::model_identity::begin(Some(cfg.model()));
-    super::storage::prepare();
     let path = breaker_path();
     if !breaker::allow(&path, breaker::current_time(), cfg.timeout) {
         return Err(DecideError::Unavailable);
