@@ -590,12 +590,55 @@ pub(super) fn merge_or_repair_findings(
     );
     clear_stale_coderabbit_repair_label(folder_path, number, labels, summary.as_deref());
     clear_coderabbit_repair_cap(mcp, item);
+    let held_gates = held_item_gates(mcp, item, label_id_by_name);
     clear_item_dispatch_gates(mcp, item, label_id_by_name);
     clear_github_needs_human_label(folder_path, number, labels);
     if merge_if_approved(mcp, item, repo_root, number, labels, merge) {
         PassingPrOutcome::Merged
     } else {
+        restore_gates_if_unmerged(mcp, item, folder_path, number, labels, &held_gates);
         PassingPrOutcome::NotMerged
+    }
+}
+
+/// Puts back the gates cleared ahead of a merge that did not happen -- a
+/// SHA-pinned merge refused because the head moved, a withdrawn approval, an
+/// unreachable GitHub. Without them the next sweep sees an ungated item and a
+/// new head can dispatch repair work with no fresh human release. An armed
+/// auto-merge keeps them cleared: GitHub merges that head, and the sweep
+/// withdraws the arming itself if the head moves.
+fn restore_gates_if_unmerged(
+    mcp: &AgentflareMcp,
+    item: &agentflare_backend::item::Item,
+    folder_path: &str,
+    number: u64,
+    labels: &[String],
+    held_gates: &[&str],
+) {
+    let armed = mcp
+        .with_backend_db(|conn| agentflare_backend::item::get(conn, &item.id))
+        .ok()
+        .and_then(Result::ok)
+        .is_some_and(|fresh| super::auto_merge::armed_auto_merge(&fresh).is_some());
+    if armed {
+        return;
+    }
+    for name in held_gates {
+        let _ = mcp.with_backend_db(|conn| {
+            agentflare_backend::item::add_label_by_name(conn, &item.id, name)
+        });
+    }
+    if labels.iter().any(|l| l == NEEDS_HUMAN_PR_LABEL)
+        && let Some(repo) =
+            crate::github::RepoId::resolve_from_remote(std::path::Path::new(folder_path))
+        && let Ok(client) = crate::github::Client::new()
+    {
+        let _ = crate::github::issues::add_labels(
+            &client,
+            &repo,
+            number,
+            &[NEEDS_HUMAN_PR_LABEL.to_string()],
+        );
     }
 }
 

@@ -377,6 +377,35 @@ fn handle_ci_green_notifies_once_for_a_gated_approved_pr() {
 
 #[test]
 fn merge_or_repair_findings_clears_dispatch_gate_labels_when_approved_and_clean() {
+    // An armed auto-merge is the merge proceeding: GitHub lands it.
+    let (remaining, manual_id, gate_id) = approved_clean_gated_sweep(true);
+    assert!(
+        !remaining.contains(&manual_id),
+        "needs-manual-dispatch must be cleared on approved green PR"
+    );
+    assert!(
+        !remaining.contains(&gate_id),
+        "needs-human-gate must be cleared on approved green PR"
+    );
+}
+
+/// The SHA-pinned merge was refused (head moved, GitHub unreachable): nothing
+/// merged, so the dispatch gates cleared ahead of it must be put back, or the
+/// next sweep sees an ungated item and dispatches repair with no human release.
+#[test]
+fn merge_or_repair_findings_restores_dispatch_gate_labels_when_the_merge_does_not_happen() {
+    let (remaining, manual_id, gate_id) = approved_clean_gated_sweep(false);
+    assert!(
+        remaining.contains(&manual_id),
+        "needs-manual-dispatch restored"
+    );
+    assert!(remaining.contains(&gate_id), "needs-human-gate restored");
+}
+
+/// Runs `merge_or_repair_findings` on an approved, finding-free PR whose item
+/// carries both dispatch gates and returns the item's labels afterwards, with
+/// the two gate label ids. No GitHub remote exists, so the merge never lands.
+fn approved_clean_gated_sweep(armed: bool) -> (Vec<String>, String, String) {
     crate::paths::test_support::with_temp_home(|| {
         let mcp = test_mcp();
         let queue = test_queue();
@@ -413,6 +442,10 @@ fn merge_or_repair_findings_clears_dispatch_gate_labels_when_approved_and_clean(
         })
         .unwrap();
 
+        if armed {
+            let seeded = current_item(&mcp, &item_id);
+            crate::supervisor::auto_merge::record_armed_auto_merge(&mcp, &seeded, None, "node-1");
+        }
         let item = current_item(&mcp, &item_id);
         let labels = vec![PR_APPROVAL_LABEL.to_string()];
         let review = ReviewBotState::default();
@@ -438,15 +471,8 @@ fn merge_or_repair_findings_clears_dispatch_gate_labels_when_approved_and_clean(
         let remaining = mcp
             .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id).unwrap())
             .unwrap();
-        assert!(
-            !remaining.contains(&manual_id),
-            "needs-manual-dispatch must be cleared on approved green PR"
-        );
-        assert!(
-            !remaining.contains(&gate_id),
-            "needs-human-gate must be cleared on approved green PR"
-        );
-    });
+        (remaining, manual_id, gate_id)
+    })
 }
 
 #[test]
