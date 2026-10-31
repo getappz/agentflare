@@ -203,7 +203,11 @@ const LEAN_CTX_STATE: &str = ".local/share/lean-ctx";
 /// single job makes rather than being silently discarded each time.
 const GH_CACHE_STATE: &str = ".cache/gh";
 
-const WRITABLE_HOME_DIRS: &[&str] = &[".agentflare", LEAN_CTX_STATE, GH_CACHE_STATE];
+/// mise's state dir, relative to `$HOME` -- holds tracked-configs and tool
+/// state. Left off the sandbox, mise shims warn or fail with EROFS (issue #974).
+const MISE_STATE: &str = ".local/state/mise";
+
+const WRITABLE_HOME_DIRS: &[&str] = &[".agentflare", LEAN_CTX_STATE, GH_CACHE_STATE, MISE_STATE];
 
 /// `AGENTFLARE_SANDBOX_WRITABLE_HOME_DIRS`, comma-separated, parsed into a
 /// dir list -- e.g. `".foo,.bar"`. Empty/unset -> no extra dirs. Read fresh
@@ -235,6 +239,11 @@ fn config() -> SandboxConfig {
         .map(|s| (*s).to_string())
         .collect();
     writable_home_dirs.extend(extra_writable_home_dirs_from_env());
+    if let Some(home) = agentflare_config::try_home() {
+        for dir in &writable_home_dirs {
+            let _ = std::fs::create_dir_all(home.join(dir));
+        }
+    }
     SandboxConfig {
         agent_profiles: AGENT_PROFILES,
         writable_home_dirs,
@@ -411,6 +420,7 @@ mod tests {
                 ".agentflare",
                 LEAN_CTX_STATE,
                 GH_CACHE_STATE,
+                MISE_STATE,
                 ".foo",
                 ".bar"
             ]
@@ -428,7 +438,10 @@ mod tests {
         if let Some(v) = saved {
             unsafe { std::env::set_var("AGENTFLARE_SANDBOX_WRITABLE_HOME_DIRS", v) };
         }
-        assert_eq!(dirs, vec![".agentflare", LEAN_CTX_STATE, GH_CACHE_STATE]);
+        assert_eq!(
+            dirs,
+            vec![".agentflare", LEAN_CTX_STATE, GH_CACHE_STATE, MISE_STATE]
+        );
     }
 
     #[test]

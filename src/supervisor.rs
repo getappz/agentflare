@@ -410,9 +410,10 @@ fn per_project_work_cap() -> u64 {
 /// (real work to dispatch), once per project per tick; a `false` return
 /// leaves the project to `dispatch_item`'s defensive guard, which declines
 /// safely (item stays `ready-for-work`) instead of orphaning anything.
-fn ensure_dispatched_label(
+fn ensure_label(
     conn: &rusqlite::Connection,
     project_id: &str,
+    label_name: &str,
     label_id_by_name: &mut std::collections::HashMap<String, String>,
 ) -> bool {
     let workspace_id = match agentflare_backend::project::get(conn, project_id) {
@@ -420,7 +421,7 @@ fn ensure_dispatched_label(
         Err(e) => {
             eprintln!(
                 "agentflare-supervisor: failed to resolve workspace for project {project_id} \
-                 — cannot auto-create {DISPATCHED_LABEL} label: {e}"
+                 — cannot auto-create {label_name} label: {e}"
             );
             return false;
         }
@@ -430,7 +431,7 @@ fn ensure_dispatched_label(
         agentflare_backend::label::CreateLabel {
             project_id: Some(project_id.to_string()),
             workspace_id,
-            name: DISPATCHED_LABEL.to_string(),
+            name: label_name.to_string(),
             color: None,
             parent_id: None,
             sort_order: None,
@@ -440,7 +441,7 @@ fn ensure_dispatched_label(
     ) {
         Ok(label) => {
             eprintln!(
-                "agentflare-supervisor: auto-created missing {DISPATCHED_LABEL} label for \
+                "agentflare-supervisor: auto-created missing {label_name} label for \
                  project {project_id}"
             );
             label_id_by_name.insert(label.name, label.id);
@@ -449,14 +450,14 @@ fn ensure_dispatched_label(
         Err(agentflare_backend::error::Error::Duplicate(detail)) => {
             // Lost a create race (another tick/process got there first) --
             // re-read rather than leaving the map stale for this whole tick.
-            match agentflare_backend::label::get_by_name(conn, project_id, DISPATCHED_LABEL) {
+            match agentflare_backend::label::get_by_name(conn, project_id, label_name) {
                 Ok(label) => {
                     label_id_by_name.insert(label.name, label.id);
                     true
                 }
                 Err(e) => {
                     eprintln!(
-                        "agentflare-supervisor: {DISPATCHED_LABEL} label creation raced \
+                        "agentflare-supervisor: {label_name} label creation raced \
                          ({detail}) but re-read failed for project {project_id}: {e}"
                     );
                     false
@@ -465,12 +466,20 @@ fn ensure_dispatched_label(
         }
         Err(e) => {
             eprintln!(
-                "agentflare-supervisor: failed to auto-create {DISPATCHED_LABEL} label for \
+                "agentflare-supervisor: failed to auto-create {label_name} label for \
                  project {project_id}: {e}"
             );
             false
         }
     }
+}
+
+fn ensure_dispatched_label(
+    conn: &rusqlite::Connection,
+    project_id: &str,
+    label_id_by_name: &mut std::collections::HashMap<String, String>,
+) -> bool {
+    ensure_label(conn, project_id, DISPATCHED_LABEL, label_id_by_name)
 }
 
 /// Project ids whose registered folder was missing the last time discovery
@@ -566,6 +575,9 @@ pub(crate) fn run_discovery_tick(
             // `dispatch_item`'s guard, which declines safely.
             if !label_id_by_name.contains_key(DISPATCHED_LABEL) {
                 ensure_dispatched_label(conn, &dir.project_id, &mut label_id_by_name);
+            }
+            if !label_id_by_name.contains_key(NEEDS_MANUAL_LABEL) {
+                ensure_label(conn, &dir.project_id, NEEDS_MANUAL_LABEL, &mut label_id_by_name);
             }
             let items =
                 match agentflare_backend::item::list_by_label(conn, &dir.project_id, &ready_id) {

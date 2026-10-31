@@ -217,28 +217,10 @@ pub(super) fn handle_ci_green(
     // CI-green PR with real findings on it got merged untouched
     // because the two were checked in the wrong order -- see GitHub
     // PR 791). Skip the two live GitHub calls this fetch costs
-    // entirely once the item is already gated or a repair job is
-    // already in flight -- `coderabbit_repair_or_gate` would just
-    // discard the findings and return `Skipped` anyway, but not
-    // before paying for the fetch on every single tick for as long
-    // as the PR sits gated or in-flight.
-    if already_gated_or_in_flight(mcp, queue, item, label_id_by_name) {
-        // Item #341: a green, approved PR held only by a dispatch gate label
-        // (needs-manual-dispatch / needs-human) otherwise sits silently
-        // skipped every tick, with nothing telling the operator why.
-        if !label_missing
-            && item_gated(mcp, item, label_id_by_name)
-            && first_time_gated(&format!("pr-gated:{}", item.id))
-        {
-            notify_human_gate(
-                item,
-                &format!(
-                    "PR #{number} is green and approved but the sweep is skipping it: the item \
-                     carries a dispatch gate label (needs-manual-dispatch / needs-human)."
-                ),
-            );
-            post_item_dispatch_gate_pr_comment(mcp, item, folder_path, number);
-        }
+    // entirely once a repair job is already in flight, or when the
+    // approval label is missing and the item is already gated.
+    if job_in_flight(queue, &item.id) || (label_missing && item_gated(mcp, item, label_id_by_name))
+    {
         result.skipped += 1;
     } else {
         let head_sha = merge.head_sha();
@@ -528,6 +510,19 @@ pub(super) fn merge_or_repair_findings(
             number,
             "unresolved review-bot findings hold the merge",
         );
+        if item_gated(mcp, item, label_id_by_name)
+            && first_time_gated(&format!("pr-gated:{}", item.id))
+        {
+            notify_human_gate(
+                item,
+                &format!(
+                    "PR #{number} is green and approved but the sweep is holding it: the item \
+                     carries a dispatch gate label (needs-manual-dispatch / needs-human) \
+                     and review findings remain."
+                ),
+            );
+            post_item_dispatch_gate_pr_comment(mcp, item, folder_path, number);
+        }
     }
     if review.dispatch_needed() {
         let outcome = coderabbit_repair_or_gate(
@@ -595,10 +590,41 @@ pub(super) fn merge_or_repair_findings(
     );
     clear_stale_coderabbit_repair_label(folder_path, number, labels, summary.as_deref());
     clear_coderabbit_repair_cap(mcp, item);
+    clear_item_dispatch_gates(mcp, item, label_id_by_name);
+    clear_github_needs_human_label(folder_path, number, labels);
     if merge_if_approved(mcp, item, repo_root, number, labels, merge) {
         PassingPrOutcome::Merged
     } else {
         PassingPrOutcome::NotMerged
+    }
+}
+
+/// Clears dispatch gate labels (`needs-human-gate`, `needs-manual-dispatch`)
+/// from the work item once the PR has human approval and no blocking findings.
+fn clear_item_dispatch_gates(
+    mcp: &AgentflareMcp,
+    item: &agentflare_backend::item::Item,
+    label_id_by_name: &std::collections::HashMap<String, String>,
+) {
+    for name in [NEEDS_HUMAN_GATE_LABEL, NEEDS_MANUAL_LABEL] {
+        let _ = mcp.with_backend_db(|conn| {
+            if let Some(label_id) = label_id_by_name.get(name) {
+                let _ = agentflare_backend::item::remove_label(conn, &item.id, label_id);
+            }
+            let _ = agentflare_backend::item::remove_label_by_name(conn, &item.id, name);
+        });
+    }
+}
+
+/// Clears `NEEDS_HUMAN_PR_LABEL` (`agentflare:needs-human`) from the GitHub PR
+/// once human approval is confirmed and review findings are clean.
+fn clear_github_needs_human_label(folder_path: &str, number: u64, labels: &[String]) {
+    if labels.iter().any(|l| l == NEEDS_HUMAN_PR_LABEL)
+        && let Some(repo) =
+            crate::github::RepoId::resolve_from_remote(std::path::Path::new(folder_path))
+        && let Ok(client) = crate::github::Client::new()
+    {
+        let _ = crate::github::issues::remove_label(&client, &repo, number, NEEDS_HUMAN_PR_LABEL);
     }
 }
 

@@ -201,7 +201,7 @@ fn ensure_worktrees_ignored_is_noop_when_already_ignored() {
     let repo = init_repo();
     let exclude_path = repo.path.join(".git").join("info").join("exclude");
     std::fs::create_dir_all(exclude_path.parent().unwrap()).unwrap();
-    std::fs::write(&exclude_path, ".worktrees/\n.cargo/\n").unwrap();
+    std::fs::write(&exclude_path, format!(".worktrees/\n.cargo/\n{ITEM_ID_MARKER}\n")).unwrap();
     let before = std::fs::read_to_string(&exclude_path).unwrap();
     ensure_worktrees_ignored(&repo.path);
     let after = std::fs::read_to_string(&exclude_path).unwrap();
@@ -220,6 +220,7 @@ fn ensure_worktrees_ignored_adds_only_the_missing_pattern() {
     let content = std::fs::read_to_string(&exclude_path).unwrap();
     assert_eq!(content.matches(".worktrees/").count(), 1);
     assert_eq!(content.matches(".cargo/").count(), 1);
+    assert_eq!(content.matches(ITEM_ID_MARKER).count(), 1);
 }
 
 #[test]
@@ -230,6 +231,7 @@ fn ensure_worktrees_ignored_adds_to_local_exclude_without_committing() {
     let content = std::fs::read_to_string(&exclude_path).unwrap();
     assert!(content.contains(".worktrees/"));
     assert!(content.contains(".cargo/"));
+    assert!(content.contains(ITEM_ID_MARKER));
     // Must never touch the tracked .gitignore or create a commit.
     assert!(!repo.path.join(".gitignore").exists());
     let log = run_git_in(&repo.path, &["log", "--oneline"]).unwrap();
@@ -1486,4 +1488,52 @@ fn create_worktree_refuses_to_recreate_over_a_dirty_checkout() {
         worktree_path.join("uncommitted.txt").exists(),
         "dirty work must be preserved"
     );
+}
+
+#[test]
+fn worktree_ownership_marker_lifecycle() {
+    let repo = init_repo();
+    let item_a = test_item(1);
+    let target = resolve_default_branch(&repo.path);
+    let wt_path = create_worktree(&item_a, &repo.path, &target, None).unwrap();
+    assert!(wt_path.join(ITEM_ID_MARKER).is_file());
+    assert_eq!(worktree_owner_id(&wt_path).as_deref(), Some(item_a.id.as_str()));
+    assert!(is_worktree_owned_by_item(&wt_path, &item_a.id));
+    assert!(!is_worktree_owned_by_item(&wt_path, "different-item-id"));
+}
+
+#[test]
+fn create_worktree_replaces_clean_stale_worktree_on_reused_sequence_id() {
+    let repo = init_repo();
+    let mut item_a = test_item(1);
+    item_a.id = "item-alpha".to_string();
+    let target = resolve_default_branch(&repo.path);
+    let wt_a = create_worktree(&item_a, &repo.path, &target, None).unwrap();
+    assert_eq!(worktree_owner_id(&wt_a).as_deref(), Some("item-alpha"));
+
+    let mut item_b = test_item(1);
+    item_b.id = "item-beta".to_string();
+    let wt_b = create_worktree(&item_b, &repo.path, &target, None).unwrap();
+    assert_eq!(wt_a, wt_b);
+    assert_eq!(worktree_owner_id(&wt_b).as_deref(), Some("item-beta"));
+}
+
+#[test]
+fn create_worktree_refuses_dirty_worktree_on_reused_sequence_id() {
+    let repo = init_repo();
+    let mut item_a = test_item(1);
+    item_a.id = "item-alpha".to_string();
+    let target = resolve_default_branch(&repo.path);
+    let wt = create_worktree(&item_a, &repo.path, &target, None).unwrap();
+    std::fs::write(wt.join("uncommitted.txt"), b"dirty").unwrap();
+
+    let mut item_b = test_item(1);
+    item_b.id = "item-beta".to_string();
+    let err = create_worktree(&item_b, &repo.path, &target, None)
+        .expect_err("must refuse to recreate over dirty worktree of another item");
+    assert!(
+        err.contains("refusing to recreate over dirty worktree"),
+        "error: {err}"
+    );
+    assert!(wt.join("uncommitted.txt").exists());
 }

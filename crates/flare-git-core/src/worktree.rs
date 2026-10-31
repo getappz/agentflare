@@ -153,13 +153,44 @@ pub fn already_isolated_for(branch: &str, repo_root: &Path) -> bool {
     }
 }
 
+pub(crate) const ITEM_ID_MARKER: &str = ".agentflare-item-id";
+
+/// Returns the item ID that owns `worktree_path`, if the marker file exists.
+#[must_use]
+pub fn worktree_owner_id(worktree_path: &Path) -> Option<String> {
+    let marker = worktree_path.join(ITEM_ID_MARKER);
+    if marker.is_file() {
+        if let Ok(id) = std::fs::read_to_string(&marker) {
+            let trimmed = id.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Returns true if `worktree_path` has no marker (legacy) or has a marker matching `item_id`.
+#[must_use]
+pub fn is_worktree_owned_by_item(worktree_path: &Path, item_id: &str) -> bool {
+    match worktree_owner_id(worktree_path) {
+        Some(owner) => owner == item_id,
+        None => true,
+    }
+}
+
+/// Records item ownership marker in the worktree.
+pub fn record_worktree_owner(worktree_path: &Path, item_id: &str) {
+    let _ = std::fs::write(worktree_path.join(ITEM_ID_MARKER), item_id);
+}
+
 /// `true` if `worktree_path` already exists on disk and is itself a git
 /// worktree checked out to `branch` -- the on-disk counterpart to
 /// `already_isolated_for` above, for callers running from outside the
 /// worktree (the daemon's normal case) rather than from inside it.
 #[must_use]
-fn worktree_already_checked_out(worktree_path: &Path, branch: &str) -> bool {
-    if !worktree_path.is_dir() {
+fn worktree_already_checked_out(worktree_path: &Path, branch: &str, item_id: &str) -> bool {
+    if !worktree_path.is_dir() || !is_worktree_owned_by_item(worktree_path, item_id) {
         return false;
     }
     match run_git_in(worktree_path, &["branch", "--show-current"]) {
@@ -187,7 +218,7 @@ pub fn ensure_worktrees_ignored(repo_root: &Path) {
     let exclude_path = repo_root.join(common_dir).join("info").join("exclude");
     let mut content = std::fs::read_to_string(&exclude_path).unwrap_or_default();
     let mut changed = false;
-    for pat in [".worktrees/", ".cargo/"] {
+    for pat in [".worktrees/", ".cargo/", ITEM_ID_MARKER] {
         if content.lines().any(|l| l.trim() == pat) {
             continue;
         }
@@ -382,6 +413,7 @@ fn tracked_pr_branch(item: &Item) -> Option<String> {
 fn resolve_worktree_branch(item: &Item, worktree_path: &Path) -> String {
     let expected = tracked_pr_branch(item).unwrap_or_else(|| task_branch_name(item));
     if worktree_path.is_dir()
+        && is_worktree_owned_by_item(worktree_path, &item.id)
         && let Ok(current) = run_git_in(worktree_path, &["branch", "--show-current"])
         && !current.is_empty()
         && (current == expected
@@ -507,7 +539,7 @@ pub fn create_worktree_for(
     // check never fires there -- it needs the on-disk check too, or
     // `git worktree add` below fails ("already exists") on a re-claim.
     if already_isolated_for(&branch, repo_root)
-        || worktree_already_checked_out(&worktree_path, &branch)
+        || worktree_already_checked_out(&worktree_path, &branch, &item.id)
     {
         // Re-claiming an existing worktree: nothing to create, but still
         // ensure its target dir is isolated (idempotent, no-op if present),
@@ -519,12 +551,15 @@ pub fn create_worktree_for(
         retire_legacy_cargo_config(&worktree_path);
         provision_shared_deps(repo_root, &worktree_path);
         lock_item_worktree(repo_root, &worktree_path);
+        record_worktree_owner(&worktree_path, &item.id);
         return Ok(worktree_path);
     }
+    ensure_worktrees_ignored(repo_root);
     // Never silently proceed over an existing checkout holding uncommitted
     // work: a retry racing a half-torn-down worktree must fail loudly rather
     // than clobber it (item #633 ask 4 — #631's rescue was manual).
-    if worktree_path.is_dir() && !worktree_already_checked_out(&worktree_path, &branch) {
+    if worktree_path.is_dir() && !worktree_already_checked_out(&worktree_path, &branch, &item.id) {
+        let is_mismatched = !is_worktree_owned_by_item(&worktree_path, &item.id);
         // Fail closed: if cleanliness cannot be verified, don't proceed to
         // stale-cleanup + recreate — an unreadable status must never read as
         // "clean".
@@ -535,7 +570,11 @@ pub fn create_worktree_for(
                 item.id
             )
         })?;
-        if !status.trim().is_empty() {
+        let is_dirty = status.lines().any(|l| {
+            let trimmed = l.trim();
+            !trimmed.is_empty() && !trimmed.ends_with(ITEM_ID_MARKER)
+        });
+        if is_dirty {
             let msg = format!(
                 "worktree: refusing to recreate over dirty worktree at {} for item {} \
                  (uncommitted changes preserved; clear or commit them before retrying)",
@@ -545,9 +584,22 @@ pub fn create_worktree_for(
             eprintln!("{msg}");
             return Err(msg);
         }
-        // Clean, but on a detached HEAD or another branch: `worktree add`
-        // can never succeed over the occupied path, so switch it in place.
-        if is_own_checkout(&worktree_path) {
+        if is_mismatched {
+            eprintln!(
+                "worktree: {} belonged to another item, cleaning up stale worktree for item {}",
+                worktree_path.display(),
+                item.id
+            );
+            let path = worktree_path.to_string_lossy().to_string();
+            let _ = run_git_in(
+                repo_root,
+                &["worktree", "remove", "--force", &path],
+            );
+            if worktree_path.exists() {
+                remove_worktree_dir(&worktree_path, &label);
+            }
+            remove_stale_registration_for_path(repo_root, &worktree_path);
+        } else if is_own_checkout(&worktree_path) {
             adopt_existing_checkout(&worktree_path, &branch, &label).map_err(|e| {
                 format!(
                     "worktree: could not switch existing checkout at {} onto {branch} for item {}: {e}",
@@ -559,6 +611,7 @@ pub fn create_worktree_for(
             retire_legacy_cargo_config(&worktree_path);
             provision_shared_deps(repo_root, &worktree_path);
             lock_item_worktree(repo_root, &worktree_path);
+            record_worktree_owner(&worktree_path, &item.id);
             return Ok(worktree_path);
         }
     }
@@ -744,6 +797,7 @@ pub fn create_worktree_for(
                 retire_legacy_cargo_config(&worktree_path);
                 provision_shared_deps(repo_root, &worktree_path);
                 lock_item_worktree(repo_root, &worktree_path);
+                record_worktree_owner(&worktree_path, &item.id);
                 return Ok(worktree_path);
             }
             Err(e) => {
