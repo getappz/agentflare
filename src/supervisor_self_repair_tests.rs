@@ -376,6 +376,80 @@ fn handle_ci_green_notifies_once_for_a_gated_approved_pr() {
 }
 
 #[test]
+fn merge_or_repair_findings_clears_dispatch_gate_labels_when_approved_and_clean() {
+    crate::paths::test_support::with_temp_home(|| {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        let auth_conn = test_auth_conn();
+        let auto_merge = AutoMergeRef::default();
+        let mut label_id_by_name = seed_gate_label(&mcp);
+        let manual_id = mcp
+            .with_backend_db(|conn| {
+                let project = mcp.resolve_project(conn).unwrap();
+                agentflare_backend::label::create(
+                    conn,
+                    agentflare_backend::label::CreateLabel {
+                        project_id: Some(project.id.clone()),
+                        workspace_id: project.workspace_id.clone(),
+                        name: NEEDS_MANUAL_LABEL.into(),
+                        color: None,
+                        parent_id: None,
+                        sort_order: None,
+                        external_source: None,
+                        external_id: None,
+                    },
+                )
+                .unwrap()
+                .id
+            })
+            .unwrap();
+        label_id_by_name.insert(NEEDS_MANUAL_LABEL.to_string(), manual_id.clone());
+
+        let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
+        let gate_id = label_id_by_name[NEEDS_HUMAN_GATE_LABEL].clone();
+        mcp.with_backend_db(|conn| {
+            agentflare_backend::item::add_label(conn, &item_id, &manual_id).unwrap();
+            agentflare_backend::item::add_label(conn, &item_id, &gate_id).unwrap();
+        })
+        .unwrap();
+
+        let item = current_item(&mcp, &item_id);
+        let labels = vec![PR_APPROVAL_LABEL.to_string()];
+        let review = ReviewBotState::default();
+
+        let _ = merge_or_repair_findings(
+            &mcp,
+            &queue,
+            &auth_conn,
+            agentflare_resource_gate::Policy::Normal,
+            &item,
+            Path::new("/repo"),
+            1,
+            &review,
+            &labels,
+            &label_id_by_name,
+            "/repo",
+            CiGreenMerge::Allowed {
+                head_sha: None,
+                auto_merge: &auto_merge,
+            },
+        );
+
+        let remaining = mcp
+            .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id).unwrap())
+            .unwrap();
+        assert!(
+            !remaining.contains(&manual_id),
+            "needs-manual-dispatch must be cleared on approved green PR"
+        );
+        assert!(
+            !remaining.contains(&gate_id),
+            "needs-human-gate must be cleared on approved green PR"
+        );
+    });
+}
+
+#[test]
 fn self_repair_or_gate_redispatches_silently_for_identical_failing_checks() {
     let mcp = test_mcp();
     let queue = test_queue();
