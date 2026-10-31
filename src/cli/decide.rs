@@ -18,6 +18,10 @@ enum DecideCmd {
     /// looked up in the environment, then the agentflare vault, then ~/.env.
     /// Store the key with: agentflare vault set OPENROUTER_API_KEY
     Ping,
+    /// Benchmark the offline flare-decide engines on the built-in cases.
+    /// The "Jev" row is simulated, and the cases overlap the rules, so
+    /// treat the numbers as a smoke test, not a quality comparison.
+    Bench,
     /// Show how often Jev agrees with the current decision, per site
     /// (router, skill_rerank, sdd_judge), from the shadow log.
     Report {
@@ -70,6 +74,12 @@ impl DecideArgs {
     pub fn run(self) {
         match self.cmd {
             DecideCmd::Ping => ping(),
+            DecideCmd::Bench => print!(
+                "{}",
+                flare_decide::bench::format_markdown_table(
+                    &flare_decide::bench::run_all_benchmarks()
+                )
+            ),
             DecideCmd::Report { site, json } => {
                 let report = decide::report::load(
                     &decide::shadow::log_path(),
