@@ -76,15 +76,25 @@ fn is_transient_lock_error(err: &Error) -> bool {
 
 const OPEN_RETRIES: usize = 10;
 
+/// No new attempt starts once this much time has passed. An attempt can still
+/// wait out the 5s busy timeout, so a persistent lock costs at most this plus
+/// one busy timeout instead of ten of them.
+const OPEN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub fn open_file(path: &Path, migrations: &Migrations) -> Result<Connection, Error> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    let start = std::time::Instant::now();
     let mut delay = std::time::Duration::from_millis(50);
     for attempt in 0..OPEN_RETRIES {
         match open_file_once(path, migrations) {
             Ok(conn) => return Ok(conn),
-            Err(e) if attempt + 1 < OPEN_RETRIES && is_transient_lock_error(&e) => {
+            Err(e)
+                if attempt + 1 < OPEN_RETRIES
+                    && start.elapsed() < OPEN_DEADLINE
+                    && is_transient_lock_error(&e) =>
+            {
                 std::thread::sleep(delay);
                 delay = (delay * 2).min(std::time::Duration::from_secs(1));
             }

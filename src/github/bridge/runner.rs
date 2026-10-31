@@ -105,18 +105,13 @@ pub fn spawn_if_enabled() -> Option<std::thread::JoinHandle<()>> {
 /// block behind the bridge's network latency. A second SQLite connection to
 /// the same file is the normal way to give a background thread its own
 /// handle.
-fn open_items_db() -> Option<rusqlite::Connection> {
+///
+/// Returns the failure instead of printing it: the caller runs this every
+/// tick, and only it knows whether the failure is new.
+fn open_items_db() -> Result<rusqlite::Connection, String> {
     let path = crate::paths::agentflare_dir().join("backend.db");
-    match agentflare_backend::db::open_db(&path) {
-        Ok(c) => Some(c),
-        Err(e) => {
-            eprintln!(
-                "github bridge: item database unavailable at {} ({e}); not starting",
-                path.display()
-            );
-            None
-        }
-    }
+    agentflare_backend::db::open_db(&path)
+        .map_err(|e| format!("item database unavailable at {} ({e})", path.display()))
 }
 
 fn run_forever(config: BridgeConfig) {
@@ -138,13 +133,13 @@ fn run_forever(config: BridgeConfig) {
 
     loop {
         let conn = match open_items_db() {
-            Some(c) => {
+            Ok(c) => {
                 logged_no_db = false;
                 c
             }
-            None => {
+            Err(e) => {
                 if !logged_no_db {
-                    eprintln!("github bridge: waiting for item database to become available...");
+                    eprintln!("github bridge: {e}; waiting for it to become available...");
                     logged_no_db = true;
                 }
                 std::thread::sleep(interval);
