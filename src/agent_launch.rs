@@ -121,7 +121,7 @@ pub fn run_launch_env(
         Ok(s) if s.success() => LaunchOutcome::Launched,
         Ok(s) => {
             let code = s.code().unwrap_or(-1);
-            std::process::exit(code);
+            crate::decide::exit(code);
         }
         Err(e) => LaunchOutcome::NotFound(format!("failed to launch {}: {e}", binary.display())),
     }

@@ -193,6 +193,9 @@ fn judge_markers_and_counts() {
 #[test]
 fn repetition_rate_computed() {
     let mk = |site: &str, key: &str, label: &str| Row {
+        decision_id: None,
+        question: None,
+        answer: None,
         schema: SCHEMA,
         ts: 100,
         site: site.into(),
