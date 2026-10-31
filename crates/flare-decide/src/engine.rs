@@ -46,11 +46,9 @@ pub struct EngineConfig {
 
 impl Default for EngineConfig {
     fn default() -> Self {
-        Self {
-            strategy: Strategy::Hybrid,
-            temperature: 0.12,
-            semantic_weight: 0.45,
-        }
+        // Rules only: on a 31-prompt held-out router set the ONNX hybrid gave
+        // identical predictions to the rules, and MiniLM alone scored 3/31.
+        Self::lexical()
     }
 }
 
@@ -72,7 +70,11 @@ impl EngineConfig {
     }
 
     pub fn hybrid() -> Self {
-        Self::default()
+        Self {
+            strategy: Strategy::Hybrid,
+            temperature: 0.12,
+            semantic_weight: 0.45,
+        }
     }
 }
 
@@ -401,9 +403,37 @@ fn render_state(state: &Value) -> String {
 
 fn tokenize_content(s: &str) -> HashSet<String> {
     const STOP: &[&str] = &[
-        "the", "this", "that", "with", "from", "into", "have", "does", "would", "should", "could",
-        "task", "state", "described", "help", "skill", "given", "what", "when", "where", "which",
-        "their", "there", "about", "only", "some", "more", "than", "then", "also", "very",
+        "the",
+        "this",
+        "that",
+        "with",
+        "from",
+        "into",
+        "have",
+        "does",
+        "would",
+        "should",
+        "could",
+        "task",
+        "state",
+        "described",
+        "help",
+        "skill",
+        "given",
+        "what",
+        "when",
+        "where",
+        "which",
+        "their",
+        "there",
+        "about",
+        "only",
+        "some",
+        "more",
+        "than",
+        "then",
+        "also",
+        "very",
     ];
     let sanitized = flare_search_kit::fts_phrase_query(s);
     sanitized
@@ -441,8 +471,7 @@ fn choice_domain_score(
     let base_overlap = token_jaccard_and_overlap(state_text, &format!("{key} {desc}"));
 
     // 1. Router difficulty classification ("easy" | "medium" | "hard")
-    if instructions.contains("How hard is this task")
-    {
+    if instructions.contains("How hard is this task") {
         let words = state_text.split_whitespace().count();
         let paths = state_text
             .split_whitespace()
@@ -530,7 +559,8 @@ fn choice_domain_score(
     }
 
     // 2. SDD Judge 9-way action classification
-    if instructions.contains("multi-task pipeline do next") || state.get("latest_role_reply").is_some()
+    if instructions.contains("multi-task pipeline do next")
+        || state.get("latest_role_reply").is_some()
     {
         let reply = state
             .get("latest_role_reply")

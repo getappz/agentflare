@@ -61,9 +61,7 @@ pub fn simulate_jev(state: &Value, questions: &BTreeMap<String, Question>) -> Ou
             for p in probabilities.values_mut() {
                 *p /= sum;
             }
-            if let Some((best_k, &best_p)) = probabilities
-                .iter()
-                .max_by(|a, b| a.1.total_cmp(b.1))
+            if let Some((best_k, &best_p)) = probabilities.iter().max_by(|a, b| a.1.total_cmp(b.1))
             {
                 *choice = best_k.clone();
                 *confidence = Some(best_p);
@@ -517,18 +515,14 @@ pub fn run_all_benchmarks() -> Vec<EngineMetrics> {
     let jev = evaluate_runner("Jev (simulated /v1/systemone)", onnx_active, simulate_jev);
 
     let verdict_engine = DecideEngine::new(EngineConfig::verdict_biencoder());
-    let verdict = evaluate_runner(
-        "Verdict (pure ONNX Bi-Encoder)",
-        onnx_active,
-        |s, q| verdict_engine.ask(s, q).unwrap(),
-    );
+    let verdict = evaluate_runner("Verdict (pure ONNX Bi-Encoder)", onnx_active, |s, q| {
+        verdict_engine.ask(s, q).unwrap()
+    });
 
     let lexical_engine = DecideEngine::new(EngineConfig::lexical());
-    let lexical = evaluate_runner(
-        "flare-decide (Lexical/Domain only)",
-        false,
-        |s, q| lexical_engine.ask(s, q).unwrap(),
-    );
+    let lexical = evaluate_runner("flare-decide (Lexical/Domain only)", false, |s, q| {
+        lexical_engine.ask(s, q).unwrap()
+    });
 
     let hybrid_engine = DecideEngine::new(EngineConfig::hybrid());
     let hybrid = evaluate_runner(
@@ -546,9 +540,7 @@ pub fn format_markdown_table(metrics: &[EngineMetrics]) -> String {
     out.push_str(
         "| Engine | ONNX | Router Acc | Skill F1 | Judge Acc | Triage Acc | Overall | Brier ↓ | Pos Flip ↓ | Latency/q |\n",
     );
-    out.push_str(
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
-    );
+    out.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
     for m in metrics {
         out.push_str(&format!(
             "| {} | {} | {:.1}% | {:.1}% | {:.1}% | {:.1}% | {:.1}% | {:.4} | {:.1}% | {} µs |\n",
