@@ -533,9 +533,9 @@ fn choice_domain_score(
 
         let target_tier = if hard_hits >= 1 || paths >= 4 || words >= 70 || fences >= 2 {
             "hard"
-        } else if easy_hits >= 1 && hard_hits == 0 && med_hits == 0 && words <= 22 && paths <= 1 {
-            "easy"
-        } else if words <= 10 && hard_hits == 0 && med_hits == 0 {
+        } else if (easy_hits >= 1 && hard_hits == 0 && med_hits == 0 && words <= 22 && paths <= 1)
+            || (words <= 10 && hard_hits == 0 && med_hits == 0)
+        {
             "easy"
         } else {
             "medium"
