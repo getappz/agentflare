@@ -44,25 +44,38 @@ fn run_with(
         };
     }
 
+    let start = std::time::Instant::now();
     match ask(&batch) {
         Ok(outcome) => Result {
             route_nudge: match (batch_route, jev_route_ctx) {
-                (true, Some(ctx)) => {
-                    crate::optimize::jev_router::route_batch_success(ctx, &outcome, record)
-                }
+                (true, Some(ctx)) => crate::optimize::jev_router::route_batch_success(
+                    ctx,
+                    &outcome.for_prefix("router."),
+                    record,
+                ),
                 _ => None,
             },
-            skill_pick: pending_rerank
-                .map(|pending| pending.finish_success(&outcome, "skill_rerank.", record)),
+            skill_pick: pending_rerank.map(|pending| {
+                pending.finish_success(
+                    &outcome.for_prefix("skill_rerank."),
+                    "skill_rerank.",
+                    record,
+                )
+            }),
         },
         Err(err) => Result {
             route_nudge: match (batch_route, jev_route_ctx) {
-                (true, Some(ctx)) => {
-                    crate::optimize::jev_router::route_batch_error(ctx, &err, record)
-                }
+                (true, Some(ctx)) => crate::optimize::jev_router::route_batch_error(
+                    ctx,
+                    &err,
+                    start.elapsed().as_millis() as u64,
+                    record,
+                ),
                 _ => None,
             },
-            skill_pick: pending_rerank.map(|pending| pending.finish_error(&err, record)),
+            skill_pick: pending_rerank.map(|pending| {
+                pending.finish_error(&err, start.elapsed().as_millis() as u64, record)
+            }),
         },
     }
 }

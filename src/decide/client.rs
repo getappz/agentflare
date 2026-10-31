@@ -10,6 +10,40 @@ pub struct Outcome {
     pub elapsed_ms: u64,
 }
 
+impl Outcome {
+    /// Allocate batch billing once across sites, including integer remainders.
+    pub fn for_prefix(&self, prefix: &str) -> Self {
+        let n = self.response.answers.len().max(1) as u64;
+        let indices: Vec<_> = self
+            .response
+            .answers
+            .keys()
+            .enumerate()
+            .filter(|(_, id)| id.starts_with(prefix))
+            .map(|(i, _)| i as u64)
+            .collect();
+        let tokens = |total: u64| {
+            indices
+                .iter()
+                .map(|i| total / n + u64::from(*i < total % n))
+                .sum()
+        };
+        let mut response = self.response.clone();
+        response.answers.retain(|id, _| id.starts_with(prefix));
+        response.usage.input_tokens = tokens(self.response.usage.input_tokens);
+        response.usage.output_tokens = tokens(self.response.usage.output_tokens);
+        response.usage.cost = self
+            .response
+            .usage
+            .cost
+            .map(|c| c * indices.len() as f64 / n as f64);
+        Self {
+            response,
+            elapsed_ms: self.elapsed_ms,
+        }
+    }
+}
+
 pub struct Batch {
     state: Value,
     questions: BTreeMap<String, Question>,
@@ -158,6 +192,7 @@ fn ask_configured(
     questions: &BTreeMap<String, Question>,
     cap: Option<std::time::Duration>,
 ) -> Result<Outcome, DecideError> {
+    super::model_identity::begin(None);
     let mut cfg = Config::from_lookup(get)?;
     if let Some(cap) = cap {
         cfg.timeout = cfg.timeout.min(cap);
@@ -170,6 +205,7 @@ pub fn ask_with(
     state: &Value,
     questions: &BTreeMap<String, Question>,
 ) -> Result<Outcome, DecideError> {
+    super::model_identity::begin(Some(cfg.model()));
     // In-process engine: no remote to trip the breaker over.
     if matches!(cfg.provider, Provider::Local) {
         return send_local(state, questions);
