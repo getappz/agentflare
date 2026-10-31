@@ -31,14 +31,20 @@
 
     #[test]
     fn pick_duplicate_pr_prefers_a_merged_match_over_an_open_one() {
-        let picked = pick_duplicate_pr(vec![open_duplicate_pr(1), duplicate_pr(2, true)], None, None)
-            .unwrap();
+        let picked = pick_duplicate_pr(
+            vec![open_duplicate_pr(1), duplicate_pr(2, true)],
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
         assert_eq!(picked.number, 2);
     }
 
     #[test]
     fn pick_duplicate_pr_returns_none_for_an_empty_list() {
-        assert!(pick_duplicate_pr(vec![], None, None).is_none());
+        assert!(pick_duplicate_pr(vec![], None, None, None, &[]).is_none());
     }
 
     /// A closed-but-unmerged PR (a previously abandoned attempt, e.g. one
@@ -48,14 +54,19 @@
     /// `state: "closed"`, `merged_at: None`.
     #[test]
     fn pick_duplicate_pr_ignores_a_closed_unmerged_pr() {
-        assert!(pick_duplicate_pr(vec![duplicate_pr(3, false)], None, None).is_none());
+        assert!(pick_duplicate_pr(vec![duplicate_pr(3, false)], None, None, None, &[]).is_none());
     }
 
     #[test]
     fn pick_duplicate_pr_selects_a_genuinely_open_pr_when_no_merged_match_exists() {
-        let picked =
-            pick_duplicate_pr(vec![duplicate_pr(4, false), open_duplicate_pr(5)], None, None)
-                .unwrap();
+        let picked = pick_duplicate_pr(
+            vec![duplicate_pr(4, false), open_duplicate_pr(5)],
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
         assert_eq!(picked.number, 5);
     }
 
@@ -65,14 +76,14 @@
     /// short-circuited away.
     #[test]
     fn pick_duplicate_pr_excludes_an_open_pr_already_on_the_current_branch() {
-        assert!(
-            pick_duplicate_pr(
-                vec![open_duplicate_pr_on_branch(6, "task/186-toolchain-sniffer")],
-                Some("task/186-toolchain-sniffer"),
-                None,
-            )
-            .is_none()
-        );
+        assert!(pick_duplicate_pr(
+            vec![open_duplicate_pr_on_branch(6, "task/186-toolchain-sniffer")],
+            Some("task/186-toolchain-sniffer"),
+            None,
+            None,
+            &[],
+        )
+        .is_none());
     }
 
     /// A genuinely different open PR (different branch) for the same item
@@ -85,6 +96,8 @@
             vec![open_duplicate_pr_on_branch(7, "task/186-someone-elses-attempt")],
             Some("task/186-toolchain-sniffer"),
             None,
+            None,
+            &[],
         )
         .unwrap();
         assert_eq!(picked.number, 7);
@@ -97,9 +110,7 @@
     /// the branch-based exclusion landed.
     #[test]
     fn pick_duplicate_pr_excludes_an_open_pr_matching_the_items_own_tracked_pr_number() {
-        assert!(
-            pick_duplicate_pr(vec![open_duplicate_pr(8)], None, Some(8)).is_none()
-        );
+        assert!(pick_duplicate_pr(vec![open_duplicate_pr(8)], None, Some(8), None, &[]).is_none());
     }
 
     /// The own-PR-number exclusion is specific to that exact PR -- a
@@ -108,8 +119,71 @@
     /// tracked PR recorded.
     #[test]
     fn pick_duplicate_pr_still_flags_a_different_open_pr_when_own_pr_number_does_not_match() {
-        let picked = pick_duplicate_pr(vec![open_duplicate_pr(9)], None, Some(8)).unwrap();
+        let picked =
+            pick_duplicate_pr(vec![open_duplicate_pr(9)], None, Some(8), None, &[]).unwrap();
         assert_eq!(picked.number, 9);
+    }
+
+    /// Item #973: a merged PR whose merged_at predates item.created_at is an
+    /// old PR from a reused sequence id, NOT a duplicate of this item.
+    #[test]
+    fn pick_duplicate_pr_ignores_a_merged_pr_predating_item_creation() {
+        let old_merged: crate::github::models::PullRequest = serde_json::from_value(serde_json::json!({
+            "number": 221,
+            "html_url": "https://github.com/o/r/pull/221",
+            "state": "closed",
+            "title": "Old PR",
+            "merged_at": "2026-08-01T00:00:00Z",
+        }))
+        .unwrap();
+        let item_created = chrono::DateTime::parse_from_rfc3339("2026-10-01T00:00:00Z")
+            .unwrap()
+            .timestamp();
+        assert!(
+            pick_duplicate_pr(vec![old_merged], None, None, Some(item_created), &[]).is_none()
+        );
+    }
+
+    /// Item #973: a human operator can explicitly dismiss false-positive PRs
+    /// recorded in item metadata.
+    #[test]
+    fn pick_duplicate_pr_ignores_explicitly_dismissed_prs() {
+        let picked = pick_duplicate_pr(
+            vec![duplicate_pr(2, true), duplicate_pr(3, true)],
+            None,
+            None,
+            None,
+            &[2],
+        )
+        .unwrap();
+        assert_eq!(picked.number, 3);
+    }
+
+    #[test]
+    fn pr_predates_item_checks_all_timestamps_and_clock_skew() {
+        let base_dt = chrono::DateTime::parse_from_rfc3339("2026-10-01T12:00:00Z").unwrap();
+        let item_created = base_dt.timestamp();
+
+        // Older than item_created - 120s => true
+        let old_merged: crate::github::models::PullRequest = serde_json::from_value(serde_json::json!({
+            "number": 1, "html_url": "u", "state": "closed", "title": "t",
+            "merged_at": "2026-10-01T11:57:00Z",
+        })).unwrap();
+        assert!(pr_predates_item(&old_merged, item_created));
+
+        // Within 120s tolerance (clock skew) => false
+        let skew_merged: crate::github::models::PullRequest = serde_json::from_value(serde_json::json!({
+            "number": 1, "html_url": "u", "state": "closed", "title": "t",
+            "merged_at": "2026-10-01T11:59:00Z",
+        })).unwrap();
+        assert!(!pr_predates_item(&skew_merged, item_created));
+
+        // After item_created => false
+        let fresh_merged: crate::github::models::PullRequest = serde_json::from_value(serde_json::json!({
+            "number": 1, "html_url": "u", "state": "closed", "title": "t",
+            "merged_at": "2026-10-01T12:05:00Z",
+        })).unwrap();
+        assert!(!pr_predates_item(&fresh_merged, item_created));
     }
 
     fn open_duplicate_pr_created_at(number: u64, created_at: &str) -> crate::github::models::PullRequest {
