@@ -146,6 +146,7 @@ pub fn route_batch_success(
         outcome.elapsed_ms,
         outcome.response.usage.cost,
         outcome.response.model.as_deref(),
+        &outcome.response.usage,
         record,
     )
 }
@@ -153,20 +154,21 @@ pub fn route_batch_success(
 pub fn route_batch_error(
     ctx: &RouteContext,
     err: &DecideError,
+    elapsed_ms: u64,
     record: &dyn Fn(&shadow::Row),
 ) -> Option<String> {
     let baseline = KeywordRouter.route(ctx);
     match err {
-        DecideError::Disabled | DecideError::NoCredentials | DecideError::Unavailable => baseline,
+        DecideError::Disabled | DecideError::NoCredentials => baseline,
         e => {
             let prompt: String = ctx.prompt.trim().chars().take(MAX_PROMPT_CHARS).collect();
             let baseline_label = if baseline.is_some() { "haiku" } else { "none" };
-            record(&shadow::Row::failed(
-                SITE,
-                &prompt,
-                baseline_label,
-                &e.to_string(),
-            ));
+            decide::tracking::failure(
+                shadow::Row::failed(SITE, &prompt, baseline_label, &e.to_string()),
+                &questions(),
+                elapsed_ms,
+                record,
+            );
             baseline
         }
     }
@@ -185,19 +187,20 @@ fn route_with(
     }
     let prompt: String = prompt.chars().take(MAX_PROMPT_CHARS).collect();
     let baseline_label = if baseline.is_some() { "haiku" } else { "none" };
+    let start = std::time::Instant::now();
     let outcome = match ask(&prompt) {
         Ok(outcome) => outcome,
         // Not configured: behave exactly like the keyword router, silently.
-        Err(DecideError::Disabled | DecideError::NoCredentials | DecideError::Unavailable) => {
+        Err(DecideError::Disabled | DecideError::NoCredentials) => {
             return baseline;
         }
         Err(e) => {
-            record(&shadow::Row::failed(
-                SITE,
-                &prompt,
-                baseline_label,
-                &e.to_string(),
-            ));
+            decide::tracking::failure(
+                shadow::Row::failed(SITE, &prompt, baseline_label, &e.to_string()),
+                &questions(),
+                start.elapsed().as_millis() as u64,
+                record,
+            );
             return baseline;
         }
     };
@@ -207,6 +210,7 @@ fn route_with(
         outcome.elapsed_ms,
         outcome.response.usage.cost,
         outcome.response.model.as_deref(),
+        &outcome.response.usage,
         record,
     )
 }
@@ -217,21 +221,22 @@ fn route_answer(
     elapsed_ms: u64,
     cost: Option<f64>,
     source_model: Option<&str>,
+    usage: &decide::Usage,
     record: &dyn Fn(&shadow::Row),
 ) -> Option<String> {
     let baseline = KeywordRouter.route(ctx);
     let prompt: String = ctx.prompt.trim().chars().take(MAX_PROMPT_CHARS).collect();
     let baseline_label = if baseline.is_some() { "haiku" } else { "none" };
     let Some((tier, confidence)) = answer.and_then(tier_of_answer) else {
-        record(&shadow::Row::failed(
-            SITE,
-            &prompt,
-            baseline_label,
-            "unexpected answer shape",
-        ));
+        decide::tracking::failure(
+            shadow::Row::failed(SITE, &prompt, baseline_label, "unexpected answer shape"),
+            &questions(),
+            elapsed_ms,
+            record,
+        );
         return baseline;
     };
-    record(&shadow::Row::answered(
+    let row = shadow::Row::answered(
         SITE,
         &prompt,
         baseline_label,
@@ -239,18 +244,31 @@ fn route_answer(
         confidence,
         elapsed_ms,
         cost,
-    ));
-    if let Some(answer) = answer.filter(|_| decide::capture::enabled()) {
-        decide::capture::record(decide::capture::Input {
-            site: SITE,
-            features: decide::capture::router_features(&prompt),
-            norm_input: &prompt,
-            label: decide::capture::label_of(answer),
-            confidence,
-            baseline: baseline_label,
+    );
+    let answers = answer
+        .map(|a| BTreeMap::from([(QUESTION_ID.to_string(), a.clone())]))
+        .unwrap_or_default();
+    let captured = answer.map(|answer| decide::capture::Input {
+        site: SITE,
+        features: decide::capture::router_features(&prompt),
+        norm_input: &prompt,
+        label: decide::capture::label_of(answer),
+        confidence,
+        baseline: baseline_label,
+        source_model,
+    });
+    decide::tracking::finish(
+        row,
+        decide::tracking::Context {
+            questions: &questions(),
+            answers: &answers,
             source_model,
-        });
-    }
+            usage,
+            applied: confidence.is_some_and(|c| c >= MIN_CONFIDENCE),
+        },
+        captured,
+        record,
+    );
     match confidence {
         Some(c) if c >= MIN_CONFIDENCE => nudge(tier, c, ctx.current_model.as_deref()),
         _ => baseline,
@@ -368,12 +386,13 @@ mod tests {
     }
 
     #[test]
-    fn open_breaker_keeps_baseline_without_logging() {
+    fn open_breaker_keeps_baseline_and_tracks_status() {
         let (nudge, rows) = run(&ctx("find the config file", None), |_| {
             Err(DecideError::Unavailable)
         });
         assert!(nudge.is_some());
-        assert!(rows.is_empty());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].details.status.as_deref(), Some("breaker-open"));
     }
 
     fn err_clone(e: &DecideError) -> DecideError {
