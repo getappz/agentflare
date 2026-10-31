@@ -123,8 +123,10 @@ mod tests {
 
         // Only structural properties are asserted. Accuracy numbers come from a
         // small hand-written case set (and a simulated Jev), so they are reported,
-        // not gated on.
-        for m in &results[1..] {
+        // not gated on. Relabel-invariance is asserted only for the rules-only
+        // engine: the embedding rows read option names, and without the cached
+        // model (CI) they differ from a dev machine.
+        for m in results.iter().filter(|m| m.name.contains("Lexical")) {
             assert_eq!(m.position_flip_rate, 0.0, "{} flipped on relabel", m.name);
         }
     }
