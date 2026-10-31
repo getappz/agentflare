@@ -422,5 +422,5 @@ fn read_stdin() -> String {
 
 fn fail(msg: String) -> ! {
     crate::ui::error(&format!("review: {msg}"));
-    std::process::exit(1);
+    crate::decide::exit(1);
 }

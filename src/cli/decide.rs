@@ -24,13 +24,36 @@ enum DecideCmd {
         /// Only this decision site.
         #[arg(long)]
         site: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
+    /// Append a later ground-truth answer to the retained decision ledger.
+    Outcome {
+        #[command(subcommand)]
+        cmd: OutcomeCmd,
+    },
+    /// Delete decisions, outcomes, dropped-write counts and captured inputs.
+    Clear,
     /// The opt-in local training dataset (AGENTFLARE_DECIDE_CAPTURE=1). It
     /// contains truncated, redacted user prompt text; it never leaves this
     /// machine.
     Dataset {
         #[command(subcommand)]
         cmd: DatasetCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum OutcomeCmd {
+    Add {
+        #[arg(long)]
+        decision_id: String,
+        /// human_override, pr_review_result, item_final_state, incident_confirmed
+        #[arg(long)]
+        kind: String,
+        /// Correct answer in the same domain as the report's baseline/Jev answer.
+        #[arg(long)]
+        answer: String,
     },
 }
 
@@ -47,13 +70,54 @@ impl DecideArgs {
     pub fn run(self) {
         match self.cmd {
             DecideCmd::Ping => ping(),
-            DecideCmd::Report { site } => {
-                println!("breaker: {}", decide::breaker::status());
-                let rows = decide::shadow::load(&decide::shadow::log_path());
-                print!(
-                    "{}",
-                    decide::shadow::render(&decide::shadow::summarize(&rows, site.as_deref()))
+            DecideCmd::Report { site, json } => {
+                let report = decide::report::load(
+                    &decide::shadow::log_path(),
+                    &decide::capture::dataset_path(),
+                    site.as_deref(),
                 );
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&report).expect("finite report")
+                    );
+                } else {
+                    println!("breaker: {}", decide::breaker::status());
+                    print!("{}", decide::report::render(&report));
+                }
+            }
+            DecideCmd::Outcome {
+                cmd:
+                    OutcomeCmd::Add {
+                        decision_id,
+                        kind,
+                        answer,
+                    },
+            } => {
+                let result = serde_json::from_value(serde_json::Value::String(kind))
+                    .map_err(|e| e.to_string())
+                    .and_then(|kind| {
+                        decide::tracking::outcome_add(
+                            &decide::shadow::log_path(),
+                            &decision_id,
+                            kind,
+                            &answer,
+                        )
+                    });
+                if let Err(e) = result {
+                    eprintln!("cannot label decision: {e}");
+                    std::process::exit(1);
+                }
+                println!("outcome added for {decision_id}");
+            }
+            DecideCmd::Clear => {
+                for path in [decide::shadow::log_path(), decide::capture::dataset_path()] {
+                    if let Err(e) = decide::capture::clear(&path) {
+                        eprintln!("failed to clear decisions: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                println!("decision ledger and dataset cleared");
             }
             DecideCmd::Dataset { cmd } => {
                 let path = decide::capture::dataset_path();
@@ -88,7 +152,16 @@ fn ping() {
         "is_urgent".to_string(),
         Question::noul("Does this message convey urgency?"),
     )]);
-    match decide::ask(&state, &questions) {
+    match decide::tracking::ask_with(
+        "ping",
+        "none",
+        |_| false,
+        &state,
+        &questions,
+        || decide::ask(&state, &questions),
+    )
+    .result
+    {
         Ok(out) => {
             for (id, answer) in &out.response.answers {
                 println!("{id}: {}", answer.summary());
@@ -105,7 +178,7 @@ fn ping() {
         }
         Err(e) => {
             eprintln!("{e}");
-            std::process::exit(1);
+            decide::exit(1);
         }
     }
 }
