@@ -29,11 +29,15 @@ pub enum DecideError {
     InvalidBaseUrl,
     #[error("decision backend temporarily unavailable (circuit breaker open)")]
     Unavailable,
+    #[error("local decision engine failed: {0}")]
+    Local(String),
     #[error("decision budget exhausted: {0}")]
     Budget(&'static str),
 }
 
 pub enum Provider {
+    /// Offline `flare-decide` engine: no credentials, no network.
+    Local,
     OpenRouter {
         key: String,
     },
@@ -88,6 +92,7 @@ impl Config {
         let provider = match val("AGENTFLARE_JEV_PROVIDER").as_deref() {
             Some("openrouter") => openrouter(),
             Some("cloudflare") => cloudflare(),
+            Some("local") => Some(Provider::Local),
             Some(_) => None,
             None => openrouter().or_else(cloudflare),
         }
@@ -108,6 +113,7 @@ impl Config {
         self.model_override
             .clone()
             .unwrap_or_else(|| match self.provider {
+                Provider::Local => "flare-decide-lexical-v1".into(),
                 Provider::OpenRouter { .. } => OPENROUTER_MODEL.into(),
                 Provider::Cloudflare { .. } => CLOUDFLARE_MODEL.into(),
             })
@@ -115,6 +121,7 @@ impl Config {
 
     pub fn request(&self, state: &Value, questions: &BTreeMap<String, Question>) -> HttpRequest {
         match &self.provider {
+            Provider::Local => unreachable!("local provider makes no HTTP request"),
             Provider::OpenRouter { key } => HttpRequest {
                 url: self
                     .url_override
