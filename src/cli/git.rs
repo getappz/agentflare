@@ -1257,7 +1257,7 @@ fn partition_claims_by_owner(
 fn scope_check(subcommand: &str, staged_only: bool) {
     let mut result = run_scope_check(subcommand, staged_only);
     if !result.deny {
-        result = run_secret_scan(subcommand);
+        result = run_secret_scan(subcommand, staged_only);
     }
     let json = serde_json::to_string(&result).unwrap_or_else(|_| {
         r#"{"deny":true,"reason":"internal error serializing scope-check result"}"#.to_string()
@@ -1464,7 +1464,7 @@ const MAX_SCAN_LINES: usize = 500_000;
 /// tracked-repo-only like every other shim guard -- a human with no agent
 /// detected gets no new restriction; `AGENTFLARE_GIT_BYPASS` is honoured
 /// upstream by the shim itself, before this child is ever spawned.
-fn run_secret_scan(subcommand: &str) -> ScopeCheckResult {
+fn run_secret_scan(subcommand: &str, staged_only: bool) -> ScopeCheckResult {
     let agent = classify::agent_invocation_detected();
     let cwd = std::env::current_dir().unwrap_or_default();
     let Some(repo_root) = branch::repo_toplevel(&cwd) else {
@@ -1477,6 +1477,7 @@ fn run_secret_scan(subcommand: &str) -> ScopeCheckResult {
         agent,
         allow_secrets,
         audit::default_path("git.jsonl").as_deref(),
+        staged_only,
     )
 }
 
@@ -1497,12 +1498,13 @@ fn secret_scan_for(
     agent_detected: bool,
     allow_secrets: bool,
     audit_path: Option<&Path>,
+    staged_only: bool,
 ) -> ScopeCheckResult {
     use crate::mcp_server::secret_scan::{check_fields, redact};
     if !agent_detected || !matches!(subcommand, "commit" | "push") {
         return scope_pass();
     }
-    let added = match secret_scan_added_lines(repo_root, subcommand) {
+    let added = match secret_scan_added_lines(repo_root, subcommand, staged_only) {
         Ok(a) => a,
         Err(e) => {
             return scope_error(format!(
@@ -1558,6 +1560,7 @@ fn secret_scan_for(
 fn secret_scan_added_lines(
     repo_root: &Path,
     subcommand: &str,
+    staged_only: bool,
 ) -> Result<Vec<(String, String)>, String> {
     const DIFF: &[&str] = &[
         "--no-color",
@@ -1589,7 +1592,11 @@ fn secret_scan_added_lines(
     let lines = match subcommand {
         "commit" => {
             let mut lines = run(&["diff"], &["--cached"])?;
-            lines.extend(run(&["diff"], &[])?);
+            // A plain index-only commit records the index alone; another
+            // agent's unstaged edits are not part of it.
+            if !staged_only {
+                lines.extend(run(&["diff"], &[])?);
+            }
             lines
         }
         // Per-commit patches, not the net diff: a later commit removing a
@@ -2276,7 +2283,7 @@ mod tests {
     const GH_TOKEN: &str = "ghp_abcdefghijklmnopqrstuvwxyz012345";
 
     fn scan(repo: &Path, subcommand: &str) -> ScopeCheckResult {
-        secret_scan_for(repo, subcommand, true, false, None)
+        secret_scan_for(repo, subcommand, true, false, None, false)
     }
 
     #[test]
@@ -2314,6 +2321,27 @@ mod tests {
         let result = scan(repo.path(), "commit");
         assert!(result.deny);
         assert!(result.reason.unwrap().contains("tracked.txt"));
+    }
+
+    #[test]
+    fn secret_scan_staged_only_ignores_unstaged_edits_but_still_scans_the_index() {
+        let repo = init_repo();
+        std::fs::write(
+            repo.path().join("tracked.txt"),
+            format!(
+                "v1
+token = {GH_TOKEN}
+"
+            ),
+        )
+        .unwrap();
+        // Unstaged credential: not part of a plain index-only commit.
+        let unstaged = secret_scan_for(repo.path(), "commit", true, false, None, true);
+        assert!(!unstaged.deny, "{:?}", unstaged.reason);
+        // Staged credential: still denied.
+        run_git(repo.path(), &["add", "tracked.txt"]);
+        let staged = secret_scan_for(repo.path(), "commit", true, false, None, true);
+        assert!(staged.deny);
     }
 
     #[test]
@@ -2493,7 +2521,7 @@ mod tests {
         let audit_dir = tempfile::tempdir().unwrap();
         let audit_path = audit_dir.path().join("git.jsonl");
 
-        let result = secret_scan_for(repo.path(), "commit", true, true, Some(&audit_path));
+        let result = secret_scan_for(repo.path(), "commit", true, true, Some(&audit_path), false);
         assert!(!result.deny);
 
         let events: Vec<classify::Event> = audit::read_events(&audit_path).unwrap();
@@ -2525,7 +2553,7 @@ mod tests {
         // detected the scan never runs, so nothing can deny.
         let dir = tempfile::tempdir().unwrap();
         let bogus = dir.path().join("not-a-repo");
-        let result = secret_scan_for(&bogus, "commit", false, false, None);
+        let result = secret_scan_for(&bogus, "commit", false, false, None, false);
         assert!(!result.deny);
     }
 
