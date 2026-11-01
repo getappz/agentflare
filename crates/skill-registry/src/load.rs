@@ -173,6 +173,14 @@ impl Registry {
         })
     }
 
+    /// Drop the debounce so the next `ensure_fresh` rescans immediately.
+    /// Use after an out-of-band install (`agentflare skill install`, or the
+    /// MCP load path's own registry install) so a just-written skill is
+    /// visible without waiting out `REFRESH_DEBOUNCE_SECS`.
+    pub fn invalidate(&mut self) {
+        self.refreshed_once = false;
+    }
+
     /// Rescan sources when never scanned or debounce elapsed. `detect_agents` is
     /// only invoked when a rescan actually happens (not on every debounced call),
     /// so a long-lived cached `Registry` (e.g. mcp_server.rs's per-process cache)

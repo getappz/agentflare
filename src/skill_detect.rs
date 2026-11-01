@@ -459,19 +459,23 @@ pub fn build_injection(skills: &[RankedSkill]) -> Option<String> {
 /// "skill(s)"; otherwise falls back to the generic search hint. `None` unless
 /// the prompt has both the words "install" and "skill(s)".
 pub fn install_hint(prompt: &str) -> Option<String> {
-    const STOP: &[&str] = &[
-        "the", "a", "an", "this", "that", "new", "any", "some", "please",
-    ];
-    // Words that follow "skill" in free text ("skill for pdf", "skill from
-    // github") — never a skill name, so those prompts get the generic hint.
+    const STOP: &[&str] = &["the", "a", "an", "this", "new", "any", "some", "please"];
+    // Words that follow "skill" in free text ("skill for pdf", "skill that
+    // converts…", "skill from github") — never a skill name, so those prompts
+    // get the generic hint. Keep clause connectors like "that" here (not in
+    // STOP) so stripping them doesn't make the next verb look like a name.
     const NOT_A_NAME: &[&str] = &[
         "from", "for", "in", "into", "to", "on", "of", "with", "my", "our", "your", "it", "using",
-        "via", "about", "called", "named", "which", "and", "or", "by", "at", "as",
+        "via", "about", "called", "named", "which", "and", "or", "by", "at", "as", "that",
     ];
-    // Keep the original case: names are looked up case-sensitively.
+    // Keep original case (registry lookup is case-sensitive) and the same
+    // character set the installer accepts (`-_ .`), trimming only other
+    // punctuation so `_pdf` / `foo.bar` survive.
     let toks: Vec<&str> = prompt
         .split_whitespace()
-        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()))
+        .map(|t| {
+            t.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+        })
         .collect();
     let in_list = |t: &str, list: &[&str]| list.iter().any(|w| t.eq_ignore_ascii_case(w));
     let is_skill = |t: &str| in_list(t, &["skill", "skills"]);
@@ -482,25 +486,31 @@ pub fn install_hint(prompt: &str) -> Option<String> {
         return None;
     }
     let ident = |t: &str| {
-        !t.is_empty()
-            && !is_skill(t)
-            && !in_list(t, NOT_A_NAME)
-            && t.chars()
-                .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_'))
+        crate::cli::skill::is_plain_skill_name(t) && !is_skill(t) && !in_list(t, NOT_A_NAME)
     };
     let rest: Vec<&str> = toks[i + 1..]
         .iter()
         .copied()
         .filter(|t| !in_list(t, STOP))
         .collect();
-    let name = match rest.as_slice() {
-        [a, b, ..] if is_skill(b) && ident(a) => Some(*a),
-        [a, b, ..] if is_skill(a) && ident(b) => Some(*b),
+    // Collect every `<name> skill` / `skill <name>` pair; name only when
+    // exactly one candidate (multiple → generic search hint).
+    let mut candidates: Vec<&str> = Vec::new();
+    for w in rest.windows(2) {
+        if is_skill(w[1]) && ident(w[0]) {
+            candidates.push(w[0]);
+        } else if is_skill(w[0]) && ident(w[1]) {
+            candidates.push(w[1]);
+        }
+    }
+    candidates.dedup();
+    let name = match candidates.as_slice() {
+        [n] => Some(*n),
         _ => None,
     };
     Some(match name {
         Some(n) => format!(
-            "@skill-install: call the skill tool with action=\"load\", name=\"{n}\" to load it into this session; if it isn't indexed, run `agentflare skill install \"{n}\"` (stages in ~/.agentflare/skills, not an agent dir), then load it"
+            "@skill-install: call the skill tool with action=\"load\", name=\"{n}\" to load it into this session; if it isn't indexed, run `agentflare skill install \"{n}\"` (stages in ~/.agentflare/skills, not an agent dir), then load it again — load force-rescans so the new install is visible past the registry debounce"
         ),
         None => "@skill-install: call the skill tool with action=\"search\" (query=...) then action=\"load\" (name=...) to use a skill on demand; `agentflare skill install <name>` only if it isn't indexed"
             .to_string(),
@@ -722,6 +732,14 @@ mod tests {
     }
 
     #[test]
+    fn install_hint_preserves_underscores_and_periods() {
+        let h = install_hint("install _pdf skill").unwrap();
+        assert!(h.contains("name=\"_pdf\""), "{h}");
+        let h = install_hint("install foo.bar skill").unwrap();
+        assert!(h.contains("name=\"foo.bar\""), "{h}");
+    }
+
+    #[test]
     fn install_hint_never_picks_a_preposition_as_the_name() {
         let generic = install_hint("install skill").unwrap();
         for p in [
@@ -729,6 +747,8 @@ mod tests {
             "install skill for pdf",
             "install a skill for pdf processing",
             "install skill in my agent",
+            "install a skill that converts PDFs",
+            "install pdf skill and json skill",
         ] {
             assert_eq!(install_hint(p).unwrap(), generic, "{p}");
         }
