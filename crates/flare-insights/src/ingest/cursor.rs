@@ -111,9 +111,7 @@ fn ingest_from_conn(conn: &Connection) -> Result<IngestBundle, IngestError> {
         Err(e) if is_missing_cursor_disk_kv(&e) => return Ok(bundle),
         Err(e) => return Err(e.into()),
     };
-    let rows = stmt.query_map([], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
-    })?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, value_bytes(r, 1)?)))?;
 
     for row in rows {
         let (key, value_bytes) = row?;
@@ -148,6 +146,18 @@ fn ingest_from_conn(conn: &Connection) -> Result<IngestBundle, IngestError> {
         }
     }
     Ok(bundle)
+}
+
+/// Reads a `cursorDiskKV.value` cell. Cursor stores JSON as BLOB in most rows
+/// but as TEXT in others; a strict `Vec<u8>` read fails the whole scan on the
+/// first TEXT row. Any other type yields no bytes, which callers skip.
+fn value_bytes(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<Vec<u8>> {
+    use rusqlite::types::ValueRef;
+    Ok(match row.get_ref(idx)? {
+        ValueRef::Blob(b) => b.to_vec(),
+        ValueRef::Text(t) => t.to_vec(),
+        _ => Vec::new(),
+    })
 }
 
 fn is_missing_cursor_disk_kv(err: &rusqlite::Error) -> bool {
@@ -500,7 +510,7 @@ fn load_bubble(
     let bytes: Vec<u8> = match conn.query_row(
         "SELECT value FROM cursorDiskKV WHERE key = ?1",
         [&key],
-        |r| r.get(0),
+        |r| value_bytes(r, 0),
     ) {
         Ok(bytes) => bytes,
         Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
@@ -907,6 +917,39 @@ mod tests {
         let bundle = CursorAdapter.scan(&cfg, &cursors, &mut |_, _| {}).unwrap();
         assert_eq!(bundle.sessions.len(), 1);
         assert_eq!(bundle.file_cursors.len(), 1);
+    }
+
+    #[test]
+    fn text_typed_values_ingest_like_blob_values() {
+        // Cursor stores some cursorDiskKV values as TEXT; a BLOB-only read
+        // aborted the whole scan with "Invalid column type Text".
+        let dir = TempDir::new().unwrap();
+        let blob_db = dir.path().join("blob.vscdb");
+        let text_db = dir.path().join("text.vscdb");
+        write_fixture(&blob_db);
+        write_fixture(&text_db);
+        let conn = Connection::open(&text_db).unwrap();
+        conn.execute("UPDATE cursorDiskKV SET value = CAST(value AS TEXT)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO cursorDiskKV(key, value) VALUES ('composerData:null-row', NULL)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let scan = |db: PathBuf| {
+            let cfg = InsightsConfig {
+                sources: [("cursor".into(), db)].into(),
+                ..Default::default()
+            };
+            CursorAdapter
+                .scan(&cfg, &FileCursors::default(), &mut |_, _| {})
+                .unwrap()
+        };
+        let (blob, text) = (scan(blob_db), scan(text_db));
+        assert_eq!(text.sessions.len(), 1);
+        assert_eq!(text.turns.len(), blob.turns.len());
+        assert_eq!(text.tool_calls.len(), blob.tool_calls.len());
     }
 
     #[test]
