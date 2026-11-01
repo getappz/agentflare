@@ -454,6 +454,45 @@ pub fn build_injection(skills: &[RankedSkill]) -> Option<String> {
     Some(lines.join("\n"))
 }
 
+/// Hint for prompts like "install pdf skill" / "install the skill pdf-tools".
+/// Names the skill only when exactly one identifier-shaped word sits next to
+/// "skill(s)"; otherwise falls back to the generic search hint. `None` unless
+/// the prompt has both the words "install" and "skill(s)".
+pub fn install_hint(prompt: &str) -> Option<String> {
+    const STOP: &[&str] = &["the", "a", "an", "this", "that", "new", "any", "some", "please"];
+    let toks: Vec<String> = prompt
+        .split_whitespace()
+        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+        .collect();
+    let is_skill = |t: &str| t == "skill" || t == "skills";
+    let i = toks.iter().position(|t| t == "install")?;
+    if !toks.iter().any(|t| is_skill(t)) {
+        return None;
+    }
+    let ident = |t: &str| {
+        !t.is_empty()
+            && !is_skill(t)
+            && t.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '_'))
+    };
+    let rest: Vec<&str> = toks[i + 1..]
+        .iter()
+        .map(String::as_str)
+        .filter(|t| !STOP.contains(t))
+        .collect();
+    let name = match rest.as_slice() {
+        [a, b, ..] if is_skill(b) && ident(a) => Some(*a),
+        [a, b, ..] if is_skill(a) && ident(b) => Some(*b),
+        _ => None,
+    };
+    Some(match name {
+        Some(n) => format!(
+            "@skill-install: use skill_load(\"{n}\") to load it into this session; if it isn't indexed, run `agentflare skill install \"{n}\"` (stages in ~/.agentflare/skills, not an agent dir), then skill_load it"
+        ),
+        None => "@skill-install: skill_search(<query>) then skill_load(name) to use a skill on demand; `agentflare skill install <name>` only if it isn't indexed"
+            .to_string(),
+    })
+}
+
 pub fn session_context_queries() -> Vec<String> {
     let cwd = std::env::current_dir().ok();
     let mut queries = Vec::new();
@@ -646,6 +685,35 @@ mod tests {
         let out = build_injection(&skills).unwrap();
         assert!(out.contains("test-driven-development"));
         assert!(out.contains("87%"));
+    }
+
+    #[test]
+    fn install_hint_names_the_skill_without_mangling_it() {
+        for p in [
+            "please install the pdf skill",
+            "Install skill pdf",
+            "can you install the pdf skills?",
+        ] {
+            let h = install_hint(p).unwrap();
+            assert!(h.contains("skill_load(\"pdf\")"), "{p}: {h}");
+            assert!(h.contains("agentflare skill install \"pdf\""), "{p}: {h}");
+        }
+    }
+
+    #[test]
+    fn install_hint_falls_back_to_search_for_free_text_and_ignores_unrelated() {
+        let generic = "@skill-install: skill_search(<query>) then skill_load(name) to use a skill on demand; `agentflare skill install <name>` only if it isn't indexed";
+        // Long free-form prompt: the old code stripped every 'a' and echoed it.
+        assert_eq!(
+            install_hint("after doing flare skill search, i do not want to install it into the agent")
+                .unwrap(),
+            generic
+        );
+        assert_eq!(install_hint("install skill").unwrap(), generic);
+        assert!(install_hint("install the package").is_none());
+        assert!(install_hint("this skill is great").is_none());
+        // "installed" must not count as the word "install".
+        assert!(install_hint("the skill is installed").is_none());
     }
 
     fn ranked(name: &str, score: f64) -> RankedSkill {
