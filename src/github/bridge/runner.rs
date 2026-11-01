@@ -128,19 +128,21 @@ fn run_forever(config: BridgeConfig) {
     // one daemon now polls several independently.
     let mut last_soft: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut had_targets = true; // forces the "nothing registered" message on the first empty tick
-    let mut logged_no_db = false;
+    let mut last_db_err: Option<String> = None;
     let mut logged_no_client = false;
 
     loop {
         let conn = match open_items_db() {
             Ok(c) => {
-                logged_no_db = false;
+                last_db_err = None;
                 c
             }
             Err(e) => {
-                if !logged_no_db {
+                // Log on change, not once: a lock error followed by a
+                // schema-ahead error needs its rebuild instructions shown.
+                if last_db_err.as_deref() != Some(e.as_str()) {
                     eprintln!("github bridge: {e}; waiting for it to become available...");
-                    logged_no_db = true;
+                    last_db_err = Some(e);
                 }
                 std::thread::sleep(interval);
                 continue;
