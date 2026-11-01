@@ -158,16 +158,9 @@ pub(crate) const ITEM_ID_MARKER: &str = ".agentflare-item-id";
 /// Returns the item ID that owns `worktree_path`, if the marker file exists.
 #[must_use]
 pub fn worktree_owner_id(worktree_path: &Path) -> Option<String> {
-    let marker = worktree_path.join(ITEM_ID_MARKER);
-    if marker.is_file() {
-        if let Ok(id) = std::fs::read_to_string(&marker) {
-            let trimmed = id.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-    None
+    let id = std::fs::read_to_string(worktree_path.join(ITEM_ID_MARKER)).ok()?;
+    let trimmed = id.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 /// Returns true if `worktree_path` has no marker (legacy) or has a marker matching `item_id`.
@@ -591,10 +584,7 @@ pub fn create_worktree_for(
                 item.id
             );
             let path = worktree_path.to_string_lossy().to_string();
-            let _ = run_git_in(
-                repo_root,
-                &["worktree", "remove", "--force", &path],
-            );
+            let _ = run_git_in(repo_root, &["worktree", "remove", "--force", &path]);
             if worktree_path.exists() {
                 remove_worktree_dir(&worktree_path, &label);
             }

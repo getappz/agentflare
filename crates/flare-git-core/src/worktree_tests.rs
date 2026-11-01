@@ -201,7 +201,11 @@ fn ensure_worktrees_ignored_is_noop_when_already_ignored() {
     let repo = init_repo();
     let exclude_path = repo.path.join(".git").join("info").join("exclude");
     std::fs::create_dir_all(exclude_path.parent().unwrap()).unwrap();
-    std::fs::write(&exclude_path, format!(".worktrees/\n.cargo/\n{ITEM_ID_MARKER}\n")).unwrap();
+    std::fs::write(
+        &exclude_path,
+        format!(".worktrees/\n.cargo/\n{ITEM_ID_MARKER}\n"),
+    )
+    .unwrap();
     let before = std::fs::read_to_string(&exclude_path).unwrap();
     ensure_worktrees_ignored(&repo.path);
     let after = std::fs::read_to_string(&exclude_path).unwrap();
@@ -1497,7 +1501,10 @@ fn worktree_ownership_marker_lifecycle() {
     let target = resolve_default_branch(&repo.path);
     let wt_path = create_worktree(&item_a, &repo.path, &target, None).unwrap();
     assert!(wt_path.join(ITEM_ID_MARKER).is_file());
-    assert_eq!(worktree_owner_id(&wt_path).as_deref(), Some(item_a.id.as_str()));
+    assert_eq!(
+        worktree_owner_id(&wt_path).as_deref(),
+        Some(item_a.id.as_str())
+    );
     assert!(is_worktree_owned_by_item(&wt_path, &item_a.id));
     assert!(!is_worktree_owned_by_item(&wt_path, "different-item-id"));
 }

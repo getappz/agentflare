@@ -577,7 +577,12 @@ pub(crate) fn run_discovery_tick(
                 ensure_dispatched_label(conn, &dir.project_id, &mut label_id_by_name);
             }
             if !label_id_by_name.contains_key(NEEDS_MANUAL_LABEL) {
-                ensure_label(conn, &dir.project_id, NEEDS_MANUAL_LABEL, &mut label_id_by_name);
+                ensure_label(
+                    conn,
+                    &dir.project_id,
+                    NEEDS_MANUAL_LABEL,
+                    &mut label_id_by_name,
+                );
             }
             let items =
                 match agentflare_backend::item::list_by_label(conn, &dir.project_id, &ready_id) {
