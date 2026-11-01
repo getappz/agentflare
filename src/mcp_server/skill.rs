@@ -85,7 +85,18 @@ impl AgentflareMcp {
                 if name.trim().is_empty() {
                     return Err(ErrorData::invalid_params("name is required", None));
                 }
-                let result = self.with_fresh_registry(|reg| reg.load(&name, req.original))?;
+                let mut result = self.with_fresh_registry(|reg| reg.load(&name, req.original))?;
+                // Not indexed: try the configured registries, staging into
+                // ~/.agentflare/skills (never an agent dir), then load once more.
+                if matches!(result, Err(skill_registry::LoadError::NotFound(_)))
+                    && crate::cli::skill::is_plain_skill_name(&name)
+                    && matches!(
+                        crate::cli::skill::install_from_registries(&name).await,
+                        Ok(true)
+                    )
+                {
+                    result = self.with_fresh_registry(|reg| reg.load(&name, req.original))?;
+                }
                 match result {
                     Ok(s) => {
                         let json = serde_json::to_string_pretty(&s).unwrap_or_default();
