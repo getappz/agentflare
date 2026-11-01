@@ -459,25 +459,39 @@ pub fn build_injection(skills: &[RankedSkill]) -> Option<String> {
 /// "skill(s)"; otherwise falls back to the generic search hint. `None` unless
 /// the prompt has both the words "install" and "skill(s)".
 pub fn install_hint(prompt: &str) -> Option<String> {
-    const STOP: &[&str] = &["the", "a", "an", "this", "that", "new", "any", "some", "please"];
-    let toks: Vec<String> = prompt
+    const STOP: &[&str] = &[
+        "the", "a", "an", "this", "that", "new", "any", "some", "please",
+    ];
+    // Words that follow "skill" in free text ("skill for pdf", "skill from
+    // github") — never a skill name, so those prompts get the generic hint.
+    const NOT_A_NAME: &[&str] = &[
+        "from", "for", "in", "into", "to", "on", "of", "with", "my", "our", "your", "it", "using",
+        "via", "about", "called", "named", "which", "and", "or", "by", "at", "as",
+    ];
+    // Keep the original case: names are looked up case-sensitively.
+    let toks: Vec<&str> = prompt
         .split_whitespace()
-        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()))
         .collect();
-    let is_skill = |t: &str| t == "skill" || t == "skills";
-    let i = toks.iter().position(|t| t == "install")?;
+    let in_list = |t: &str, list: &[&str]| list.iter().any(|w| t.eq_ignore_ascii_case(w));
+    let is_skill = |t: &str| in_list(t, &["skill", "skills"]);
+    let i = toks
+        .iter()
+        .position(|t| t.eq_ignore_ascii_case("install"))?;
     if !toks.iter().any(|t| is_skill(t)) {
         return None;
     }
     let ident = |t: &str| {
         !t.is_empty()
             && !is_skill(t)
-            && t.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '_'))
+            && !in_list(t, NOT_A_NAME)
+            && t.chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_'))
     };
     let rest: Vec<&str> = toks[i + 1..]
         .iter()
-        .map(String::as_str)
-        .filter(|t| !STOP.contains(t))
+        .copied()
+        .filter(|t| !in_list(t, STOP))
         .collect();
     let name = match rest.as_slice() {
         [a, b, ..] if is_skill(b) && ident(a) => Some(*a),
@@ -486,9 +500,9 @@ pub fn install_hint(prompt: &str) -> Option<String> {
     };
     Some(match name {
         Some(n) => format!(
-            "@skill-install: use skill_load(\"{n}\") to load it into this session; if it isn't indexed, run `agentflare skill install \"{n}\"` (stages in ~/.agentflare/skills, not an agent dir), then skill_load it"
+            "@skill-install: call the skill tool with action=\"load\", name=\"{n}\" to load it into this session; if it isn't indexed, run `agentflare skill install \"{n}\"` (stages in ~/.agentflare/skills, not an agent dir), then load it"
         ),
-        None => "@skill-install: skill_search(<query>) then skill_load(name) to use a skill on demand; `agentflare skill install <name>` only if it isn't indexed"
+        None => "@skill-install: call the skill tool with action=\"search\" (query=...) then action=\"load\" (name=...) to use a skill on demand; `agentflare skill install <name>` only if it isn't indexed"
             .to_string(),
     })
 }
@@ -695,18 +709,40 @@ mod tests {
             "can you install the pdf skills?",
         ] {
             let h = install_hint(p).unwrap();
-            assert!(h.contains("skill_load(\"pdf\")"), "{p}: {h}");
+            assert!(h.contains("action=\"load\", name=\"pdf\""), "{p}: {h}");
             assert!(h.contains("agentflare skill install \"pdf\""), "{p}: {h}");
         }
     }
 
     #[test]
+    fn install_hint_preserves_the_skill_name_case() {
+        let h = install_hint("install MySkill skill").unwrap();
+        assert!(h.contains("name=\"MySkill\""), "{h}");
+        assert!(h.contains("install \"MySkill\""), "{h}");
+    }
+
+    #[test]
+    fn install_hint_never_picks_a_preposition_as_the_name() {
+        let generic = install_hint("install skill").unwrap();
+        for p in [
+            "how do I install a skill from github",
+            "install skill for pdf",
+            "install a skill for pdf processing",
+            "install skill in my agent",
+        ] {
+            assert_eq!(install_hint(p).unwrap(), generic, "{p}");
+        }
+    }
+
+    #[test]
     fn install_hint_falls_back_to_search_for_free_text_and_ignores_unrelated() {
-        let generic = "@skill-install: skill_search(<query>) then skill_load(name) to use a skill on demand; `agentflare skill install <name>` only if it isn't indexed";
+        let generic = "@skill-install: call the skill tool with action=\"search\" (query=...) then action=\"load\" (name=...) to use a skill on demand; `agentflare skill install <name>` only if it isn't indexed";
         // Long free-form prompt: the old code stripped every 'a' and echoed it.
         assert_eq!(
-            install_hint("after doing flare skill search, i do not want to install it into the agent")
-                .unwrap(),
+            install_hint(
+                "after doing flare skill search, i do not want to install it into the agent"
+            )
+            .unwrap(),
             generic
         );
         assert_eq!(install_hint("install skill").unwrap(), generic);
