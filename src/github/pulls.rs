@@ -375,6 +375,26 @@ pub(crate) fn tag_allows(body: Option<&str>, item_id: &str) -> bool {
     true
 }
 
+/// False when `body` carries an origin stamp naming a *different* item than
+/// `item_id`. Unstamped PRs (legacy/hand-opened) still pass.
+pub(crate) fn origin_item_allows(body: Option<&str>, item_id: &str) -> bool {
+    let Some(mut rest) = body else {
+        return true;
+    };
+    while let Some((_, after_prefix)) = rest.split_once(ORIGIN_TAG_PREFIX) {
+        let Some((fields, after_tag)) = after_prefix.split_once("-->") else {
+            return false;
+        };
+        if let Some(origin) = parse_origin_fields(fields)
+            && origin.item != item_id
+        {
+            return false;
+        }
+        rest = after_tag;
+    }
+    true
+}
+
 /// [`marks_item`] plus the identity-tag check: the PR must carry this
 /// sequence number's marker *and* not be tagged for some other item.
 /// A foreign origin stamp additionally disqualifies the PR even when the
@@ -382,7 +402,7 @@ pub(crate) fn tag_allows(body: Option<&str>, item_id: &str) -> bool {
 /// same-numbered marker from another workstation says nothing about this
 /// item (item #347 phase 2).
 pub fn marks_this_item(body: Option<&str>, sequence_id: i64, item_id: &str) -> bool {
-    marks_item(body, sequence_id) && tag_allows(body, item_id)
+    marks_item(body, sequence_id) && tag_allows(body, item_id) && origin_item_allows(body, item_id)
 }
 
 /// True if `body` carries agentflare's own stamp -- for *any* item, unlike
@@ -464,6 +484,7 @@ pub fn find_by_item_marker(
         .filter(|pr| {
             pr.body.as_deref().is_some_and(|b| b.contains(&marker))
                 && tag_allows(pr.body.as_deref(), item_id)
+                && origin_item_allows(pr.body.as_deref(), item_id)
                 && origin_allows(pr.body.as_deref(), &self_instance)
         })
         .collect())
@@ -1244,6 +1265,17 @@ mod tests {
         );
         assert!(marks_item(Some(&body), 259));
         assert!(!marks_item(Some(&body), 260));
+    }
+
+    #[test]
+    fn marks_this_item_rejects_a_pr_with_foreign_item_in_own_origin_tag() {
+        let me = self_instance();
+        let body = format!(
+            "---\n_Opened by `a` on **m** for item #259 via agentflare._\n{}",
+            origin_tag(&me, "foreign-uuid", 259, "task/259-x"),
+        );
+        assert!(!marks_this_item(Some(&body), 259, "my-uuid"));
+        assert!(marks_this_item(Some(&body), 259, "foreign-uuid"));
     }
 
     #[test]
