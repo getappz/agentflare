@@ -186,7 +186,9 @@ impl Registry {
             return Ok(());
         }
         self.detected_agents = detect_agents();
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        // Shared resolver: honors AGENTFLARE_HOME_OVERRIDE, matching where
+        // `agentflare skill install` writes (`~/.agentflare/skills`).
+        let home = agentflare_config::try_home().unwrap_or_else(|| PathBuf::from("."));
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let sources = crate::sources::default_sources(&home, &cwd, &self.detected_agents);
         let out = crate::sources::scan_sources(&sources);
