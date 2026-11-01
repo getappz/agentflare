@@ -118,6 +118,15 @@ const READ_ONLY_ESCAPE_SUBCOMMANDS: &[&str] = &[
 
 /// Only positively recognized listing forms may bypass repository classification.
 fn escape_hatch_read_only(subcommand: &str, rest: &[String]) -> bool {
+    if subcommand == "grep" {
+        // `-O<pager>` / `--open-files-in-pager=<cmd>` runs a caller-chosen
+        // program on a match. Over-denying a short cluster that merely
+        // contains `O` is the safe side.
+        return !rest.iter().any(|a| {
+            a.starts_with("--open-files-in-pager")
+                || (a.starts_with('-') && !a.starts_with("--") && a.contains('O'))
+        });
+    }
     if READ_ONLY_ESCAPE_SUBCOMMANDS.contains(&subcommand) {
         return true;
     }
@@ -807,6 +816,21 @@ mod tests {
 
     fn a(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn escape_hatch_grep_rejects_pager_execution() {
+        assert!(escape_hatch_read_only("grep", &a(&["-n", "pattern"])));
+        assert!(!escape_hatch_read_only(
+            "grep",
+            &a(&["--open-files-in-pager=sh", "pattern"])
+        ));
+        assert!(!escape_hatch_read_only(
+            "grep",
+            &a(&["--open-files-in-pager"])
+        ));
+        assert!(!escape_hatch_read_only("grep", &a(&["-Osh", "pattern"])));
+        assert!(!escape_hatch_read_only("grep", &a(&["-nO", "pattern"])));
     }
 
     #[test]
