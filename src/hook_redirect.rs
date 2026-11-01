@@ -216,7 +216,7 @@ pub(crate) fn branch_guard_reason_for(
     };
     is_protected.then(|| {
         format!(
-            "'{branch}' is this repo's default branch — direct edits are blocked. Create an isolated worktree first (e.g. `git worktree add ../<dir> -b <branch-name>`) and retry the edit there; a plain `git checkout -b <branch-name>` works too if a full worktree isn't needed."
+            "'{branch}' is this repo's default branch — direct edits are blocked. Create an isolated worktree first (e.g. `git worktree add ../<dir> -b <branch-name>`) and retry the edit there."
         )
     })
 }
