@@ -241,6 +241,9 @@ fn config() -> SandboxConfig {
     writable_home_dirs.extend(extra_writable_home_dirs_from_env());
     if let Some(home) = agentflare_config::try_home() {
         for dir in &writable_home_dirs {
+            if !flare_sandbox::advisor::is_valid_writable_dir(dir) {
+                continue;
+            }
             let _ = std::fs::create_dir_all(home.join(dir));
         }
     }

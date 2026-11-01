@@ -66,7 +66,11 @@ impl AgentflareMcp {
                     .map_err(internal_err)?;
                     let blocked_by = live.filter(|c| c.owner != assignee_agent);
                     let resource_policy = agentflare_resource_gate::current_policy();
-                    let resource_blocked = !matches!(resource_policy, agentflare_resource_gate::Policy::Normal);
+                    let resource_blocked = !matches!(
+                        resource_policy,
+                        agentflare_resource_gate::Policy::Normal
+                            | agentflare_resource_gate::Policy::Aggressive
+                    );
                     let dispatchable = blocked_by.is_none() && !resource_blocked;
                     let mut refusal_reason: Option<String> = None;
                     if let Some(ref c) = blocked_by {

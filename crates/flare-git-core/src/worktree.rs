@@ -173,8 +173,17 @@ pub fn is_worktree_owned_by_item(worktree_path: &Path, item_id: &str) -> bool {
 }
 
 /// Records item ownership marker in the worktree.
-pub fn record_worktree_owner(worktree_path: &Path, item_id: &str) {
-    let _ = std::fs::write(worktree_path.join(ITEM_ID_MARKER), item_id);
+///
+/// # Errors
+/// Returns the write failure: a worktree whose ownership cannot be recorded
+/// would later read as legacy/unowned, so creation must not report success.
+pub fn record_worktree_owner(worktree_path: &Path, item_id: &str) -> Result<(), String> {
+    std::fs::write(worktree_path.join(ITEM_ID_MARKER), item_id).map_err(|e| {
+        format!(
+            "worktree: could not record ownership marker in {}: {e}",
+            worktree_path.display()
+        )
+    })
 }
 
 /// `true` if `worktree_path` already exists on disk and is itself a git
@@ -544,7 +553,10 @@ pub fn create_worktree_for(
         retire_legacy_cargo_config(&worktree_path);
         provision_shared_deps(repo_root, &worktree_path);
         lock_item_worktree(repo_root, &worktree_path);
-        record_worktree_owner(&worktree_path, &item.id);
+        // Old local excludes lack the marker rule; install it before writing
+        // the marker so it cannot be staged with the item's work.
+        ensure_worktrees_ignored(repo_root);
+        record_worktree_owner(&worktree_path, &item.id)?;
         return Ok(worktree_path);
     }
     ensure_worktrees_ignored(repo_root);
@@ -563,11 +575,29 @@ pub fn create_worktree_for(
                 item.id
             )
         })?;
-        let is_dirty = status.lines().any(|l| {
-            let trimmed = l.trim();
-            !trimmed.is_empty() && !trimmed.ends_with(ITEM_ID_MARKER)
-        });
-        if is_dirty {
+        // Only the root ownership marker is ignorable; `notes.<marker>` or a
+        // nested copy is real user content.
+        let is_dirty = status
+            .lines()
+            .any(|l| !l.trim().is_empty() && l.get(3..).map(str::trim) != Some(ITEM_ID_MARKER));
+        // Replacing another item's checkout would drop commits reachable only
+        // from its detached HEAD, which `status` reports as clean. (Our own
+        // checkout is rescued by `adopt_existing_checkout` instead.)
+        let has_unreachable_commits = is_mismatched
+            && run_git_in(
+                worktree_path.as_path(),
+                &[
+                    "rev-list",
+                    "-n",
+                    "1",
+                    "HEAD",
+                    "--not",
+                    "--branches",
+                    "--remotes",
+                ],
+            )
+            .map_or(true, |o| !o.trim().is_empty());
+        if is_dirty || has_unreachable_commits {
             let msg = format!(
                 "worktree: refusing to recreate over dirty worktree at {} for item {} \
                  (uncommitted changes preserved; clear or commit them before retrying)",
@@ -601,7 +631,7 @@ pub fn create_worktree_for(
             retire_legacy_cargo_config(&worktree_path);
             provision_shared_deps(repo_root, &worktree_path);
             lock_item_worktree(repo_root, &worktree_path);
-            record_worktree_owner(&worktree_path, &item.id);
+            record_worktree_owner(&worktree_path, &item.id)?;
             return Ok(worktree_path);
         }
     }
@@ -787,7 +817,7 @@ pub fn create_worktree_for(
                 retire_legacy_cargo_config(&worktree_path);
                 provision_shared_deps(repo_root, &worktree_path);
                 lock_item_worktree(repo_root, &worktree_path);
-                record_worktree_owner(&worktree_path, &item.id);
+                record_worktree_owner(&worktree_path, &item.id)?;
                 return Ok(worktree_path);
             }
             Err(e) => {
