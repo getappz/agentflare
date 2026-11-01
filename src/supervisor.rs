@@ -2154,6 +2154,15 @@ fn item_gated(
     item: &agentflare_backend::item::Item,
     label_id_by_name: &std::collections::HashMap<String, String>,
 ) -> bool {
+    !held_item_gates(mcp, item, label_id_by_name).is_empty()
+}
+
+/// The dispatch gate labels `item` currently carries.
+fn held_item_gates(
+    mcp: &AgentflareMcp,
+    item: &agentflare_backend::item::Item,
+    label_id_by_name: &std::collections::HashMap<String, String>,
+) -> Vec<&'static str> {
     let item_label_ids = mcp
         .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item.id))
         .ok()
@@ -2165,13 +2174,14 @@ fn item_gated(
     // defeating the cap. The stray-item recovery path already excludes both
     // gates for the same reason (see `stray_candidates` above).
     [NEEDS_HUMAN_GATE_LABEL, NEEDS_MANUAL_LABEL]
-        .iter()
-        .any(|name| {
+        .into_iter()
+        .filter(|name| {
             label_id_by_name
                 .get(*name)
                 .zip(item_label_ids.as_ref())
                 .is_some_and(|(gate_id, ids)| ids.contains(gate_id))
         })
+        .collect()
 }
 
 /// True when the item's state group is `needs_input` (non-dispatchable).

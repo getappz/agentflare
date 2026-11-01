@@ -48,6 +48,94 @@ pub(super) fn record_armed_auto_merge(
     );
 }
 
+/// `metadata.pr.<key>` as a list of strings; empty when absent.
+pub(super) fn pr_string_list(item: &agentflare_backend::item::Item, key: &str) -> Vec<String> {
+    serde_json::from_str::<serde_json::Value>(&item.metadata)
+        .ok()
+        .and_then(|m| m.get("pr")?.get(key)?.as_array().cloned())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn set_pr_string_list(
+    mcp: &AgentflareMcp,
+    item: &agentflare_backend::item::Item,
+    key: &'static str,
+    list: &[String],
+) {
+    set_pr_field(
+        mcp,
+        item,
+        key,
+        (!list.is_empty()).then(|| serde_json::json!(list)),
+    );
+}
+
+/// Remembers the dispatch gates cleared when auto-merge was armed, so
+/// withdrawing the arming can put them back.
+pub(super) fn record_held_gates(
+    mcp: &AgentflareMcp,
+    item: &agentflare_backend::item::Item,
+    gates: &[String],
+) {
+    set_pr_string_list(mcp, item, "held_gates", gates);
+}
+
+/// Puts `gates` back on the item (and `NEEDS_HUMAN_PR_LABEL` on the PR). Any
+/// write that fails is kept in `metadata.pr.pending_gates` for
+/// `retry_pending_gate_restore`, so a failed write cannot silently leave the
+/// item ungated.
+pub(super) fn restore_gates(
+    mcp: &AgentflareMcp,
+    item: &agentflare_backend::item::Item,
+    repo_root: &std::path::Path,
+    number: u64,
+    gates: &[String],
+) {
+    let mut failed = Vec::new();
+    for name in gates {
+        let ok = if name == NEEDS_HUMAN_PR_LABEL {
+            crate::github::RepoId::resolve_from_remote(repo_root)
+                .zip(crate::github::Client::new().ok())
+                .is_some_and(|(repo, client)| {
+                    crate::github::issues::add_labels(
+                        &client,
+                        &repo,
+                        number,
+                        std::slice::from_ref(name),
+                    )
+                    .is_ok()
+                })
+        } else {
+            mcp.with_backend_db(|conn| {
+                agentflare_backend::item::add_label_by_name(conn, &item.id, name)
+            })
+            .is_ok_and(|r| r.is_ok())
+        };
+        if !ok {
+            failed.push(name.clone());
+        }
+    }
+    set_pr_string_list(mcp, item, "pending_gates", &failed);
+}
+
+/// Retries a gate restore that failed on an earlier tick.
+pub(super) fn retry_pending_gate_restore(
+    mcp: &AgentflareMcp,
+    item: &agentflare_backend::item::Item,
+    repo_root: &std::path::Path,
+    number: u64,
+) {
+    let pending = pr_string_list(item, "pending_gates");
+    if !pending.is_empty() {
+        restore_gates(mcp, item, repo_root, number, &pending);
+    }
+}
+
 /// Forgets a recorded arming -- after disarming it, or once GitHub reports
 /// it gone.
 pub(super) fn clear_armed_auto_merge(mcp: &AgentflareMcp, item: &agentflare_backend::item::Item) {
@@ -62,6 +150,16 @@ fn set_pr_auto_merge(
     item: &agentflare_backend::item::Item,
     value: Option<serde_json::Value>,
 ) {
+    set_pr_field(mcp, item, "auto_merge", value);
+}
+
+/// Writes or removes `metadata.pr.<key>`; see `set_pr_auto_merge`.
+fn set_pr_field(
+    mcp: &AgentflareMcp,
+    item: &agentflare_backend::item::Item,
+    key: &'static str,
+    value: Option<serde_json::Value>,
+) {
     let outcome = mcp.with_backend_db(|conn| {
         crate::mcp_server::merge_item_metadata(conn, &item.id, |merged| {
             let mut pr = merged
@@ -71,10 +169,10 @@ fn set_pr_auto_merge(
                 .unwrap_or_default();
             match value {
                 Some(v) => {
-                    pr.insert("auto_merge".into(), v);
+                    pr.insert(key.into(), v);
                 }
                 None => {
-                    pr.remove("auto_merge");
+                    pr.remove(key);
                 }
             }
             merged.insert("pr".into(), serde_json::Value::Object(pr));
@@ -118,7 +216,22 @@ pub(super) fn disarm_our_auto_merge(
         return false;
     }
     clear_armed_auto_merge(mcp, item);
+    restore_held_gates(mcp, item, repo_root, number);
     true
+}
+
+/// Restores and forgets the gates recorded at arming time.
+fn restore_held_gates(
+    mcp: &AgentflareMcp,
+    item: &agentflare_backend::item::Item,
+    repo_root: &std::path::Path,
+    number: u64,
+) {
+    let held = pr_string_list(item, "held_gates");
+    if !held.is_empty() {
+        record_held_gates(mcp, item, &[]);
+        restore_gates(mcp, item, repo_root, number, &held);
+    }
 }
 
 /// `disarm_our_auto_merge`'s GitHub half, split out for mock-server tests
@@ -198,7 +311,16 @@ pub(super) fn reconcile_armed_auto_merge(
     };
     match judge_armed_auto_merge(&armed, data) {
         ArmedVerdict::Keep => {}
-        ArmedVerdict::Forget => clear_armed_auto_merge(mcp, item),
+        ArmedVerdict::Forget => {
+            clear_armed_auto_merge(mcp, item);
+            // Merged or closed: the gates have nothing left to guard. Anything
+            // else means someone withdrew the arming, so the gates come back.
+            if data.is_some_and(|d| d.merged || d.closed) {
+                record_held_gates(mcp, item, &[]);
+            } else {
+                restore_held_gates(mcp, item, repo_root, number);
+            }
+        }
         ArmedVerdict::Disarm => {
             disarm_our_auto_merge(
                 mcp,
