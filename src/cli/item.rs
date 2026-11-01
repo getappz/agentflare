@@ -374,7 +374,13 @@ impl ItemArgs {
                         Some(num) => num,
                         None => {
                             let repo_root = std::env::current_dir().unwrap_or_default();
-                            crate::cli::work::find_duplicate_pr(&item, &repo_root)
+                            // Dispatch looks from the item worktree, which excludes the
+                            // item's own PR; the repo root would not, and could pick it.
+                            let worktree_path = flare_git_core::worktree::item_worktree_path(
+                                &repo_root,
+                                item.sequence_id,
+                            );
+                            crate::cli::work::find_duplicate_pr(&item, &worktree_path)
                                 .map(|p| p.number)
                                 .ok_or_else(|| {
                                     rmcp::model::ErrorData::new(
