@@ -123,6 +123,9 @@ ALLOWLIST=(
   # Keep this scoped fix separate from a worktree module/test split.
   src/worktree/mod.rs
   src/worktree/mod_tests.rs
+  # Near LIMIT on master before item #414's worktree collision tests;
+  # freeze at <= FROZEN_LIMIT until tests are split into submodules.
+  crates/flare-git-core/src/worktree_tests.rs
 )
 
 cd "$(dirname "$0")/.."
