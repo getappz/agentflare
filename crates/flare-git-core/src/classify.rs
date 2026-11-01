@@ -438,7 +438,7 @@ pub fn classify_pure(
             if is_protected_branch(target, Some(default_branch)) && !working_tree_clean {
                 Disposition::Deny {
                     reason: format!(
-                        "'{target}' is this repo's default branch — direct checkout/switch is blocked by the agentflare git shim. Call `item(action=\"claim\", id=<item>)` to get an isolated worktree instead (not the standalone `claim`/`mcp__flare__claim` tool, which only takes a scope lock)."
+                        "'{target}' is this repo's default branch and the working tree has uncommitted changes — switching would carry them onto '{target}', so the agentflare git shim blocked it. Commit them on a feature branch (or `git stash push -u -m <tag>`) and retry: a checkout/switch of '{target}' from a clean tree is allowed. For item work, call `item(action=\"claim\", id=<item>)` to get an isolated worktree instead (not the standalone `claim`/`mcp__flare__claim` tool, which only takes a scope lock)."
                     ),
                 }
             } else {
@@ -536,12 +536,16 @@ pub fn resolve_trust_root_touch(
     trust_root_paths: &[String],
 ) -> TrustRootTouch {
     let range = format!("{target}...{branch}");
-    match crate::shell::run_in(repo_root, &["diff", "--name-only", &range]) {
+    // Bound large diffs before allocating the entire path listing; overflow is unverifiable.
+    match crate::shell::run_in_lines_bounded(
+        repo_root,
+        &["diff", "--name-only", &range],
+        TRUST_ROOT_DIFF_MAX_PATHS,
+    ) {
         Ok(names) => {
             let mut matched: Vec<String> = names
-                .lines()
+                .into_iter()
                 .filter(|f| trust_root_paths.iter().any(|p| f.starts_with(p.as_str())))
-                .map(str::to_string)
                 .collect();
             matched.sort();
             matched.dedup();
@@ -553,6 +557,91 @@ pub fn resolve_trust_root_touch(
         }
         Err(_) => TrustRootTouch::Unknown,
     }
+}
+
+/// Match the scope-check changed-path cap.
+const TRUST_ROOT_DIFF_MAX_PATHS: usize = 50_000;
+
+/// Commit options whose values must not be mistaken for pathspecs.
+const VALUE_TAKING_COMMIT_FLAGS: &[&str] = &[
+    "--message",
+    "--file",
+    "--reuse-message",
+    "--reedit-message",
+    "--fixup",
+    "--squash",
+    "--author",
+    "--date",
+    "--template",
+    "--cleanup",
+    "--trailer",
+];
+
+/// Whether a commit can include unstaged content. Unknown options keep the broader check.
+#[must_use]
+pub fn commit_includes_unstaged(args: &[String]) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        i += 1;
+        if a == "--" {
+            return i < args.len();
+        }
+        if a.starts_with('-') && !a.starts_with("--") && a.len() > 1 {
+            for (at, flag) in a[1..].char_indices() {
+                match flag {
+                    'm' | 'F' | 'C' | 'c' | 't' => {
+                        // Everything after a value flag is its attached value, even `a`/`i`/`p`.
+                        if at + 2 == a.len() {
+                            i += 1;
+                        }
+                        break;
+                    }
+                    'S' | 'u' => break, // optional attached value
+                    'q' | 'v' | 's' | 'n' | 'e' | 'z' | 'o' => {}
+                    _ => return true,
+                }
+            }
+            continue;
+        }
+        let name = a.split('=').next().unwrap_or(a);
+        if VALUE_TAKING_COMMIT_FLAGS.contains(&name) {
+            if a == name {
+                i += 1;
+            }
+            continue;
+        }
+        if !matches!(
+            name,
+            "--quiet"
+                | "--verbose"
+                | "--signoff"
+                | "--no-signoff"
+                | "--no-verify"
+                | "--amend"
+                | "--no-edit"
+                | "--edit"
+                | "--reset-author"
+                | "--only"
+                | "--allow-empty"
+                | "--allow-empty-message"
+                | "--no-post-rewrite"
+                | "--dry-run"
+                | "--short"
+                | "--branch"
+                | "--porcelain"
+                | "--long"
+                | "--null"
+                | "--status"
+                | "--no-status"
+                | "--gpg-sign"
+                | "--no-gpg-sign"
+                | "--untracked-files"
+        ) {
+            return true; // pathspec, working-tree flag, or unknown option (including abbreviations)
+        }
+    }
+    false
 }
 
 /// One ref a `push` invocation would actually write, split into the two

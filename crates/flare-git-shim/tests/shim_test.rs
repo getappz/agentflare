@@ -182,6 +182,33 @@ fn unrecognized_subcommand_passes_through_to_real_git() {
 }
 
 #[test]
+fn escape_hatch_denies_ls_remote_before_running_upload_pack() {
+    let repo = init_repo();
+    let home = tempfile::TempDir::new().unwrap();
+    let marker = repo.path().join("upload-pack-ran");
+    let out = shim(
+        repo.path(),
+        home.path(),
+        &[
+            "-C",
+            repo.path().to_str().unwrap(),
+            "ls-remote",
+            "--upload-pack=echo ran > upload-pack-ran; exit 1",
+            ".",
+        ],
+    );
+    assert!(
+        !marker.exists(),
+        "upload-pack helper ran through the read escape"
+    );
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("denied"), "{stderr}");
+    let audit = std::fs::read_to_string(home.path().join(".agentflare/audit/git.jsonl")).unwrap();
+    assert!(audit.contains("ls-remote"), "{audit}");
+}
+
+#[test]
 fn escape_hatch_flags_are_denied_for_mutating_subcommands() {
     let repo = init_repo();
     let home = tempfile::TempDir::new().unwrap();
@@ -251,6 +278,102 @@ fn escape_hatch_mutating_commit_from_non_repo_dir_is_denied() {
     assert!(!out.status.success(), "{out:?}");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("denied"), "{stderr}");
+}
+
+/// Item #770 theme c: the benign reads agents reach for across worktrees
+/// (`rev-parse`, `ls-files`, `branch --show-current`, `worktree list`,
+/// `remote -v`) used to be denied outright alongside the mutating cases.
+#[test]
+fn escape_hatch_lets_benign_reads_through_beyond_log_status_diff_show() {
+    let repo = init_repo();
+    let home = tempfile::TempDir::new().unwrap();
+    let repo_path = repo.path().to_str().unwrap();
+    for read in [
+        &["rev-parse", "HEAD"][..],
+        &["rev-parse", "--show-toplevel"],
+        &["ls-files"],
+        &["branch", "--show-current"],
+        &["branch", "-a"],
+        &["worktree", "list"],
+        &["remote", "-v"],
+        &["cat-file", "-t", "HEAD"],
+    ] {
+        let mut full = vec!["-C", repo_path];
+        full.extend_from_slice(read);
+        let out = shim(repo.path(), home.path(), &full);
+        assert!(out.status.success(), "{read:?}: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!stderr.contains("denied"), "{read:?}: {stderr}");
+    }
+}
+
+#[test]
+fn git_dir_selector_allows_reads_and_denies_writes() {
+    let repo = init_repo();
+    let home = tempfile::TempDir::new().unwrap();
+    let selector = format!("--git-dir={}", repo.path().join(".git").display());
+    let read = shim(repo.path(), home.path(), &[&selector, "rev-parse", "HEAD"]);
+    assert!(read.status.success(), "{selector}: {read:?}");
+    let write = shim(
+        repo.path(),
+        home.path(),
+        &[&selector, "branch", "feature/new"],
+    );
+    assert!(!write.status.success(), "{selector}: {write:?}");
+    assert!(
+        String::from_utf8_lossy(&write.stderr).contains("denied"),
+        "{write:?}"
+    );
+}
+
+/// The widened read-only set must not leak writes: a `branch` that creates/
+/// deletes, a `worktree add`, or a `remote add` under `-C` stays denied.
+#[test]
+fn escape_hatch_still_denies_mutating_forms_of_the_arg_dependent_subcommands() {
+    let repo = init_repo();
+    let home = tempfile::TempDir::new().unwrap();
+    let repo_path = repo.path().to_str().unwrap();
+    for write in [
+        &["branch", "feature/new"][..],
+        &["branch", "-l", "feature/new"],
+        &["branch", "--list", "-Df", "master"],
+        &["branch", "-D", "feature/new"],
+        &["branch", "--list", "-f", "x", "HEAD"],
+        &["worktree", "add", "../x"],
+        &["remote", "add", "up", "https://example.invalid/r.git"],
+        &["remote", "-v", "add", "up", "https://example.invalid/r.git"],
+        &["update-ref", "refs/heads/master", "HEAD"],
+    ] {
+        let mut full = vec!["-C", repo_path];
+        full.extend_from_slice(write);
+        let out = shim(repo.path(), home.path(), &full);
+        assert!(!out.status.success(), "{write:?}: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("denied"), "{write:?}: {stderr}");
+    }
+}
+
+/// Item #770 theme f: the escape-hatch deny was the one deny path that left
+/// no audit entry.
+#[test]
+fn escape_hatch_deny_is_logged_to_the_audit_log() {
+    let repo = init_repo();
+    let home = tempfile::TempDir::new().unwrap();
+    let out = shim(
+        repo.path(),
+        home.path(),
+        &["-C", repo.path().to_str().unwrap(), "commit", "-m", "x"],
+    );
+    assert!(!out.status.success(), "{out:?}");
+    let audit_log = home
+        .path()
+        .join(".agentflare")
+        .join("audit")
+        .join("git.jsonl");
+    let content = std::fs::read_to_string(&audit_log).expect("audit log must exist");
+    assert!(content.contains("\"commit\""), "{content}");
+    assert!(content.contains("Deny"), "{content}");
+    assert!(content.contains("-C/--git-dir/--work-tree"), "{content}");
 }
 
 #[test]
