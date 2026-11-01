@@ -376,6 +376,109 @@ fn handle_ci_green_notifies_once_for_a_gated_approved_pr() {
 }
 
 #[test]
+fn merge_or_repair_findings_restores_gates_when_the_arming_was_not_observed() {
+    // Only an auto-merge the merge attempt itself reports as armed keeps the
+    // gates cleared. A stale arming record with GitHub unreachable (this
+    // repo has no remote) is not that: the attempt is `NotMerged`, so the
+    // gates come back rather than being inferred away from item metadata.
+    let (remaining, manual_id, gate_id) = approved_clean_gated_sweep(true);
+    assert!(
+        remaining.contains(&manual_id),
+        "needs-manual-dispatch must be restored when no armed merge was observed"
+    );
+    assert!(
+        remaining.contains(&gate_id),
+        "needs-human-gate must be restored when no armed merge was observed"
+    );
+}
+
+/// The SHA-pinned merge was refused (head moved, GitHub unreachable): nothing
+/// merged, so the dispatch gates cleared ahead of it must be put back, or the
+/// next sweep sees an ungated item and dispatches repair with no human release.
+#[test]
+fn merge_or_repair_findings_restores_dispatch_gate_labels_when_the_merge_does_not_happen() {
+    let (remaining, manual_id, gate_id) = approved_clean_gated_sweep(false);
+    assert!(
+        remaining.contains(&manual_id),
+        "needs-manual-dispatch restored"
+    );
+    assert!(remaining.contains(&gate_id), "needs-human-gate restored");
+}
+
+/// Runs `merge_or_repair_findings` on an approved, finding-free PR whose item
+/// carries both dispatch gates and returns the item's labels afterwards, with
+/// the two gate label ids. No GitHub remote exists, so the merge never lands.
+fn approved_clean_gated_sweep(armed: bool) -> (Vec<String>, String, String) {
+    crate::paths::test_support::with_temp_home(|| {
+        let mcp = test_mcp();
+        let queue = test_queue();
+        let auth_conn = test_auth_conn();
+        let auto_merge = AutoMergeRef::default();
+        let mut label_id_by_name = seed_gate_label(&mcp);
+        let manual_id = mcp
+            .with_backend_db(|conn| {
+                let project = mcp.resolve_project(conn).unwrap();
+                agentflare_backend::label::create(
+                    conn,
+                    agentflare_backend::label::CreateLabel {
+                        project_id: Some(project.id.clone()),
+                        workspace_id: project.workspace_id.clone(),
+                        name: NEEDS_MANUAL_LABEL.into(),
+                        color: None,
+                        parent_id: None,
+                        sort_order: None,
+                        external_source: None,
+                        external_id: None,
+                    },
+                )
+                .unwrap()
+                .id
+            })
+            .unwrap();
+        label_id_by_name.insert(NEEDS_MANUAL_LABEL.to_string(), manual_id.clone());
+
+        let item_id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1_900);
+        let gate_id = label_id_by_name[NEEDS_HUMAN_GATE_LABEL].clone();
+        mcp.with_backend_db(|conn| {
+            agentflare_backend::item::add_label(conn, &item_id, &manual_id).unwrap();
+            agentflare_backend::item::add_label(conn, &item_id, &gate_id).unwrap();
+        })
+        .unwrap();
+
+        if armed {
+            let seeded = current_item(&mcp, &item_id);
+            crate::supervisor::auto_merge::record_armed_auto_merge(&mcp, &seeded, None, "node-1");
+        }
+        let item = current_item(&mcp, &item_id);
+        let labels = vec![PR_APPROVAL_LABEL.to_string()];
+        let review = ReviewBotState::default();
+
+        let _ = merge_or_repair_findings(
+            &mcp,
+            &queue,
+            &auth_conn,
+            agentflare_resource_gate::Policy::Normal,
+            &item,
+            Path::new("/repo"),
+            1,
+            &review,
+            &labels,
+            &label_id_by_name,
+            "/repo",
+            CiGreenMerge::Allowed {
+                head_sha: None,
+                auto_merge: &auto_merge,
+            },
+        );
+
+        let remaining = mcp
+            .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id).unwrap())
+            .unwrap();
+        (remaining, manual_id, gate_id)
+    })
+}
+
+#[test]
 fn self_repair_or_gate_redispatches_silently_for_identical_failing_checks() {
     let mcp = test_mcp();
     let queue = test_queue();
