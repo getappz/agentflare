@@ -1064,26 +1064,8 @@ pub fn prompt_submit(agent: &str) {
             bits.push(injection);
         }
         // Detect "install <something> skill" patterns → suggest CLI command.
-        let q = prompt.to_lowercase();
-        if q.contains("install") && (q.contains("skill") || q.contains("skills")) {
-            let name = q
-                .replace("install", "")
-                .replace("skill", "")
-                .replace("the", "")
-                .replace("a", "")
-                .replace("please", "")
-                .trim()
-                .to_string();
-            if !name.is_empty() {
-                bits.push(format!(
-                    "@skill-install: agentflare skill install \"{name}\" to search and install"
-                ));
-            } else {
-                bits.push(
-                    "@skill-install: agentflare skill search <query> to find and install skills"
-                        .to_string(),
-                );
-            }
+        if let Some(hint) = crate::skill_detect::install_hint(prompt) {
+            bits.push(hint);
         }
     }
 
