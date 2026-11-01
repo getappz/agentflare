@@ -498,6 +498,7 @@ pub(super) fn merge_or_repair_findings(
     folder_path: &str,
     merge: CiGreenMerge<'_>,
 ) -> PassingPrOutcome {
+    retry_pending_gate_restore(mcp, item, repo_root, number);
     if review.dispatch_needed() || review.blocks_merge() {
         // Auto-merge this sweep armed on an earlier, findings-free tick
         // would let the next approving review merge these findings
@@ -518,7 +519,7 @@ pub(super) fn merge_or_repair_findings(
                 &format!(
                     "PR #{number} is green and approved but the sweep is holding it: the item \
                      carries a dispatch gate label (needs-manual-dispatch / needs-human) \
-                     and review findings remain."
+                     and review findings remain or could not be checked."
                 ),
             );
             post_item_dispatch_gate_pr_comment(mcp, item, folder_path, number);
@@ -590,12 +591,27 @@ pub(super) fn merge_or_repair_findings(
     );
     clear_stale_coderabbit_repair_label(folder_path, number, labels, summary.as_deref());
     clear_coderabbit_repair_cap(mcp, item);
+    let mut held_gates: Vec<String> = held_item_gates(mcp, item, label_id_by_name)
+        .into_iter()
+        .map(String::from)
+        .collect();
+    if labels.iter().any(|l| l == NEEDS_HUMAN_PR_LABEL) {
+        held_gates.push(NEEDS_HUMAN_PR_LABEL.to_string());
+    }
     clear_item_dispatch_gates(mcp, item, label_id_by_name);
     clear_github_needs_human_label(folder_path, number, labels);
-    if merge_if_approved(mcp, item, repo_root, number, labels, merge) {
-        PassingPrOutcome::Merged
-    } else {
-        PassingPrOutcome::NotMerged
+    // Gates stay cleared only for an armed auto-merge (GitHub merges that
+    // head; the arming record carries the gates back if it is withdrawn).
+    // Any other outcome that is not a promoted merge puts them back.
+    match merge_if_approved(mcp, item, repo_root, number, labels, merge, &held_gates) {
+        MergeAttempt::Merged if promote_merged_item(mcp, item, repo_root) => {
+            PassingPrOutcome::Merged
+        }
+        MergeAttempt::AutoMergeArmed => PassingPrOutcome::NotMerged,
+        MergeAttempt::Merged | MergeAttempt::NotMerged => {
+            restore_gates(mcp, item, repo_root, number, &held_gates);
+            PassingPrOutcome::NotMerged
+        }
     }
 }
 
@@ -651,7 +667,8 @@ pub(super) fn merge_if_approved(
     number: u64,
     labels: &[String],
     merge: CiGreenMerge<'_>,
-) -> bool {
+    held_gates: &[String],
+) -> MergeAttempt {
     if !labels.iter().any(|l| l == PR_APPROVAL_LABEL) {
         disarm_our_auto_merge(
             mcp,
@@ -660,28 +677,29 @@ pub(super) fn merge_if_approved(
             number,
             "the approval label was removed",
         );
-        return false;
+        return MergeAttempt::NotMerged;
     }
     let Some(repo) = crate::github::RepoId::resolve_from_remote(repo_root) else {
-        return false;
+        return MergeAttempt::NotMerged;
     };
     let Ok(client) = crate::github::Client::new() else {
-        return false;
+        return MergeAttempt::NotMerged;
     };
     let auto = merge.auto_merge();
-    match merge_approved_pr(&client, &repo, number, merge) {
-        MergeAttempt::Merged => promote_merged_item(mcp, item, repo_root),
+    let attempt = merge_approved_pr(&client, &repo, number, merge);
+    match attempt {
+        MergeAttempt::Merged | MergeAttempt::NotMerged => {}
         MergeAttempt::AutoMergeArmed => {
             // Armed just now (as opposed to found already armed, which may
             // be a human's): remember the head it was pinned to, so a later
             // push can be caught and the arming withdrawn.
             if let (false, Some(node_id)) = (auto.enabled, auto.node_id.as_deref()) {
                 record_armed_auto_merge(mcp, item, merge.head_sha(), node_id);
+                record_held_gates(mcp, item, held_gates);
             }
-            false
         }
-        MergeAttempt::NotMerged => false,
     }
+    attempt
 }
 
 /// The commit-status context the sweep stamps on a head it has judged fit
