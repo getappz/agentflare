@@ -376,16 +376,19 @@ fn handle_ci_green_notifies_once_for_a_gated_approved_pr() {
 }
 
 #[test]
-fn merge_or_repair_findings_clears_dispatch_gate_labels_when_approved_and_clean() {
-    // An armed auto-merge is the merge proceeding: GitHub lands it.
+fn merge_or_repair_findings_restores_gates_when_the_arming_was_not_observed() {
+    // Only an auto-merge the merge attempt itself reports as armed keeps the
+    // gates cleared. A stale arming record with GitHub unreachable (this
+    // repo has no remote) is not that: the attempt is `NotMerged`, so the
+    // gates come back rather than being inferred away from item metadata.
     let (remaining, manual_id, gate_id) = approved_clean_gated_sweep(true);
     assert!(
-        !remaining.contains(&manual_id),
-        "needs-manual-dispatch must be cleared on approved green PR"
+        remaining.contains(&manual_id),
+        "needs-manual-dispatch must be restored when no armed merge was observed"
     );
     assert!(
-        !remaining.contains(&gate_id),
-        "needs-human-gate must be cleared on approved green PR"
+        remaining.contains(&gate_id),
+        "needs-human-gate must be restored when no armed merge was observed"
     );
 }
 
