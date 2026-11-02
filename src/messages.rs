@@ -17,6 +17,10 @@ pub mod identity;
 
 use rusqlite::{Connection, params};
 
+#[cfg(test)]
+mod receipt_tests;
+pub(crate) mod receipts;
+
 /// Largest accepted message body. Bodies are untrusted text from another
 /// agent that lands verbatim in the recipient's context.
 pub const MAX_BODY_BYTES: usize = 16 * 1024;
@@ -79,7 +83,8 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_agent_messages_inbox
             ON agent_messages(to_key, delivered_at);",
     )?;
-    add_marker_column_if_missing(conn)
+    add_marker_column_if_missing(conn)?;
+    receipts::migrate(conn)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -479,7 +484,8 @@ pub fn requeue(conn: &Connection, ids: &[i64]) -> rusqlite::Result<usize> {
     let mut n = 0;
     for id in ids {
         n += conn.execute(
-            "UPDATE agent_messages SET delivered_at = NULL WHERE id = ?1 AND read_at IS NULL",
+            "UPDATE agent_messages SET delivered_at = NULL WHERE id = ?1 AND read_at IS NULL
+             AND NOT EXISTS(SELECT 1 FROM agent_message_receipts WHERE message_id = agent_messages.id)",
             [id],
         )?;
     }
@@ -618,12 +624,22 @@ pub fn reroute_undelivered(
 /// Drops delivered messages older than a week, and undelivered ones nobody
 /// picked up in a month.
 pub fn prune(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
-    conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    let deleted = tx.execute(
         "DELETE FROM agent_messages
-         WHERE (delivered_at IS NOT NULL AND delivered_at < ?1)
-            OR (delivered_at IS NULL AND created_at < ?2)",
+         WHERE ((delivered_at IS NOT NULL AND delivered_at < ?1)
+            OR (delivered_at IS NULL AND created_at < ?2))
+         AND NOT EXISTS(SELECT 1 FROM agent_message_receipts
+                        WHERE message_id = agent_messages.id AND received_at IS NULL)",
         params![now - KEEP_DELIVERED_SECS, now - KEEP_UNDELIVERED_SECS],
-    )
+    )?;
+    tx.execute(
+        "DELETE FROM agent_message_receipts WHERE received_at IS NOT NULL
+                AND NOT EXISTS(SELECT 1 FROM agent_messages WHERE id = message_id)",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(deleted)
 }
 
 /// Process-wide publish point: every message sent from this process. Lets
@@ -741,6 +757,19 @@ mod tests {
         sessions::migrate(&c).unwrap();
         migrate(&c).unwrap();
         c
+    }
+
+    #[test]
+    fn migration_creates_delivery_receipt_ledger() {
+        let c = conn();
+        let exists: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_message_receipts')",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert!(
+            exists,
+            "message migration must create a durable receipt ledger"
+        );
     }
 
     fn live(c: &Connection, key: &str, name: Option<&str>, item: Option<&str>) {

@@ -216,6 +216,12 @@ pub(crate) struct WorkItemData {
     /// #269/#270).
     #[serde(default)]
     pub pending_corrections: Vec<String>,
+    /// Durable receiver custody, independent of read/processed status.
+    #[serde(default)]
+    pub accepted_message_receipts: std::collections::BTreeSet<String>,
+    /// Unconsumed receipt texts survive restart and stale step write-back.
+    #[serde(default)]
+    pub pending_message_receipts: std::collections::BTreeMap<i64, String>,
 }
 
 impl flare_workflow::WorkflowData for WorkItemData {
@@ -623,6 +629,7 @@ pub(crate) fn build_sdd_loop_step(
                     role_prompt
                 } else {
                     let corrections = ctx.data.pending_corrections.join("\n\n");
+                    consume_agent_messages(ctx.run_id, &ctx.data.pending_corrections);
                     ctx.data.pending_corrections.clear();
                     format!(
                         "Note -- posted after this task started, read before continuing:\n{corrections}\n\n{role_prompt}"
@@ -1543,7 +1550,7 @@ pub(crate) fn run_or_resume_with_sender(
                                  (taken over {MAX_RUN_TAKEOVERS} times); giving up"
                             ));
                         }
-                        if eng.resume_run(run_id).await.map_err(|e| e.to_string())? {
+                        if resume_with_message_custody(eng, run_id, &heartbeat_owner, None, &crate::db::agentflare_db_path()).await? {
                             eprintln!(
                                 "work_item_pipeline: item {}: took over orphaned run {run_id}",
                                 item.id
@@ -1650,6 +1657,25 @@ async fn adopt_existing_run(
     let owner_changed = state.context.data.owner != owner;
     let repair_redispatch = repair_dispatch.is_some();
     let target_changed = state.context.data.target_branch != target_branch;
+    if eng.held_by_live_executor(state) {
+        return Err(format!("workflow run {run_id} is leased elsewhere"));
+    }
+    if eng.is_driving(run_id)
+        || matches!(
+            state.status,
+            WorkflowStatus::Completed | WorkflowStatus::Failed | WorkflowStatus::Cancelled
+        )
+    {
+        prepare_message_delivery(
+            eng,
+            run_id,
+            owner,
+            Some(target_branch),
+            &crate::db::agentflare_db_path(),
+            false,
+        )
+        .await?;
+    }
     if owner_changed || repair_redispatch || target_changed {
         if owner_changed {
             eprintln!(
@@ -1662,14 +1688,6 @@ async fn adopt_existing_run(
                 "work_item_pipeline: run {run_id} adopting repair dispatch onto item {item_id}"
             );
         }
-        let new_owner = owner.to_string();
-        let target_branch = target_branch.to_string();
-        eng.patch_run_data(run_id, move |data: &mut WorkItemData| {
-            data.owner = new_owner.clone();
-            data.target_branch = target_branch.clone();
-        })
-        .await
-        .map_err(|e| e.to_string())?;
 
         if let Some((body, adopted_at)) = repair_dispatch {
             eng.state_store()
@@ -1697,8 +1715,14 @@ async fn adopt_existing_run(
         }
     }
     if !eng.is_driving(run_id)
-        && !eng.is_leased_elsewhere(state)
-        && eng.resume_run(run_id).await.map_err(|e| e.to_string())?
+        && resume_with_message_custody(
+            eng,
+            run_id,
+            owner,
+            Some(target_branch),
+            &crate::db::agentflare_db_path(),
+        )
+        .await?
     {
         eprintln!("work_item_pipeline: took over orphaned run {run_id} for this dispatch");
     }
@@ -1842,6 +1866,8 @@ mod cap_tests;
 mod judge_decision_tests;
 #[cfg(test)]
 mod judge_shadow_tests;
+#[cfg(test)]
+mod message_receipt_tests;
 #[cfg(test)]
 mod pause_tests;
 #[cfg(test)]
