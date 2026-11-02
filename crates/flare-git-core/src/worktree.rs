@@ -33,8 +33,8 @@ pub(crate) use orphans::{delete_parked, dir_size, park_dir, park_dir_in};
 use orphans::{is_structurally_broken, remove_worktree_dir};
 pub(crate) use process::run_output_timeout;
 pub use process::run_output_timeout_env;
-pub use tether::run_tether;
 use process::*;
+pub use tether::run_tether;
 use wipe_guard::restore_mass_deleted_worktree;
 
 /// Bounded `git` invocation for hook-time work (tree fingerprint, etc.).

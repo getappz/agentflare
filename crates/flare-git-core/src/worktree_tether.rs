@@ -72,9 +72,7 @@ pub fn run_tether(
     let watch = worktree_removal_detected(worktree_root).is_some();
     let mut child = spawn_tethered_child(worktree_root, program, args)?;
     if !watch {
-        let status = child
-            .wait()
-            .map_err(|e| format!("tether: wait: {e}"))?;
+        let status = child.wait().map_err(|e| format!("tether: wait: {e}"))?;
         return Ok(status.code().unwrap_or(1));
     }
 

@@ -1,7 +1,6 @@
 use super::run_tether;
 use super::tether::worktree_removal_detected;
 use std::ffi::OsStr;
-use std::process::Command;
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -14,7 +13,7 @@ fn assert_no_surviving_process(image_name: &str, cmdline_needle: &str) {
              Where-Object {{ $_.CommandLine -like '*{cmdline_needle}*' }} | \
              Select-Object -ExpandProperty ProcessId) -join ','"
         );
-        let out = Command::new("powershell")
+        let out = std::process::Command::new("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", &ps_query])
             .output();
         let survivors = out
@@ -64,10 +63,7 @@ fn tether_kills_child_when_worktree_root_removed() {
         vec![OsStr::new("-n"), OsStr::new("120"), OsStr::new("127.0.0.1")],
     );
     #[cfg(unix)]
-    let (program, args): (&OsStr, Vec<&OsStr>) = (
-        OsStr::new("sleep"),
-        vec![OsStr::new("120")],
-    );
+    let (program, args): (&OsStr, Vec<&OsStr>) = (OsStr::new("sleep"), vec![OsStr::new("120")]);
     let handle = std::thread::spawn(move || run_tether(&root, program, &args));
     std::thread::sleep(Duration::from_millis(800));
     let _ = std::fs::remove_dir_all(&root_rm);

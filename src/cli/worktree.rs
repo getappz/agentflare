@@ -39,7 +39,9 @@ impl WorktreeArgs {
 impl TetherArgs {
     pub fn run(self) {
         if self.cmd.is_empty() {
-            crate::ui::error("tether: missing command — usage: agentflare worktree tether -- CMD...");
+            crate::ui::error(
+                "tether: missing command — usage: agentflare worktree tether -- CMD...",
+            );
             crate::decide::exit(1);
         }
         let root = match self.root {
