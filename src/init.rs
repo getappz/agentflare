@@ -557,7 +557,7 @@ fn wire_claude_code_with(plugin_installed: bool) {
     };
     if plugin_installed {
         ui::step(
-            "agentflare: Claude plugin detected; PreToolUse/PostToolUse/PostToolUseFailure/PreCompact/Stop/SubagentStart are handled by the mod and were not wired.",
+            "agentflare: Claude plugin detected; PreToolUse/PostToolUse/PreCompact/SubagentStart are handled by the mod and were not wired.",
         );
     }
     let added = apply_claude_hook_specs_except(hooks_obj, &bin, skip);
@@ -1355,6 +1355,14 @@ mod tests {
             let s = read_settings();
             for ev in MOD_COVERED_EVENTS {
                 assert!(s["hooks"].get(ev).is_none(), "{ev} wired");
+            }
+            assert_eq!(
+                MOD_COVERED_EVENTS,
+                ["PreToolUse", "PostToolUse", "PreCompact", "SubagentStart"]
+            );
+            // Not covered by the mod: mail delivery, liveness and failure nudges.
+            for ev in ["Stop", "PostToolUseFailure"] {
+                assert!(s["hooks"][ev].is_array(), "{ev} must stay wired");
             }
             assert!(s["hooks"]["SessionStart"].is_array());
             assert!(s["hooks"]["UserPromptSubmit"].is_array());

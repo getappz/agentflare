@@ -505,6 +505,12 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert!(out[0].describe.contains("PreToolUse"));
         assert!(duplicate_hook_coverage(&settings, false).is_empty());
+        // Stop and PostToolUseFailure are not the mod's, so wiring them is no duplicate.
+        let kept = serde_json::json!({"hooks": {
+            "Stop": [{"hooks": [{"type":"command","command":"\"agentflare\" hook stop"}]}],
+            "PostToolUseFailure": [{"hooks": [{"type":"command","command":"\"agentflare\" hook post-tool-failure"}]}],
+        }});
+        assert!(duplicate_hook_coverage(&kept, true).is_empty());
     }
 
     #[test]

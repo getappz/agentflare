@@ -5,14 +5,10 @@ use std::path::Path;
 
 /// Hook events the plugin's mod handles itself; `init` leaves them unwired
 /// when the plugin is installed and `doctor` flags them if still present.
-pub(crate) const MOD_COVERED_EVENTS: &[&str] = &[
-    "PreToolUse",
-    "PostToolUse",
-    "PostToolUseFailure",
-    "PreCompact",
-    "Stop",
-    "SubagentStart",
-];
+/// `Stop` (inter-agent mail, busy/idle liveness) and `PostToolUseFailure`
+/// (friction nudges, failure recall) are not covered by the mod and stay wired.
+pub(crate) const MOD_COVERED_EVENTS: &[&str] =
+    &["PreToolUse", "PostToolUse", "PreCompact", "SubagentStart"];
 
 const PLUGIN_NAME: &str = "agentflare";
 

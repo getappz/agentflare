@@ -379,8 +379,10 @@ Settings (`userConfig`):
 | `guardTimeoutMs` | `3000` | How long a guard check waits for the MCP server |
 
 When the plugin is installed, `agentflare init --agent claude-code` skips the
-hooks the mod already covers, and `agentflare doctor` flags any that are wired
-twice. Requires Claude Code 2.1.287 or newer.
+`PreToolUse`, `PostToolUse`, `PreCompact` and `SubagentStart` hooks the mod
+covers, and `agentflare doctor` flags any of them that are wired twice. `Stop`
+(inter-agent mail, busy/idle liveness) and `PostToolUseFailure` (friction
+nudges, failure recall) stay wired: the mod does not cover them. Requires Claude Code 2.1.287 or newer.
 
 Notes:
 
