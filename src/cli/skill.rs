@@ -237,8 +237,7 @@ fn redact_credentials_in_message(message: &str) -> String {
                 .char_indices()
                 .rev()
                 .find(|(_, c)| {
-                    c.is_ascii_alphanumeric()
-                        || matches!(c, '-' | '_' | '.' | '/' | ':' | '@')
+                    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '@')
                 })
                 .map(|(i, c)| i + c.len_utf8())
                 .unwrap_or(0);
