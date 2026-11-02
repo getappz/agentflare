@@ -11,7 +11,7 @@ type LiveClaim = (String, i64);
 /// Item sequence id if `path` sits under `.worktrees/task/<N>/...`. Splits on
 /// both separators (a Windows path must parse on any host) and resolves `..`
 /// lexically, so `.worktrees/task/1/../../..` is not still "in" item 1.
-fn item_seq_for_path(path: &Path) -> Option<String> {
+pub(crate) fn item_seq_for_path(path: &Path) -> Option<String> {
     let mut stack: Vec<&str> = Vec::new();
     for c in path.to_str()?.split(['/', '\\']) {
         match c {
@@ -315,6 +315,22 @@ fn live_claims_in(conn: &rusqlite::Connection, seq: &str) -> Vec<LiveClaim> {
         })
         .map(|c| (c.owner, c.age_secs))
         .collect()
+}
+
+/// `#seq name (id)` for the live item claim behind a `.worktrees/task/<seq>` cwd.
+pub(crate) fn active_claim_line(conn: &rusqlite::Connection, cwd: &Path) -> Option<String> {
+    let seq = item_seq_for_path(cwd)?;
+    let (id, name): (String, String) = conn
+        .query_row(
+            "SELECT id, name FROM items WHERE sequence_id = ?1 AND deleted_at IS NULL",
+            [&seq],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok()?;
+    let ttl = crate::mcp_server::types::backend_claim_ttl_secs();
+    let claim = agentflare_backend::claim::live_claim_on_item(conn, &id, db_kit::ids::now(), ttl)
+        .ok()??;
+    Some(format!("#{seq} {name} ({id}), claimed by {}", claim.owner))
 }
 
 fn live_claims_from_db(seq: &str) -> Vec<LiveClaim> {

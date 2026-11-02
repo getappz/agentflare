@@ -146,7 +146,7 @@ fn hold_lifetime_lock(path: PathBuf, timeout: Duration) -> Result<(), String> {
     Ok(())
 }
 
-fn read_pid_from_file() -> Option<u32> {
+pub(crate) fn read_pid_from_file() -> Option<u32> {
     let content = std::fs::read_to_string(daemon_pid_path()).ok()?;
     content.trim().parse::<u32>().ok()
 }
