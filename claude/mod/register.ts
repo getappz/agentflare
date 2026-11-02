@@ -1,4 +1,5 @@
 import type { Register } from 'claude-code'
+import { registerGuard } from './guard'
 import { connect, type AutopilotClient } from './mcp'
 
 export const AGENT = 'claude-code'
@@ -25,6 +26,13 @@ let warned = false
 const DEFAULT_GUARD_TIMEOUT_MS = 3000
 
 export const register: Register = (on, options) => {
+  const guardTimeoutMs = Number(options.guardTimeoutMs) || DEFAULT_GUARD_TIMEOUT_MS
+  registerGuard(on, {
+    client: () => client,
+    agent: AGENT,
+    options: { readOnlyAutoAllow: options.readOnlyAutoAllow !== false, guardTimeoutMs },
+  })
+
   on('session.start', async ($, e, next) => {
     // A hot reload resets the module flag, so the command list is the real guard against a second /flare.
     if (!registered) {
@@ -48,7 +56,7 @@ export const register: Register = (on, options) => {
     }
     if (!client) {
       try {
-        client = await connect($, Number(options.guardTimeoutMs) || DEFAULT_GUARD_TIMEOUT_MS)
+        client = await connect($, guardTimeoutMs)
       } catch (err) {
         $.ui.log(`agentflare: MCP connect failed: ${String(err)}`)
       }

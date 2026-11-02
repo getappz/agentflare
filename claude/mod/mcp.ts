@@ -12,7 +12,7 @@ export type Observed = { recorded: 'verification' | 'review' | 'diagnosis' | 'no
 
 export type AutopilotClient = {
   check(a: { tool_name: string; tool_input: unknown; cwd: string; session_id: string; agent: string }): Promise<Decision>
-  observe(a: { session_id: string; cwd: string; agent: string; tool_name: string; exit_code?: number; output_excerpt: string; item_action?: string; item_success?: boolean }): Promise<Observed>
+  observe(a: { session_id: string; cwd: string; agent: string; tool_name: string; tool_input: unknown; exit_code?: number; output_excerpt: string; item_action?: string; item_success?: boolean }): Promise<Observed>
   briefing(a: { cwd: string; session_id: string; agent: string; etag?: string }): Promise<Briefing>
   checkpoint(a: { session_id: string; cwd: string; payload: unknown }): Promise<Checkpoint>
   nextWork(a: { agent: string; cwd: string; max_cost_usd: number; rate_limit_pct: number }): Promise<NextWork>
