@@ -49,6 +49,79 @@ fn is_ancestor(repo_root: &Path, a: &str, b: &str) -> bool {
     run_in_ok(repo_root, &["merge-base", "--is-ancestor", a, b])
 }
 
+/// How many recent default-branch commits the patch-id check compares against. A squash merge
+/// buried deeper falls back to the GitHub check.
+const PATCH_ID_WALK: &str = "100";
+
+/// Offline proof that `branch`'s work is already in `base`, naming the check that matched.
+/// Cheapest first; a branch with any change that is not in `base` matches none of them.
+fn squash_merged(repo_root: &Path, base: &str, branch: &str, default: &str) -> Option<String> {
+    // 1. No added changes since the fork point.
+    if run_in_ok(
+        repo_root,
+        &["diff", "--quiet", &format!("{base}...{branch}")],
+    ) {
+        return Some(format!("no changes beyond {default}"));
+    }
+    let tree = |r: &str| run_in_opt(repo_root, &["rev-parse", &format!("{r}^{{tree}}")]);
+    let base_tree = tree(base)?;
+    // 2. Identical trees.
+    if tree(branch).as_deref() == Some(base_tree.as_str()) {
+        return Some(format!("tree matches {default}"));
+    }
+    // 3. Merging the branch into `base` changes nothing. A conflict exits non-zero, and so does a
+    //    git older than 2.38 (no `--write-tree`); both fall through.
+    if let Ok(merged) = run_in(repo_root, &["merge-tree", "--write-tree", base, branch])
+        && merged.lines().next() == Some(base_tree.as_str())
+    {
+        return Some(format!("merging adds nothing to {default}"));
+    }
+    // 4. The branch's whole diff has the patch-id of one recent commit on `base`.
+    let fork = run_in_opt(repo_root, &["merge-base", base, branch])?;
+    let own = patch_ids(repo_root, &["diff", &fork, branch])?;
+    let own = own.lines().next()?.split_whitespace().next()?.to_string();
+    let recent = patch_ids(
+        repo_root,
+        &[
+            "log",
+            "-n",
+            PATCH_ID_WALK,
+            "--no-merges",
+            "-p",
+            "--format=commit %H",
+            base,
+        ],
+    )?;
+    recent
+        .lines()
+        .any(|l| l.split_whitespace().next() == Some(own.as_str()))
+        .then(|| format!("squash-merged into {default} (same patch)"))
+}
+
+/// `git patch-id --stable` over the output of `git <diff_args>`.
+fn patch_ids(repo_root: &Path, diff_args: &[&str]) -> Option<String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let diff = run_in(repo_root, diff_args)
+        .ok()
+        .filter(|d| !d.is_empty())?;
+    let mut cmd = Command::new(crate::shell::git_binary());
+    cmd.args(["patch-id", "--stable"])
+        .current_dir(repo_root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    flare_process::no_window(&mut cmd);
+    crate::shell::apply_filtered_path(&mut cmd);
+    let mut child = cmd.spawn().ok()?;
+    // patch-id's output is small, so writing all of stdin before reading cannot deadlock.
+    child.stdin.take()?.write_all(diff.as_bytes()).ok()?;
+    let out = child.wait_with_output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 pub(super) fn classify_local(
     input: &ScanInput,
     repo_root: &Path,
@@ -104,6 +177,11 @@ fn classify_one(
     let ahead = cherry.lines().filter(|l| l.starts_with('+')).count();
     if ahead == 0 {
         return Verdict::Merged(format!("patches already in {default}"));
+    }
+    // Squash merges leave no ancestor and no equivalent patches; these offline checks catch
+    // them without a GitHub lookup. Anything they cannot prove falls through to the PR check.
+    if let Some(why) = squash_merged(repo_root, base, &full, default) {
+        return Verdict::Merged(why);
     }
     let Some(pr) = input.prs.for_branch(name) else {
         return Verdict::Skip(format!("not merged ({ahead} commit(s) not in {default})"));
@@ -265,14 +343,26 @@ mod tests {
     }
 
     #[test]
-    fn squash_merged_branch_needs_a_merged_pr_containing_the_local_tip() {
+    fn squash_merged_branch_edited_in_review_needs_a_merged_pr_containing_the_local_tip() {
         let repo = init_repo_with_branch("master");
         run_in(&repo.path, &["switch", "-c", "feat"]).unwrap();
-        commit(&repo, "a.txt", "a\n", "one");
-        let tip = commit(&repo, "b.txt", "b\n", "two");
+        commit(
+            &repo, "a.txt", "a
+", "one",
+        );
+        let tip = commit(
+            &repo, "b.txt", "b
+", "two",
+        );
+        // The squash commit was edited on GitHub, so no offline check can prove it.
         run_in(&repo.path, &["switch", "master"]).unwrap();
-        run_in(&repo.path, &["merge", "--squash", "feat"]).unwrap();
-        run_in(&repo.path, &["commit", "-m", "squashed (#9)"]).unwrap();
+        commit(
+            &repo,
+            "a.txt",
+            "a, edited
+",
+            "squashed (#9)",
+        );
 
         let none = verdicts(&repo, &NoPrLookup, &HashMap::new());
         assert!(
@@ -284,6 +374,79 @@ mod tests {
             verdicts(&repo, &merged, &HashMap::new())["feat"],
             "merged: PR #9 merged"
         );
+    }
+
+    /// Branch `feat` with two commits (so `git cherry` cannot match them one by one),
+    /// squash-merged into master.
+    fn squashed(extra_on_master: impl FnOnce(&Repo)) -> Repo {
+        let repo = init_repo_with_branch("master");
+        run_in(&repo.path, &["switch", "-c", "feat"]).unwrap();
+        commit(
+            &repo, "a.txt", "a
+", "add a",
+        );
+        commit(
+            &repo, "b.txt", "b
+", "add b",
+        );
+        run_in(&repo.path, &["switch", "master"]).unwrap();
+        run_in(&repo.path, &["merge", "--squash", "feat"]).unwrap();
+        run_in(&repo.path, &["commit", "-m", "squashed (#9)"]).unwrap();
+        extra_on_master(&repo);
+        repo
+    }
+
+    #[test]
+    fn squash_merge_is_detected_offline_when_master_moved_on_elsewhere() {
+        let repo = squashed(|r| {
+            commit(
+                r,
+                "other.txt",
+                "o
+",
+                "unrelated",
+            );
+        });
+        let v = verdicts(&repo, &NoPrLookup, &HashMap::new());
+        assert!(v["feat"].starts_with("merged:"), "{v:?}");
+    }
+
+    #[test]
+    fn squash_merge_with_identical_trees_is_detected() {
+        let repo = squashed(|_| {});
+        let v = verdicts(&repo, &NoPrLookup, &HashMap::new());
+        assert_eq!(v["feat"], "merged: tree matches master");
+    }
+
+    #[test]
+    fn squash_merge_with_a_conflicting_later_edit_is_matched_by_patch_id() {
+        let repo = squashed(|r| {
+            commit(
+                r,
+                "a.txt",
+                "a, changed later
+",
+                "touch a again",
+            );
+        });
+        let v = verdicts(&repo, &NoPrLookup, &HashMap::new());
+        assert_eq!(v["feat"], "merged: squash-merged into master (same patch)");
+    }
+
+    #[test]
+    fn a_branch_with_a_change_missing_from_master_stays_unmerged() {
+        let repo = squashed(|_| {});
+        run_in(&repo.path, &["switch", "feat"]).unwrap();
+        commit(
+            &repo,
+            "late.txt",
+            "late
+",
+            "never merged",
+        );
+        run_in(&repo.path, &["switch", "master"]).unwrap();
+        let v = verdicts(&repo, &NoPrLookup, &HashMap::new());
+        assert!(v["feat"].starts_with("skip: not merged"), "{v:?}");
     }
 
     #[test]
