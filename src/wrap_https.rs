@@ -303,7 +303,65 @@ async fn proxy_ready(client: &reqwest::Client, port: u16) -> Result<bool, String
     if value.get("service").and_then(|value| value.as_str()) != Some("lean-ctx-proxy") {
         return Err(occupied());
     }
+    // `/health` is trivially spoofable; on Linux also require the listener to be ours (#792).
+    // Fail closed: if no listener can be found (it closed after answering
+    // `/health`, or /proc is unreadable) we cannot prove the responder is ours.
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        let uids = listener_uids(port);
+        if uids.is_empty() {
+            return Err(format!("Cannot verify who is listening on port {port}"));
+        }
+        if let Some(other) = uids.iter().find(|&&uid| uid != me) {
+            return Err(format!(
+                "Port {port} is listened on by another user (uid {other})"
+            ));
+        }
+    }
     Ok(true)
+}
+
+/// Owner uids of every TCP listener that can serve a `127.0.0.1:port`
+/// connection, from `/proc/net/tcp{,6}`.
+#[cfg(target_os = "linux")]
+fn listener_uids(port: u16) -> Vec<u32> {
+    ["/proc/net/tcp", "/proc/net/tcp6"]
+        .iter()
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .flat_map(|table| listener_uids_in(&table, port))
+        .collect()
+}
+
+/// Parses a `/proc/net/tcp{,6}` table: uids of LISTEN (`0A`) sockets on `port`
+/// whose local address can accept a connection to `127.0.0.1` -- IPv4 loopback
+/// or wildcard, and their IPv6 forms (v4-mapped loopback, `::`). Listeners on
+/// other addresses (e.g. a LAN IP) cannot serve it and are ignored.
+#[cfg(any(target_os = "linux", test))]
+fn listener_uids_in(table: &str, port: u16) -> Vec<u32> {
+    const SERVES_LOOPBACK_V4: &[&str] = &[
+        "0100007F",
+        "00000000",
+        "0000000000000000FFFF00000100007F",
+        "00000000000000000000000000000000",
+    ];
+    let want = format!("{port:04X}");
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let (addr, p) = f.get(1)?.split_once(':')?;
+            let serves = SERVES_LOOPBACK_V4
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case(addr));
+            if f.get(3) != Some(&"0A") || !p.eq_ignore_ascii_case(&want) || !serves {
+                return None;
+            }
+            f.get(7)?.parse().ok()
+        })
+        .collect()
 }
 
 pub(super) async fn shared_proxy(lean: &Path, port: u16) -> Result<(), String> {
