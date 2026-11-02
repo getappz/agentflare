@@ -195,3 +195,37 @@ async fn shared_proxy_health_requires_lean_ctx_identity() {
     );
     task.abort();
 }
+
+#[test]
+fn listener_uid_in_reads_the_owner_of_a_listening_socket() {
+    let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   \
+        0: 0100007F:115C 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1001        0 12345 1 0 100 0 0 10 0\n   \
+        1: 0100007F:115C 0100007F:9C40 01 00000000:00000000 00:00000000 00000000  1002        0 23456 1 0 100 0 0 10 0\n   \
+        2: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1003        0 34567 1 0 100 0 0 10 0\n";
+    assert_eq!(listener_uids_in(table, 4444), vec![1001]); // 0x115C; ignores the ESTABLISHED row
+    assert_eq!(listener_uids_in(table, 8080), vec![1003]);
+    assert!(listener_uids_in(table, 9999).is_empty());
+}
+
+#[test]
+fn listener_uids_in_matches_the_serving_address_not_just_the_port() {
+    let header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+    let row = |addr: &str, state: &str, uid: u32| {
+        format!(
+            "   0: {addr}:115C 00000000:0000 {state} 00000000:00000000 00:00000000 00000000  {uid}        0 1 1 0 100 0 0 10 0\n"
+        )
+    };
+    // A LAN-IP listener (192.168.1.5) cannot serve 127.0.0.1: ignored.
+    let lan = format!("{header}{}", row("0501A8C0", "0A", 2000));
+    assert!(listener_uids_in(&lan, 4444).is_empty());
+    // Wildcard, v4-mapped loopback and `::` all can serve it; every one is reported.
+    let many = format!(
+        "{header}{}{}{}",
+        row("00000000", "0A", 1001),
+        row("0000000000000000FFFF00000100007F", "0A", 1002),
+        row("00000000000000000000000000000000", "0A", 1003),
+    );
+    assert_eq!(listener_uids_in(&many, 4444), vec![1001, 1002, 1003]);
+    // Non-LISTEN rows never count.
+    assert!(listener_uids_in(&format!("{header}{}", row("0100007F", "01", 1001)), 4444).is_empty());
+}
