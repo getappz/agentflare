@@ -75,9 +75,11 @@ jobs:
     permissions:
       contents: read
     # A hung test would otherwise pin a runner for GitHub's 6h default and
-    # block the branch's required check indefinitely; fail fast instead. A
-    # cold-cache build+test finishes well under this on every OS.
-    timeout-minutes: 25
+    # block the branch's required check indefinitely; fail fast instead.
+    # windows-latest is the long pole (~17-21 min: ~4 min compile, ~15 min
+    # for 4.8k tests), so this leaves headroom for a slow runner rather than
+    # failing a healthy run.
+    timeout-minutes: 35
     strategy:
       matrix:
         os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest", "windows-latest"]') || fromJSON('["ubuntu-latest", "macos-latest", "windows-latest"]') }}
