@@ -1,0 +1,11 @@
+{
+  "name": "agentflare",
+  "owner": { "name": "agentflare" },
+  "plugins": [
+    {
+      "name": "agentflare",
+      "source": "./",
+      "description": "agentflare autopilot mod for Claude Code."
+    }
+  ]
+}

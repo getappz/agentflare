@@ -1,0 +1,50 @@
+{
+  "name": "agentflare",
+  "version": "1.8.1",
+  "description": "agentflare autopilot mod: guard, briefing, compaction, spawn, capture and idle work-pull for Claude Code.",
+  "hooks": "./claude/hooks.json",
+  "types": "./claude/types/index.d.ts",
+  "mcpServers": {
+    "agentflare": { "command": "agentflare", "args": ["mcp"] }
+  },
+  "userConfig": {
+    "autopilot": {
+      "type": "string",
+      "title": "Autopilot",
+      "description": "Pull the next work item when idle. 'once' pulls one item, then returns to off.",
+      "options": ["off", "once", "on"],
+      "default": "off"
+    },
+    "idleMinutes": {
+      "type": "number",
+      "title": "Idle minutes",
+      "description": "Minutes of idleness before autopilot pulls work.",
+      "default": 3
+    },
+    "maxCostUsd": {
+      "type": "number",
+      "title": "Max cost (USD)",
+      "description": "Session cost ceiling above which autopilot will not pull work.",
+      "default": 25
+    },
+    "memoryCapture": {
+      "type": "string",
+      "title": "Memory capture",
+      "description": "Whether learnings are captured to memory automatically, after asking, or never.",
+      "options": ["auto", "ask", "off"],
+      "default": "auto"
+    },
+    "readOnlyAutoAllow": {
+      "type": "boolean",
+      "title": "Auto-allow read-only tools",
+      "description": "Let the guard allow read-only tool calls without a prompt.",
+      "default": true
+    },
+    "guardTimeoutMs": {
+      "type": "number",
+      "title": "Guard timeout (ms)",
+      "description": "How long a guard check waits for the agentflare MCP server.",
+      "default": 3000
+    }
+  }
+}

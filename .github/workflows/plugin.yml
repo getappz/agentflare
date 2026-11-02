@@ -1,0 +1,70 @@
+name: plugin
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - ".claude-plugin/**"
+      - "claude/**"
+      - ".github/workflows/plugin.yml"
+  pull_request:
+    paths:
+      - ".claude-plugin/**"
+      - "claude/**"
+      - ".github/workflows/plugin.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
+
+permissions:
+  contents: read
+
+jobs:
+  claude-plugin:
+    name: claude plugin (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install Claude Code
+        run: npm i -g @anthropic-ai/claude-code@latest
+
+      - name: Validate plugin
+        run: claude plugin validate .
+
+      - name: Test plugin
+        run: claude plugin test .
+
+      - name: Type-check
+        run: |
+          if [ -d .claude-plugin/types/claude-code ] || [ -f .claude-plugin/types/claude-code/index.d.ts ]; then
+            npx --yes -p typescript tsc -p claude
+          else
+            echo "::notice::generated claude-code types are absent; skipping tsc"
+          fi
+
+      - name: Mod never uses fs.write, process or http
+        run: |
+          if grep -rE '\$\.(fs\.write|process|http)\b' claude/mod; then
+            echo "::error::the mod references a forbidden capability"
+            exit 1
+          fi
+
+      - name: Access footprint matches claude/ACCESS.md
+        run: |
+          claude plugin validate . --json \
+            | jq -r '.contents[] | select(.type == "hooks") | .notes[] | select(test("calls:"))' \
+            | tr -d '\r' > "$RUNNER_TEMP/access.txt"
+          diff <(tr -d '\r' < claude/ACCESS.md) "$RUNNER_TEMP/access.txt"

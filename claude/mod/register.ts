@@ -1,0 +1,44 @@
+import type { Register } from 'claude-code'
+import { connect, type AutopilotClient } from './mcp'
+
+export const AGENT = 'claude-code'
+
+// The mod needs Claude Code 2.1.287 or newer. The generated types (claude-code.d.ts) declare no
+// manifest field for a version floor, so session.start checks it with $.session.version().
+// $.ui.notice is tied to a tool_use_id (claude-code.d.ts:2382), so the warning is a toast.
+const MIN_VERSION = [2, 1, 287]
+
+function isBelowFloor(version: string): boolean {
+  const parts = version.split(/[.-]/).slice(0, 3).map(Number)
+  for (let i = 0; i < 3; i++) {
+    if ((parts[i] ?? 0) !== MIN_VERSION[i]) return (parts[i] ?? 0) < MIN_VERSION[i]
+  }
+  return false
+}
+
+// Module-scope guards: session.start can fire again (resume, clear); register and connect once.
+// The client is handed to the guard, briefing, compaction, spawn, capture and autopilot modules as they land.
+let client: AutopilotClient | null = null
+let registered = false
+let warned = false
+
+export const register: Register = (on, options) => {
+  on('session.start', async ($, e, next) => {
+    if (!registered) {
+      registered = true
+      await $.command.register({ name: 'flare', description: 'agentflare autopilot status and controls' })
+      const { base, version } = await $.session.version()
+      if (isBelowFloor(base ?? version)) {
+        $.ui.toast(`agentflare needs Claude Code ${MIN_VERSION.join('.')} or newer (running ${version}).`)
+      }
+    }
+    if (!client) {
+      client = await connect($, Number(options.guardTimeoutMs))
+      if (!client && !warned) {
+        warned = true
+        $.ui.toast('agentflare MCP server is not connected; autopilot is inactive this session.')
+      }
+    }
+    return next(e)
+  })
+}
