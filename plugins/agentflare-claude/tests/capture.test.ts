@@ -1,6 +1,8 @@
 import { expect, mock, test } from 'claude-code/testing'
+import { registerCapture } from '../mod/capture'
 
 const START = { cwd: '/', surface: 'terminal', isInteractive: true } as const
+const THROW = '<classify throws>'
 const ANSWER = 'Fixed the race in store::open by adding busy_timeout.\nSecond line.'
 
 // Stubs every op session.start and the capture hook call; tests override what they assert on.
@@ -17,7 +19,7 @@ function stubSession(on: any, label: string | undefined = 'bugfix', answer = 'ye
   on('ui.invalidate', () => ({ value: {} }))
   on('state.set', () => ({ value: { isSet: true, version: 1 } }))
   on('mcp.connect', () => ({ value: { isConnected: true, server: 'agentflare' } }))
-  on('model.classify', () => { seen.classify++; return { value: label } })
+  on('model.classify', () => { seen.classify++; if (label === THROW) throw new Error('model down'); return { value: label } })
   // $.ui.ask is not a stubbable op: it is a tool.call of AskUserQuestion, so the test plays the user there.
   on('tool.call', (_: any, e: any) => {
     seen.ask.push(e)
@@ -101,6 +103,30 @@ test('title and content are bounded', async ($, on) => {
   await $.turn.complete({ reason: 'answer', answer: '\n\n' + 'x'.repeat(5000), durationMs: 1, isAborted: false, turnId: 't1' })
   expect(seen.memory[0].args.title).toHaveLength(120)
   expect(seen.memory[0].args.content).toHaveLength(2000)
+})
+
+test('a throwing classify writes nothing and still returns the turn result', async ($, on) => {
+  const { seen } = stubSession(on, THROW)
+  await $.session.start(START)
+  const r = await $.turn.complete({ reason: 'answer', answer: ANSWER, durationMs: 1, isAborted: false, turnId: 't1' })
+  expect(r.text).toBe(ANSWER)
+  expect(seen.memory).toHaveLength(0)
+})
+
+// The kit loads the mod in its own module graph, so the current item is set by calling
+// registerCapture directly with a capturing `on` and a stub `$`.
+test('a current item keys the memory topic by its id', async () => {
+  let hook: any
+  registerCapture(((_: string, h: any) => { hook = h }) as any, { server: () => 'agentflare', options: { memoryCapture: 'auto' }, current: () => ({ item: { id: 'itm1' } }) })
+  const calls: any[] = []
+  const $ = {
+    model: { classify: async () => 'decision' },
+    mcp: { call: async (...a: any[]) => { calls.push(a); return { content: [] } } },
+    clock: { sleep: () => new Promise(() => {}) },
+    ui: { log: () => {} },
+  }
+  await hook($, { reason: 'answer', answer: ANSWER }, async () => ({ text: ANSWER }))
+  expect(calls[0][2].topic_key).toBe('autopilot:itm1:decision')
 })
 
 test('a throwing memory call still returns the turn result', async ($, on) => {

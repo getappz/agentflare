@@ -54,12 +54,17 @@ jobs:
       - name: Test plugin
         run: claude plugin test .
 
-      - name: Type-check
+      # No tsc step: the claude-code types tsconfig.json includes are written by the engine when it
+      # loads the plugin in a session, and neither `validate` nor `test` lays them on a runner, so a
+      # tsc step here could only ever skip. `claude plugin test` type-loads the mod and its tests.
+
+      - name: plugin.json version matches Cargo.toml
         run: |
-          if [ -d .claude-plugin/types/claude-code ] || [ -f .claude-plugin/types/claude-code/index.d.ts ]; then
-            npx --yes -p typescript tsc -p .
-          else
-            echo "::notice::generated claude-code types are absent; skipping tsc"
+          plugin=$(jq -r .version .claude-plugin/plugin.json)
+          cargo=$(sed -n 's/^version = "\(.*\)"$/\1/p' ../../Cargo.toml | head -n 1)
+          if [ "$plugin" != "$cargo" ]; then
+            echo "::error::plugin.json version $plugin != Cargo.toml version $cargo"
+            exit 1
           fi
 
       - name: Mod never uses fs.write, process or http

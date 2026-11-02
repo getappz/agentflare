@@ -21,6 +21,7 @@ test('session.start with MCP down toasts once and still returns', async ($, on) 
   on('session.version', () => ({ value: { version: '2.1.316', base: '2.1.316' } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   expect(toasts).toBe(1)
 })
 

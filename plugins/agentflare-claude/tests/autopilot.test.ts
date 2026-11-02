@@ -5,24 +5,25 @@ const TURN = { reason: 'answer', answer: 'done', durationMs: 1, isAborted: false
 const ready = { item: { id: 'abc', seq: 12, title: 'Fix X', description: 'd' }, claimed: true }
 const HEALTH = { daemon: 'up', stale_binary: false, auth: 'ok', mcp_version: '1' }
 
-type Opts = { messages?: any[]; usage?: any; reply?: (a: any) => unknown; connected?: boolean; stateThrows?: boolean; submitFailsOnce?: boolean }
+type Opts = { messages?: any[]; usage?: any; reply?: (a: any) => unknown; connected?: boolean; stateThrows?: boolean; submitFailsOnce?: boolean; persisted?: Record<string, unknown> }
 
 // Stubs every op session.start, the turn.complete hooks and /flare call; returns what the tests assert on.
 function stub(on: any, o: Opts = {}) {
   const clock = mock.clock(on)
-  const seen = { nextWork: [] as any[], woke: [] as string[], notify: [] as string[], toasts: [] as string[], state: [] as any[], briefing: 0 }
+  const seen = { nextWork: [] as any[], woke: [] as string[], notify: [] as string[], toasts: [] as string[], state: [] as any[], briefing: 0, logs: [] as string[] }
   const reply = o.reply ?? ((a: any) => (a.action === 'next_work' ? ready : a.action === 'health' ? HEALTH : { etag: 'e', text: 'B' }))
   on('command.list', () => ({ value: [] }))
   on('command.register', () => ({ value: { command: 'flare' } }))
   on('session.version', () => ({ value: { version: '2.1.316', base: '2.1.316' } }))
   on('session.cwd', () => ({ value: '/' }))
   on('session.id', () => ({ value: 's1' }))
-  on('ui.log', () => ({ value: {} }))
+  on('ui.log', (_: any, e: any) => { seen.logs.push(JSON.stringify(e)); return { value: {} } })
   on('ui.toast', (_: any, e: any) => { seen.toasts.push(e.text ?? e.message ?? JSON.stringify(e)); return { value: {} } })
   on('ui.notify', (_: any, e: any) => { seen.notify.push(JSON.stringify(e)); return { value: {} } })
   on('ui.invalidate', () => ({ value: {} }))
   let submits = 0
   on('state.set', (_: any, e: any) => { if (o.stateThrows) throw new Error('boom'); seen.state.push(e); return { value: { isSet: true, version: 1 } } })
+  on('state.get', (_: any, e: any) => ({ value: { value: o.persisted?.[e.key], version: 1 } }))
   on('mcp.connect', () => ({ value: o.connected === false ? { isConnected: false, reason: 'x' } : { isConnected: true, server: 'agentflare' } }))
   on('mcp.call', (_: any, e: any) => {
     if (e.args.action === 'next_work') seen.nextWork.push(e.args)
@@ -211,4 +212,48 @@ test('the budget toast is shown once while over budget', { options: { autopilot:
   await $.turn.complete(TURN)
   await $.turn.complete(TURN)
   expect(seen.toasts.filter(t => t.includes('budget'))).toHaveLength(1)
+})
+
+test('a hot reload does not re-wake the item persisted as current', { options: { autopilot: 'on', idleMinutes: 0 } }, async ($, on) => {
+  const { seen } = stub(on, { persisted: { currentItemId: 'abc' } })
+  await $.session.start(START)
+  await $.turn.complete(TURN)
+  expect(seen.nextWork).toHaveLength(1)
+  expect(seen.woke).toHaveLength(0)
+})
+
+test('a wake persists the current item id', { options: { autopilot: 'on', idleMinutes: 0 } }, async ($, on) => {
+  const { seen } = stub(on)
+  await $.session.start(START)
+  await $.turn.complete(TURN)
+  expect(seen.state.find((s: any) => s.key === 'currentItemId')?.value).toBe('abc')
+})
+
+test('/flare autopilot on arms the idle timer right away', { options: { autopilot: 'off', idleMinutes: 1 } }, async ($, on) => {
+  const { clock, seen } = stub(on)
+  await $.session.start(START)
+  await $.command.run({ command: 'flare', args: 'autopilot on' })
+  expect(seen.nextWork).toHaveLength(0)
+  await clock.advance(60_000)
+  expect(seen.nextWork).toHaveLength(1)
+  expect(seen.woke).toHaveLength(1)
+})
+
+test('/flare autopilot once with no idle wait wakes from a zero timer, never re-polls in a loop', { options: { autopilot: 'off', idleMinutes: 0 } }, async ($, on) => {
+  const { clock, seen } = stub(on)
+  await $.session.start(START)
+  await $.command.run({ command: 'flare', args: 'autopilot once' })
+  await clock.advance(1)
+  expect({ nextWork: seen.nextWork.length, woke: seen.woke.length, log: seen.logs }).toEqual({ nextWork: 1, woke: 1, log: [] })
+  await clock.advance(10 * 60_000)
+  expect(seen.nextWork).toHaveLength(1)
+})
+
+test('/flare autopilot off cancels a pending idle timer', { options: { autopilot: 'on', idleMinutes: 1 } }, async ($, on) => {
+  const { clock, seen } = stub(on)
+  await $.session.start(START)
+  await $.turn.complete(TURN)
+  await $.command.run({ command: 'flare', args: 'autopilot off' })
+  await clock.advance(5 * 60_000)
+  expect(seen.nextWork).toHaveLength(0)
 })

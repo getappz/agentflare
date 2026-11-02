@@ -111,6 +111,9 @@ test('current() feeds the checkpoint payload', async () => {
   let args: any
   await runDirect(async a => { args = a; return { handoff_id: 'h', text: '[agentflare checkpoint] ok' } })
   expect(args.payload).toMatchObject({ item: NOW.item, branch: 'feat/x' })
+  // Gate freshness comes from the server's session record only; the mod never sends a flag.
+  expect('verification_fresh' in args.payload).toBe(false)
+  expect('review_fresh' in args.payload).toBe(false)
 })
 
 test('current() feeds the minimal text on failure', async () => {

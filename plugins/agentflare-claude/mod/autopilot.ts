@@ -16,6 +16,7 @@ export type AutopilotContext = {
 }
 
 const RATE_LIMIT_PAUSE_PCT = 90
+const CURRENT_ITEM = { plugin: 'agentflare', key: 'currentItemId' } as const
 
 // Module state resets on hot reload (the timer is cancelled before it is re-armed, so at most one is live).
 let mode: Mode = 'off'
@@ -24,14 +25,23 @@ let timer: Timer | null = null
 const notified = new Set<string>()
 let ctx: AutopilotContext
 
-/** The effective mode, paused reason and a way to change the mode, for /flare. */
+/** The effective mode and paused reason, for /flare status. */
 export const autopilotState = {
   mode: (): Mode => mode,
   paused: (): string | null => paused,
-  setMode: (next: Mode): void => {
-    mode = next
-    paused = null
-  },
+}
+
+/**
+ * /flare autopilot <mode>. Switching to on/once arms the idle timer now: a session already idle
+ * since its last turn would otherwise never poll. A zero wait still goes through a timer, because
+ * the host refuses prompt.submit (the wake) from inside the command.run hook. Off cancels the timer.
+ */
+export function setAutopilotMode($: EngineInterface, next: Mode): void {
+  mode = next
+  paused = null
+  timer?.cancel()
+  timer = null
+  if (next !== 'off') armIdleTimer($)
 }
 
 /**
@@ -47,6 +57,11 @@ export async function wake($: EngineInterface, text: string): Promise<void> {
     // Forget the item so the next step can retry it instead of reporting 'working' forever.
     ctx.setCurrent({})
     $.ui.log(`agentflare: wake failed: ${String(err)}`)
+    try {
+      await $.state.set(CURRENT_ITEM, null)
+    } catch {
+      // The module state is already cleared; the persisted id only matters after a reload.
+    }
   }
 }
 
@@ -85,8 +100,11 @@ async function step($: EngineInterface): Promise<StepResult> {
   }
   if (!r.item || !r.claimed) return 'idle'
   const { id, seq, title } = r.item
-  if (id === current().item?.id) return 'working'
+  // A hot reload empties the module's current item; the persisted id still names the one already woken.
+  const held = current().item?.id ?? (await $.state.get(CURRENT_ITEM)).value
+  if (id === held) return 'working'
   setCurrent({ item: { id, seq, title } })
+  await $.state.set(CURRENT_ITEM, id)
   void wake($, `Work agentflare item #${seq} (${id}): ${title}. Read it with the item tool first, work in its bound worktree, run the gate before done.`)
   // Consume `once` right away: a throw below must not leave the mode armed for a second wake.
   if (mode === 'once') mode = 'off'
@@ -107,14 +125,16 @@ async function guardedStep($: EngineInterface): Promise<StepResult> {
 // Cancel-before-arm keeps exactly one live timer.
 function armIdleTimer($: EngineInterface): void {
   timer?.cancel()
-  timer = $.clock.after(ctx.options.idleMinutes * 60_000, () => void pollAndRearm($))
+  timer = $.clock.after(Math.max(0, ctx.options.idleMinutes) * 60_000, () => void pollAndRearm($))
 }
 
 // Every result re-polls after another idle period. A wake re-arms too: its prompt may be rejected
-// (no turn.complete then), and a turn that does run cancels and re-arms the timer itself.
+// (no turn.complete then), and a turn that does run cancels and re-arms the timer itself. With no
+// idle wait (idleMinutes <= 0) the step runs at each turn.complete instead; re-arming a zero timer
+// here would poll in a tight loop.
 async function pollAndRearm($: EngineInterface): Promise<void> {
   await guardedStep($)
-  if (mode !== 'off') armIdleTimer($)
+  if (mode !== 'off' && ctx.options.idleMinutes > 0) armIdleTimer($)
 }
 
 export function registerAutopilot(on: On, context: AutopilotContext): { step($: EngineInterface): Promise<StepResult> } {

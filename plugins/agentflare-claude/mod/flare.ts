@@ -1,5 +1,5 @@
 import type { On } from 'claude-code'
-import { autopilotState, type Mode } from './autopilot'
+import { autopilotState, setAutopilotMode, type Mode } from './autopilot'
 import type { Current } from './compaction'
 import { refreshBriefing } from './briefing'
 import type { AutopilotClient } from './mcp'
@@ -20,7 +20,7 @@ export function flareCommand(on: On, { client, current, agent }: FlareContext): 
     if (!c) return { text: 'agentflare MCP is not connected.' }
     const [sub, arg] = e.args.trim().split(/\s+/)
     if (sub === 'autopilot' && MODES.includes(arg ?? '')) {
-      autopilotState.setMode(arg as Mode)
+      setAutopilotMode($, arg as Mode)
       return { text: `autopilot: ${arg}` }
     }
     if (sub === 'briefing' && arg === 'refresh') {

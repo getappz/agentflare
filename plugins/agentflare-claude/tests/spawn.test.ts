@@ -77,6 +77,25 @@ test('a routing call that times out leaves the model unset', async ($, on) => {
   expect(seen.prompt.startsWith('Reach lean-ctx')).toBe(true)
 })
 
+for (const [name, answer] of [
+  ['a throwing', () => { throw new Error('boom') }],
+  ['an isError', () => ({ value: { content: [{ type: 'text', text: 'nope' }], isError: true } })],
+  ['a model:null', () => reply({ agent: 'claude-code', model: null, effort: null, advisory: true })],
+] as const) {
+  test(`${name} routing reply leaves the model unset and still shapes the prompt`, async ($, on) => {
+    stubSession(on)
+    let routed = 0
+    on('mcp.call', (_: any, e: any) => { if (e.tool === 'get_routing_suggestion') { routed++; return answer() } return reply({}) })
+    let seen: any
+    on('agent.spawn', (_: any, e: any) => { seen = e; return { model: e.model ?? 'sonnet', agentId: 'a1' } })
+    await $.session.start(START)
+    await $.agent.spawn({ prompt: 'x' })
+    expect(routed).toBe(1)
+    expect(seen.model).toBeUndefined()
+    expect(seen.prompt.startsWith('Reach lean-ctx')).toBe(true)
+  })
+}
+
 test('a failing routing call or a missing server still shapes the prompt', async ($, on) => {
   stubSession(on, false)
   let seen: any
