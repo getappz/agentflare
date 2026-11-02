@@ -7,6 +7,7 @@ impl AgentflareMcp {
         match req.action.as_str() {
             "health" => Ok(Self::autopilot_health().to_string()),
             "check" => Ok(Self::autopilot_check(&req).to_string()),
+            "observe" => Ok(Self::autopilot_observe(&req).to_string()),
             other => Err(ErrorData::invalid_params(
                 format!(
                     "unknown autopilot action `{other}` (expected check|observe|briefing|checkpoint|next_work|health)"
@@ -37,6 +38,52 @@ impl AgentflareMcp {
             "auth": "ok",
             "mcp_version": env!("CARGO_PKG_VERSION"),
         })
+    }
+
+    /// Records verification/review/diagnosis evidence through the same
+    /// function the PostToolUse hook uses. The tree is fingerprinted from the
+    /// request's `cwd` (see `check`), so both actions compare the same tree.
+    fn autopilot_observe(req: &AutopilotRequest) -> serde_json::Value {
+        let raw_name = req.tool_name.as_deref().unwrap_or_default();
+        let (tool, input) =
+            crate::hook_redirect::unwrap_gateway_call(raw_name, req.tool_input.as_ref());
+        let command = input.as_ref().and_then(|ti| {
+            ["command", "cmd", "script", "CommandLine"]
+                .into_iter()
+                .find_map(|k| ti.get(k).and_then(|v| v.as_str()))
+        });
+        let cwd = req
+            .cwd
+            .clone()
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|d| d.display().to_string())
+            })
+            .unwrap_or_default();
+        let obs = crate::hook_completion_gate::Observation {
+            session_id: req.session_id.as_deref().unwrap_or_default(),
+            cwd: &cwd,
+            agent: req.agent.as_deref().unwrap_or("claude"),
+            tool_name: &tool,
+            command,
+            exit_code: req.exit_code,
+            output_text: req.output_excerpt.as_deref().unwrap_or_default(),
+            review_submitted: tool == "mcp__flare__review"
+                && req.item_action.as_deref() == Some("submit")
+                && req.item_success == Some(true),
+            trust_end_tree: true,
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut runtime = crate::optimize::load_runtime();
+        let recorded = crate::hook_completion_gate::record_observation(&mut runtime, &obs, now);
+        if recorded != crate::hook_completion_gate::Recorded::None {
+            crate::optimize::save_runtime(&runtime);
+        }
+        serde_json::json!({ "recorded": recorded.as_str() })
     }
 
     /// Guard parity with the PreToolUse hook: same functions, same order,
@@ -97,12 +144,19 @@ impl AgentflareMcp {
                     verification_start_tree: None,
                 });
             let task_type = crate::hook::resolve_item_task_type(&tool, input.as_ref());
-            if let Some(reason) = crate::hook_completion_gate::completion_gate_denial(
+            // Same explicit cwd `observe` fingerprints, never the MCP process cwd.
+            let cwd = req
+                .cwd
+                .as_deref()
+                .map(std::path::PathBuf::from)
+                .or_else(|| std::env::current_dir().ok());
+            if let Some(reason) = crate::hook_completion_gate::completion_gate_denial_in(
                 &record,
                 now,
                 &tool,
                 input.as_ref(),
                 task_type.as_deref(),
+                cwd.as_deref(),
             ) {
                 return deny("completion_gate", reason);
             }

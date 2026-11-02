@@ -133,3 +133,164 @@ fn check_reason_strings_match_hook_path() {
         hook["hookSpecificOutput"]["permissionDecisionReason"]
     );
 }
+
+/// Unique per run: `observe` persists to the real runtime-state file.
+fn uniq_session(tag: &str) -> String {
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("{tag}-{}-{n}", std::process::id())
+}
+
+fn observe(
+    s: &AgentflareMcp,
+    session: &str,
+    cwd: &std::path::Path,
+    tool: &str,
+    input: serde_json::Value,
+    exit_code: Option<i32>,
+    output: &str,
+) -> serde_json::Value {
+    let out = s
+        .autopilot_impl(AutopilotRequest {
+            action: "observe".into(),
+            session_id: Some(session.into()),
+            cwd: Some(cwd.display().to_string()),
+            agent: Some("claude-code".into()),
+            tool_name: Some(tool.into()),
+            tool_input: Some(input),
+            exit_code,
+            output_excerpt: Some(output.into()),
+            ..Default::default()
+        })
+        .unwrap();
+    serde_json::from_str(&out).unwrap()
+}
+
+fn check_done(s: &AgentflareMcp, session: &str, cwd: &std::path::Path) -> serde_json::Value {
+    let out = s
+        .autopilot_impl(AutopilotRequest {
+            action: "check".into(),
+            session_id: Some(session.into()),
+            cwd: Some(cwd.display().to_string()),
+            agent: Some("claude-code".into()),
+            tool_name: Some("mcp__flare__item".into()),
+            tool_input: Some(json!({"action":"done","id":"abc"})),
+            ..Default::default()
+        })
+        .unwrap();
+    serde_json::from_str(&out).unwrap()
+}
+
+#[test]
+fn observe_passing_cargo_test_records_verification_then_only_review_is_missing() {
+    let (_tmp, s) = harness();
+    let repo = init_temp_repo("task/x");
+    let sid = uniq_session("obs-pass");
+    let out = observe(
+        &s,
+        &sid,
+        repo.path(),
+        "Bash",
+        json!({"command":"cargo test"}),
+        Some(0),
+        "test result: ok. 12 passed",
+    );
+    assert_eq!(out["recorded"], "verification");
+    let chk = check_done(&s, &sid, repo.path());
+    assert_eq!(chk["decision"], "deny");
+    assert!(chk["reason"].as_str().unwrap().contains("review"), "{chk}");
+}
+
+#[test]
+fn observe_failing_test_is_recorded_as_a_failed_run_and_gate_stays_closed() {
+    let (_tmp, s) = harness();
+    let repo = init_temp_repo("task/x");
+    let sid = uniq_session("obs-fail");
+    let out = observe(
+        &s,
+        &sid,
+        repo.path(),
+        "Bash",
+        json!({"command":"cargo test"}),
+        Some(1),
+        "test result: FAILED",
+    );
+    assert_eq!(out["recorded"], "verification");
+    let reason = check_done(&s, &sid, repo.path())["reason"]
+        .as_str()
+        .unwrap()
+        .to_lowercase();
+    assert!(
+        reason.contains("verif") || reason.contains("test"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn observe_unrelated_command_records_none() {
+    let (_tmp, s) = harness();
+    let repo = init_temp_repo("task/x");
+    let out = observe(
+        &s,
+        &uniq_session("obs-none"),
+        repo.path(),
+        "Bash",
+        json!({"command":"ls"}),
+        Some(0),
+        "",
+    );
+    assert_eq!(out["recorded"], "none");
+}
+
+#[test]
+fn observe_report_findings_records_review() {
+    let (_tmp, s) = harness();
+    let repo = init_temp_repo("task/x");
+    let out = observe(
+        &s,
+        &uniq_session("obs-review"),
+        repo.path(),
+        "ReportFindings",
+        json!({}),
+        None,
+        "{\"findings\":[]}",
+    );
+    assert_eq!(out["recorded"], "review");
+}
+
+#[test]
+fn observe_and_check_agree_on_the_request_cwd_tree() {
+    let (_tmp, s) = harness();
+    let (a, b) = (init_temp_repo("task/a"), init_temp_repo("task/b"));
+    std::fs::write(b.path().join("diff.txt"), "different tree").unwrap();
+    let sid = uniq_session("obs-cwd");
+    observe(
+        &s,
+        &sid,
+        a.path(),
+        "Bash",
+        json!({"command":"cargo test"}),
+        Some(0),
+        "test result: ok. 1 passed",
+    );
+    observe(&s, &sid, a.path(), "ReportFindings", json!({}), None, "{}");
+    // Same tree the evidence was recorded against: both gates satisfied.
+    let same = check_done(&s, &sid, a.path());
+    assert!(
+        !same["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("review")
+            && !same["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .to_lowercase()
+                .contains("verif"),
+        "{same}"
+    );
+    // A different tree must see that evidence as stale.
+    let other = check_done(&s, &sid, b.path());
+    assert_eq!(other["decision"], "deny", "{other}");
+}

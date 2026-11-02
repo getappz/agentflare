@@ -440,48 +440,95 @@ pub fn post_tool_use(agent: &str) {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    if crate::optimize::is_review_completion(&parsed.tool_name) || parsed.review_submitted {
-        let mut runtime = crate::optimize::load_runtime();
-        crate::optimize::prune_stale_sessions(&mut runtime, now);
-        let record = runtime
-            .sessions
-            .entry(session_key.clone())
-            .or_insert_with(|| crate::optimize::SessionRecord {
-                start_ts: now,
-                turn_count: 0,
-                recent_tool_calls: vec![],
-                last_verification: None,
-                last_review: None,
-                last_diagnosis: None,
-                verification_start_tree: None,
-            });
-        record.last_review = Some(crate::optimize::ReviewEvidence {
-            source: parsed.tool_name.clone(),
-            ts: now,
-            tree: crate::optimize::tree_fingerprint(),
-        });
-        crate::optimize::save_runtime(&runtime);
-        return;
-    }
-
-    let Some(command) = &parsed.command else {
-        return;
-    };
-    let is_verification = crate::optimize::is_verification_command(command);
-    let is_diagnosis = crate::optimize::is_diagnosis_command(command);
-    if !is_verification && !is_diagnosis {
-        return;
-    }
-
-    let passed = verification_passed_for_hook(
+    let cwd = std::env::current_dir()
+        .map(|d| d.display().to_string())
+        .unwrap_or_default();
+    let obs = Observation {
+        session_id: &parsed.session_id,
+        cwd: &cwd,
         agent,
-        &parsed.tool_name,
-        parsed.exit_code,
-        &parsed.output_text,
-    );
-
+        tool_name: &parsed.tool_name,
+        command: parsed.command.as_deref(),
+        exit_code: parsed.exit_code,
+        output_text: &parsed.output_text,
+        review_submitted: parsed.review_submitted,
+        trust_end_tree: false,
+    };
+    if !obs.is_evidence() {
+        return;
+    }
     let mut runtime = crate::optimize::load_runtime();
-    crate::optimize::prune_stale_sessions(&mut runtime, now);
+    if record_observation(&mut runtime, &obs, now) != Recorded::None {
+        crate::optimize::save_runtime(&runtime);
+    }
+}
+
+/// What a successful tool call looks like to the evidence recorder: the
+/// subset of a PostToolUse payload `record_observation` needs. `cwd` is the
+/// directory whose tree is fingerprinted (the hook passes its process cwd;
+/// the MCP `observe` action passes the request's cwd).
+pub(crate) struct Observation<'a> {
+    pub session_id: &'a str,
+    pub cwd: &'a str,
+    pub agent: &'a str,
+    pub tool_name: &'a str,
+    pub command: Option<&'a str>,
+    pub exit_code: Option<i32>,
+    pub output_text: &'a str,
+    pub review_submitted: bool,
+    /// No PreToolUse start fingerprint exists (MCP `observe`): treat the tree
+    /// at observation time as the tree the command ran against.
+    pub trust_end_tree: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Recorded {
+    Verification,
+    Review,
+    Diagnosis,
+    None,
+}
+
+impl Recorded {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Verification => "verification",
+            Self::Review => "review",
+            Self::Diagnosis => "diagnosis",
+            Self::None => "none",
+        }
+    }
+}
+
+impl Observation<'_> {
+    /// Cheap pre-check so callers skip loading the runtime for calls that
+    /// can never produce evidence.
+    pub(crate) fn is_evidence(&self) -> bool {
+        crate::optimize::is_review_completion(self.tool_name)
+            || self.review_submitted
+            || self.command.is_some_and(|c| {
+                crate::optimize::is_verification_command(c)
+                    || crate::optimize::is_diagnosis_command(c)
+            })
+    }
+}
+
+/// Records review / verification / diagnosis evidence for the session into
+/// `runtime` (the caller saves it). Shared by the PostToolUse hook and the
+/// MCP `autopilot observe` action so both write identical `SessionRecord`s.
+/// A failed verification run is still recorded (`passed: false`) so it
+/// supersedes an older pass.
+pub(crate) fn record_observation(
+    runtime: &mut crate::optimize::RuntimeState,
+    obs: &Observation,
+    now: u64,
+) -> Recorded {
+    if !obs.is_evidence() {
+        return Recorded::None;
+    }
+    let session_key = crate::optimize::scoped_session_key(obs.agent, obs.session_id);
+    let tree = crate::optimize::tree_fingerprint_in(std::path::Path::new(obs.cwd));
+    crate::optimize::prune_stale_sessions(runtime, now);
     let record =
         runtime
             .sessions
@@ -495,24 +542,44 @@ pub fn post_tool_use(agent: &str) {
                 last_diagnosis: None,
                 verification_start_tree: None,
             });
+    if crate::optimize::is_review_completion(obs.tool_name) || obs.review_submitted {
+        record.last_review = Some(crate::optimize::ReviewEvidence {
+            source: obs.tool_name.to_string(),
+            ts: now,
+            tree,
+        });
+        return Recorded::Review;
+    }
+    let Some(command) = obs.command else {
+        return Recorded::None;
+    };
+    let mut recorded = Recorded::None;
     if crate::optimize::is_verification_command(command) {
-        let start = record.verification_start_tree.take();
-        let end = crate::optimize::tree_fingerprint();
+        let passed =
+            verification_passed_for_hook(obs.agent, obs.tool_name, obs.exit_code, obs.output_text);
+        let start = record
+            .verification_start_tree
+            .take()
+            .or_else(|| obs.trust_end_tree.then(|| tree.clone()).flatten());
         record.last_verification = Some(crate::optimize::VerificationEvidence {
-            command: command.clone(),
-            exit_code: parsed.exit_code,
+            command: command.to_string(),
+            exit_code: obs.exit_code,
             passed,
             ts: now,
-            tree: crate::optimize::verification_evidence_tree(start, end),
+            tree: crate::optimize::verification_evidence_tree(start, tree),
         });
+        recorded = Recorded::Verification;
     }
     if crate::optimize::is_diagnosis_command(command) {
         record.last_diagnosis = Some(crate::optimize::DiagnosisEvidence {
-            command: command.clone(),
+            command: command.to_string(),
             ts: now,
         });
+        if recorded == Recorded::None {
+            recorded = Recorded::Diagnosis;
+        }
     }
-    crate::optimize::save_runtime(&runtime);
+    recorded
 }
 
 /// Whether `f` (a freshness check) accepts the record against the cwd tree
@@ -570,13 +637,33 @@ pub(crate) fn completion_gate_denial(
     tool_input: Option<&serde_json::Value>,
     task_type: Option<&str>,
 ) -> Option<String> {
+    completion_gate_denial_in(
+        record,
+        now,
+        tool_name,
+        tool_input,
+        task_type,
+        std::env::current_dir().ok().as_deref(),
+    )
+}
+
+/// [`completion_gate_denial`] against an explicit working directory instead
+/// of the process cwd (the MCP server's cwd is not the session's).
+pub(crate) fn completion_gate_denial_in(
+    record: &crate::optimize::SessionRecord,
+    now: u64,
+    tool_name: &str,
+    tool_input: Option<&serde_json::Value>,
+    task_type: Option<&str>,
+    cwd: Option<&std::path::Path>,
+) -> Option<String> {
     // Only gated item calls can hit the gate, so only they pay for the
     // database lookup and the git hashes.
     let is_item_call = tool_name == crate::hook_redirect::ITEM_TOOL_NAME || tool_name == "item";
     if !is_item_call || crate::hook_redirect::gated_item_action(tool_input).is_none() {
         return None;
     }
-    let cwd_tree = crate::optimize::tree_fingerprint();
+    let cwd_tree = cwd.and_then(crate::optimize::tree_fingerprint_in);
     let cwd_passing = cwd_tree
         .as_deref()
         .is_some_and(|h| crate::optimize::has_fresh_passing_verification(record, now, Some(h)));
@@ -584,8 +671,8 @@ pub(crate) fn completion_gate_denial(
         .as_deref()
         .is_some_and(|h| crate::optimize::has_fresh_review(record, now, Some(h)));
 
-    let item_dir = resolve_item_worktree(tool_input);
-    let cwd_path = std::env::current_dir().ok();
+    let item_dir = resolve_item_worktree(tool_input, cwd);
+    let cwd_path = cwd.map(std::path::Path::to_path_buf);
     let is_same_dir = match (&cwd_path, &item_dir) {
         (Some(c), Some(i)) => {
             std::fs::canonicalize(c).ok().as_deref() == std::fs::canonicalize(i).ok().as_deref()
@@ -664,7 +751,10 @@ pub(crate) fn completion_gate_denial(
 
 /// The item's task worktree (`<repo>/.worktrees/task/<seq>`), found among
 /// the cwd repo's registered worktrees. `None` on any lookup failure.
-fn resolve_item_worktree(tool_input: Option<&serde_json::Value>) -> Option<std::path::PathBuf> {
+fn resolve_item_worktree(
+    tool_input: Option<&serde_json::Value>,
+    cwd: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
     let id_or_seq = tool_input?.get("id")?.as_str()?;
     let db_path = crate::paths::agentflare_dir().join("backend.db");
     if !db_path.exists() {
@@ -679,7 +769,7 @@ fn resolve_item_worktree(tool_input: Option<&serde_json::Value>) -> Option<std::
         .join("task")
         .join(seq.to_string());
     let list = flare_git_core::worktree::run_git_opt_timeout(
-        &std::env::current_dir().ok()?,
+        cwd?,
         &["worktree", "list", "--porcelain"],
         2,
         &[],
