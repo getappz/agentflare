@@ -511,3 +511,13 @@ otherwise open.
   `github.com/getappz/lean-ctx`; upstream is `yvgude/lean-ctx`.
 - `README.md:349` "What Gets Created" lists 3 rule files; `init` writes 5
   plus coaching rules.
+
+## 8. Addressed by autopilot mod M1
+
+The Claude plugin and its autopilot mod (`plugins/agentflare-claude/`, listed by `.claude-plugin/marketplace.json`) address part of the Layer A gaps. Layer B (headless workers) and Layer C are untouched.
+
+- **Finding 9 (no Claude plugin)**: closed for Claude Code. A plugin manifest, marketplace install and `userConfig` now exist. The `claude mcp serve` adapter, `--channels`, Agent SDK and GitHub Action items remain open.
+- **Finding 5 (PreCompact no-op, no post-compaction re-inject)**: addressed inside the mod. It writes a checkpoint handoff before compaction and re-injects it afterwards. The wired `PreCompact` command hook in `src/hook.rs` is unchanged, and `SessionStart` still ignores `source` for users without the plugin.
+- **Finding 6 (hook system under-used)**: partly addressed. The mod calls agentflare's MCP server in-process rather than spawning a process per event, and it uses `allow` for read-only calls. `http`, `prompt` and `agent` hook types, `StopFailure`, `PermissionRequest` and the other unused events are still open.
+- **Finding 4 (subagents)**: partly addressed. The mod shapes and routes subagent spawns. Apps personas are still projected as files and invoked by prose.
+- **Not addressed**: findings 2, 3 and 8 (bare headless workers, `--dangerously-skip-permissions`, config-dir and uninstall hygiene). Findings 1 and 7 are fixed on this branch (see above). The new init and doctor duplicate-hook handling covers only hooks the mod claims.

@@ -15,6 +15,20 @@ impl AgentflareMcp {
                 let r#type = req
                     .r#type
                     .ok_or_else(|| ErrorData::invalid_params("type is required", None))?;
+                // Same scan and same answer as handoff: a flagged entry is refused,
+                // never stored (design §5: capture excludes anything the secret
+                // scanner flags). The error names the field and pattern class only.
+                if let Some((field, pattern)) = super::secret_scan::flagged_field([
+                    ("title", title.as_str()),
+                    ("content", content.as_str()),
+                ]) {
+                    return Err(ErrorData::invalid_params(
+                        format!(
+                            "memory remember blocked: field '{field}' looks like it contains a {pattern} -- refusing to store a credential in memory. Remove it and retry."
+                        ),
+                        None,
+                    ));
+                }
                 let input = crate::memory::mcp::RememberInput {
                     title,
                     content,

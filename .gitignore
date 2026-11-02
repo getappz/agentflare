@@ -63,3 +63,6 @@ node_modules/
  
 # Flare Desktop -- private sibling repo getappz/flare-desktop, not part of agentflare 
 /flare-desktop/ 
+
+# Branch build dir for the autopilot plugin probes; never staged
+/target-autopilot/
