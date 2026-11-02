@@ -177,10 +177,7 @@ async fn try_install_from_source(
     }
 
     let repo_url = parsed.url.as_str();
-    let temp = match clone_repo(repo_url, parsed.git_ref.as_deref()).await {
-        Ok(d) => d,
-        Err(_) => return Ok(false),
-    };
+    let temp = clone_repo(repo_url, parsed.git_ref.as_deref()).await?;
     let entries = match parsed.subpath.as_ref() {
         Some(sub) => discover_skills(temp.path(), Some(sub), &DiscoverOptions::default()).await?,
         None => discover_skills(temp.path(), None, &DiscoverOptions::default()).await?,
@@ -195,26 +192,99 @@ async fn try_install_from_source(
 }
 
 /// Install `name` from the first configured registry that has it, into
-/// `~/.agentflare/skills` only (never an agent's discovery dir). `Ok(false)` =
-/// no registry has it. Rejects anything but a plain skill name so a caller
+/// `~/.agentflare/skills` only (never an agent's discovery dir). `Ok(Some(url))`
+/// = installed from that registry; `Ok(None)` = no registry has it. A registry
+/// that fails (clone/IO error) is skipped so a later one can still serve the
+/// skill; if none did and one failed, that failure is returned rather than a
+/// misleading "not found". Rejects anything but a plain skill name so a caller
 /// can't escape the skills dir via `..`, `/` or `source:name` qualifiers.
-pub(crate) async fn install_from_registries(name: &str) -> Result<bool, skill::error::SkillError> {
+pub(crate) async fn install_from_registries(
+    name: &str,
+) -> Result<Option<String>, skill::error::SkillError> {
     if !is_plain_skill_name(name) {
-        return Ok(false);
+        return Ok(None);
     }
     let manager = build_manager();
+    let mut first_err = None;
     for url in &load_registries() {
-        if try_install_from_source(&manager, url, name).await? {
-            return Ok(true);
+        match try_install_from_source(&manager, url, name).await {
+            Ok(true) => return Ok(Some(redact_url_credentials(url))),
+            Ok(false) => {}
+            Err(e) => {
+                first_err.get_or_insert(redact_skill_error(e));
+            }
         }
     }
-    Ok(false)
+    first_err.map_or(Ok(None), Err)
 }
 
+fn redact_skill_error(e: skill::error::SkillError) -> skill::error::SkillError {
+    use skill::error::SkillError;
+    match e {
+        SkillError::GitClone { url, message } => SkillError::GitClone {
+            url: redact_url_credentials(&url),
+            message: redact_credentials_in_message(&message),
+        },
+        other => other,
+    }
+}
+
+fn redact_credentials_in_message(message: &str) -> String {
+    message
+        .split_whitespace()
+        .map(|w| {
+            let end = w
+                .char_indices()
+                .rev()
+                .find(|(_, c)| {
+                    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '@')
+                })
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(0);
+            let (core, tail) = w.split_at(end);
+            if core.contains("://") {
+                format!("{}{}", redact_url_credentials(core), tail)
+            } else {
+                w.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `url` without any `user[:password]@` in its authority, so a registry
+/// configured as `https://token@host/repo` never leaks into responses.
+/// Anything without a `scheme://` (local paths, `gh:` shorthands) is unchanged.
+fn redact_url_credentials(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    match rest[..authority_end].rfind('@') {
+        Some(at) => format!("{scheme}://{}", &rest[at + 1..]),
+        None => url.to_string(),
+    }
+}
+
+/// A bare skill name safe to use as a directory name on every platform:
+/// `[A-Za-z0-9._-]`, no leading/trailing `.`, and not a Windows device name
+/// (which Windows also reserves when followed by an extension: `CON.txt`).
 pub(crate) fn is_plain_skill_name(name: &str) -> bool {
+    const RESERVED: &[&str] = &[
+        "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+        "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    ];
     !name.is_empty()
-        && name != "."
-        && name != ".."
+        && !name.starts_with('.')
+        && !name.ends_with('.')
+        && !RESERVED.contains(
+            &name
+                .split('.')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
+        )
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
@@ -226,7 +296,7 @@ async fn run_install(name: &str) -> Result<(), skill::error::SkillError> {
         return Ok(());
     }
 
-    if install_from_registries(name).await? {
+    if install_from_registries(name).await?.is_some() {
         crate::ui::success(&format!("installed '{name}'"));
         return Ok(());
     }
@@ -1099,17 +1169,61 @@ mod tests {
             write_fixture_skill(reg.path(), "zz-demo", "demo skill");
             save_registries(&[reg.path().to_string_lossy().to_string()]);
 
-            assert!(block_on(install_from_registries("zz-demo")).unwrap());
+            assert!(
+                block_on(install_from_registries("zz-demo"))
+                    .unwrap()
+                    .is_some()
+            );
             assert!(home_skills().join("zz-demo").join("SKILL.md").exists());
             let home = crate::paths::home();
             assert!(!home.join(".claude").join("skills").join("zz-demo").exists());
 
-            assert!(!block_on(install_from_registries("missing")).unwrap());
-            for bad in ["../zz-demo", "a/b", "src:zz-demo", "", ".."] {
+            assert!(
+                block_on(install_from_registries("missing"))
+                    .unwrap()
+                    .is_none()
+            );
+            for bad in [
+                "../zz-demo",
+                "a/b",
+                "src:zz-demo",
+                "",
+                "..",
+                ".hidden",
+                "foo.",
+                "nul",
+                "CON",
+                "com1",
+                "CON.txt",
+                "nul.tar.gz",
+            ] {
                 assert!(!is_plain_skill_name(bad), "{bad}");
-                assert!(!block_on(install_from_registries(bad)).unwrap(), "{bad}");
+                assert!(
+                    block_on(install_from_registries(bad)).unwrap().is_none(),
+                    "{bad}"
+                );
             }
         });
+    }
+
+    #[test]
+    fn redact_url_credentials_strips_userinfo_only() {
+        assert_eq!(
+            redact_url_credentials("https://tok:secret@github.com/o/r.git"),
+            "https://github.com/o/r.git"
+        );
+        assert_eq!(
+            redact_url_credentials("https://tok@github.com/o/r"),
+            "https://github.com/o/r"
+        );
+        // An `@` after the authority (a path) is not userinfo.
+        assert_eq!(
+            redact_url_credentials("https://github.com/o/r@v1"),
+            "https://github.com/o/r@v1"
+        );
+        for plain in ["C:\\reg\\dir", "/tmp/reg", "gh:getappz/skill-registry"] {
+            assert_eq!(redact_url_credentials(plain), plain);
+        }
     }
 
     fn write_fixture_skill(dir: &Path, name: &str, description: &str) {

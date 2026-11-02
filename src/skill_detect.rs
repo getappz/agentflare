@@ -471,10 +471,13 @@ pub fn install_hint(prompt: &str) -> Option<String> {
     // Keep original case (registry lookup is case-sensitive) and the same
     // character set the installer accepts (`-_ .`), trimming only other
     // punctuation so `_pdf` / `foo.bar` survive.
+    // A trailing `.` is sentence punctuation (`install pdf skill.`), never part
+    // of a name (`is_plain_skill_name` rejects names ending in `.`).
     let toks: Vec<&str> = prompt
         .split_whitespace()
         .map(|t| {
             t.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+                .trim_end_matches('.')
         })
         .collect();
     let in_list = |t: &str, list: &[&str]| list.iter().any(|w| t.eq_ignore_ascii_case(w));
@@ -482,6 +485,10 @@ pub fn install_hint(prompt: &str) -> Option<String> {
     let i = toks
         .iter()
         .position(|t| t.eq_ignore_ascii_case("install"))?;
+    // "do not install pdf skill": the user refused; never steer toward a load.
+    if i > 0 && in_list(toks[i - 1], &["not", "never", "don't", "dont"]) {
+        return None;
+    }
     if !toks.iter().any(|t| is_skill(t)) {
         return None;
     }
@@ -495,17 +502,24 @@ pub fn install_hint(prompt: &str) -> Option<String> {
         .collect();
     // Collect every `<name> skill` / `skill <name>` pair; name only when
     // exactly one candidate (multiple → generic search hint).
-    let mut candidates: Vec<&str> = Vec::new();
-    for w in rest.windows(2) {
+    let mut candidates: Vec<(usize, &str)> = Vec::new();
+    for (k, w) in rest.windows(2).enumerate() {
         if is_skill(w[1]) && ident(w[0]) {
-            candidates.push(w[0]);
+            candidates.push((k, w[0]));
         } else if is_skill(w[0]) && ident(w[1]) {
-            candidates.push(w[1]);
+            candidates.push((k + 1, w[1]));
         }
     }
-    candidates.dedup();
+    candidates.dedup_by_key(|c| c.1);
+    // "pdf and json skills" / "skill pdf or json": a conjunction next to the
+    // name means several skills were asked for, so don't pick one. A source
+    // URL means the name isn't a registry name at all.
+    let conjoined = |p: usize| {
+        (p > 0 && in_list(rest[p - 1], &["and", "or"]))
+            || rest.get(p + 1).is_some_and(|t| in_list(t, &["and", "or"]))
+    };
     let name = match candidates.as_slice() {
-        [n] => Some(*n),
+        [(p, n)] if !conjoined(*p) && !prompt.contains("://") => Some(*n),
         _ => None,
     };
     Some(match name {
@@ -752,6 +766,35 @@ mod tests {
         ] {
             assert_eq!(install_hint(p).unwrap(), generic, "{p}");
         }
+    }
+
+    #[test]
+    fn install_hint_handles_punctuation_negation_conjunctions_and_urls() {
+        let generic = install_hint("install skill").unwrap();
+        // Sentence punctuation after the keyword or the name.
+        assert!(
+            install_hint("install pdf skill.")
+                .unwrap()
+                .contains("name=\"pdf\"")
+        );
+        assert!(
+            install_hint("install the pdf. skill")
+                .unwrap()
+                .contains("name=\"pdf\"")
+        );
+        // A refusal is not an install request.
+        assert!(install_hint("do not install pdf skill").is_none());
+        assert!(install_hint("please don't install the pdf skill").is_none());
+        // Several skills (or a source URL) must not collapse to one name.
+        assert_eq!(
+            install_hint("install pdf and json skills").unwrap(),
+            generic
+        );
+        assert_eq!(install_hint("install skill pdf or json").unwrap(), generic);
+        assert_eq!(
+            install_hint("install pdf skill from https://example.com/x").unwrap(),
+            generic
+        );
     }
 
     #[test]
