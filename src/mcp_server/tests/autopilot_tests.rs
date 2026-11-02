@@ -624,3 +624,41 @@ fn checkpoint_without_flags_or_record_is_stale() {
         assert!(t.contains("tests stale, review stale"), "{t}");
     });
 }
+
+#[test]
+fn memory_remember_refuses_a_flagged_secret_and_stores_nothing() {
+    crate::paths::test_support::with_temp_home(|| {
+        let (_tmp, s) = harness();
+        // Built at runtime so the literal never looks like a key to a scanner.
+        let key = format!("AKIA{}", "QWERTYUIOPASDFGH");
+        let remember = |content: String| -> MemoryRequest {
+            serde_json::from_value(json!({
+                "action": "remember", "type": "discovery",
+                "title": "autopilot capture probe", "content": content,
+            }))
+            .unwrap()
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = rt
+            .block_on(s.memory_impl(remember(format!("deploy with {key} today"))))
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("field 'content'"), "{}", err.message);
+        assert!(err.message.contains("AWS access key id"), "{}", err.message);
+        assert!(
+            !err.message.contains(&key),
+            "the error must not echo the secret"
+        );
+        let recall = crate::memory::mcp::handle_recall(crate::memory::mcp::RecallInput {
+            query: Some("autopilot capture probe".into()),
+            id: None,
+            r#type: None,
+            project: None,
+            limit: Some(5),
+        })
+        .unwrap_or_default();
+        assert!(!recall.contains("autopilot capture probe"), "{recall}");
+        rt.block_on(s.memory_impl(remember("deploy with the usual key today".into())))
+            .expect("clean content is stored");
+    });
+}

@@ -101,19 +101,27 @@ static CAPTURE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 pub(crate) fn check_fields<'a>(
     fields: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> Result<(), ErrorData> {
-    for (field, text) in fields {
-        if let Some(pattern) = find_secret(text) {
-            return Err(ErrorData::invalid_params(
-                format!(
-                    "handoff blocked: field '{field}' looks like it contains a {pattern} -- \
-                     refusing to persist a credential to a stored asset/item. Remove it, or \
-                     pass allow_secrets=true if this is an intentional credential handoff."
-                ),
-                None,
-            ));
-        }
+    match flagged_field(fields) {
+        Some((field, pattern)) => Err(ErrorData::invalid_params(
+            format!(
+                "handoff blocked: field '{field}' looks like it contains a {pattern} -- \
+                 refusing to persist a credential to a stored asset/item. Remove it, or \
+                 pass allow_secrets=true if this is an intentional credential handoff."
+            ),
+            None,
+        )),
+        None => Ok(()),
     }
-    Ok(())
+}
+
+/// The first `(field, pattern class)` whose text matches a secret pattern;
+/// never the matched text itself.
+pub(crate) fn flagged_field<'a>(
+    fields: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Option<(&'a str, &'static str)> {
+    fields
+        .into_iter()
+        .find_map(|(field, text)| find_secret(text).map(|pattern| (field, pattern)))
 }
 
 #[cfg(test)]
