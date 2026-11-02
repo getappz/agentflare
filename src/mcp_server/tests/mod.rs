@@ -181,24 +181,68 @@ async fn skill_search_empty_query_is_invalid_params() {
     assert!(err.to_string().contains("query"));
 }
 
-#[tokio::test]
-async fn skill_load_unknown_name_reports_not_found_with_search_hint() {
-    // Isolated DB path so the test never opens/refreshes the shared skills.db.
-    let tmp = tempfile::tempdir().unwrap();
-    let s = AgentflareMcp {
-        skills_db_override: Some(tmp.path().join("skills.db")),
-        ..Default::default()
-    };
-    let out = s
-        .skill(Parameters(SkillRequest {
-            action: "load".into(),
-            name: Some("definitely-not-a-skill-xyz".into()),
-            original: false,
+/// Run `skill load <name>` against an isolated home (own registries.json and
+/// skills dirs) and an isolated skills.db, so tests never touch real state or
+/// the network. `registries` are written to the temp home's registries.json.
+fn load_skill_isolated(registries: &[String], name: &str) -> Result<String, rmcp::ErrorData> {
+    crate::paths::test_support::with_temp_home(|| {
+        let reg_file = crate::paths::agentflare_dir().join("registries.json");
+        std::fs::create_dir_all(reg_file.parent().unwrap()).unwrap();
+        std::fs::write(&reg_file, serde_json::to_string(registries).unwrap()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let s = AgentflareMcp {
+            skills_db_override: Some(tmp.path().join("skills.db")),
             ..Default::default()
-        }))
-        .await
-        .unwrap_err();
+        };
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(s.skill(Parameters(SkillRequest {
+                action: "load".into(),
+                name: Some(name.into()),
+                original: false,
+                ..Default::default()
+            })))
+    })
+}
+
+#[test]
+fn skill_load_unknown_name_reports_not_found_with_search_hint() {
+    // Empty registry list: nothing to auto-install from, so plain NotFound.
+    let out = load_skill_isolated(&[], "definitely-not-a-skill-xyz").unwrap_err();
     assert!(out.to_string().contains("skill_search"));
+}
+
+#[test]
+fn skill_load_auto_installs_from_a_configured_registry_and_says_so() {
+    let reg = tempfile::tempdir().unwrap();
+    let d = reg.path().join("zz-auto");
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(
+        d.join("SKILL.md"),
+        "---\nname: zz-auto\ndescription: auto installed fixture\n---\nBody.\n",
+    )
+    .unwrap();
+    let registry = reg.path().to_string_lossy().to_string();
+    let out = load_skill_isolated(&[registry.clone()], "zz-auto").unwrap();
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["name"], "zz-auto");
+    assert_eq!(v["installed_from_registry"], registry.as_str());
+}
+
+#[test]
+fn skill_load_surfaces_auto_install_failure_instead_of_plain_not_found() {
+    // A registry path that does not exist: install fails, and the caller must
+    // be told an install was attempted rather than get a bare "not found".
+    let missing = std::env::temp_dir()
+        .join("agentflare-no-such-registry-dir")
+        .to_string_lossy()
+        .to_string();
+    let out = load_skill_isolated(&[missing], "zz-auto").unwrap_err();
+    let msg = out.to_string();
+    assert!(
+        msg.contains("auto-install") || msg.contains("skill_search"),
+        "{msg}"
+    );
 }
 
 #[tokio::test]

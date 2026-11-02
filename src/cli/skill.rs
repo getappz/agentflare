@@ -177,10 +177,7 @@ async fn try_install_from_source(
     }
 
     let repo_url = parsed.url.as_str();
-    let temp = match clone_repo(repo_url, parsed.git_ref.as_deref()).await {
-        Ok(d) => d,
-        Err(_) => return Ok(false),
-    };
+    let temp = clone_repo(repo_url, parsed.git_ref.as_deref()).await?;
     let entries = match parsed.subpath.as_ref() {
         Some(sub) => discover_skills(temp.path(), Some(sub), &DiscoverOptions::default()).await?,
         None => discover_skills(temp.path(), None, &DiscoverOptions::default()).await?,
@@ -195,26 +192,43 @@ async fn try_install_from_source(
 }
 
 /// Install `name` from the first configured registry that has it, into
-/// `~/.agentflare/skills` only (never an agent's discovery dir). `Ok(false)` =
-/// no registry has it. Rejects anything but a plain skill name so a caller
+/// `~/.agentflare/skills` only (never an agent's discovery dir). `Ok(Some(url))`
+/// = installed from that registry; `Ok(None)` = no registry has it. A registry
+/// that fails (clone/IO error) is skipped so a later one can still serve the
+/// skill; if none did and one failed, that failure is returned rather than a
+/// misleading "not found". Rejects anything but a plain skill name so a caller
 /// can't escape the skills dir via `..`, `/` or `source:name` qualifiers.
-pub(crate) async fn install_from_registries(name: &str) -> Result<bool, skill::error::SkillError> {
+pub(crate) async fn install_from_registries(
+    name: &str,
+) -> Result<Option<String>, skill::error::SkillError> {
     if !is_plain_skill_name(name) {
-        return Ok(false);
+        return Ok(None);
     }
     let manager = build_manager();
+    let mut first_err = None;
     for url in &load_registries() {
-        if try_install_from_source(&manager, url, name).await? {
-            return Ok(true);
+        match try_install_from_source(&manager, url, name).await {
+            Ok(true) => return Ok(Some(url.clone())),
+            Ok(false) => {}
+            Err(e) => {
+                first_err.get_or_insert(e);
+            }
         }
     }
-    Ok(false)
+    first_err.map_or(Ok(None), Err)
 }
 
+/// A bare skill name safe to use as a directory name on every platform:
+/// `[A-Za-z0-9._-]`, no leading/trailing `.`, and not a Windows device name.
 pub(crate) fn is_plain_skill_name(name: &str) -> bool {
+    const RESERVED: &[&str] = &[
+        "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+        "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    ];
     !name.is_empty()
-        && name != "."
-        && name != ".."
+        && !name.starts_with('.')
+        && !name.ends_with('.')
+        && !RESERVED.contains(&name.to_ascii_lowercase().as_str())
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
@@ -226,7 +240,7 @@ async fn run_install(name: &str) -> Result<(), skill::error::SkillError> {
         return Ok(());
     }
 
-    if install_from_registries(name).await? {
+    if install_from_registries(name).await?.is_some() {
         crate::ui::success(&format!("installed '{name}'"));
         return Ok(());
     }
@@ -1099,15 +1113,37 @@ mod tests {
             write_fixture_skill(reg.path(), "zz-demo", "demo skill");
             save_registries(&[reg.path().to_string_lossy().to_string()]);
 
-            assert!(block_on(install_from_registries("zz-demo")).unwrap());
+            assert!(
+                block_on(install_from_registries("zz-demo"))
+                    .unwrap()
+                    .is_some()
+            );
             assert!(home_skills().join("zz-demo").join("SKILL.md").exists());
             let home = crate::paths::home();
             assert!(!home.join(".claude").join("skills").join("zz-demo").exists());
 
-            assert!(!block_on(install_from_registries("missing")).unwrap());
-            for bad in ["../zz-demo", "a/b", "src:zz-demo", "", ".."] {
+            assert!(
+                block_on(install_from_registries("missing"))
+                    .unwrap()
+                    .is_none()
+            );
+            for bad in [
+                "../zz-demo",
+                "a/b",
+                "src:zz-demo",
+                "",
+                "..",
+                ".hidden",
+                "foo.",
+                "nul",
+                "CON",
+                "com1",
+            ] {
                 assert!(!is_plain_skill_name(bad), "{bad}");
-                assert!(!block_on(install_from_registries(bad)).unwrap(), "{bad}");
+                assert!(
+                    block_on(install_from_registries(bad)).unwrap().is_none(),
+                    "{bad}"
+                );
             }
         });
     }

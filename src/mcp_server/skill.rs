@@ -86,7 +86,7 @@ impl AgentflareMcp {
                     return Err(ErrorData::invalid_params("name is required", None));
                 }
                 let mut result = self.with_fresh_registry(|reg| reg.load(&name, req.original))?;
-                // Not indexed: force-rescan once (CLI install may have landed
+                // Not indexed: force-rescan once (a CLI install may have landed
                 // inside the debounce window), then try the configured
                 // registries, staging into ~/.agentflare/skills (never an
                 // agent dir), and force-rescan again so the new files show up.
@@ -94,19 +94,37 @@ impl AgentflareMcp {
                     result =
                         self.with_forced_fresh_registry(|reg| reg.load(&name, req.original))?;
                 }
+                let mut installed_from: Option<String> = None;
                 if matches!(result, Err(skill_registry::LoadError::NotFound(_)))
                     && crate::cli::skill::is_plain_skill_name(&name)
-                    && matches!(
-                        crate::cli::skill::install_from_registries(&name).await,
-                        Ok(true)
-                    )
                 {
-                    result =
-                        self.with_forced_fresh_registry(|reg| reg.load(&name, req.original))?;
+                    match crate::cli::skill::install_from_registries(&name).await {
+                        Ok(Some(registry)) => {
+                            installed_from = Some(registry);
+                            result = self
+                                .with_forced_fresh_registry(|reg| reg.load(&name, req.original))?;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            return Err(ErrorData::internal_error(
+                                format!(
+                                    "skill '{name}' is not indexed and auto-install from the configured registries failed: {e}"
+                                ),
+                                None,
+                            ));
+                        }
+                    }
                 }
                 match result {
                     Ok(s) => {
-                        let json = serde_json::to_string_pretty(&s).unwrap_or_default();
+                        // Tell the caller when this call fetched the skill, and from where.
+                        let mut value = serde_json::to_value(&s).unwrap_or_default();
+                        if let (Some(registry), Some(obj)) =
+                            (&installed_from, value.as_object_mut())
+                        {
+                            obj.insert("installed_from_registry".into(), registry.clone().into());
+                        }
+                        let json = serde_json::to_string_pretty(&value).unwrap_or_default();
                         if req.activation_wrapper {
                             let siblings: Vec<String> = s
                                 .siblings
