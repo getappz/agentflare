@@ -195,3 +195,14 @@ async fn shared_proxy_health_requires_lean_ctx_identity() {
     );
     task.abort();
 }
+
+#[test]
+fn listener_uid_in_reads_the_owner_of_a_listening_socket() {
+    let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   \
+        0: 0100007F:115C 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1001        0 12345 1 0 100 0 0 10 0\n   \
+        1: 0100007F:115C 0100007F:9C40 01 00000000:00000000 00:00000000 00000000  1002        0 23456 1 0 100 0 0 10 0\n   \
+        2: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1003        0 34567 1 0 100 0 0 10 0\n";
+    assert_eq!(listener_uid_in(table, 4444), Some(1001)); // 0x115C; ignores the ESTABLISHED row
+    assert_eq!(listener_uid_in(table, 8080), Some(1003));
+    assert_eq!(listener_uid_in(table, 9999), None);
+}

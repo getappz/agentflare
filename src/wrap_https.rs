@@ -303,7 +303,38 @@ async fn proxy_ready(client: &reqwest::Client, port: u16) -> Result<bool, String
     if value.get("service").and_then(|value| value.as_str()) != Some("lean-ctx-proxy") {
         return Err(occupied());
     }
+    // `/health` is trivially spoofable; on Linux also require the listener to be ours (#792).
+    #[cfg(target_os = "linux")]
+    if let Some(uid) = listener_uid(port) {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if uid != unsafe { libc::geteuid() } {
+            return Err(format!(
+                "Port {port} is listened on by another user (uid {uid})"
+            ));
+        }
+    }
     Ok(true)
+}
+
+/// Owner uid of the TCP listener on 127.0.0.1/::1 `port`, from `/proc/net/tcp{,6}`.
+#[cfg(target_os = "linux")]
+fn listener_uid(port: u16) -> Option<u32> {
+    ["/proc/net/tcp", "/proc/net/tcp6"]
+        .iter()
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .find_map(|table| listener_uid_in(&table, port))
+}
+
+/// Parses a `/proc/net/tcp` table: the uid of a LISTEN (`0A`) socket bound to `port`.
+#[cfg(any(target_os = "linux", test))]
+fn listener_uid_in(table: &str, port: u16) -> Option<u32> {
+    let suffix = format!(":{port:04X}");
+    table.lines().skip(1).find_map(|line| {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        (f.get(3) == Some(&"0A") && f.get(1)?.ends_with(&suffix))
+            .then(|| f.get(7)?.parse().ok())
+            .flatten()
+    })
 }
 
 pub(super) async fn shared_proxy(lean: &Path, port: u16) -> Result<(), String> {
