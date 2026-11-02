@@ -1,5 +1,6 @@
 import type { Register } from 'claude-code'
 import { refreshBriefing, registerBriefing } from './briefing'
+import { registerCompaction, type Current } from './compaction'
 import { registerGuard } from './guard'
 import { connect, type AutopilotClient } from './mcp'
 
@@ -23,6 +24,12 @@ function isBelowFloor(version: string): boolean {
 let client: AutopilotClient | null = null
 let registered = false
 let warned = false
+let current: Current = {}
+
+/** The item the mod is working on, for the compaction checkpoint; branch and worktree stay unknown in M1. */
+export function setCurrent(next: Current): void {
+  current = next
+}
 
 const DEFAULT_GUARD_TIMEOUT_MS = 3000
 
@@ -36,6 +43,7 @@ export const register: Register = (on, options) => {
 
   const briefingCtx = { client: () => client, agent: AGENT }
   registerBriefing(on, briefingCtx)
+  registerCompaction(on, { ...briefingCtx, current: () => current })
 
   on('session.start', async ($, e, next) => {
     // A hot reload resets the module flag, so the command list is the real guard against a second /flare.
