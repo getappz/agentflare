@@ -1,4 +1,5 @@
 import type { Register } from 'claude-code'
+import { refreshBriefing, registerBriefing } from './briefing'
 import { registerGuard } from './guard'
 import { connect, type AutopilotClient } from './mcp'
 
@@ -33,6 +34,9 @@ export const register: Register = (on, options) => {
     options: { readOnlyAutoAllow: options.readOnlyAutoAllow !== false, guardTimeoutMs },
   })
 
+  const briefingCtx = { client: () => client, agent: AGENT }
+  registerBriefing(on, briefingCtx)
+
   on('session.start', async ($, e, next) => {
     // A hot reload resets the module flag, so the command list is the real guard against a second /flare.
     if (!registered) {
@@ -65,6 +69,7 @@ export const register: Register = (on, options) => {
         $.ui.toast('agentflare MCP server is not connected; autopilot is inactive this session.')
       }
     }
+    await refreshBriefing($, briefingCtx)
     return next(e)
   })
 }

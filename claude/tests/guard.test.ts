@@ -33,7 +33,7 @@ test('a denied check refuses the tool with the server reason', async ($, on) => 
 test('a read tool never calls check', async ($, on) => {
   stubSession(on)
   let calls = 0
-  on('mcp.call', () => { calls++; return { value: { content: [] } } })
+  on('mcp.call', (_: any, e: any) => { if (e.args.action === 'check') calls++; return reply({ etag: 'e0', unchanged: true }) })
   on('tool.call', () => ({ result: {} }))
   await $.session.start(START)
   await $.tool.call({ tool: 'Read', file_path: '/x' })
