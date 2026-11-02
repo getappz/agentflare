@@ -389,6 +389,139 @@ mod tests {
         assert!(format!("{err:?}").contains("unsupported source"), "{err:?}");
     }
 
+    /// Keep every foreign store and both publish targets inside the fixture.
+    /// Caller holds `env_lock` until these guards have been dropped.
+    fn antigravity_env(root: &std::path::Path) -> Vec<EnvGuard> {
+        let brain = root.join("brain");
+        let logs = brain.join("agy-resume-1/.system_generated/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let rows = [
+            serde_json::json!({
+                "type": "USER_INPUT", "source": "USER_EXPLICIT",
+                "created_at": "2026-10-27T10:00:00Z",
+                "content": "<USER_REQUEST>fix duplicate PR detection</USER_REQUEST>",
+            }),
+            serde_json::json!({
+                "type": "PLANNER_RESPONSE", "source": "MODEL",
+                "created_at": "2026-10-27T10:01:00Z",
+                "content": "Reuse the existing duplicate matcher",
+                "tool_calls": [{"name": "read_file", "args": {"Path": "src/main.rs"}}],
+            }),
+        ];
+        std::fs::write(
+            logs.join("transcript.jsonl"),
+            rows.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let conn = rusqlite::Connection::open(root.join("conversation_summaries.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE conversation_summaries (conversation_id TEXT, workspace_uris TEXT);",
+        )
+        .unwrap();
+        let uris =
+            serde_json::to_string(&[reqwest::Url::from_directory_path(&cwd).unwrap().to_string()])
+                .unwrap();
+        conn.execute(
+            "INSERT INTO conversation_summaries VALUES (?1, ?2)",
+            rusqlite::params!["agy-resume-1", uris],
+        )
+        .unwrap();
+        let mut guards: Vec<_> = [
+            "CLAUDE_PROJECTS_DIR",
+            "CODEX_SESSIONS_DIR",
+            "OPENCODE_DIR",
+            "CURSOR_STATE_VSCDB",
+        ]
+        .into_iter()
+        .map(|key| EnvGuard::set(key, &root.join("missing")))
+        .collect();
+        guards.push(EnvGuard::set("ANTIGRAVITY_BRAIN_DIR", &brain));
+        guards.push(EnvGuard::set(INSIGHTS_DB_ENV, &root.join("observatory.db")));
+        guards.push(EnvGuard::set(ARTIFACTS_DIR_ENV, &root.join("artifacts")));
+        guards
+    }
+
+    #[test]
+    fn explicit_antigravity_resume_reads_live_transcript_without_sync() {
+        let _lock = env_lock().lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = antigravity_env(tmp.path());
+        let server = crate::mcp_server::AgentflareMcp::default();
+        for from in ["antigravity", "antigravity-cli", "auto"] {
+            let out = server
+                .resume_impl(ResumeRequest {
+                    session: Some("agy-resume-1".into()),
+                    from: Some(from.into()),
+                    to: Some("codex".into()),
+                    dry_run: Some(true),
+                    ..Default::default()
+                })
+                .unwrap();
+            let out: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(out["status"], "preview");
+            assert_eq!(out["picked"]["source"], "antigravity");
+            assert_eq!(out["picked"]["session"], "agy-resume-1");
+            let preview = out["preview"].as_str().unwrap();
+            assert!(preview.contains("fix duplicate PR detection"));
+            assert!(preview.contains("Reuse the existing duplicate matcher"));
+        }
+        assert!(!tmp.path().join("observatory.db").exists());
+        assert!(!tmp.path().join("artifacts").exists());
+    }
+
+    #[test]
+    fn auto_antigravity_resume_confirms_then_publishes_live_context() {
+        use flare_insights::ingest::Adapter;
+        let _lock = env_lock().lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = antigravity_env(tmp.path());
+        let bundle = flare_insights::ingest::antigravity::AntigravityAdapter
+            .scan(&Default::default(), &Default::default(), &mut |_, _| {})
+            .unwrap();
+        let session = &bundle.sessions[0];
+        assert!(session.cwd.is_none());
+        assert!(session.project_path.is_some());
+        let store =
+            flare_insights::store::InsightsStore::open(&tmp.path().join("observatory.db")).unwrap();
+        store.upsert_session(session).unwrap();
+        let server = crate::mcp_server::AgentflareMcp::default();
+        let first = server
+            .resume_impl(ResumeRequest {
+                from: Some("antigravity".into()),
+                to: Some("codex".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let first: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(first["status"], "needs_confirm");
+        assert_eq!(first["picked"]["session"], "agy-resume-1");
+        assert!(!tmp.path().join("artifacts").exists());
+        let sent = server
+            .resume_impl(ResumeRequest {
+                from: Some("antigravity".into()),
+                to: Some("codex".into()),
+                confirm_session: Some("agy-resume-1".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let sent: serde_json::Value = serde_json::from_str(&sent).unwrap();
+        assert_eq!(sent["status"], "resumed");
+        let artifacts = agentflare_artifacts::ArtifactStore::new(tmp.path().join("artifacts"));
+        let artifact = artifacts
+            .get(sent["artifact"]["id"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(artifact.sender.as_deref(), Some("antigravity"));
+        assert!(
+            artifact
+                .content
+                .contains("Reuse the existing duplicate matcher")
+        );
+    }
+
     #[test]
     fn auto_without_db_points_at_insights_sync() {
         let _lock = env_lock().lock().unwrap();
