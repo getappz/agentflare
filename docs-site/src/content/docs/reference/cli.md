@@ -36,7 +36,8 @@ map.
 |---|---|
 | `agentflare run <agent>` | Launch an agent through mise with `.dev.vars` injected. |
 | `agentflare work <target> --agent <agent>` | Claim an item, run an agent in an isolated worktree, and report back. |
-| `agentflare wrap` / `agentflare unwrap` | Install or remove the opt-in Claude shell wrapper (`--with-proxy`). |
+| `agentflare apps run <dir>` | Run an AgentFlare App end-to-end from its self-contained directory. |
+| `agentflare wrap claude` / `agentflare unwrap claude` | Install or remove the opt-in Claude shell wrapper (`claude-code` is an alias). |
 | `agentflare agents` | List detected agent CLIs and their versions. |
 
 ## Optimization

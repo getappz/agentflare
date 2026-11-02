@@ -46,8 +46,9 @@ you pass `-y`/`--yes`.
 agentflare doctor
 ```
 
-`doctor` reports missing or conflicting configuration per host and, with `--fix` where
-supported, repairs it. `agentflare agents` lists detected agent installs.
+`doctor` reports missing or conflicting configuration per host; it does not
+repair wiring. To fix a host, rerun `agentflare init --agent <host>` for that
+host. `agentflare agents` lists detected agent installs.
 
 ## Next
 

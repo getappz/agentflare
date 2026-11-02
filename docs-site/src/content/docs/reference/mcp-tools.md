@@ -223,7 +223,7 @@ mcp__flare__skill_recommend(cwd=".")
 ### `skill_create`
 
 Scaffold a new skill from a template (`base`, `web-development`, `api-development`,
-`testing`, or a custom path). Writes to `.claude/skills/<name>/` by default.
+or `testing`). Writes to `.claude/skills/<name>/` by default.
 
 ```text
 mcp__flare__skill_create(name="release-notes", template="base", description="Draft release notes from merged PRs")

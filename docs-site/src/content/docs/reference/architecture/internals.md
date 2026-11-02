@@ -130,9 +130,5 @@ but queued schedules require it to execute.
 
 ---
 
-Next: [Checkout and ecosystem](/docs/reference/architecture/checkout-and-ecosystem/) | [Architectural blueprint](/docs/reference/architecture/blueprint/)
-
----
-
-Previous: [Installation and verification](/docs/reference/architecture/installation-and-verification/) | Next: [Checkout and ecosystem](/docs/reference/architecture/checkout-and-ecosystem/)
+Previous: [Installation and verification](/docs/reference/architecture/installation-and-verification/) | Next: [Checkout and ecosystem](/docs/reference/architecture/checkout-and-ecosystem/) · [Architectural blueprint](/docs/reference/architecture/blueprint/)
 

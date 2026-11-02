@@ -15,18 +15,21 @@ go/no-go decision, an unanswerable question, or a CI self-repair cap.
 1. Message [@BotFather](https://t.me/BotFather) on Telegram and run `/newbot`, following
    the prompts to name your bot. It replies with a bot token that looks like
    `123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11`.
-2. Store it in the vault — `set` always reads the value from stdin, never a CLI
-   argument, so it can't leak into shell history:
+2. Store it in the vault — prompt silently so the token never lands in shell
+   history; `vault set` reads the value from stdin, never a CLI argument:
 
    ```bash
-   echo "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11" | agentflare vault set telegram_bot_token
+   IFS= read -rs TELEGRAM_BOT_TOKEN
+   printf '%s' "$TELEGRAM_BOT_TOKEN" | agentflare vault set telegram_bot_token
    ```
 
 3. Get the chat id to send to: open a chat with your bot (or add it to a group) and send
-   it any message, then fetch:
+   it any message, then fetch (reuse the same shell variable; do not paste the token
+   into the command line):
 
    ```bash
-   curl "https://api.telegram.org/bot<token>/getUpdates"
+   curl "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates"
+   unset TELEGRAM_BOT_TOKEN
    ```
 
    and read `result[].message.chat.id` from the response.

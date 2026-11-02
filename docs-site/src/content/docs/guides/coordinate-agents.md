@@ -12,23 +12,29 @@ getting lost between sessions. These are all backed by a local SQLite store
 ## Claiming and working a backlog item
 
 Your team (or your other agents) track work as items in agentflare's built-in project
-tracker. Before starting on one, claim it so a second agent doesn't pick up the same
-work:
+tracker. Pick **one** of these paths — do not manually claim an item and then start
+`agentflare work` on it; the CLI claims under its own process identity and will refuse
+if your session already holds the claim.
+
+**Work it yourself** — claim, do the work in your session, then release or mark done:
 
 ```text
 item(action="claim", id="42")
+# … implement …
+item(action="done", id="42")   # or item(action="release", id="42")
 ```
 
-Then either work it yourself, or hand the whole claim-run-report loop to
-`agentflare work`, which claims the item, runs an agent on it in an isolated worktree,
-and reports the result back as a comment (with a PR link, if one was opened):
+**Or** hand the whole claim-run-report loop to `agentflare work`, which claims the
+item itself, runs an agent in an isolated worktree, and reports back as a comment
+(with a PR link, if one was opened):
 
 ```bash
 agentflare work 42 --agent claude-code --timeout 1800
 ```
 
-When it's done, `item(action="release", id="42")` or `item(action="done", id="42")`
-frees it up — `agentflare work` does this for you automatically on success or failure.
+On failure, `agentflare work` releases the claim. On success with no open PR, it
+releases or completes the item. When a PR is opened and waiting on review, the item
+moves to in-review and the claim is retained until merge/`check_merge`.
 
 ## Publishing a spec as a shareable artifact
 

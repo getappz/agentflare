@@ -5,12 +5,21 @@ description: Install the agentflare binary on Linux, macOS, or Windows, and veri
 
 ## Linux and macOS
 
-The install script downloads a prebuilt binary. It verifies the SHA-256 checksum when
-`sha256sum` or `shasum` is available and warns otherwise. Run from inside a clone, it
-builds from source instead.
+The piped installer always downloads a prebuilt binary — even if your shell is
+already inside a clone. It verifies the SHA-256 checksum when `sha256sum` or
+`shasum` is available and warns otherwise.
 
 ```bash
 curl -fsSL https://agentflare.dev/install.sh | sh
+```
+
+To build from source, run the script as a local file beside `Cargo.toml` (that
+is the only path that triggers a source build):
+
+```bash
+git clone https://github.com/getappz/agentflare
+cd agentflare
+./install.sh
 ```
 
 ## Homebrew

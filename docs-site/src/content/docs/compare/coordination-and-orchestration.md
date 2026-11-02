@@ -92,3 +92,5 @@ local-first and machine-scoped by design; that is the trade.
 - [Taskmaster](https://github.com/eyaltoledano/claude-task-master)
 - [claude-squad](https://github.com/smtg-ai/claude-squad)
 - [OpenHands](https://github.com/All-Hands-AI/OpenHands)
+- [Vibe Kanban shutdown announcement](https://www.vibekanban.com/blog/shutdown) · [repo](https://github.com/BloopAI/vibe-kanban)
+- [Crystal → Nimbalyst](https://github.com/stravu/crystal) · [Nimbalyst](https://github.com/nimbalyst/nimbalyst)

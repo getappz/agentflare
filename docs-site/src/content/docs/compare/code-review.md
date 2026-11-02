@@ -12,9 +12,12 @@ are already running how to review each other's work.
 - **Findings and rounds** (MCP `review`) — submit structured findings against a
   diff, run several reviewers, and record rounds so repeated reviews do not
   restart from zero.
-- **Consensus** — when participants disagree, the review engine scores
-  confidence, detects pairwise disagreement, and produces a majority/minority
-  verdict.
+- **Consensus** — verifies each finding's cited line against the diff, clusters
+  nearby findings, and tags each cluster `CONFIRMED` (multiple agents, matching
+  severity), `DISPUTED` (multiple agents, conflicting severity), `UNIQUE` (one
+  agent, verified citation), or `UNVERIFIED` (citation not on a changed line).
+  Results are ranked Confirmed → Disputed → Unique → Unverified. There is no
+  confidence score or majority/minority verdict in the payload.
 - **Per-criterion verification** — acceptance criteria get `pass`, `fail`, or
   `uncertain` verdicts with a required evidence citation. A pass without
   evidence is demoted to uncertain.
@@ -29,14 +32,14 @@ It coordinates reviewers — human or agent — that you already run.
 
 ## How the alternatives differ
 
-| | agentflare | CodeRabbit | Greptile | Graphite Diamond | PR-Agent |
-|---|---|---|---|---|---|
-| Where it runs | Locally, alongside your agents | Hosted app | Hosted app | Hosted, inside Graphite | Your CI, Docker, or CLI |
-| Trigger | You call it | Webhook on PR events | Webhook on PR events | Graphite review flow | Comment command or action |
-| Context | Whatever the reviewers gather | Diff plus retrieved context and linters | Full-repo code graph | PR inside a stacked-PR workflow | Diff plus configurable context |
-| Deterministic checks | None built in | Bundled linters and analyzers | None documented | None documented | Depends on your CI |
-| Multi-agent consensus | Yes | Single product verdict | Single product verdict | Single product verdict | Single model call per tool |
-| Open source | Yes | No | No | No | Yes |
+| | agentflare | CodeRabbit | Greptile | Graphite Diamond | Cursor BugBot | GitHub Copilot | PR-Agent |
+|---|---|---|---|---|---|---|---|
+| Where it runs | Locally, alongside your agents | Hosted app | Hosted app | Hosted, inside Graphite | Cursor / cloud | Hosted, on GitHub | Your CI, Docker, or CLI |
+| Trigger | You call it | Webhook on PR events | Webhook on PR events | Graphite review flow | PR events in Cursor | PR review request | Comment command or action |
+| Context | Whatever the reviewers gather | Diff plus retrieved context and linters | Full-repo code graph | PR inside a stacked-PR workflow | Diff plus `BUGBOT.md` rules | Diff in GitHub | Diff plus configurable context |
+| Deterministic checks | None built in | Bundled linters and analyzers | None documented | None documented | None documented | None documented | Depends on your CI |
+| Multi-agent consensus | Yes | Single product verdict | Single product verdict | Single product verdict | Single product verdict | Single product verdict | Single model call per tool |
+| Open source | Yes | No | No | No | No | No | Yes |
 
 **CodeRabbit** ([coderabbit.ai](https://www.coderabbit.ai)) posts a PR summary
 plus line-level comments and runs bundled linters and analyzers before the

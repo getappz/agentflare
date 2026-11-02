@@ -23,7 +23,9 @@ splits those jobs across separate tools instead of one memory service.
 - **lean-ctx integration** — code reads and searches route through lean-ctx's
   cached, compressed reader rather than re-reading whole files.
 
-All of it is local. There is no hosted memory service and no account.
+Storage is local (SQLite on disk) and there is no hosted memory service or
+account. Web search and model-backed paths (`optimize output`, the search web
+arm) can still send data off the machine when you use them.
 
 ## How the alternatives differ
 
@@ -66,7 +68,8 @@ remember.
 - Retrieval is keyword-first. Semantic memory services handle paraphrased recall
   better out of the box.
 - The payoff is inspectability: the store is a SQLite file you can query, back
-  up, or delete, and nothing leaves the machine.
+  up, or delete. Keeping storage local is not the same as never leaving the
+  machine when you opt into web or model-backed calls.
 
 ## When to choose what
 
