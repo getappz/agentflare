@@ -36,3 +36,100 @@ fn autopilot_is_listed_as_a_builtin_tool() {
             .any(|h| h.tool == "mcp__flare__autopilot")
     );
 }
+
+use crate::hook_redirect::test_support::init_temp_repo;
+use serde_json::json;
+
+fn check(
+    s: &AgentflareMcp,
+    tool: &str,
+    input: serde_json::Value,
+    cwd: &std::path::Path,
+) -> serde_json::Value {
+    let out = s
+        .autopilot_impl(AutopilotRequest {
+            action: "check".into(),
+            session_id: Some("s1".into()),
+            cwd: Some(cwd.display().to_string()),
+            tool_name: Some(tool.into()),
+            tool_input: Some(input),
+            ..Default::default()
+        })
+        .unwrap();
+    serde_json::from_str(&out).unwrap()
+}
+
+#[test]
+fn check_denies_edit_on_default_branch_with_branch_guard_rule() {
+    let (_tmp, s) = harness();
+    let repo = init_temp_repo("master");
+    let out = check(
+        &s,
+        "Edit",
+        json!({"file_path": repo.path().join("a.rs")}),
+        repo.path(),
+    );
+    assert_eq!(out["decision"], "deny");
+    assert_eq!(out["rule"], "branch_guard");
+}
+
+#[test]
+fn check_unwraps_gateway_ctx_patch_and_windows_backslash_path() {
+    let (_tmp, s) = harness();
+    let repo = init_temp_repo("master");
+    let p = repo
+        .path()
+        .join("src")
+        .join("x.rs")
+        .display()
+        .to_string()
+        .replace('/', "\\");
+    let out = check(
+        &s,
+        "mcp__flare__tool",
+        json!({"action":"execute","server":"leanctx","tool":"ctx_patch","args":{"path": p}}),
+        repo.path(),
+    );
+    assert_eq!(out["decision"], "deny");
+    assert_eq!(out["rule"], "branch_guard");
+}
+
+#[test]
+fn check_allows_read_tools_without_touching_guards() {
+    let (_tmp, s) = harness();
+    assert_eq!(
+        check(
+            &s,
+            "Read",
+            json!({"file_path":"/x"}),
+            std::env::temp_dir().as_path()
+        )["decision"],
+        "allow"
+    );
+}
+
+#[test]
+fn check_denies_item_done_without_fresh_verification_with_completion_gate_rule() {
+    let (_tmp, s) = harness();
+    let out = check(
+        &s,
+        "mcp__flare__item",
+        json!({"action":"done","id":"abc"}),
+        std::env::temp_dir().as_path(),
+    );
+    assert_eq!(out["decision"], "deny");
+    assert_eq!(out["rule"], "completion_gate");
+}
+
+#[test]
+fn check_reason_strings_match_hook_path() {
+    let (_tmp, s) = harness();
+    let repo = init_temp_repo("master");
+    let input = json!({"file_path": repo.path().join("a.rs")});
+    let hook = crate::hook_redirect::redirect_decision("Edit", Some(&input)).unwrap();
+    let out = check(&s, "Edit", input, repo.path());
+    assert_eq!(
+        out["reason"],
+        hook["hookSpecificOutput"]["permissionDecisionReason"]
+    );
+}

@@ -453,7 +453,7 @@ pub use crate::hook_completion_gate::post_tool_use;
 /// a synchronous local SQLite read, precedented by `session_start_message`'s
 /// own unconditional `agentflare_backend::db::open_db` call above -- no
 /// timeout wrapper needed.
-fn resolve_item_task_type(
+pub(crate) fn resolve_item_task_type(
     tool_name: &str,
     tool_input: Option<&serde_json::Value>,
 ) -> Option<String> {
