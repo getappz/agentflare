@@ -482,3 +482,65 @@ fn checkpoint_still_returns_text_when_memory_write_fails() {
         );
     });
 }
+
+fn checkpoint_text_for(sid: &str, cwd: &std::path::Path, payload: serde_json::Value) -> String {
+    let (_tmp, s) = harness();
+    let mut req = checkpoint_req(Some(sid), Some(payload));
+    req.cwd = Some(cwd.display().to_string());
+    req.agent = Some("claude-code".into());
+    let out: serde_json::Value = serde_json::from_str(&s.autopilot_impl(req).unwrap()).unwrap();
+    out["text"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn checkpoint_explicit_flags_win_over_the_session_record() {
+    crate::paths::test_support::with_temp_home(|| {
+        let (_tmp, s) = harness();
+        let repo = init_temp_repo("task/x");
+        let sid = uniq_session("ckpt-explicit");
+        observe(
+            &s,
+            &sid,
+            repo.path(),
+            "Bash",
+            json!({"command":"cargo test"}),
+            Some(0),
+            "test result: ok. 1 passed",
+        );
+        let t = checkpoint_text_for(
+            &sid,
+            repo.path(),
+            json!({"verification_fresh": false, "review_fresh": true}),
+        );
+        assert!(t.contains("tests stale, review fresh"), "{t}");
+    });
+}
+
+#[test]
+fn checkpoint_without_flags_derives_freshness_from_the_session_record() {
+    crate::paths::test_support::with_temp_home(|| {
+        let (_tmp, s) = harness();
+        let repo = init_temp_repo("task/x");
+        let sid = uniq_session("ckpt-derive");
+        observe(
+            &s,
+            &sid,
+            repo.path(),
+            "Bash",
+            json!({"command":"cargo test"}),
+            Some(0),
+            "test result: ok. 1 passed",
+        );
+        let t = checkpoint_text_for(&sid, repo.path(), json!({}));
+        assert!(t.contains("tests fresh, review stale"), "{t}");
+    });
+}
+
+#[test]
+fn checkpoint_without_flags_or_record_is_stale() {
+    crate::paths::test_support::with_temp_home(|| {
+        let repo = init_temp_repo("task/x");
+        let t = checkpoint_text_for(&uniq_session("ckpt-none"), repo.path(), json!({}));
+        assert!(t.contains("tests stale, review stale"), "{t}");
+    });
+}

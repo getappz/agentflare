@@ -17,10 +17,9 @@ pub struct CheckpointPayload {
     pub item: Option<CheckpointItem>,
     pub branch: Option<String>,
     pub worktree: Option<String>,
-    #[serde(default)]
-    pub verification_fresh: bool,
-    #[serde(default)]
-    pub review_fresh: bool,
+    /// Absent = derived from the session record (see `fill_gate_freshness`).
+    pub verification_fresh: Option<bool>,
+    pub review_fresh: Option<bool>,
     #[serde(default)]
     pub decisions: Vec<String>,
     #[serde(default)]
@@ -53,12 +52,16 @@ worktree: {w}"
     t.push_str(&format!(
         "
 gates: tests {}, review {}",
-        if p.verification_fresh {
+        if p.verification_fresh.unwrap_or(false) {
             "fresh"
         } else {
             "stale"
         },
-        if p.review_fresh { "fresh" } else { "stale" }
+        if p.review_fresh.unwrap_or(false) {
+            "fresh"
+        } else {
+            "stale"
+        }
     ));
     for (label, list) in [("decisions", &p.decisions), ("remaining", &p.remaining)] {
         if !list.is_empty() {
@@ -266,7 +269,10 @@ impl AgentflareMcp {
         serde_json::json!({ "etag": etag, "text": text })
     }
 
-    /// Stores a memory handoff and returns the re-inject text. A failed
+    /// Request: `session_id`, `payload`, optional `cwd` (tree for gate
+    /// freshness) and `agent` (default `claude`; scopes the session record).
+    /// Response: `{ handoff_id, text }`. Stores a memory handoff and returns
+    /// the re-inject text. A failed
     /// memory write yields `handoff_id: null` -- never an error, since the mod
     /// must always get a checkpoint to re-inject. The id is the session id
     /// (handoffs are keyed by it).
@@ -276,12 +282,13 @@ impl AgentflareMcp {
             .session_id
             .clone()
             .ok_or_else(|| bad("session_id is required"))?;
-        let payload: CheckpointPayload = serde_json::from_value(
+        let mut payload: CheckpointPayload = serde_json::from_value(
             req.payload
                 .clone()
                 .ok_or_else(|| bad("payload is required"))?,
         )
         .map_err(|e| bad(&format!("invalid payload: {e}")))?;
+        Self::fill_gate_freshness(req, &sid, &mut payload);
         let text = checkpoint_text(&payload);
         let strs = |v: &[String]| Some(v.iter().map(|s| serde_json::json!(s)).collect());
         let stored = crate::memory::mcp::handle_handoff(crate::memory::mcp::HandoffInput {
@@ -298,6 +305,36 @@ impl AgentflareMcp {
         });
         let handoff_id = stored.ok().map(|_| sid);
         Ok(serde_json::json!({ "handoff_id": handoff_id, "text": text }))
+    }
+
+    /// Fills `verification_fresh`/`review_fresh` the payload left out from the
+    /// session record, with the completion gate's own freshness functions over
+    /// the request `cwd` tree (a missing record counts as stale). Flags the
+    /// caller did send are kept as they are.
+    fn fill_gate_freshness(req: &AutopilotRequest, sid: &str, p: &mut CheckpointPayload) {
+        if p.verification_fresh.is_some() && p.review_fresh.is_some() {
+            return;
+        }
+        let key =
+            crate::optimize::scoped_session_key(req.agent.as_deref().unwrap_or("claude"), sid);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let record = crate::optimize::load_runtime().sessions.remove(&key);
+        let tree = req
+            .cwd
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .and_then(|d| crate::optimize::tree_fingerprint_in(&d));
+        let fresh = |f: fn(&crate::optimize::SessionRecord, u64, Option<&str>) -> bool| {
+            record.as_ref().is_some_and(|r| f(r, now, tree.as_deref()))
+        };
+        p.verification_fresh
+            .get_or_insert_with(|| fresh(crate::optimize::has_fresh_passing_verification));
+        p.review_fresh
+            .get_or_insert_with(|| fresh(crate::optimize::has_fresh_review));
     }
 
     /// Memory recall for "<repo> <cwd basename>"; any failure or empty result

@@ -24,9 +24,12 @@ function stubSession(on: any, connected = true) {
 
 test('compaction passes keep instructions and appends the server checkpoint', async ($, on) => {
   stubSession(on)
-  on('mcp.call', (_: any, e: any) => e.args.action === 'checkpoint'
-    ? reply({ handoff_id: 'h1', text: '[agentflare checkpoint] item #12' })
-    : reply({}))
+  let checkpointAgent = ''
+  on('mcp.call', (_: any, e: any) => {
+    if (e.args.action !== 'checkpoint') return reply({})
+    checkpointAgent = e.args.agent
+    return reply({ handoff_id: 'h1', text: '[agentflare checkpoint] item #12' })
+  })
   let seenInstructions = ''
   on('session.compact', (_: any, e: any) => { seenInstructions = e.instructions ?? ''; return { messages: [{ role: 'assistant', text: 'summary', toolUses: [] }] } })
   await $.session.start(START)
@@ -34,6 +37,7 @@ test('compaction passes keep instructions and appends the server checkpoint', as
   expect(seenInstructions).toContain('Keep verbatim')
   expect(r.messages?.at(-1)).toMatchObject({ role: 'user', text: '[agentflare checkpoint] item #12' })
   expect(r.messages).toHaveLength(2)
+  expect(checkpointAgent).toBe('claude-code')
 })
 
 test('a failed checkpoint call still appends a minimal checkpoint and sends the instructions', async ($, on) => {

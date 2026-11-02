@@ -12,7 +12,7 @@ function minimalText({ item, branch }: Current): string {
   return `[agentflare checkpoint] item ${item?.seq ?? 'none'}; branch ${branch ?? 'unknown'}; gate state unknown; re-run the gate before item done.`
 }
 
-export function registerCompaction(on: On, { client, current }: CompactionContext): void {
+export function registerCompaction(on: On, { client, agent, current }: CompactionContext): void {
   on('session.compact', async ($, e, next) => {
     if (e.agentId !== undefined) return next(e)
     const instructions = e.instructions ? `${e.instructions}\n\n${KEEP}` : KEEP
@@ -23,7 +23,7 @@ export function registerCompaction(on: On, { client, current }: CompactionContex
       if (c) {
         const [cwd, session_id] = await Promise.all([$.session.cwd(), $.session.id()])
         // Gate freshness is left out on purpose: the server's session record is the only source, absent means stale.
-        const reply = await c.checkpoint({ session_id, cwd, payload: { ...(now.item ? { item: now.item } : {}), ...(now.branch ? { branch: now.branch } : {}), ...(now.worktree ? { worktree: now.worktree } : {}), decisions: [], remaining: [] } })
+        const reply = await c.checkpoint({ session_id, cwd, agent, payload: { ...(now.item ? { item: now.item } : {}), ...(now.branch ? { branch: now.branch } : {}), ...(now.worktree ? { worktree: now.worktree } : {}), decisions: [], remaining: [] } })
         if (typeof reply.text === 'string' && reply.text) text = reply.text
       }
     } catch {
