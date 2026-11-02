@@ -663,9 +663,10 @@ fn merge_if_approved_skips_without_touching_network_when_label_is_absent() {
         42,
         &["size/s".to_string()],
         allowed(None, &auto),
+        &[],
     );
 
-    assert!(!merged);
+    assert_eq!(merged, MergeAttempt::NotMerged);
     let still_in_review = mcp
         .with_backend_db(|conn| {
             let refetched = agentflare_backend::item::get(conn, &item_id).unwrap();
@@ -897,4 +898,58 @@ fn armed_auto_merge_with_green_checks_still_repairs_unresolved_findings() {
             .len(),
         1
     );
+}
+
+#[test]
+fn failed_gate_restore_is_kept_pending_and_retried() {
+    let repo = throwaway_repo();
+    let mcp = test_mcp_with_repo(repo.path().to_path_buf());
+    let item_id = seed_in_review_item(&mcp, Some("claude-code"));
+    let fetch = || {
+        mcp.with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
+            .unwrap()
+    };
+
+    // The project has no such label yet, so the write fails and must be kept.
+    restore_gates(
+        &mcp,
+        &fetch(),
+        repo.path(),
+        42,
+        &[NEEDS_MANUAL_LABEL.to_string()],
+    );
+    assert_eq!(
+        pr_string_list(&fetch(), "pending_gates"),
+        vec![NEEDS_MANUAL_LABEL.to_string()]
+    );
+
+    // Once the write can succeed, the next tick's retry lands it and clears the record.
+    let label_id = mcp
+        .with_backend_db(|conn| {
+            let project = mcp.resolve_project(conn).unwrap();
+            agentflare_backend::label::create(
+                conn,
+                agentflare_backend::label::CreateLabel {
+                    project_id: Some(project.id.clone()),
+                    workspace_id: project.workspace_id.clone(),
+                    name: NEEDS_MANUAL_LABEL.into(),
+                    color: None,
+                    parent_id: None,
+                    sort_order: None,
+                    external_source: None,
+                    external_id: None,
+                },
+            )
+            .unwrap();
+            agentflare_backend::label::get_by_name(conn, &project.id, NEEDS_MANUAL_LABEL)
+                .unwrap()
+                .id
+        })
+        .unwrap();
+    retry_pending_gate_restore(&mcp, &fetch(), repo.path(), 42);
+    assert!(pr_string_list(&fetch(), "pending_gates").is_empty());
+    let carried = mcp
+        .with_backend_db(|conn| agentflare_backend::item::list_labels(conn, &item_id).unwrap())
+        .unwrap();
+    assert!(carried.contains(&label_id));
 }

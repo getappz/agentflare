@@ -591,9 +591,9 @@ impl WorkArgs {
             // closes entirely, even with a human in the loop. Left unresolved on purpose; an
             // override (e.g. `--i-am-a-human`, or a prompt requiring real terminal input) is a
             // deliberate future decision, not something to route around here.
-            std::process::exit(1);
+            crate::decide::exit(1);
         }
-        std::process::exit(execute_work(self, &mut std::io::stdout()).exit_code);
+        crate::decide::exit(execute_work(self, &mut std::io::stdout()).exit_code);
     }
 }
 

@@ -95,13 +95,16 @@ mod wrap;
 use clap::Parser;
 
 fn main() {
+    if let Some(code) = decide::recovery_entrypoint() {
+        std::process::exit(code);
+    }
     color_eyre::install().expect("color_eyre::install failed");
     if let Some(result) = wrap::handle_entrypoint() {
         match result {
-            Ok(code) => std::process::exit(code),
+            Ok(code) => decide::exit(code),
             Err(error) => {
                 ui::error(&error);
-                std::process::exit(1);
+                decide::exit(1);
             }
         }
     }
@@ -111,4 +114,5 @@ fn main() {
         Some(command) => command.run(),
         None => crate::about::run(crate::about::AboutArgs {}),
     }
+    decide::shutdown();
 }

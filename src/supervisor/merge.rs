@@ -217,28 +217,10 @@ pub(super) fn handle_ci_green(
     // CI-green PR with real findings on it got merged untouched
     // because the two were checked in the wrong order -- see GitHub
     // PR 791). Skip the two live GitHub calls this fetch costs
-    // entirely once the item is already gated or a repair job is
-    // already in flight -- `coderabbit_repair_or_gate` would just
-    // discard the findings and return `Skipped` anyway, but not
-    // before paying for the fetch on every single tick for as long
-    // as the PR sits gated or in-flight.
-    if already_gated_or_in_flight(mcp, queue, item, label_id_by_name) {
-        // Item #341: a green, approved PR held only by a dispatch gate label
-        // (needs-manual-dispatch / needs-human) otherwise sits silently
-        // skipped every tick, with nothing telling the operator why.
-        if !label_missing
-            && item_gated(mcp, item, label_id_by_name)
-            && first_time_gated(&format!("pr-gated:{}", item.id))
-        {
-            notify_human_gate(
-                item,
-                &format!(
-                    "PR #{number} is green and approved but the sweep is skipping it: the item \
-                     carries a dispatch gate label (needs-manual-dispatch / needs-human)."
-                ),
-            );
-            post_item_dispatch_gate_pr_comment(mcp, item, folder_path, number);
-        }
+    // entirely once a repair job is already in flight, or when the
+    // approval label is missing and the item is already gated.
+    if job_in_flight(queue, &item.id) || (label_missing && item_gated(mcp, item, label_id_by_name))
+    {
         result.skipped += 1;
     } else {
         let head_sha = merge.head_sha();
@@ -516,6 +498,7 @@ pub(super) fn merge_or_repair_findings(
     folder_path: &str,
     merge: CiGreenMerge<'_>,
 ) -> PassingPrOutcome {
+    retry_pending_gate_restore(mcp, item, repo_root, number);
     if review.dispatch_needed() || review.blocks_merge() {
         // Auto-merge this sweep armed on an earlier, findings-free tick
         // would let the next approving review merge these findings
@@ -528,6 +511,19 @@ pub(super) fn merge_or_repair_findings(
             number,
             "unresolved review-bot findings hold the merge",
         );
+        if item_gated(mcp, item, label_id_by_name)
+            && first_time_gated(&format!("pr-gated:{}", item.id))
+        {
+            notify_human_gate(
+                item,
+                &format!(
+                    "PR #{number} is green and approved but the sweep is holding it: the item \
+                     carries a dispatch gate label (needs-manual-dispatch / needs-human) \
+                     and review findings remain or could not be checked."
+                ),
+            );
+            post_item_dispatch_gate_pr_comment(mcp, item, folder_path, number);
+        }
     }
     if review.dispatch_needed() {
         let outcome = coderabbit_repair_or_gate(
@@ -595,10 +591,56 @@ pub(super) fn merge_or_repair_findings(
     );
     clear_stale_coderabbit_repair_label(folder_path, number, labels, summary.as_deref());
     clear_coderabbit_repair_cap(mcp, item);
-    if merge_if_approved(mcp, item, repo_root, number, labels, merge) {
-        PassingPrOutcome::Merged
-    } else {
-        PassingPrOutcome::NotMerged
+    let mut held_gates: Vec<String> = held_item_gates(mcp, item, label_id_by_name)
+        .into_iter()
+        .map(String::from)
+        .collect();
+    if labels.iter().any(|l| l == NEEDS_HUMAN_PR_LABEL) {
+        held_gates.push(NEEDS_HUMAN_PR_LABEL.to_string());
+    }
+    clear_item_dispatch_gates(mcp, item, label_id_by_name);
+    clear_github_needs_human_label(folder_path, number, labels);
+    // Gates stay cleared only for an armed auto-merge (GitHub merges that
+    // head; the arming record carries the gates back if it is withdrawn).
+    // Any other outcome that is not a promoted merge puts them back.
+    match merge_if_approved(mcp, item, repo_root, number, labels, merge, &held_gates) {
+        MergeAttempt::Merged if promote_merged_item(mcp, item, repo_root) => {
+            PassingPrOutcome::Merged
+        }
+        MergeAttempt::AutoMergeArmed => PassingPrOutcome::NotMerged,
+        MergeAttempt::Merged | MergeAttempt::NotMerged => {
+            restore_gates(mcp, item, repo_root, number, &held_gates);
+            PassingPrOutcome::NotMerged
+        }
+    }
+}
+
+/// Clears dispatch gate labels (`needs-human-gate`, `needs-manual-dispatch`)
+/// from the work item once the PR has human approval and no blocking findings.
+fn clear_item_dispatch_gates(
+    mcp: &AgentflareMcp,
+    item: &agentflare_backend::item::Item,
+    label_id_by_name: &std::collections::HashMap<String, String>,
+) {
+    for name in [NEEDS_HUMAN_GATE_LABEL, NEEDS_MANUAL_LABEL] {
+        let _ = mcp.with_backend_db(|conn| {
+            if let Some(label_id) = label_id_by_name.get(name) {
+                let _ = agentflare_backend::item::remove_label(conn, &item.id, label_id);
+            }
+            let _ = agentflare_backend::item::remove_label_by_name(conn, &item.id, name);
+        });
+    }
+}
+
+/// Clears `NEEDS_HUMAN_PR_LABEL` (`agentflare:needs-human`) from the GitHub PR
+/// once human approval is confirmed and review findings are clean.
+fn clear_github_needs_human_label(folder_path: &str, number: u64, labels: &[String]) {
+    if labels.iter().any(|l| l == NEEDS_HUMAN_PR_LABEL)
+        && let Some(repo) =
+            crate::github::RepoId::resolve_from_remote(std::path::Path::new(folder_path))
+        && let Ok(client) = crate::github::Client::new()
+    {
+        let _ = crate::github::issues::remove_label(&client, &repo, number, NEEDS_HUMAN_PR_LABEL);
     }
 }
 
@@ -625,7 +667,8 @@ pub(super) fn merge_if_approved(
     number: u64,
     labels: &[String],
     merge: CiGreenMerge<'_>,
-) -> bool {
+    held_gates: &[String],
+) -> MergeAttempt {
     if !labels.iter().any(|l| l == PR_APPROVAL_LABEL) {
         disarm_our_auto_merge(
             mcp,
@@ -634,28 +677,29 @@ pub(super) fn merge_if_approved(
             number,
             "the approval label was removed",
         );
-        return false;
+        return MergeAttempt::NotMerged;
     }
     let Some(repo) = crate::github::RepoId::resolve_from_remote(repo_root) else {
-        return false;
+        return MergeAttempt::NotMerged;
     };
     let Ok(client) = crate::github::Client::new() else {
-        return false;
+        return MergeAttempt::NotMerged;
     };
     let auto = merge.auto_merge();
-    match merge_approved_pr(&client, &repo, number, merge) {
-        MergeAttempt::Merged => promote_merged_item(mcp, item, repo_root),
+    let attempt = merge_approved_pr(&client, &repo, number, merge);
+    match attempt {
+        MergeAttempt::Merged | MergeAttempt::NotMerged => {}
         MergeAttempt::AutoMergeArmed => {
             // Armed just now (as opposed to found already armed, which may
             // be a human's): remember the head it was pinned to, so a later
             // push can be caught and the arming withdrawn.
             if let (false, Some(node_id)) = (auto.enabled, auto.node_id.as_deref()) {
                 record_armed_auto_merge(mcp, item, merge.head_sha(), node_id);
+                record_held_gates(mcp, item, held_gates);
             }
-            false
         }
-        MergeAttempt::NotMerged => false,
     }
+    attempt
 }
 
 /// The commit-status context the sweep stamps on a head it has judged fit

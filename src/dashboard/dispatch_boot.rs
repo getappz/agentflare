@@ -17,6 +17,11 @@ pub(super) const PIPELINE_RECOVERY_RETRY_INTERVAL: std::time::Duration =
 /// the work-item pipeline's in-flight runs have been recovered, so a fresh
 /// dispatch can never race a resumed run for the same item.
 pub(super) fn start_work_dispatch(queue: &agentflare_jobs::Queue) {
+    eprintln!(
+        "agentflare-supervisor: work dispatch started (discovery every {}s, review every {}s)",
+        SUPERVISOR_DISCOVERY_INTERVAL.as_secs(),
+        SUPERVISOR_REVIEW_SWEEP_INTERVAL.as_secs()
+    );
     let mut worker_pool = agentflare_jobs::WorkerPool::new(queue.clone())
         .with_executor(std::sync::Arc::new(crate::cli::work::WorkItemExecutor))
         .with_terminal_failure_hook(std::sync::Arc::new(|_job_id, job| {

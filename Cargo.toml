@@ -1,5 +1,5 @@
 [workspace]
-members = ["agentflare-workspace-hack","crates/flare-insights","crates/flare-code", "crates/agent-registry", "crates/skill-registry", "crates/gateway-registry", "crates/flare-output", "crates/agentflare-artifacts", "crates/agentflare-backend", "crates/agentflare-db-kit", "crates/flare-search-kit", "crates/agentflare-store", "crates/flare-proxy", "crates/agentflare-shim", "crates/flare-git-core", "crates/flare-process", "crates/flare-git-shim", "crates/agentflare-jobs", "crates/flare-docs", "crates/flare-vault", "crates/agentflare-resource-gate", "crates/flare-workflow", "crates/flare-sandbox", "crates/agentflare-apps", "crates/flare-consensus", "crates/flare-consensus-proxy", "crates/flare-browser", "crates/agentflare-config", "crates/flare-channels", "crates/agentflare-approval", "crates/agentflare-bin-lib"]
+members = ["agentflare-workspace-hack","crates/flare-insights","crates/flare-code", "crates/agent-registry", "crates/skill-registry", "crates/gateway-registry", "crates/flare-output", "crates/agentflare-artifacts", "crates/agentflare-backend", "crates/agentflare-db-kit", "crates/flare-search-kit", "crates/flare-decide", "crates/agentflare-store", "crates/flare-proxy", "crates/agentflare-shim", "crates/flare-git-core", "crates/flare-process", "crates/flare-git-shim", "crates/agentflare-jobs", "crates/flare-docs", "crates/flare-vault", "crates/agentflare-resource-gate", "crates/flare-workflow", "crates/flare-sandbox", "crates/agentflare-apps", "crates/flare-consensus", "crates/flare-consensus-proxy", "crates/flare-browser", "crates/agentflare-config", "crates/flare-channels", "crates/agentflare-approval", "crates/agentflare-bin-lib"]
 # flare-db(-macros) are independently published and select exactly one database backend.
 # Keep their feature matrices and release lockfiles separate from the Agentflare binary.
 exclude = ["crates/flare-db", "crates/flare-db-macros"]
@@ -82,6 +82,7 @@ agentflare-artifacts = { path = "crates/agentflare-artifacts" }
 agentflare-backend = { package = "agentflare-backend", path = "crates/agentflare-backend" }
 db_kit = { package = "agentflare-db-kit", path = "crates/agentflare-db-kit" }
 flare-search-kit = { path = "crates/flare-search-kit" }
+flare-decide = { path = "crates/flare-decide" }
 axum = "0.8"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }

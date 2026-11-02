@@ -43,7 +43,11 @@ pub(crate) fn judge_shadow_state(
             format!(
                 "{i}. {}{}",
                 judge_shadow_clip(&t.title, JUDGE_SHADOW_TITLE_CHARS),
-                if i == current_task_index { " <- current" } else { "" }
+                if i == current_task_index {
+                    " <- current"
+                } else {
+                    ""
+                }
             )
         })
         .collect();
@@ -68,22 +72,49 @@ pub(crate) fn judge_shadow_state(
 /// and from how the loop applies each action; if Jev disagrees systematically,
 /// the shadow report is where a wrong description shows up. Options are sent in
 /// alphabetical order and Jev leans toward the first one, hence shadow-only.
-pub(crate) fn judge_shadow_questions()
--> std::collections::BTreeMap<String, crate::decide::Question> {
+pub(crate) fn judge_shadow_questions() -> std::collections::BTreeMap<String, crate::decide::Question>
+{
     std::collections::BTreeMap::from([(
         "action".to_string(),
         crate::decide::Question::choice(
             "Given the plan, ledger and the role's latest reply in the state, what should the multi-task pipeline do next?",
             [
-                ("advance_task", "The current task is complete and verified; move on to the next task"),
-                ("complete_pipeline", "Every planned task is done; finish the whole pipeline"),
-                ("continue_task", "The current task is not finished yet; let the role keep working on it unchanged"),
-                ("escalate", "Repeated attempts are not converging or the role is stuck; escalate to a stronger approach"),
-                ("fix_round", "The work has concrete problems or review issues to fix; run another fix pass on this task"),
-                ("insert_task", "Extra work is needed that deserves its own new task added to the plan"),
-                ("park_finding", "A non-blocking finding was reported; record it for later and do not act on it now"),
-                ("rule_and_continue", "A decision or rule was settled that should be noted in the ledger; then continue the same task"),
-                ("skip_task", "The current task is unnecessary or already satisfied; skip it without more work"),
+                (
+                    "advance_task",
+                    "The current task is complete and verified; move on to the next task",
+                ),
+                (
+                    "complete_pipeline",
+                    "Every planned task is done; finish the whole pipeline",
+                ),
+                (
+                    "continue_task",
+                    "The current task is not finished yet; let the role keep working on it unchanged",
+                ),
+                (
+                    "escalate",
+                    "Repeated attempts are not converging or the role is stuck; escalate to a stronger approach",
+                ),
+                (
+                    "fix_round",
+                    "The work has concrete problems or review issues to fix; run another fix pass on this task",
+                ),
+                (
+                    "insert_task",
+                    "Extra work is needed that deserves its own new task added to the plan",
+                ),
+                (
+                    "park_finding",
+                    "A non-blocking finding was reported; record it for later and do not act on it now",
+                ),
+                (
+                    "rule_and_continue",
+                    "A decision or rule was settled that should be noted in the ledger; then continue the same task",
+                ),
+                (
+                    "skip_task",
+                    "The current task is unnecessary or already satisfied; skip it without more work",
+                ),
             ],
         ),
     )])
@@ -112,25 +143,28 @@ pub(crate) fn judge_shadow_compare(
 ) {
     use crate::decide::{Answer, DecideError, shadow};
     let input = state.to_string();
+    let start = std::time::Instant::now();
     let outcome = match ask(state, &judge_shadow_questions()) {
         Ok(outcome) => outcome,
         // Not configured: nothing to compare, nothing to log.
         Err(DecideError::Disabled | DecideError::NoCredentials) => return,
         Err(e) => {
-            record(&shadow::Row::failed(
-                JUDGE_SHADOW_SITE,
-                &input,
-                claude_action,
-                &e.to_string(),
-            ));
+            crate::decide::tracking::failure(
+                shadow::Row::failed(JUDGE_SHADOW_SITE, &input, claude_action, &e.to_string()),
+                &judge_shadow_questions(),
+                start.elapsed().as_millis() as u64,
+                record,
+            );
             return;
         }
     };
     match outcome.response.answers.get("action") {
-        Some(answer @ Answer::Choice {
-            choice, confidence, ..
-        }) => {
-            record(&shadow::Row::answered(
+        Some(
+            answer @ Answer::Choice {
+                choice, confidence, ..
+            },
+        ) => {
+            let row = shadow::Row::answered(
                 JUDGE_SHADOW_SITE,
                 &input,
                 claude_action,
@@ -138,10 +172,10 @@ pub(crate) fn judge_shadow_compare(
                 *confidence,
                 outcome.elapsed_ms,
                 outcome.response.usage.cost,
-            ));
-            if crate::decide::capture::enabled() {
-                let (features, norm_input) = crate::decide::capture::judge_features(state);
-                crate::decide::capture::record(crate::decide::capture::Input {
+            );
+            let (features, norm_input) = crate::decide::capture::judge_features(state);
+            let captured =
+                crate::decide::capture::enabled().then(|| crate::decide::capture::Input {
                     site: JUDGE_SHADOW_SITE,
                     features,
                     norm_input: &norm_input,
@@ -150,14 +184,32 @@ pub(crate) fn judge_shadow_compare(
                     baseline: claude_action,
                     source_model: outcome.response.model.as_deref(),
                 });
-            }
+            crate::decide::tracking::finish(
+                row,
+                crate::decide::tracking::Context {
+                    questions: &judge_shadow_questions(),
+                    answers: &outcome.response.answers,
+                    source_model: outcome.response.model.as_deref(),
+                    usage: &outcome.response.usage,
+                    applied: false,
+                },
+                captured,
+                record,
+            );
         }
-        _ => record(&shadow::Row::failed(
-            JUDGE_SHADOW_SITE,
-            &input,
-            claude_action,
-            "unexpected answer shape",
-        )),
+        _ => {
+            crate::decide::tracking::failure(
+                shadow::Row::failed(
+                    JUDGE_SHADOW_SITE,
+                    &input,
+                    claude_action,
+                    "unexpected answer shape",
+                ),
+                &judge_shadow_questions(),
+                outcome.elapsed_ms,
+                record,
+            );
+        }
     }
 }
 
@@ -193,9 +245,7 @@ pub(crate) fn spawn_judge_shadow(
         judge_shadow_compare(
             &state,
             &claude_action,
-            &|state, questions| {
-                crate::decide::ask_within(state, questions, JUDGE_SHADOW_BUDGET)
-            },
+            &|state, questions| crate::decide::ask_within(state, questions, JUDGE_SHADOW_BUDGET),
             &crate::decide::shadow::record,
         );
     }));

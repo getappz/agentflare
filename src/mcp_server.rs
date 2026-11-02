@@ -321,6 +321,23 @@ impl AgentflareMcp {
         &self,
         f: impl FnOnce(&skill_registry::Registry) -> T,
     ) -> crate::errors::Result<T> {
+        self.with_fresh_registry_inner(false, f)
+    }
+
+    /// Like `with_fresh_registry`, but bypasses `ensure_fresh`'s debounce so a
+    /// skill just written under `~/.agentflare/skills` is visible immediately.
+    fn with_forced_fresh_registry<T>(
+        &self,
+        f: impl FnOnce(&skill_registry::Registry) -> T,
+    ) -> crate::errors::Result<T> {
+        self.with_fresh_registry_inner(true, f)
+    }
+
+    fn with_fresh_registry_inner<T>(
+        &self,
+        force: bool,
+        f: impl FnOnce(&skill_registry::Registry) -> T,
+    ) -> crate::errors::Result<T> {
         let mut guard = self
             .skills_registry
             .lock()
@@ -334,6 +351,9 @@ impl AgentflareMcp {
             *guard = Some(reg);
         }
         let reg = guard.as_mut().expect("just initialized above");
+        if force {
+            reg.invalidate();
+        }
         reg.ensure_fresh(crate::components::detected_skill_agents)?;
         Ok(f(reg))
     }
@@ -1181,13 +1201,19 @@ impl AgentflareMcp {
         if guard.is_some() {
             return Ok(());
         }
-        let store = match &self.flare_docs_store_override {
+        // The open retries on a transient lock with sleeps and SQLite's own
+        // busy timeout, so it runs off the runtime: the stdio MCP runtime has
+        // one thread, and parking it would stall every other tool call.
+        let over = self.flare_docs_store_override.clone();
+        let store = tokio::task::spawn_blocking(move || match over {
             Some(path) if path == std::path::Path::new(":memory:") => {
                 flare_docs::DocsStore::open_memory()
             }
-            Some(path) => flare_docs::DocsStore::open_file(path),
+            Some(path) => flare_docs::DocsStore::open_file(&path),
             None => flare_docs::DocsStore::open_default(),
-        }
+        })
+        .await
+        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         *guard = Some(store);
         Ok(())

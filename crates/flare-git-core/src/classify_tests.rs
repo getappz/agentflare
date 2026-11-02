@@ -1250,3 +1250,73 @@ fn project_local_config_can_relax_a_denied_plumbing_subcommand() {
         after.disposition
     );
 }
+
+/// Item #770 theme b: the dirty-tree deny must tell the agent that a clean
+/// tree passes, or it reads as "the default branch is never reachable" with
+/// no documented way to land locally.
+#[test]
+fn protected_branch_checkout_deny_explains_the_dirty_tree_and_the_clean_path() {
+    let policy = ResolvedGitShimPolicy::baseline();
+    let d = classify_pure(
+        "switch",
+        &args(&["master"]),
+        "master",
+        &TrustRootTouch::Clean,
+        false,
+        false,
+        &policy,
+    );
+    let Disposition::Deny { reason } = d else {
+        panic!("expected deny for a dirty-tree switch to the default branch, got {d:?}");
+    };
+    assert!(reason.contains("uncommitted changes"), "{reason}");
+    assert!(reason.contains("from a clean tree is allowed"), "{reason}");
+    assert!(reason.contains("item(action=\"claim\""), "{reason}");
+}
+
+/// Item #770 theme e: only commit shapes that reach past the index count as
+/// carrying unstaged content.
+#[test]
+fn commit_includes_unstaged_recognizes_index_only_commits() {
+    for index_only in [
+        &["-m", "fix"][..],
+        &["-m", "fix a bug"],
+        &["-mfix a bug"],
+        &["--message=fix a bug"],
+        &["-sm", "fix"],
+        &["--amend", "--no-edit"],
+        &["-F", "msg.txt", "--no-verify"],
+        &["-q", "-m", "x", "--"],
+        &[],
+    ] {
+        assert!(
+            !commit_includes_unstaged(&args(index_only)),
+            "{index_only:?} commits exactly the index"
+        );
+    }
+}
+
+#[test]
+fn commit_includes_unstaged_recognizes_working_tree_commits() {
+    for reaches_tree in [
+        &["-a", "-m", "x"][..],
+        &["--all", "-m", "x"],
+        &["-am", "x"],
+        &["-sam", "x"],
+        &["--interactive", "-m", "x"],
+        &["--patch", "-m", "x"],
+        &["-pm", "x"],
+        &["-im", "x"],
+        &["--al", "-m", "x"],
+        &["-i", "-m", "x", "file.rs"],
+        &["--include", "file.rs"],
+        &["-m", "x", "src/lib.rs"],
+        &["-m", "x", "--", "src/lib.rs"],
+        &["--pathspec-from-file=list.txt"],
+    ] {
+        assert!(
+            commit_includes_unstaged(&args(reaches_tree)),
+            "{reaches_tree:?} commits working-tree content"
+        );
+    }
+}

@@ -105,30 +105,21 @@ pub fn spawn_if_enabled() -> Option<std::thread::JoinHandle<()>> {
 /// block behind the bridge's network latency. A second SQLite connection to
 /// the same file is the normal way to give a background thread its own
 /// handle.
-fn open_items_db() -> Option<rusqlite::Connection> {
+///
+/// Returns the failure instead of printing it: the caller runs this every
+/// tick, and only it knows whether the failure is new.
+fn open_items_db() -> Result<rusqlite::Connection, String> {
     let path = crate::paths::agentflare_dir().join("backend.db");
-    match agentflare_backend::db::open_db(&path) {
-        Ok(c) => Some(c),
-        Err(e) => {
-            eprintln!(
-                "github bridge: item database unavailable at {} ({e}); not starting",
-                path.display()
-            );
-            None
-        }
-    }
+    agentflare_backend::db::open_db(&path)
+        .map_err(|e| format!("item database unavailable at {} ({e})", path.display()))
 }
 
 fn run_forever(config: BridgeConfig) {
     let interval = std::time::Duration::from_secs(config.interval_secs);
-    let Some(conn) = open_items_db() else { return };
-    let client = match crate::github::Client::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("github bridge: no usable credential ({e}); not starting");
-            return;
-        }
-    };
+    eprintln!(
+        "github bridge: started poll loop (every {}s)",
+        config.interval_secs
+    );
 
     // Soft errors repeat every tick by nature, so log a CHANGE per repo
     // rather than each occurrence: 1440 identical lines a day would bury the
@@ -137,7 +128,41 @@ fn run_forever(config: BridgeConfig) {
     // one daemon now polls several independently.
     let mut last_soft: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut had_targets = true; // forces the "nothing registered" message on the first empty tick
+    let mut last_db_err: Option<String> = None;
+    let mut logged_no_client = false;
+
     loop {
+        let conn = match open_items_db() {
+            Ok(c) => {
+                last_db_err = None;
+                c
+            }
+            Err(e) => {
+                // Log on change, not once: a lock error followed by a
+                // schema-ahead error needs its rebuild instructions shown.
+                if last_db_err.as_deref() != Some(e.as_str()) {
+                    eprintln!("github bridge: {e}; waiting for it to become available...");
+                    last_db_err = Some(e);
+                }
+                std::thread::sleep(interval);
+                continue;
+            }
+        };
+
+        let client = match crate::github::Client::new() {
+            Ok(c) => {
+                logged_no_client = false;
+                c
+            }
+            Err(e) => {
+                if !logged_no_client {
+                    eprintln!("github bridge: waiting for usable credential ({e})...");
+                    logged_no_client = true;
+                }
+                std::thread::sleep(interval);
+                continue;
+            }
+        };
         let targets = bridge_targets(&conn);
         if targets.is_empty() {
             if had_targets {

@@ -194,20 +194,41 @@ async fn try_install_from_source(
     Ok(false)
 }
 
+/// Install `name` from the first configured registry that has it, into
+/// `~/.agentflare/skills` only (never an agent's discovery dir). `Ok(false)` =
+/// no registry has it. Rejects anything but a plain skill name so a caller
+/// can't escape the skills dir via `..`, `/` or `source:name` qualifiers.
+pub(crate) async fn install_from_registries(name: &str) -> Result<bool, skill::error::SkillError> {
+    if !is_plain_skill_name(name) {
+        return Ok(false);
+    }
+    let manager = build_manager();
+    for url in &load_registries() {
+        if try_install_from_source(&manager, url, name).await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+pub(crate) fn is_plain_skill_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 async fn run_install(name: &str) -> Result<(), skill::error::SkillError> {
     if home_skills().join(name).join("SKILL.md").exists() {
         crate::ui::skip(&format!("'{name}' already installed"));
         return Ok(());
     }
 
-    let manager = build_manager();
-    let sources = load_registries();
-
-    for url in &sources {
-        if try_install_from_source(&manager, url, name).await? {
-            crate::ui::success(&format!("installed '{name}'"));
-            return Ok(());
-        }
+    if install_from_registries(name).await? {
+        crate::ui::success(&format!("installed '{name}'"));
+        return Ok(());
     }
 
     crate::ui::error(&format!("skill '{name}' not found in any registry"));
@@ -1068,6 +1089,26 @@ mod tests {
             run_registry(RegistryAction::Add { url: url.clone() });
             let regs = load_registries();
             assert_eq!(regs.iter().filter(|r| **r == url).count(), 1);
+        });
+    }
+
+    #[test]
+    fn install_from_registries_stages_only_in_agentflare_dir_and_rejects_unsafe_names() {
+        crate::paths::test_support::with_temp_home(|| {
+            let reg = tempfile::tempdir().unwrap();
+            write_fixture_skill(reg.path(), "zz-demo", "demo skill");
+            save_registries(&[reg.path().to_string_lossy().to_string()]);
+
+            assert!(block_on(install_from_registries("zz-demo")).unwrap());
+            assert!(home_skills().join("zz-demo").join("SKILL.md").exists());
+            let home = crate::paths::home();
+            assert!(!home.join(".claude").join("skills").join("zz-demo").exists());
+
+            assert!(!block_on(install_from_registries("missing")).unwrap());
+            for bad in ["../zz-demo", "a/b", "src:zz-demo", "", ".."] {
+                assert!(!is_plain_skill_name(bad), "{bad}");
+                assert!(!block_on(install_from_registries(bad)).unwrap(), "{bad}");
+            }
         });
     }
 

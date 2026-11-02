@@ -5,14 +5,14 @@
 //! user prompt text; it stays on this machine, is size-capped, and is removed
 //! with `agentflare decide dataset clear`. Writing is best-effort.
 mod features;
-mod norm;
+pub(crate) mod norm;
 mod stats;
 #[cfg(test)]
 mod tests;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub use features::{judge_features, rerank_features, router_features};
@@ -24,6 +24,12 @@ pub const SCHEMA: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Row {
+    #[serde(default)]
+    pub decision_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<Value>,
     pub schema: u32,
     pub ts: i64,
     pub site: String,
@@ -70,6 +76,9 @@ fn rotated(path: &Path) -> PathBuf {
 
 pub fn build_row(i: Input<'_>) -> Row {
     Row {
+        decision_id: None,
+        question: None,
+        answer: None,
         schema: SCHEMA,
         ts: chrono::Utc::now().timestamp(),
         site: i.site.to_string(),
@@ -85,11 +94,41 @@ pub fn build_row(i: Input<'_>) -> Row {
 /// No-op unless opted in; errors are deliberately ignored.
 pub fn record(i: Input<'_>) {
     if enabled() {
-        let _ = append(&dataset_path(), &build_row(i), MAX_BYTES);
+        super::storage::capture(build_row(i));
     }
 }
 
-pub(crate) fn append(path: &Path, row: &Row, max_bytes: u64) -> std::io::Result<()> {
+pub(crate) fn append(path: &Path, row: &impl Serialize, max_bytes: u64) -> std::io::Result<()> {
+    append_many(
+        path,
+        std::iter::once((0, row)),
+        max_bytes,
+        |_| true,
+        |_| {},
+        false,
+    )
+}
+
+pub(crate) fn append_many<'a, T: Serialize + 'a>(
+    path: &Path,
+    rows: impl IntoIterator<Item = (u64, &'a T)>,
+    max_bytes: u64,
+    mut allowed: impl FnMut(u64) -> bool,
+    mut written: impl FnMut(u64),
+    recover: bool,
+) -> std::io::Result<()> {
+    let mut lines = Vec::new();
+    for (ticket, row) in rows {
+        let mut line = serde_json::to_string(row).map_err(std::io::Error::other)?;
+        line.push('\n');
+        if line.len() > 64 * 1024 {
+            return Err(std::io::Error::other("decision record exceeds 64 KiB"));
+        }
+        lines.push((ticket, line));
+    }
+    if lines.is_empty() {
+        return Ok(());
+    }
     if let Some(parent) = path.parent() {
         let mut b = std::fs::DirBuilder::new();
         b.recursive(true);
@@ -98,17 +137,110 @@ pub(crate) fn append(path: &Path, row: &Row, max_bytes: u64) -> std::io::Result<
         b.create(parent)?;
         restrict(parent, path)?;
     }
-    if std::fs::metadata(path).is_ok_and(|m| m.len() > max_bytes) {
-        // rename replaces the target; a lost race or locked file must not drop the row.
-        let _ = std::fs::rename(path, rotated(path));
-    }
-    let mut line = serde_json::to_string(row).map_err(std::io::Error::other)?;
-    line.push('\n');
     let mut opts = std::fs::OpenOptions::new();
-    opts.create(true).append(true);
+    opts.create(true).write(true).read(true).truncate(false);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
-    opts.open(path)?.write_all(line.as_bytes())
+    let mut file = opts.open(path)?;
+    // Never wait for another process; contention is counted as a dropped write.
+    fs2::FileExt::try_lock_exclusive(&file)?;
+    repair_tail(&mut file, max_bytes)?;
+    #[cfg(test)]
+    if std::env::var("AGENTFLARE_TEST_LEDGER_LOCK_DELAY").as_deref() == Ok("1") {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    if recover {
+        let mut bytes = match std::fs::read(rotated(path)) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e),
+        };
+        bytes.push(b'\n');
+        file.seek(SeekFrom::Start(0))?;
+        Read::by_ref(&mut file)
+            .take(max_bytes)
+            .read_to_end(&mut bytes)?;
+        for line in String::from_utf8_lossy(&bytes).lines() {
+            if let Ok(value) = serde_json::from_str::<Value>(line)
+                && value.get("site").is_some()
+                && let Some(id) = value.get("decision_id").and_then(Value::as_str)
+            {
+                seen.insert(id.to_owned());
+            }
+        }
+    }
+    let mut len = file.metadata()?.len();
+    for (ticket, line) in lines {
+        if !allowed(ticket) {
+            continue;
+        }
+        let id = if recover {
+            serde_json::from_str::<Value>(&line).ok().and_then(|v| {
+                v.get("decision_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+        } else {
+            None
+        };
+        if id.as_ref().is_some_and(|id| seen.contains(id)) {
+            written(ticket);
+            continue;
+        }
+        if len + line.len() as u64 > max_bytes {
+            // Windows permits neither replacing nor renaming an open locked file.
+            // Keep the lock inode stable: copy the bounded old bytes, then truncate.
+            file.seek(SeekFrom::Start(0))?;
+            let mut bytes = Vec::new();
+            Read::by_ref(&mut file)
+                .take(max_bytes)
+                .read_to_end(&mut bytes)?;
+            let mut backup = std::fs::OpenOptions::new();
+            backup.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut backup, 0o600);
+            backup.open(rotated(path))?.write_all(&bytes)?;
+            file.set_len(0)?;
+            len = 0;
+        }
+        file.seek(SeekFrom::End(0))?;
+        if let Err(e) = file.write_all(line.as_bytes()) {
+            let _ = file.set_len(len);
+            return Err(e);
+        }
+        len += line.len() as u64;
+        written(ticket);
+        if let Some(id) = id {
+            seen.insert(id);
+        }
+    }
+    Ok(())
+}
+
+fn repair_tail(file: &mut std::fs::File, max_bytes: u64) -> std::io::Result<()> {
+    let len = file.metadata()?.len();
+    if len == 0 || len > max_bytes {
+        return Ok(());
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0];
+    file.read_exact(&mut last)?;
+    if last[0] == b'\n' {
+        return Ok(());
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    Read::by_ref(file).take(max_bytes).read_to_end(&mut bytes)?;
+    let complete = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+    if serde_json::from_slice::<Value>(&bytes[complete..]).is_ok() {
+        file.seek(SeekFrom::End(0))?;
+        file.write_all(b"\n")?;
+    } else {
+        // Exit can interrupt write_all before its error rollback runs.
+        file.set_len(complete as u64)?;
+    }
+    Ok(())
 }
 
 /// Unix: dir 0o700, any pre-existing dataset/rotated file 0o600. Errors

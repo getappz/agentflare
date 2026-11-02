@@ -65,13 +65,34 @@ impl AgentflareMcp {
                     )
                     .map_err(internal_err)?;
                     let blocked_by = live.filter(|c| c.owner != assignee_agent);
-                    let dispatchable = blocked_by.is_none();
+                    let resource_policy = agentflare_resource_gate::current_policy();
+                    let resource_blocked = !matches!(
+                        resource_policy,
+                        agentflare_resource_gate::Policy::Normal
+                            | agentflare_resource_gate::Policy::Aggressive
+                    );
+                    let dispatchable = blocked_by.is_none() && !resource_blocked;
+                    let mut refusal_reason: Option<String> = None;
+                    if let Some(ref c) = blocked_by {
+                        refusal_reason = Some(format!(
+                            "live claim held by agent '{}' (age {}s, ttl {}s)",
+                            c.owner, c.age_secs, effective_ttl
+                        ));
+                    } else if resource_blocked {
+                        refusal_reason = Some(format!(
+                            "host resource gate policy is {:?} (host resource constrained)",
+                            resource_policy
+                        ));
+                    }
                     let mut resp = serde_json::json!({
                         "item_id": item_id,
                         "ready": true,
                         "dispatchable": dispatchable,
                         "assignee_agent": assignee_agent,
                     });
+                    if let Some(ref reason) = refusal_reason {
+                        resp["refusal_reason"] = reason.as_str().into();
+                    }
                     match cancel_result {
                         Some(Ok(n)) => resp["jobs_cancelled"] = n.into(),
                         Some(Err(e)) => resp["warning"] = job_cancel_warning(&e).into(),

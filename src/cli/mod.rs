@@ -34,7 +34,7 @@ mod project;
 mod review;
 mod run;
 mod serve;
-mod skill;
+pub(crate) mod skill;
 mod store;
 mod uninstall;
 mod update;

@@ -294,6 +294,12 @@ pub fn default_sources(home: &Path, cwd: &Path, detected_agents: &[String]) -> V
             id: "agentflare-builtin".into(),
             kind: SourceKind::FlatDir(builtin_dir),
         },
+        // Where `agentflare skill install` writes — indexed so installed skills
+        // are searchable/loadable on demand without touching any agent's config.
+        Source {
+            id: "agentflare-user".into(),
+            kind: SourceKind::FlatDir(home.join(".agentflare").join("skills")),
+        },
         Source {
             id: "claude-user".into(),
             kind: SourceKind::FlatDir(home.join(".claude").join("skills")),
@@ -609,6 +615,26 @@ mod tests {
         let srcs = default_sources(home, home, &["codex".into()]);
         assert!(srcs.iter().any(|s| s.id == "codex"));
         assert!(!srcs.iter().any(|s| s.id == "cursor"));
+    }
+
+    #[test]
+    fn default_sources_indexes_skills_installed_into_agentflare_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let d = home.join(".agentflare").join("skills").join("my-skill");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("SKILL.md"),
+            "---\nname: my-skill\ndescription: Installed via agentflare skill install.\n---\nbody\n",
+        )
+        .unwrap();
+        let srcs = default_sources(home, home, &[]);
+        let src = srcs
+            .iter()
+            .find(|s| s.id == "agentflare-user")
+            .expect("agentflare-user source must be present when the dir exists");
+        let out = scan_sources(std::slice::from_ref(src));
+        assert!(out.entries.iter().any(|e| e.name == "my-skill"));
     }
 
     #[test]

@@ -454,6 +454,69 @@ pub fn build_injection(skills: &[RankedSkill]) -> Option<String> {
     Some(lines.join("\n"))
 }
 
+/// Hint for prompts like "install pdf skill" / "install the skill pdf-tools".
+/// Names the skill only when exactly one identifier-shaped word sits next to
+/// "skill(s)"; otherwise falls back to the generic search hint. `None` unless
+/// the prompt has both the words "install" and "skill(s)".
+pub fn install_hint(prompt: &str) -> Option<String> {
+    const STOP: &[&str] = &["the", "a", "an", "this", "new", "any", "some", "please"];
+    // Words that follow "skill" in free text ("skill for pdf", "skill that
+    // converts…", "skill from github") — never a skill name, so those prompts
+    // get the generic hint. Keep clause connectors like "that" here (not in
+    // STOP) so stripping them doesn't make the next verb look like a name.
+    const NOT_A_NAME: &[&str] = &[
+        "from", "for", "in", "into", "to", "on", "of", "with", "my", "our", "your", "it", "using",
+        "via", "about", "called", "named", "which", "and", "or", "by", "at", "as", "that",
+    ];
+    // Keep original case (registry lookup is case-sensitive) and the same
+    // character set the installer accepts (`-_ .`), trimming only other
+    // punctuation so `_pdf` / `foo.bar` survive.
+    let toks: Vec<&str> = prompt
+        .split_whitespace()
+        .map(|t| {
+            t.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+        })
+        .collect();
+    let in_list = |t: &str, list: &[&str]| list.iter().any(|w| t.eq_ignore_ascii_case(w));
+    let is_skill = |t: &str| in_list(t, &["skill", "skills"]);
+    let i = toks
+        .iter()
+        .position(|t| t.eq_ignore_ascii_case("install"))?;
+    if !toks.iter().any(|t| is_skill(t)) {
+        return None;
+    }
+    let ident = |t: &str| {
+        crate::cli::skill::is_plain_skill_name(t) && !is_skill(t) && !in_list(t, NOT_A_NAME)
+    };
+    let rest: Vec<&str> = toks[i + 1..]
+        .iter()
+        .copied()
+        .filter(|t| !in_list(t, STOP))
+        .collect();
+    // Collect every `<name> skill` / `skill <name>` pair; name only when
+    // exactly one candidate (multiple → generic search hint).
+    let mut candidates: Vec<&str> = Vec::new();
+    for w in rest.windows(2) {
+        if is_skill(w[1]) && ident(w[0]) {
+            candidates.push(w[0]);
+        } else if is_skill(w[0]) && ident(w[1]) {
+            candidates.push(w[1]);
+        }
+    }
+    candidates.dedup();
+    let name = match candidates.as_slice() {
+        [n] => Some(*n),
+        _ => None,
+    };
+    Some(match name {
+        Some(n) => format!(
+            "@skill-install: call the skill tool with action=\"load\", name=\"{n}\" to load it into this session; if it isn't indexed, run `agentflare skill install \"{n}\"` (stages in ~/.agentflare/skills, not an agent dir), then load it again — load force-rescans so the new install is visible past the registry debounce"
+        ),
+        None => "@skill-install: call the skill tool with action=\"search\" (query=...) then action=\"load\" (name=...) to use a skill on demand; `agentflare skill install <name>` only if it isn't indexed"
+            .to_string(),
+    })
+}
+
 pub fn session_context_queries() -> Vec<String> {
     let cwd = std::env::current_dir().ok();
     let mut queries = Vec::new();
@@ -646,6 +709,67 @@ mod tests {
         let out = build_injection(&skills).unwrap();
         assert!(out.contains("test-driven-development"));
         assert!(out.contains("87%"));
+    }
+
+    #[test]
+    fn install_hint_names_the_skill_without_mangling_it() {
+        for p in [
+            "please install the pdf skill",
+            "Install skill pdf",
+            "can you install the pdf skills?",
+        ] {
+            let h = install_hint(p).unwrap();
+            assert!(h.contains("action=\"load\", name=\"pdf\""), "{p}: {h}");
+            assert!(h.contains("agentflare skill install \"pdf\""), "{p}: {h}");
+        }
+    }
+
+    #[test]
+    fn install_hint_preserves_the_skill_name_case() {
+        let h = install_hint("install MySkill skill").unwrap();
+        assert!(h.contains("name=\"MySkill\""), "{h}");
+        assert!(h.contains("install \"MySkill\""), "{h}");
+    }
+
+    #[test]
+    fn install_hint_preserves_underscores_and_periods() {
+        let h = install_hint("install _pdf skill").unwrap();
+        assert!(h.contains("name=\"_pdf\""), "{h}");
+        let h = install_hint("install foo.bar skill").unwrap();
+        assert!(h.contains("name=\"foo.bar\""), "{h}");
+    }
+
+    #[test]
+    fn install_hint_never_picks_a_preposition_as_the_name() {
+        let generic = install_hint("install skill").unwrap();
+        for p in [
+            "how do I install a skill from github",
+            "install skill for pdf",
+            "install a skill for pdf processing",
+            "install skill in my agent",
+            "install a skill that converts PDFs",
+            "install pdf skill and json skill",
+        ] {
+            assert_eq!(install_hint(p).unwrap(), generic, "{p}");
+        }
+    }
+
+    #[test]
+    fn install_hint_falls_back_to_search_for_free_text_and_ignores_unrelated() {
+        let generic = "@skill-install: call the skill tool with action=\"search\" (query=...) then action=\"load\" (name=...) to use a skill on demand; `agentflare skill install <name>` only if it isn't indexed";
+        // Long free-form prompt: the old code stripped every 'a' and echoed it.
+        assert_eq!(
+            install_hint(
+                "after doing flare skill search, i do not want to install it into the agent"
+            )
+            .unwrap(),
+            generic
+        );
+        assert_eq!(install_hint("install skill").unwrap(), generic);
+        assert!(install_hint("install the package").is_none());
+        assert!(install_hint("this skill is great").is_none());
+        // "installed" must not count as the word "install".
+        assert!(install_hint("the skill is installed").is_none());
     }
 
     fn ranked(name: &str, score: f64) -> RankedSkill {

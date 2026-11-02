@@ -160,6 +160,29 @@ fn item724_checks_identity_without_breaking_renamed_stamped_tasks() {
 }
 
 #[test]
+fn item724_discovered_untagged_pr_survives_a_title_edit_but_a_foreign_pr_does_not() {
+    let mcp = test_mcp();
+    let id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1900);
+    let mut item = mcp
+        .with_backend_db(|c| agentflare_backend::item::get(c, &id).unwrap())
+        .unwrap();
+    item.name = "hand opened title".into();
+    let branch = "hand-opened-branch";
+    // `create_tracking_item` / `attach_pr_to_item` stamp `identity_validated` for their own PR.
+    item.metadata =
+        r#"{"pr":{"number":870,"branch":"hand-opened-branch","identity_validated":true}}"#.into();
+    let mut edited = pr(branch, "completely different title", None);
+    assert!(crate::worktree::pr_item_mismatch(&item, &edited).is_none());
+    // Validation is bound to the recorded PR number, not to the item.
+    edited.number = 871;
+    assert!(crate::worktree::pr_item_mismatch(&item, &edited).is_some());
+    // An item without the marker (e.g. attached by an earlier collision bug) is still caught.
+    item.metadata = r#"{"pr":{"number":870,"branch":"hand-opened-branch"}}"#.into();
+    edited.number = 870;
+    assert!(crate::worktree::pr_item_mismatch(&item, &edited).is_some());
+}
+
+#[test]
 fn item724_bare_numeric_branches_need_title_identity() {
     let mcp = test_mcp();
     let id = seed_in_review_item_with_claim_age(&mcp, Some("claude-code"), 1900);

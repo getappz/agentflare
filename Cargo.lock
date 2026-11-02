@@ -92,6 +92,7 @@ dependencies = [
  "eyre",
  "flare-browser",
  "flare-channels",
+ "flare-decide",
  "flare-docs",
  "flare-git-core",
  "flare-process",
@@ -372,6 +373,7 @@ dependencies = [
 name = "agentflare-skill-registry"
 version = "0.1.1"
 dependencies = [
+ "agentflare-config",
  "agentflare-db-kit",
  "agentflare-gateway-registry",
  "agentflare-store",
@@ -1669,6 +1671,19 @@ dependencies = [
  "thiserror",
  "tokio",
  "tower",
+]
+
+[[package]]
+name = "flare-decide"
+version = "0.1.0"
+dependencies = [
+ "agentflare-store",
+ "agentflare-workspace-hack",
+ "flare-search-kit",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

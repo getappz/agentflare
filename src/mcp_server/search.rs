@@ -317,13 +317,35 @@ impl AgentflareMcp {
         let limit = req.limit.unwrap_or(50);
         let root = Self::repo_root();
 
-        let args = serde_json::json!({
-            "pattern": q,
-            "path": root.to_string_lossy(),
-            "max_results": limit,
-        });
+        let root = root.to_string_lossy();
 
-        match self.gateway_execute("leanctx", "ctx_search", args).await {
+        // Semantic first so a sentence finds code by meaning; the exact-text
+        // form is the fallback when it errors or yields nothing (lean-ctx
+        // reports index-building and no-hit as plain text, not as an error).
+        let semantic = self
+            .gateway_execute(
+                "leanctx",
+                "ctx_search",
+                code_search_args(q, &root, limit, true),
+            )
+            .await;
+        let found = match semantic {
+            Ok(val) if has_semantic_hits(&val) => Ok(val),
+            other => match self
+                .gateway_execute(
+                    "leanctx",
+                    "ctx_search",
+                    code_search_args(q, &root, limit, false),
+                )
+                .await
+            {
+                Ok(val) => Ok(val),
+                // Keep the semantic reply (e.g. "No results found") over a fallback error.
+                Err(e) => other.or(Err(e)),
+            },
+        };
+
+        match found {
             Ok(val) => Ok(serde_json::json!({"source": "code", "query": q, "results": val}).to_string()),
             Err(e) => Ok(serde_json::json!({"source": "code", "query": q, "error": format!("leanctx ctx_search failed: {e}"), "results": []}).to_string()),
         }
@@ -817,9 +839,78 @@ fn extract_youtube_id(input: &str) -> Option<&str> {
     None
 }
 
+/// `ctx_search` arguments for a `type=code` query. `semantic` ranks by meaning
+/// (hybrid BM25 + dense); otherwise `q` is an exact-text `pattern`.
+fn code_search_args(q: &str, root: &str, limit: usize, semantic: bool) -> serde_json::Value {
+    if semantic {
+        serde_json::json!({
+            "action": "semantic",
+            "query": q,
+            "mode": "hybrid",
+            "top_k": limit,
+            "path": root,
+        })
+    } else {
+        serde_json::json!({"pattern": q, "path": root, "max_results": limit})
+    }
+}
+
+/// A semantic `ctx_search` reply has one `--- Result N` block per hit, or in
+/// compact mode a header reporting `(N results from ...)`; with neither it was
+/// an error, an index-building notice or zero hits.
+fn has_semantic_hits(reply: &serde_json::Value) -> bool {
+    let text = reply.to_string();
+    let header_count = text.find(" results from ").map(|i| {
+        let digits: String = text[..i]
+            .chars()
+            .rev()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits
+            .chars()
+            .rev()
+            .collect::<String>()
+            .parse::<u32>()
+            .unwrap_or(0)
+    });
+    text.contains("--- Result ") || header_count.is_some_and(|n| n > 0)
+}
+
 #[cfg(test)]
 mod helper_tests {
     use super::*;
+
+    #[test]
+    fn semantic_reply_without_result_blocks_is_not_a_hit() {
+        let hit = serde_json::json!(
+            "Semantic search (Hybrid): \"q\" (1 results)\n\n--- Result 1 (rrf: 0.1) ---\nsrc/a.rs :: f [Function] (L1-2)"
+        );
+        assert!(has_semantic_hits(&hit));
+        let compact = serde_json::json!(
+            "Semantic search (Hybrid): \"q\" (2 results from 900 indexed chunks in /r)\n12|fn a\n40|fn b"
+        );
+        assert!(has_semantic_hits(&compact));
+        for miss in [
+            "ERR: index building, retry shortly",
+            "Semantic search (Hybrid): \"q\" (0 results from 900 indexed chunks in /r)\nNo results found.",
+        ] {
+            assert!(!has_semantic_hits(&serde_json::json!(miss)));
+        }
+    }
+
+    #[test]
+    fn code_search_args_are_semantic_by_default_and_text_as_fallback() {
+        let sem = code_search_args("where is auth handled", "/r", 7, true);
+        assert_eq!(sem["action"], "semantic");
+        assert_eq!(sem["query"], "where is auth handled");
+        assert_eq!(sem["top_k"], 7);
+        assert!(sem.get("pattern").is_none());
+
+        let text = code_search_args("fn auth", "/r", 7, false);
+        assert_eq!(text["pattern"], "fn auth");
+        assert_eq!(text["max_results"], 7);
+        assert!(text.get("action").is_none());
+    }
 
     #[test]
     fn urlencoding_percent_encodes_reserved_bytes() {

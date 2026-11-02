@@ -75,6 +75,9 @@ tools any MCP-capable agent can call:
 | **Git-aware PATH shim** | Impersonates `git`; branch-protection policy resolves against the *target file's own repo*, not the host process's cwd, so a stray write can't land on `master`/`main` from the wrong worktree. |
 | **Comments, labels, projects, webhooks, channel_send** | Threaded discussion on items, categorization, cross-project views, and outbound notifications (Telegram/Slack/Discord). |
 
+See [Git shim workflow](GIT-WORKFLOW.md) for worktree claims, protected-branch
+checkout, scope checks, and approved force-push retries.
+
 A companion crate, `flare-proxy`, provides an Anthropic-compatible HTTP proxy in
 front of alternate/free OpenAI-style providers. The dashboard mounts it at
 `/proxy/v1/messages`; provider routing is configured separately from agent setup.

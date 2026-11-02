@@ -191,6 +191,30 @@ pub(super) fn find_dirs(root: &Path, kinds: &[String]) -> Vec<(PathBuf, &'static
     found
 }
 
+/// Whether `dir` is inside a git work tree: a `.git` (directory, or the file
+/// a linked worktree has) in the directory or any parent, as `git rev-parse
+/// --is-inside-work-tree` answers, without spawning a process.
+fn inside_work_tree(dir: &Path) -> bool {
+    dir.ancestors()
+        .any(|a| std::fs::symlink_metadata(a.join(".git")).is_ok())
+}
+
+/// Whether `path` holds no tracked files and, for names that are also
+/// ordinary source directories, is git-ignored. Asked of the nearest
+/// enclosing repo, so a nested repo answers for its own files.
+fn is_untracked_artifact(path: &Path) -> bool {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
+    else {
+        return false;
+    };
+    let in_repo = inside_work_tree(parent);
+    if in_repo && !run_in(parent, &["ls-files", "--", name]).is_ok_and(|o| o.is_empty()) {
+        return false; // holds tracked files (or git could not say): not an artifact
+    }
+    !AMBIGUOUS.contains(&name)
+        || (in_repo && run_in_ok(parent, &["check-ignore", "-q", "--", name]))
+}
+
 /// A process that is plausibly building in `project`: cwd inside it, not
 /// under a nested `.worktrees` (those are separate checkouts), not a shell.
 pub(super) fn builder<'a>(project: &Path, live: &'a [LiveProc]) -> Option<&'a LiveProc> {
@@ -234,22 +258,13 @@ pub(super) fn scan(input: &ScanInput, kinds: &[String]) -> (Vec<Item>, Vec<Skipp
     let mut skipped = Vec::new();
     let mut kept: Vec<(PathBuf, &'static str, Duration)> = Vec::new();
 
-    for (path, kind) in find_dirs(&root, kinds) {
-        let (Some(parent), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
-        else {
+    let found = find_dirs(&root, kinds);
+    // The git checks spawn processes, one or two per candidate: run them side by side.
+    let untracked = par_map(&found, |(path, _)| is_untracked_artifact(path));
+    for ((path, kind), untracked) in found.into_iter().zip(untracked) {
+        let Some(parent) = path.parent().filter(|_| untracked) else {
             continue;
         };
-        // Asked of the nearest enclosing repo, so a nested repo answers for
-        // its own files.
-        let in_repo = run_in_ok(parent, &["rev-parse", "--is-inside-work-tree"]);
-        if in_repo && !run_in(parent, &["ls-files", "--", name]).is_ok_and(|o| o.is_empty()) {
-            continue; // holds tracked files (or git could not say): not an artifact
-        }
-        if AMBIGUOUS.contains(&name)
-            && !(in_repo && run_in_ok(parent, &["check-ignore", "-q", "--", name]))
-        {
-            continue;
-        }
         // Hard-linked from the shared dependency store: deleting it frees
         // nothing, so it is never offered (item #329).
         if crate::deps::is_provisioned(&path) {
@@ -436,6 +451,20 @@ mod tests {
         touch(&d.path().join("dist/x.js"));
         touch(&d.path().join("node_modules/a/i.js"));
         assert_eq!(labels(d.path(), None, &all(), &[]).0, ["node_modules"]);
+    }
+
+    #[test]
+    fn inside_work_tree_finds_a_git_dir_or_gitfile_in_any_parent() {
+        let d = tempfile::TempDir::new().unwrap();
+        let deep = d.path().join("a/b/c");
+        std::fs::create_dir_all(&deep).unwrap();
+        assert!(!inside_work_tree(&deep));
+        // A linked worktree has a `.git` file, not a directory.
+        std::fs::write(d.path().join("a/.git"), "gitdir: elsewhere\n").unwrap();
+        assert!(inside_work_tree(&deep));
+        assert!(!inside_work_tree(d.path()));
+        std::fs::create_dir(d.path().join(".git")).unwrap();
+        assert!(inside_work_tree(d.path()));
     }
 
     // Review Focus 3

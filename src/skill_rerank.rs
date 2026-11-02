@@ -156,8 +156,8 @@ impl Pending {
             &outcome.response.answers,
             prefix,
             outcome.elapsed_ms,
-            outcome.response.usage.cost,
             outcome.response.model.as_deref(),
+            &outcome.response.usage,
             record,
         )
     }
@@ -165,19 +165,18 @@ impl Pending {
     pub fn finish_error(
         &self,
         err: &DecideError,
+        elapsed_ms: u64,
         record: &dyn Fn(&shadow::Row),
     ) -> Vec<RankedSkill> {
         match err {
-            DecideError::Disabled | DecideError::NoCredentials | DecideError::Unavailable => {
-                self.baseline.clone()
-            }
+            DecideError::Disabled | DecideError::NoCredentials => self.baseline.clone(),
             e => {
-                record(&shadow::Row::failed(
-                    SITE,
-                    &self.prompt,
-                    &names(&self.baseline),
-                    &e.to_string(),
-                ));
+                decide::tracking::failure(
+                    shadow::Row::failed(SITE, &self.prompt, &names(&self.baseline), &e.to_string()),
+                    &self.questions(""),
+                    elapsed_ms,
+                    record,
+                );
                 self.baseline.clone()
             }
         }
@@ -188,8 +187,8 @@ impl Pending {
         answers: &BTreeMap<String, Answer>,
         prefix: &str,
         elapsed_ms: u64,
-        cost: Option<f64>,
         source_model: Option<&str>,
+        usage: &decide::Usage,
         record: &dyn Fn(&shadow::Row),
     ) -> Vec<RankedSkill> {
         let baseline_names = names(&self.baseline);
@@ -200,12 +199,12 @@ impl Pending {
             })
             .collect();
         let Some(probabilities) = probabilities else {
-            record(&shadow::Row::failed(
-                SITE,
-                &self.prompt,
-                &baseline_names,
-                "incomplete answers",
-            ));
+            decide::tracking::failure(
+                shadow::Row::failed(SITE, &self.prompt, &baseline_names, "incomplete answers"),
+                &self.questions(prefix),
+                elapsed_ms,
+                record,
+            );
             return self.baseline.clone();
         };
         let in_baseline = |s: &RankedSkill| self.baseline.iter().any(|b| b.name == s.name);
@@ -225,23 +224,23 @@ impl Pending {
             .iter()
             .map(|p| 2.0 * (p - 0.5).abs())
             .fold(1.0, f64::min);
-        record(&shadow::Row::answered(
+        let row = shadow::Row::answered(
             SITE,
             &self.prompt,
             &baseline_names,
             &names(&picks),
             Some(certainty),
             elapsed_ms,
-            cost,
-        ));
-        if decide::capture::enabled() {
+            usage.cost,
+        );
+        let captured = if decide::capture::enabled() {
             let noul: BTreeMap<&str, f64> = self
                 .candidates
                 .iter()
                 .map(|s| s.name.as_str())
                 .zip(probabilities.iter().copied())
                 .collect();
-            decide::capture::record(decide::capture::Input {
+            Some(decide::capture::Input {
                 site: SITE,
                 features: decide::capture::rerank_features(
                     &self.prompt,
@@ -254,8 +253,27 @@ impl Pending {
                 confidence: Some(certainty),
                 baseline: &baseline_names,
                 source_model,
-            });
-        }
+            })
+        } else {
+            None
+        };
+        let site_answers = answers
+            .iter()
+            .filter(|(id, _)| id.starts_with(prefix))
+            .map(|(id, a)| (id.clone(), a.clone()))
+            .collect();
+        decide::tracking::finish(
+            row,
+            decide::tracking::Context {
+                questions: &self.questions(prefix),
+                answers: &site_answers,
+                source_model,
+                usage,
+                applied: self.mode == Mode::Apply,
+            },
+            captured,
+            record,
+        );
         match self.mode {
             Mode::Apply => picks,
             Mode::Shadow | Mode::Off => self.baseline.clone(),
@@ -315,9 +333,10 @@ fn pick_with_baseline(
         Err(baseline) => return baseline,
     };
     let questions = pending.questions("");
+    let start = std::time::Instant::now();
     match ask(pending.prompt(), &questions) {
         Ok(outcome) => pending.finish_success(&outcome, "", record),
-        Err(err) => pending.finish_error(&err, record),
+        Err(err) => pending.finish_error(&err, start.elapsed().as_millis() as u64, record),
     }
 }
 #[cfg(test)]
@@ -502,10 +521,11 @@ mod tests {
     }
 
     #[test]
-    fn open_breaker_keeps_baseline_without_logging() {
+    fn open_breaker_keeps_baseline_and_tracks_status() {
         let (picked, rows) = run(Mode::Apply, ranked(5), |_, _| Err(DecideError::Unavailable));
         assert_eq!(picked.len(), 3);
-        assert!(rows.is_empty());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].details.status.as_deref(), Some("breaker-open"));
     }
 
     #[test]

@@ -183,8 +183,21 @@ pub fn launch_model(agent: &str, prompt: &str, args: &[String]) -> Option<Select
         role,
         prompt,
         |state, questions| {
-            super::ask_within(state, questions, Duration::from_millis(1500))
-                .map(|outcome| outcome.response)
+            super::tracking::ask_with(
+                "model_routing",
+                "native-default",
+                |out| {
+                    out.response
+                        .answers
+                        .values()
+                        .all(|a| a.confidence().is_some_and(|c| c >= 0.8))
+                },
+                state,
+                questions,
+                || super::ask_within(state, questions, Duration::from_millis(1500)),
+            )
+            .result
+            .map(|outcome| outcome.response)
         },
     )
 }

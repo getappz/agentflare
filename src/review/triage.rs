@@ -278,7 +278,22 @@ pub fn scan(
                 .min(defaults.max_input_bytes),
             ..defaults
         },
-        crate::decide::ask,
+        |state, questions| {
+            crate::decide::tracking::ask_with(
+                "review_triage",
+                "unjudged",
+                |out| {
+                    out.response.answers.values().all(|answer| {
+                        matches!(answer, Answer::Noul { .. })
+                            || answer.confidence().is_some_and(|c| c >= 0.55)
+                    })
+                },
+                state,
+                questions,
+                || crate::decide::ask(state, questions),
+            )
+            .result
+        },
     ))
 }
 
