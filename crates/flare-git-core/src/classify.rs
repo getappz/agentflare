@@ -138,14 +138,18 @@ pub fn extra_trust_root_paths_from_env() -> Vec<String> {
 /// (item #637).
 ///
 /// `AGENTFLARE_GIT_ASSUME_HUMAN`, when set to a non-empty value,
-/// short-circuits this to `false` before either check runs. The detection
-/// walks ancestor processes for agent executables (opencode/claude/cursor/
-/// ...) -- a signal no env var can strip. Test-only escape hatch for suites that
-/// need to prove the human path while running *under* an agent-driven
-/// session themselves (see `flare-git-shim`'s `human_shim` test helper).
+/// short-circuits this to `false` before either check runs -- but ONLY in
+/// debug builds (`cfg!(debug_assertions)`). Release builds ignore it: any
+/// agent could otherwise set it itself and switch off the whole agent gate
+/// (item #647). Test-only escape hatch for suites that need to prove the
+/// human path while running *under* an agent-driven session themselves
+/// (see `flare-git-shim`'s `human_shim` test helper, which runs the debug
+/// binary).
 #[must_use]
 pub fn agent_invocation_detected() -> bool {
-    if std::env::var_os("AGENTFLARE_GIT_ASSUME_HUMAN").is_some_and(|s| !s.is_empty()) {
+    if cfg!(debug_assertions)
+        && std::env::var_os("AGENTFLARE_GIT_ASSUME_HUMAN").is_some_and(|s| !s.is_empty())
+    {
         return false;
     }
     flare_process::is_agent()
