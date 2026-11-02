@@ -11,7 +11,7 @@ use flare_insights::ingest::Adapter;
 use flare_insights::model::{FileEvent, Session, ToolCall, Turn};
 
 /// Sources with a reusable ingest adapter, in auto-detect order.
-pub const SUPPORTED: &[&str] = &["claude_code", "codex", "opencode", "cursor"];
+pub const SUPPORTED: &[&str] = &["claude_code", "codex", "opencode", "cursor", "antigravity"];
 
 /// One foreign session with its parts, ready for [`super::body::build`].
 #[derive(Debug)]
@@ -40,6 +40,7 @@ pub fn normalize_source(input: &str) -> Result<String, String> {
         "opencode" | "oc" => Ok("opencode".into()),
         "gemini" | "gemini-cli" => Ok("gemini".into()),
         "cursor" | "cursor-agent" | "cursor-cli" => Ok("cursor".into()),
+        "antigravity" | "antigravity-cli" => Ok("antigravity".into()),
         "auto" => Ok("auto".into()),
         other => Err(format!(
             "unsupported source '{other}' — use one of: auto, {}",
@@ -63,6 +64,8 @@ fn scan_source(
             flare_insights::ingest::opencode::OpenCodeAdapter.scan(config, &cursors, &mut noop)
         }
         "cursor" => flare_insights::ingest::cursor::CursorAdapter.scan(config, &cursors, &mut noop),
+        "antigravity" => flare_insights::ingest::antigravity::AntigravityAdapter
+            .scan(config, &cursors, &mut noop),
         other => return Err(format!("unsupported source '{other}'")),
     };
     res.map_err(|e| format!("scan {source} failed (schema drift? degrade to manual handoff): {e}"))
@@ -166,6 +169,8 @@ mod tests {
         assert_eq!(normalize_source("cursor").unwrap(), "cursor");
         assert_eq!(normalize_source("cursor-agent").unwrap(), "cursor");
         assert_eq!(normalize_source("cursor-cli").unwrap(), "cursor");
+        assert_eq!(normalize_source("antigravity").unwrap(), "antigravity");
+        assert_eq!(normalize_source("antigravity-cli").unwrap(), "antigravity");
     }
 
     #[test]

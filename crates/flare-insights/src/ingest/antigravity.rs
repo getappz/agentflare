@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -46,6 +47,29 @@ impl Adapter for AntigravityAdapter {
             .map(|e| e.path().to_path_buf())
             .collect();
 
+        let metadata_cursors: Vec<_> = dir
+            .parent()
+            .into_iter()
+            .flat_map(|root| {
+                [
+                    root.join("conversation_summaries.db"),
+                    root.join("conversation_summaries.db-wal"),
+                ]
+            })
+            // Persist absence too: cursors are upsert-only, so a removed WAL
+            // must invalidate once without forcing every later scan to repeat.
+            .map(|path| {
+                let cursor = file_cursor(&path).unwrap_or_default();
+                (path, cursor)
+            })
+            .collect();
+        let metadata_changed = metadata_cursors
+            .iter()
+            .any(|(path, cursor)| cursors.get(path) != Some(cursor));
+        let workspaces = metadata_cursors
+            .first()
+            .map(|(path, _)| native_workspaces(path))
+            .unwrap_or_default();
         let total = files.len();
         let mut bundle = IngestBundle::default();
 
@@ -54,10 +78,22 @@ impl Adapter for AntigravityAdapter {
             let Some(cursor) = file_cursor(path) else {
                 continue;
             };
-            if cursors.get(path) == Some(&cursor) {
+            if cursors.get(path) == Some(&cursor) && !metadata_changed {
                 continue;
             }
-            if let Some(b) = parse_antigravity_jsonl(path, &config.pricing) {
+            if let Some(mut b) = parse_antigravity_jsonl(path, &config.pricing) {
+                for session in &mut b.sessions {
+                    if let Some(workspace) = workspaces
+                        .get(&session.id)
+                        .filter(|_| session.project_path.is_none())
+                    {
+                        session.project = workspace
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| workspace.to_string_lossy().into_owned());
+                        session.project_path = Some(workspace.to_string_lossy().into_owned());
+                    }
+                }
                 bundle.sessions.extend(b.sessions);
                 bundle.turns.extend(b.turns);
                 bundle.tool_calls.extend(b.tool_calls);
@@ -67,8 +103,55 @@ impl Adapter for AntigravityAdapter {
             bundle.file_cursors.push((path.clone(), cursor.0, cursor.1));
         }
 
+        bundle.file_cursors.extend(
+            metadata_cursors
+                .into_iter()
+                .map(|(path, (mtime, size))| (path, mtime, size)),
+        );
         Ok(bundle)
     }
+}
+
+/// Native transcripts may omit workspace hints; the summaries DB retains them.
+/// Missing or changed schemas leave transcript ingestion available as before.
+fn native_workspaces(db: &Path) -> HashMap<String, PathBuf> {
+    let Ok(db) = std::path::absolute(db) else {
+        return HashMap::new();
+    };
+    let Ok(mut uri) = url::Url::from_file_path(&db) else {
+        return HashMap::new();
+    };
+    uri.query_pairs_mut().append_pair("mode", "ro");
+    // A checkpointed WAL-mode DB otherwise gains empty WAL/SHM files even
+    // through a read-only connection. Live WALs must still be read normally.
+    if !db.with_extension("db-wal").exists() {
+        uri.query_pairs_mut().append_pair("immutable", "1");
+    }
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | rusqlite::OpenFlags::SQLITE_OPEN_URI;
+    let Ok(conn) = rusqlite::Connection::open_with_flags(uri.as_str(), flags) else {
+        return HashMap::new();
+    };
+    let Ok(mut stmt) =
+        conn.prepare("SELECT conversation_id, workspace_uris FROM conversation_summaries")
+    else {
+        return HashMap::new();
+    };
+    let Ok(rows) = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    }) else {
+        return HashMap::new();
+    };
+    rows.filter_map(Result::ok)
+        .filter_map(|(id, raw)| {
+            let uris: Vec<String> = serde_json::from_str(&raw).ok()?;
+            let workspace = uris
+                .into_iter()
+                .find_map(|uri| url::Url::parse(&uri).ok()?.to_file_path().ok())?;
+            Some((id, workspace.components().collect()))
+        })
+        .collect()
 }
 
 pub(crate) fn parse_antigravity_jsonl(path: &Path, pricing: &PricingTable) -> Option<IngestBundle> {
@@ -238,7 +321,11 @@ pub(crate) fn parse_antigravity_jsonl(path: &Path, pricing: &PricingTable) -> Op
                     let call_id = format!("{}-{}-{}", id, seq, tool_calls.len());
 
                     // File events
-                    if let Some(path_str) = extract_file_path(call_name, &call_args) {
+                    // Antigravity stores tool args as JSON-encoded strings, so
+                    // string values keep their surrounding quotes.
+                    if let Some(path_str) = extract_file_path(call_name, &call_args)
+                        .map(|p| p.trim_matches('"').to_string())
+                    {
                         file_events.push(FileEvent {
                             id: format!("{}-fe-{}", id, file_events.len()),
                             session_id: id.clone(),
@@ -445,5 +532,143 @@ mod tests {
         let stem_bundle =
             parse_antigravity_jsonl(&stem_path, &PricingTable::default()).expect("stem parsed");
         assert_eq!(stem_bundle.sessions[0].id, "sub-conv-456");
+    }
+
+    #[test]
+    fn antigravity_file_paths_drop_json_string_quotes() {
+        let tmp = TempDir::new().unwrap();
+        let logs = tmp.path().join("conv-q/.system_generated/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let path = logs.join("transcript.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-27T07:55:38Z","tool_calls":[{"name":"read_file","args":{"Path":"\"src/main.rs\""}}]}"#,
+        )
+        .unwrap();
+        let bundle = parse_antigravity_jsonl(&path, &PricingTable::default()).unwrap();
+        assert_eq!(bundle.file_events[0].path, "src/main.rs");
+    }
+
+    #[test]
+    fn antigravity_summary_metadata_restores_workspace_for_cached_transcripts() {
+        let tmp = TempDir::new().unwrap();
+        let brain = tmp.path().join("brain");
+        let logs = brain.join("conv-123/.system_generated/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("transcript.jsonl"),
+            r#"{"type":"USER_INPUT","source":"USER_EXPLICIT","created_at":"2026-10-27T07:55:37Z","content":"<USER_REQUEST>fix duplicate PR detection</USER_REQUEST>"}"#,
+        ).unwrap();
+        let mut config = InsightsConfig::default();
+        config.sources.insert("antigravity".into(), brain);
+        let adapter = AntigravityAdapter;
+        let first = adapter
+            .scan(&config, &Default::default(), &mut |_, _| {})
+            .unwrap();
+        assert!(first.sessions[0].project_path.is_none());
+        let cached: FileCursors = first
+            .file_cursors
+            .into_iter()
+            .map(|(path, mtime, size)| (path, (mtime, size)))
+            .collect();
+
+        let workspace = tmp.path().join("my project");
+        let db = tmp.path().join("conversation_summaries.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE conversation_summaries (conversation_id TEXT, workspace_uris TEXT);",
+        )
+        .unwrap();
+        let uris = serde_json::to_string(&[url::Url::from_directory_path(&workspace)
+            .unwrap()
+            .to_string()])
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversation_summaries VALUES (?1, ?2)",
+            rusqlite::params!["conv-123", uris],
+        )
+        .unwrap();
+        drop(conn);
+        let before = std::fs::read(&db).unwrap();
+
+        let refreshed = adapter.scan(&config, &cached, &mut |_, _| {}).unwrap();
+        assert_eq!(
+            refreshed.sessions.len(),
+            1,
+            "new metadata must refresh a cached transcript"
+        );
+        assert_eq!(
+            refreshed.sessions[0].project_path.as_deref(),
+            workspace.to_str()
+        );
+        assert_eq!(refreshed.sessions[0].project, "my project");
+        assert_eq!(
+            std::fs::read(&db).unwrap(),
+            before,
+            "metadata lookup must be read-only"
+        );
+        let cached: FileCursors = refreshed
+            .file_cursors
+            .into_iter()
+            .map(|(path, mtime, size)| (path, (mtime, size)))
+            .collect();
+        assert!(adapter
+            .scan(&config, &cached, &mut |_, _| {})
+            .unwrap()
+            .sessions
+            .is_empty());
+
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        let updated_workspace = tmp.path().join("updated project");
+        let uris = serde_json::to_string(&[url::Url::from_directory_path(&updated_workspace)
+            .unwrap()
+            .to_string()])
+        .unwrap();
+        conn.execute(
+            "UPDATE conversation_summaries SET workspace_uris = ?1",
+            rusqlite::params![uris],
+        )
+        .unwrap();
+        let wal = tmp.path().join("conversation_summaries.db-wal");
+        assert!(wal.exists());
+        let updated = adapter.scan(&config, &cached, &mut |_, _| {}).unwrap();
+        assert_eq!(
+            updated.sessions[0].project_path.as_deref(),
+            updated_workspace.to_str()
+        );
+        let cached: FileCursors = updated
+            .file_cursors
+            .into_iter()
+            .map(|(path, mtime, size)| (path, (mtime, size)))
+            .collect();
+        drop(conn);
+        assert!(!wal.exists());
+        let checkpointed = adapter.scan(&config, &cached, &mut |_, _| {}).unwrap();
+        assert!(!wal.exists(), "read-only lookup must not recreate a WAL");
+        assert!(!db.with_extension("db-shm").exists());
+        assert_eq!(
+            checkpointed.sessions.len(),
+            1,
+            "WAL removal must refresh once"
+        );
+        let cached: FileCursors = checkpointed
+            .file_cursors
+            .into_iter()
+            .map(|(path, mtime, size)| (path, (mtime, size)))
+            .collect();
+        assert!(adapter
+            .scan(&config, &cached, &mut |_, _| {})
+            .unwrap()
+            .sessions
+            .is_empty());
+
+        std::fs::write(&db, b"unrecognized metadata format").unwrap();
+        let fallback = adapter
+            .scan(&config, &Default::default(), &mut |_, _| {})
+            .unwrap();
+        assert_eq!(fallback.sessions.len(), 1);
+        assert!(fallback.sessions[0].project_path.is_none());
     }
 }
