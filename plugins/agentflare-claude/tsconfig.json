@@ -10,5 +10,5 @@
     "jsxFactory": "h",
     "types": []
   },
-  "include": ["mod", "tests", "types", "../.claude-plugin/types/**/*.d.ts"]
+  "include": ["mod", "tests", "types", ".claude-plugin/types/**/*.d.ts"]
 }

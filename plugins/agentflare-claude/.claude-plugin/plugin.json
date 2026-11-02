@@ -2,8 +2,8 @@
   "name": "agentflare",
   "version": "1.8.1",
   "description": "agentflare autopilot mod: guard, briefing, compaction, spawn, capture and idle work-pull for Claude Code.",
-  "hooks": "./claude/hooks.json",
-  "types": "./claude/types/index.d.ts",
+  "hooks": "./hooks.json",
+  "types": "./types/index.d.ts",
   "mcpServers": {
     "agentflare": { "command": "agentflare", "args": ["mcp"] }
   },

@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Claude plugin with autopilot mod (M1)**: `.claude-plugin/` plus a TypeScript mod under `claude/` for Claude Code 2.1.287+. In-process guard chain, cached briefing as a system-prompt section, compaction checkpoint and re-inject, subagent shaping, turn-end memory capture, and an attended autopilot that pulls the next ready item when idle, controlled with `/flare`. Backed by a new `autopilot` MCP tool (`health`, `check`, `observe`, `briefing`, `checkpoint`, `next_work`).
+- **Claude plugin with autopilot mod (M1)**: `plugins/agentflare-claude/` (its own plugin root; the repository marketplace in `.claude-plugin/marketplace.json` points there, so the Codex `hooks/hooks.json` at the repo root never loads into Claude Code) with a TypeScript mod for Claude Code 2.1.287+. In-process guard chain, cached briefing as a system-prompt section, compaction checkpoint and re-inject, subagent shaping, turn-end memory capture, and an attended autopilot that pulls the next ready item when idle, controlled with `/flare`. Backed by a new `autopilot` MCP tool (`health`, `check`, `observe`, `briefing`, `checkpoint`, `next_work`).
 - `agentflare init --agent claude-code` skips hooks the plugin covers when it is installed; `agentflare doctor` flags duplicates.
 
 ## [1.8.1](https://github.com/getappz/agentflare/compare/v1.7.0...v1.8.1) - 2026-10-06

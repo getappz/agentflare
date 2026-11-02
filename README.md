@@ -348,6 +348,14 @@ process per tool call.
 /plugin install agentflare --marketplace getappz/agentflare
 ```
 
+The plugin lives in its own root, `plugins/agentflare-claude/` (manifest,
+`hooks.json`, the mod under `mod/`, its tests under `tests/`); the repository
+marketplace points there, so the repo-root `hooks/hooks.json` (the Codex
+plugin's) is never loaded into Claude Code. To work on it, run
+`claude --plugin-dir plugins/agentflare-claude`, and check it with
+`claude plugin validate plugins/agentflare-claude` and
+`claude plugin test plugins/agentflare-claude`.
+
 It provides:
 
 - **In-process guards**: the branch guard and related checks run before each tool call; read-only calls can be auto-allowed.

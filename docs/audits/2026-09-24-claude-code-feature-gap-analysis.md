@@ -514,7 +514,7 @@ otherwise open.
 
 ## 8. Addressed by autopilot mod M1
 
-The Claude plugin and its autopilot mod (`.claude-plugin/`, `claude/`) address part of the Layer A gaps. Layer B (headless workers) and Layer C are untouched.
+The Claude plugin and its autopilot mod (`plugins/agentflare-claude/`, listed by `.claude-plugin/marketplace.json`) address part of the Layer A gaps. Layer B (headless workers) and Layer C are untouched.
 
 - **Finding 9 (no Claude plugin)**: closed for Claude Code. A plugin manifest, marketplace install and `userConfig` now exist. The `claude mcp serve` adapter, `--channels`, Agent SDK and GitHub Action items remain open.
 - **Finding 5 (PreCompact no-op, no post-compaction re-inject)**: addressed inside the mod. It writes a checkpoint handoff before compaction and re-injects it afterwards. The wired `PreCompact` command hook in `src/hook.rs` is unchanged, and `SessionStart` still ignores `source` for users without the plugin.

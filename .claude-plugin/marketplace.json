@@ -4,7 +4,7 @@
   "plugins": [
     {
       "name": "agentflare",
-      "source": "./",
+      "source": "./plugins/agentflare-claude",
       "description": "agentflare autopilot mod for Claude Code."
     }
   ]
