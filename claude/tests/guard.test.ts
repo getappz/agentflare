@@ -5,7 +5,7 @@ const VERSION = { value: { version: '2.1.316', base: '2.1.316' } }
 const reply = (body: unknown) => ({ value: { content: [{ type: 'text', text: JSON.stringify(body) }] } })
 
 // Stubs every op the session.start and guard hooks call; tests override mcp.connect/mcp.call.
-function stubSession(on: any, connected = true) {
+function stubSession(on: any, connected = true, server = 'agentflare', tools: unknown[] = []) {
   const clock = mock.clock(on)
   on('command.list', () => ({ value: [] }))
   on('command.register', () => ({ value: { command: 'flare' } }))
@@ -14,7 +14,8 @@ function stubSession(on: any, connected = true) {
   on('session.id', () => ({ value: 's1' }))
   on('ui.log', () => ({ value: {} }))
   on('ui.toast', () => ({ value: {} }))
-  on('mcp.connect', () => ({ value: connected ? { isConnected: true, server: 'agentflare' } : { isConnected: false, reason: 'down' } }))
+  on('mcp.connect', () => ({ value: connected ? { isConnected: true, server } : { isConnected: false, reason: 'failed', message: 'down' } }))
+  on('tool.list', () => ({ value: tools }))
   on('session.start', (_: any, e: any) => ({ cwd: e.cwd }))
   return clock
 }
@@ -135,3 +136,21 @@ test('a gateway call reaches check with every input field intact', async ($, on)
   expect(chk.tool_name).toBe('mcp__flare__tool')
   expect(chk.tool_input).toEqual({ action: 'execute', server: 'leanctx', args: { path: 'C:\repo\a.rs' } })
 })
+
+test('tool.check leaves a self tool to the session rules when the plugin did not raise it', async ($, on) => {
+  stubSession(on, true, 'flare')
+  on('tool.check', () => ({ decision: 'ask' }))
+  await $.session.start(START)
+  expect((await $.tool.check({ tool: 'mcp__flare__autopilot', input: { action: 'check' } })).decision).toBe('ask')
+})
+
+test('a refused connect falls back to a connected server that serves autopilot', async ($, on) => {
+  stubSession(on, false, 'agentflare', [{ name: 'mcp__flare__search', description: '', mcp: true }, { name: 'mcp__flare__autopilot', description: '', mcp: true }])
+  const servers: string[] = []
+  on('mcp.call', (_: any, e: any) => { servers.push(e.server); return reply(e.args.action === 'check' ? { decision: 'allow' } : { etag: 'e0', unchanged: true }) })
+  on('tool.call', () => ({ result: {} }))
+  await $.session.start(START)
+  expect((await $.tool.call({ tool: 'Edit', file_path: '/r/a', old_string: 'a', new_string: 'b' })).deny).toBeUndefined()
+  expect(servers.length > 0 && servers.every(s => s === 'flare')).toBe(true)
+})
+

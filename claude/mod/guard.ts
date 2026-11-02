@@ -1,9 +1,10 @@
 import type { On } from 'claude-code'
-import type { AutopilotClient } from './mcp'
-import { MUTATING_TOOLS, OBSERVED_TOOLS, READ_ONLY_TOOLS } from './policy'
+import { toolName, type AutopilotClient } from './mcp'
+import { MUTATING_TOOLS, OBSERVED_TOOLS, READ_ONLY_TOOLS, SELF_TOOLS } from './policy'
 
 const EXCERPT_MAX = 2000
 const UNAVAILABLE = 'agentflare MCP unavailable; mutating tool refused'
+const PLUGIN = 'agentflare'
 
 /** The last `max` chars of a tool result's text; an exit code is kept by the caller. */
 export function excerpt(result: unknown, max = EXCERPT_MAX): string {
@@ -62,4 +63,16 @@ export function registerGuard(on: On, { client, agent, options }: GuardContext):
   on('tool.check', { tool: [...READ_ONLY_TOOLS] }, ($, e, next) =>
     options.readOnlyAutoAllow ? { decision: 'allow' } : next(e),
   ).catch(() => ({ decision: 'deny' }))
+
+  // The mod's own $.mcp.call rides the tool path and raises tool.check like any call, so headless auto
+  // mode's classifier refuses it and the guard then fails closed on every edit. Allowing it is not a
+  // policy decision: autopilot, memory and get_routing_suggestion on the connected agentflare server are
+  // the mod's control plane (verdicts, briefings, records), never a repo mutation. Only calls this
+  // plugin raised (next.origin) are allowed; the model's own calls to them keep the session's rules.
+  // The name follows the server connect answered, so a deduplicated twin (`flare`) is covered.
+  on('tool.check', ($, e, next) => {
+    const c = client()
+    const own = c !== null && next.origin.plugin === PLUGIN && SELF_TOOLS.some(t => toolName(c.server, t) === e.tool)
+    return own ? { decision: 'allow' } : next(e)
+  }).catch(() => ({ decision: 'deny' }))
 }

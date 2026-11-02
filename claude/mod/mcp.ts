@@ -21,12 +21,26 @@ export type AutopilotClient = {
 }
 
 const TIMED_OUT = Symbol('timed out')
+const AUTOPILOT_TOOL = /^mcp__(.+)__autopilot$/
 
-/** Connects the plugin's own `agentflare` MCP server; null when it is not connected. */
+/** The name the model and tool.check use for `tool` on `server` (`plugin:a:b` spells `plugin_a_b`). */
+export function toolName(server: string, tool: string): string {
+  return `mcp__${server.replace(/[^A-Za-z0-9_-]/g, '_')}__${tool}`
+}
+
+/**
+ * Connects the plugin's own `agentflare` MCP server; null when no server serves `autopilot`.
+ * When the session already runs the same command under another key (a user's `flare`), the engine
+ * suppresses the plugin's copy and connect answers with that key ("Or the name the session already
+ * runs the same server under", claude-code.d.ts McpConnectResult.server). If connect refuses outright,
+ * a connected server that lists an `autopilot` tool is used; $.mcp.call takes the tool-name spelling.
+ */
 export async function connect($: EngineInterface, timeoutMs: number): Promise<AutopilotClient | null> {
   const conn = await $.mcp.connect('agentflare')
-  if (!conn.isConnected) return null
-  const server = conn.server
+  const server = conn.isConnected
+    ? conn.server
+    : (await $.tool.list()).map(t => (t.mcp ? AUTOPILOT_TOOL.exec(t.name)?.[1] : undefined)).find(s => s !== undefined)
+  if (!server) return null
 
   // Every action replies with JSON in the first text block; a slow server is cut off at timeoutMs.
   async function call<T>(action: string, args: Record<string, unknown> = {}): Promise<T> {

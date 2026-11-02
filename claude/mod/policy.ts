@@ -16,6 +16,10 @@ export const MUTATING_TOOLS: readonly string[] = [
   'mcp__flare__item', 'mcp__flare__tool',
 ]
 
+// The tools the mod itself calls on its connected agentflare server (mcp.ts, capture.ts, spawn.ts):
+// agentflare's own control plane, never a repo mutation. Bare names; guard.ts prefixes the server.
+export const SELF_TOOLS: readonly string[] = ['autopilot', 'memory', 'get_routing_suggestion']
+
 // Tools whose result is reported to the server as evidence after they run.
 export const OBSERVED_TOOLS: readonly string[] = [
   'Bash', 'PowerShell', 'mcp__lean-ctx__ctx_shell', 'mcp__flare__tool', 'mcp__flare__item',
