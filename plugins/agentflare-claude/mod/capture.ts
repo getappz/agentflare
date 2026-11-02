@@ -33,7 +33,9 @@ export function registerCapture(on: On, { server, options, current }: CaptureCon
           type: label,
           title,
           content: answer.slice(0, CONTENT_MAX),
-          topic_key: `autopilot:${current().item?.id ?? 'session'}:${label}`,
+          // A shared key upserts; with no project, a null project matches every row. Upsert only
+          // within one item; free-standing captures each get their own row.
+          ...(current().item ? { topic_key: `autopilot:${current().item!.id}:${label}:${title.slice(0, 40)}` } : {}),
         }),
         $.clock.sleep(MEMORY_TIMEOUT_MS).then(() => TIMED_OUT),
       ])

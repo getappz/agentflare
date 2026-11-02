@@ -276,12 +276,19 @@ test('a data-guard deny on Bash refuses it with the server reason', async ($, on
   expect(ran).toBe(false)
 })
 
-test('without a connection a shell tool still runs and a mutating one is refused', async ($, on) => {
+test('without a connection a shell tool and a mutating one are refused', async ($, on) => {
   stubSession(on, false)
   on('tool.call', () => ({ result: {} }))
   await $.session.start(START)
-  expect((await $.tool.call({ tool: 'Bash', command: 'ls' })).deny).toBeUndefined()
+  expect((await $.tool.call({ tool: 'Bash', command: 'ls' })).deny).toContain('unavailable')
   expect((await $.tool.call({ tool: 'mcp__flare__item', action: 'done', id: 'x' } as any)).deny).toBeDefined()
+})
+
+test('tool.check refuses the model writing gate evidence through autopilot', async ($, on) => {
+  stubSession(on, true, 'flare')
+  on('tool.check', () => ({ decision: 'ask' }))
+  await $.session.start(START)
+  expect((await $.tool.check({ tool: 'mcp__flare__autopilot', input: { action: 'observe' } })).decision).toBe('deny')
 })
 
 // I4: only an explicit allow lets a checked tool run.

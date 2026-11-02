@@ -43,7 +43,6 @@ test('auto mode remembers a bugfix with a topic key', async ($, on) => {
     type: 'bugfix',
     title: 'Fixed the race in store::open by adding busy_timeout.',
     content: ANSWER,
-    topic_key: 'autopilot:session:bugfix',
   })
 })
 
@@ -126,7 +125,7 @@ test('a current item keys the memory topic by its id', async () => {
     ui: { log: () => {} },
   }
   await hook($, { reason: 'answer', answer: ANSWER }, async () => ({ text: ANSWER }))
-  expect(calls[0][2].topic_key).toBe('autopilot:itm1:decision')
+  expect(calls[0][2].topic_key).toBe(`autopilot:itm1:decision:${ANSWER.trim().split('\n')[0].slice(0, 40)}`)
 })
 
 test('a throwing memory call still returns the turn result', async ($, on) => {

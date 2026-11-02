@@ -70,6 +70,7 @@ export function registerGuard(on: On, { client, agent, options }: GuardContext):
     // Only a gateway `execute` loses an argument (its inner `tool`); recover it from the transcript,
     // let the flattened args (what actually runs) win, and refuse when it cannot be recovered: without
     // the inner tool, Rust would see a bare gateway call and allow it.
+    // (Without a connection every checked tool, shell included, is refused: no silent allow.)
     let tool_input: Record<string, unknown> = flat
     if (tool === GATEWAY_TOOL && flat.action === 'execute') {
       const recovered = typeof tool_use_id === 'string' ? await originalInput($, tool_use_id, agentId) : null
@@ -81,7 +82,7 @@ export function registerGuard(on: On, { client, agent, options }: GuardContext):
     // Same order and reasons as the PreToolUse hook (redirect, claim, coaching, completion gate),
     // all in Rust. Without a connection only mutating tools are refused; with one, anything but an
     // explicit allow refuses (a failed, timed-out or malformed check included).
-    if (checked.has(tool) && (c || mutating.has(tool))) {
+    if (checked.has(tool)) {
       if (!c) return { deny: UNAVAILABLE }
       let verdict: unknown
       try {
@@ -121,6 +122,14 @@ export function registerGuard(on: On, { client, agent, options }: GuardContext):
     const tool = normalise(e.tool, client()?.server ?? null)
     if (options.readOnlyAutoAllow && readOnly.has(tool)) return { decision: 'allow' }
     const own = next.origin.plugin === PLUGIN && SELF_TOOLS.some(t => tool === `mcp__flare__${t}`)
-    return own ? { decision: 'allow' } : next(e)
+    if (own) return { decision: 'allow' }
+    // The model must not write the gate's evidence, checkpoints or claims itself: only health and
+    // check are read-style; observe/briefing/checkpoint/next_work belong to the mod.
+    if (tool === 'mcp__flare__autopilot') {
+      const ev = e as { input?: { action?: unknown }; action?: unknown }
+      const action = ev.input?.action ?? ev.action
+      if (action !== 'health' && action !== 'check') return { decision: 'deny' }
+    }
+    return next(e)
   }).catch(() => ({ decision: 'deny' }))
 }
