@@ -43,6 +43,7 @@ mod vent;
 pub(crate) mod work;
 mod workflow;
 mod workflow_schedule;
+mod worktree;
 mod wrap;
 
 use clap::builder::styling::{AnsiColor, Effects, Styles};
@@ -107,6 +108,8 @@ pub enum Commands {
     Gateway(gateway::GatewayArgs),
     /// Git helpers for agent worktrees and branch hygiene.
     Git(git::GitArgs),
+    /// Worktree-local helpers (tether dev servers to directory lifetime).
+    Worktree(worktree::WorktreeArgs),
     /// Manage the agentflare MCP server registration for coding agents.
     Mcp(mcp::McpArgs),
     /// Inspect and manage detected coding-agent installs.
@@ -208,6 +211,7 @@ impl Commands {
             Self::Config(cmd) => cmd.run(),
             Self::Gateway(cmd) => cmd.run(),
             Self::Git(cmd) => git::run(cmd),
+            Self::Worktree(cmd) => cmd.run(),
             Self::Mcp(cmd) => cmd.run(),
             Self::Agents(cmd) => cmd.run(),
             Self::Run(cmd) => cmd.run(),
