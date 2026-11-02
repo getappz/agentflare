@@ -25,7 +25,7 @@ impl AgentflareMcp {
         req: &AutopilotRequest,
     ) -> Result<serde_json::Value, ErrorData> {
         let bad = |m: &str| ErrorData::invalid_params(m.to_string(), None);
-        if req.max_cost_usd.is_some_and(|c| !(c >= 0.0)) {
+        if req.max_cost_usd.is_some_and(|c| c.is_nan() || c < 0.0) {
             return Err(bad("max_cost_usd must be >= 0"));
         }
         if req

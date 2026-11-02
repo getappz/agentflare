@@ -305,6 +305,34 @@ pub(crate) fn stale_rules_for_host(host: &str) -> Vec<StaleRule> {
         .collect()
 }
 
+/// One failed check per `MOD_COVERED_EVENTS` entry that `settings` still wires
+/// to an agentflare command while the Claude plugin is installed: the plugin's
+/// mod handles those events, so the settings hook would run a second copy.
+pub fn duplicate_hook_coverage(settings: &serde_json::Value, installed: bool) -> Vec<CheckResult> {
+    if !installed {
+        return Vec::new();
+    }
+    crate::init::MOD_COVERED_EVENTS
+        .iter()
+        .filter(|ev| {
+            settings["hooks"][**ev].as_array().is_some_and(|entries| {
+                entries.iter().any(|e| {
+                    let e = e.to_string();
+                    e.contains("agentflare") && e.contains(" hook ")
+                })
+            })
+        })
+        .map(|ev| CheckResult {
+            host: "claude-code".to_string(),
+            component_id: "duplicate_hook_coverage",
+            ok: false,
+            describe: format!(
+                "{ev} is handled by the agentflare Claude plugin but ~/.claude/settings.json still wires an agentflare hook for it (it runs twice); remove that settings entry"
+            ),
+        })
+        .collect()
+}
+
 /// Hosts to check when `--agent` isn't given: every agent binary actually
 /// detected on PATH — avoids reporting on config for tools the user doesn't
 /// have installed. Presence-only (`detect_present`), not `detect_all`: this
@@ -336,6 +364,16 @@ pub fn run(agent: Option<&str>, json: bool) {
     for host in &hosts {
         checks.extend(check_host(host));
         stale.extend(stale_rules_for_host(host));
+    }
+    if hosts.iter().any(|h| h == "claude-code") {
+        let settings =
+            crate::jsonc::read_json_object(&crate::paths::claude_settings_path(), || {
+                serde_json::json!({})
+            });
+        checks.extend(duplicate_hook_coverage(
+            &settings,
+            crate::init::claude_plugin_installed(),
+        ));
     }
     let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("agentflare"));
     let stale_hooks = stale_hook_binaries(&current_exe, agent);
@@ -459,6 +497,15 @@ mod tests {
     use super::*;
     use crate::components::rule_targets;
     use crate::paths::test_support::with_temp_home;
+
+    #[test]
+    fn doctor_warns_on_duplicate_coverage() {
+        let settings = serde_json::json!({"hooks": {"PreToolUse": [{"hooks": [{"type":"command","command":"\"agentflare\" hook pre-tool-use"}]}]}});
+        let out = duplicate_hook_coverage(&settings, true);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].describe.contains("PreToolUse"));
+        assert!(duplicate_hook_coverage(&settings, false).is_empty());
+    }
 
     #[test]
     fn check_host_reports_rules_missing_when_absent() {

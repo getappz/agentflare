@@ -15,6 +15,9 @@ use serde_json::{Map, Value, json};
 use std::fs;
 use std::path::PathBuf;
 
+mod claude_plugin;
+pub(crate) use claude_plugin::{MOD_COVERED_EVENTS, claude_plugin_installed};
+
 fn cwd() -> PathBuf {
     std::env::current_dir().unwrap_or_default()
 }
@@ -505,9 +508,21 @@ pub(crate) fn claude_hook_specs(bin: &str) -> Vec<ClaudeHookSpec> {
 /// the retired and replacement form side by side. Returns whether anything
 /// changed.
 pub(crate) fn apply_claude_hook_specs(hooks_obj: &mut Map<String, Value>, bin: &str) -> bool {
+    apply_claude_hook_specs_except(hooks_obj, bin, &[])
+}
+
+/// [`apply_claude_hook_specs`] minus the specs whose event is in `skip`.
+fn apply_claude_hook_specs_except(
+    hooks_obj: &mut Map<String, Value>,
+    bin: &str,
+    skip: &[&str],
+) -> bool {
     let mut added =
         remove_hook_entries_matching(hooks_obj, "PostToolUseFailure", "genuine FRICTION");
-    for spec in claude_hook_specs(bin) {
+    for spec in claude_hook_specs(bin)
+        .into_iter()
+        .filter(|s| !skip.contains(&s.event))
+    {
         added |= add_hook_entry(
             hooks_obj,
             spec.event,
@@ -521,6 +536,12 @@ pub(crate) fn apply_claude_hook_specs(hooks_obj: &mut Map<String, Value>, bin: &
 }
 
 fn wire_claude_code() {
+    wire_claude_code_with(claude_plugin_installed());
+}
+
+/// With the Claude plugin installed its mod handles `MOD_COVERED_EVENTS`, so
+/// those command hooks are not written (a second copy would run each twice).
+fn wire_claude_code_with(plugin_installed: bool) {
     let path = claude_settings_path();
     let mut settings = read_json_object(&path, || json!({}));
     let bin = agentflare_binary();
@@ -529,7 +550,17 @@ fn wire_claude_code() {
     let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
     let hooks_obj = hooks.as_object_mut().unwrap();
 
-    let added = apply_claude_hook_specs(hooks_obj, &bin);
+    let skip: &[&str] = if plugin_installed {
+        MOD_COVERED_EVENTS
+    } else {
+        &[]
+    };
+    if plugin_installed {
+        ui::step(
+            "agentflare: Claude plugin detected; PreToolUse/PostToolUse/PostToolUseFailure/PreCompact/Stop/SubagentStart are handled by the mod and were not wired.",
+        );
+    }
+    let added = apply_claude_hook_specs_except(hooks_obj, &bin, skip);
 
     if !added {
         ui::skip("~/.claude/settings.json hooks (already wired)");
@@ -1030,6 +1061,10 @@ fn refresh_optimize_statusline(obj: &mut Map<String, Value>, command: &str) -> b
 }
 
 fn wire_optimize_claude_code() {
+    wire_optimize_claude_code_with(claude_plugin_installed());
+}
+
+fn wire_optimize_claude_code_with(plugin_installed: bool) {
     let path = claude_settings_path();
     let mut settings = read_json_object(&path, || json!({}));
     let bin = agentflare_binary();
@@ -1049,6 +1084,9 @@ fn wire_optimize_claude_code() {
             ("SubagentStart", "subagent-start", 5),
             ("UserPromptSubmit", "prompt-submit", 5),
         ] {
+            if plugin_installed && MOD_COVERED_EVENTS.contains(&event) {
+                continue;
+            }
             changed |= add_hook_entry(
                 hooks_obj,
                 event,
@@ -1301,6 +1339,38 @@ mod tests {
             assert!(content.contains("PreToolUse"));
             assert!(content.contains("PreCompact"));
             assert!(content.contains("PostToolUseFailure"));
+        });
+    }
+
+    fn read_settings() -> Value {
+        let content = fs::read_to_string(home().join(".claude").join("settings.json")).unwrap();
+        serde_json::from_str(&content).unwrap()
+    }
+
+    #[test]
+    fn wire_claude_code_skips_mod_covered_events_when_plugin_installed() {
+        with_temp_home(|| {
+            wire_claude_code_with(true);
+            wire_optimize_claude_code_with(true);
+            let s = read_settings();
+            for ev in MOD_COVERED_EVENTS {
+                assert!(s["hooks"].get(ev).is_none(), "{ev} wired");
+            }
+            assert!(s["hooks"]["SessionStart"].is_array());
+            assert!(s["hooks"]["UserPromptSubmit"].is_array());
+        });
+    }
+
+    #[test]
+    fn wire_claude_code_still_wires_everything_without_the_plugin() {
+        with_temp_home(|| {
+            wire_claude_code_with(false);
+            // SubagentStart is wired by the optimize hooks, not the lifecycle specs.
+            wire_optimize_claude_code_with(false);
+            let s = read_settings();
+            for ev in MOD_COVERED_EVENTS {
+                assert!(s["hooks"][ev].is_array(), "{ev} missing");
+            }
         });
     }
 
