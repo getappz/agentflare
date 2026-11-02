@@ -3,6 +3,16 @@ import type { AutopilotClient } from './mcp'
 
 const SECTION_ID = 'agentflare:briefing'
 const ETAG = { plugin: 'agentflare', key: 'briefingEtag' } as const
+// The server's briefing is the session-start notice, ANSI colors included. Sent bare, the model
+// reads it as more hook output and cannot tell the section apart (probe C3), so it is headed and
+// the terminal escapes are dropped.
+const HEADING = '# agentflare briefing'
+const ANSI = /\x1b\[[0-9;]*m/g
+
+/** The briefing as the system prompt carries it. */
+export function sectionText(raw: string): string {
+  return `${HEADING}\n\n${raw.replace(ANSI, '').trim()}`
+}
 
 type BriefingContext = { client: () => AutopilotClient | null; agent: string }
 
@@ -22,7 +32,7 @@ export async function refreshBriefing($: EngineInterface, { client, agent }: Bri
     const reply = await c.briefing({ cwd, session_id, agent, ...(text !== null && etag ? { etag } : {}) })
     if (typeof reply.etag !== 'string' || reply.etag === etag) return
     if (typeof reply.text !== 'string') return
-    text = reply.text
+    text = sectionText(reply.text)
     etag = reply.etag
     // Informational until the text is persisted too: after a reload `text` is null, so nothing is sent.
     await $.state.set(ETAG, reply.etag)
