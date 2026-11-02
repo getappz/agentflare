@@ -374,6 +374,20 @@ When the plugin is installed, `agentflare init --agent claude-code` skips the
 hooks the mod already covers, and `agentflare doctor` flags any that are wired
 twice. Requires Claude Code 2.1.287 or newer.
 
+Notes:
+
+- If you already configured an MCP server that runs the same `agentflare mcp`
+  command (for example one named `flare`), Claude Code drops the plugin's own
+  copy as a duplicate and the mod talks to yours. Nothing to change; just keep
+  that server pointing at an `agentflare` binary that has the `autopilot` tool.
+- The mod's own calls to that server (`autopilot`, `memory`,
+  `get_routing_suggestion`) are allowed at the permission check, so they work
+  in headless `claude -p` and auto mode without `--allowedTools`. The same tools
+  called by the model keep your normal permission rules.
+- Classic `PreToolUse`/`PostToolUse` command hooks you still have wired run on
+  the mod's own calls too, so leave them unwired (as `init` does) to keep the
+  spawn savings.
+
 ## Inter-agent messaging
 
 Live sessions (Claude Code, Codex, Cursor, daemon-dispatched jobs) and humans
