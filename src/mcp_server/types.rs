@@ -346,7 +346,7 @@ pub(crate) struct ResumeRequest {
     #[serde(default)]
     pub(crate) session: Option<String>,
     #[schemars(
-        description = "Exhausted agent source: auto|claude_code|codex|opencode (aliases cc/claude/oc accepted). Default auto."
+        description = "Exhausted agent source: auto|claude_code|codex|opencode|cursor|antigravity (aliases cc/claude/oc/cursor-cli/antigravity-cli accepted). Default auto."
     )]
     #[serde(default)]
     pub(crate) from: Option<String>,

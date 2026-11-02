@@ -94,7 +94,7 @@ pub enum HandoffCommands {
     Send {
         /// Foreign session id (see `agentflare insights list`).
         session: String,
-        /// Source store: auto|claude_code|codex|opencode (aliases cc/claude/oc).
+        /// Source store: auto|claude_code|codex|opencode|cursor|antigravity (aliases cc/claude/oc/cursor-cli/antigravity-cli).
         #[arg(long, default_value = "auto")]
         source: String,
         /// Receiving agent/runtime.
@@ -123,7 +123,7 @@ pub enum HandoffCommands {
     Apply {
         /// Foreign session id (see `agentflare insights list`).
         session: String,
-        /// Source store: auto|claude_code|codex|opencode (aliases cc/claude/oc).
+        /// Source store: auto|claude_code|codex|opencode|cursor|antigravity (aliases cc/claude/oc/cursor-cli/antigravity-cli).
         #[arg(long, default_value = "auto")]
         source: String,
         /// Receiving agent/runtime (selects AGENTS.md vs CLAUDE.md).
