@@ -22,18 +22,36 @@ let client: AutopilotClient | null = null
 let registered = false
 let warned = false
 
+const DEFAULT_GUARD_TIMEOUT_MS = 3000
+
 export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
+    // A hot reload resets the module flag, so the command list is the real guard against a second /flare.
     if (!registered) {
-      registered = true
-      await $.command.register({ name: 'flare', description: 'agentflare autopilot status and controls' })
-      const { base, version } = await $.session.version()
-      if (isBelowFloor(base ?? version)) {
-        $.ui.toast(`agentflare needs Claude Code ${MIN_VERSION.join('.')} or newer (running ${version}).`)
+      try {
+        const commands = await $.command.list()
+        if (!commands.some(c => c.name.replace(/^\//, '') === 'flare')) {
+          await $.command.register({ name: 'flare', description: 'agentflare autopilot status and controls' })
+        }
+        registered = true
+      } catch (err) {
+        $.ui.log(`agentflare: /flare registration failed: ${String(err)}`)
+      }
+      try {
+        const { base, version } = await $.session.version()
+        if (isBelowFloor(base ?? version)) {
+          $.ui.toast(`agentflare needs Claude Code ${MIN_VERSION.join('.')} or newer (running ${version}).`)
+        }
+      } catch (err) {
+        $.ui.log(`agentflare: version check failed: ${String(err)}`)
       }
     }
     if (!client) {
-      client = await connect($, Number(options.guardTimeoutMs))
+      try {
+        client = await connect($, Number(options.guardTimeoutMs) || DEFAULT_GUARD_TIMEOUT_MS)
+      } catch (err) {
+        $.ui.log(`agentflare: MCP connect failed: ${String(err)}`)
+      }
       if (!client && !warned) {
         warned = true
         $.ui.toast('agentflare MCP server is not connected; autopilot is inactive this session.')
