@@ -173,6 +173,12 @@ impl Registry {
         })
     }
 
+    /// Force the next `ensure_fresh` to rescan, bypassing the debounce — for
+    /// callers that just changed a source on disk (e.g. installed a skill).
+    pub fn invalidate(&mut self) {
+        self.refreshed_once = false;
+    }
+
     /// Rescan sources when never scanned or debounce elapsed. `detect_agents` is
     /// only invoked when a rescan actually happens (not on every debounced call),
     /// so a long-lived cached `Registry` (e.g. mcp_server.rs's per-process cache)

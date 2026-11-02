@@ -337,6 +337,16 @@ impl AgentflareMcp {
         reg.ensure_fresh(crate::components::detected_skill_agents)?;
         Ok(f(reg))
     }
+    /// Make the next `with_fresh_registry` rescan regardless of the debounce
+    /// (call after changing a skill source on disk, e.g. an install).
+    fn invalidate_skill_registry(&self) {
+        if let Ok(mut guard) = self.skills_registry.lock()
+            && let Some(reg) = guard.as_mut()
+        {
+            reg.invalidate();
+        }
+    }
+
     #[tool(
         description = "Detect intent from user prompt and find relevant skills. Returns intent classification + ranked skill matches."
     )]
