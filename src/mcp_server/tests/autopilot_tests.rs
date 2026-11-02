@@ -110,15 +110,17 @@ fn check_allows_read_tools_without_touching_guards() {
 
 #[test]
 fn check_denies_item_done_without_fresh_verification_with_completion_gate_rule() {
-    let (_tmp, s) = harness();
-    let out = check(
-        &s,
-        "mcp__flare__item",
-        json!({"action":"done","id":"abc"}),
-        std::env::temp_dir().as_path(),
-    );
-    assert_eq!(out["decision"], "deny");
-    assert_eq!(out["rule"], "completion_gate");
+    crate::paths::test_support::with_temp_home(|| {
+        let (_tmp, s) = harness();
+        let out = check(
+            &s,
+            "mcp__flare__item",
+            json!({"action":"done","id":"abc"}),
+            std::env::temp_dir().as_path(),
+        );
+        assert_eq!(out["decision"], "deny");
+        assert_eq!(out["rule"], "completion_gate");
+    });
 }
 
 #[test]
@@ -134,7 +136,7 @@ fn check_reason_strings_match_hook_path() {
     );
 }
 
-/// Unique per run: `observe` persists to the real runtime-state file.
+/// Unique per run; callers run inside `with_temp_home`, so the runtime state is a temp file.
 fn uniq_session(tag: &str) -> String {
     let n = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -185,112 +187,153 @@ fn check_done(s: &AgentflareMcp, session: &str, cwd: &std::path::Path) -> serde_
 
 #[test]
 fn observe_passing_cargo_test_records_verification_then_only_review_is_missing() {
-    let (_tmp, s) = harness();
-    let repo = init_temp_repo("task/x");
-    let sid = uniq_session("obs-pass");
-    let out = observe(
-        &s,
-        &sid,
-        repo.path(),
-        "Bash",
-        json!({"command":"cargo test"}),
-        Some(0),
-        "test result: ok. 12 passed",
-    );
-    assert_eq!(out["recorded"], "verification");
-    let chk = check_done(&s, &sid, repo.path());
-    assert_eq!(chk["decision"], "deny");
-    assert!(chk["reason"].as_str().unwrap().contains("review"), "{chk}");
+    crate::paths::test_support::with_temp_home(|| {
+        let (_tmp, s) = harness();
+        let repo = init_temp_repo("task/x");
+        let sid = uniq_session("obs-pass");
+        let out = observe(
+            &s,
+            &sid,
+            repo.path(),
+            "Bash",
+            json!({"command":"cargo test"}),
+            Some(0),
+            "test result: ok. 12 passed",
+        );
+        assert_eq!(out["recorded"], "verification");
+        let chk = check_done(&s, &sid, repo.path());
+        assert_eq!(chk["decision"], "deny");
+        assert!(chk["reason"].as_str().unwrap().contains("review"), "{chk}");
+    });
 }
 
 #[test]
 fn observe_failing_test_is_recorded_as_a_failed_run_and_gate_stays_closed() {
-    let (_tmp, s) = harness();
-    let repo = init_temp_repo("task/x");
-    let sid = uniq_session("obs-fail");
-    let out = observe(
-        &s,
-        &sid,
-        repo.path(),
-        "Bash",
-        json!({"command":"cargo test"}),
-        Some(1),
-        "test result: FAILED",
-    );
-    assert_eq!(out["recorded"], "verification");
-    let reason = check_done(&s, &sid, repo.path())["reason"]
-        .as_str()
-        .unwrap()
-        .to_lowercase();
-    assert!(
-        reason.contains("verif") || reason.contains("test"),
-        "{reason}"
-    );
+    crate::paths::test_support::with_temp_home(|| {
+        let (_tmp, s) = harness();
+        let repo = init_temp_repo("task/x");
+        let sid = uniq_session("obs-fail");
+        let out = observe(
+            &s,
+            &sid,
+            repo.path(),
+            "Bash",
+            json!({"command":"cargo test"}),
+            Some(1),
+            "test result: FAILED",
+        );
+        assert_eq!(out["recorded"], "verification");
+        let reason = check_done(&s, &sid, repo.path())["reason"]
+            .as_str()
+            .unwrap()
+            .to_lowercase();
+        assert!(
+            reason.contains("verif") || reason.contains("test"),
+            "{reason}"
+        );
+    });
 }
 
 #[test]
 fn observe_unrelated_command_records_none() {
-    let (_tmp, s) = harness();
-    let repo = init_temp_repo("task/x");
-    let out = observe(
-        &s,
-        &uniq_session("obs-none"),
-        repo.path(),
-        "Bash",
-        json!({"command":"ls"}),
-        Some(0),
-        "",
-    );
-    assert_eq!(out["recorded"], "none");
+    crate::paths::test_support::with_temp_home(|| {
+        let (_tmp, s) = harness();
+        let repo = init_temp_repo("task/x");
+        let out = observe(
+            &s,
+            &uniq_session("obs-none"),
+            repo.path(),
+            "Bash",
+            json!({"command":"ls"}),
+            Some(0),
+            "",
+        );
+        assert_eq!(out["recorded"], "none");
+    });
 }
 
 #[test]
 fn observe_report_findings_records_review() {
-    let (_tmp, s) = harness();
-    let repo = init_temp_repo("task/x");
-    let out = observe(
-        &s,
-        &uniq_session("obs-review"),
-        repo.path(),
-        "ReportFindings",
-        json!({}),
-        None,
-        "{\"findings\":[]}",
-    );
-    assert_eq!(out["recorded"], "review");
+    crate::paths::test_support::with_temp_home(|| {
+        let (_tmp, s) = harness();
+        let repo = init_temp_repo("task/x");
+        let out = observe(
+            &s,
+            &uniq_session("obs-review"),
+            repo.path(),
+            "ReportFindings",
+            json!({}),
+            None,
+            "{\"findings\":[]}",
+        );
+        assert_eq!(out["recorded"], "review");
+    });
 }
 
 #[test]
 fn observe_and_check_agree_on_the_request_cwd_tree() {
-    let (_tmp, s) = harness();
-    let (a, b) = (init_temp_repo("task/a"), init_temp_repo("task/b"));
-    std::fs::write(b.path().join("diff.txt"), "different tree").unwrap();
-    let sid = uniq_session("obs-cwd");
-    observe(
-        &s,
-        &sid,
-        a.path(),
-        "Bash",
-        json!({"command":"cargo test"}),
-        Some(0),
-        "test result: ok. 1 passed",
-    );
-    observe(&s, &sid, a.path(), "ReportFindings", json!({}), None, "{}");
-    // Same tree the evidence was recorded against: both gates satisfied.
-    let same = check_done(&s, &sid, a.path());
-    assert!(
-        !same["reason"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("review")
-            && !same["reason"]
+    crate::paths::test_support::with_temp_home(|| {
+        let (_tmp, s) = harness();
+        let (a, b) = (init_temp_repo("task/a"), init_temp_repo("task/b"));
+        std::fs::write(b.path().join("diff.txt"), "different tree").unwrap();
+        let sid = uniq_session("obs-cwd");
+        observe(
+            &s,
+            &sid,
+            a.path(),
+            "Bash",
+            json!({"command":"cargo test"}),
+            Some(0),
+            "test result: ok. 1 passed",
+        );
+        observe(&s, &sid, a.path(), "ReportFindings", json!({}), None, "{}");
+        // Same tree the evidence was recorded against: both gates satisfied.
+        let same = check_done(&s, &sid, a.path());
+        assert!(
+            !same["reason"]
                 .as_str()
                 .unwrap_or_default()
-                .to_lowercase()
-                .contains("verif"),
-        "{same}"
-    );
-    // A different tree must see that evidence as stale.
-    let other = check_done(&s, &sid, b.path());
-    assert_eq!(other["decision"], "deny", "{other}");
+                .contains("review")
+                && !same["reason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_lowercase()
+                    .contains("verif"),
+            "{same}"
+        );
+        // A different tree must see that evidence as stale.
+        let other = check_done(&s, &sid, b.path());
+        assert_eq!(other["decision"], "deny", "{other}");
+    });
+}
+
+#[test]
+fn autopilot_tests_do_not_touch_the_real_runtime_state() {
+    // Real path built straight from the OS home, bypassing the override.
+    let real_path = dirs::home_dir()
+        .unwrap()
+        .join(".agentflare")
+        .join("runtime-state.json");
+    let snap = || {
+        std::fs::metadata(&real_path)
+            .ok()
+            .map(|m| (m.len(), m.modified().ok()))
+    };
+    let before = snap();
+    let (_tmp, s) = harness();
+    let repo = init_temp_repo("task/x");
+    crate::paths::test_support::with_temp_home(|| {
+        observe(
+            &s,
+            &uniq_session("iso"),
+            repo.path(),
+            "ReportFindings",
+            json!({}),
+            None,
+            "{}",
+        );
+        assert!(crate::optimize::runtime_state_path().exists());
+        assert_ne!(crate::optimize::runtime_state_path(), real_path);
+    });
+    assert_eq!(snap(), before);
 }
