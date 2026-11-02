@@ -2,6 +2,81 @@
 
 use super::*;
 
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct CheckpointItem {
+    #[serde(default)]
+    pub id: String,
+    pub seq: Option<i64>,
+    #[serde(default)]
+    pub title: String,
+}
+
+/// Session state the mod hands over before compaction.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct CheckpointPayload {
+    pub item: Option<CheckpointItem>,
+    pub branch: Option<String>,
+    pub worktree: Option<String>,
+    #[serde(default)]
+    pub verification_fresh: bool,
+    #[serde(default)]
+    pub review_fresh: bool,
+    #[serde(default)]
+    pub decisions: Vec<String>,
+    #[serde(default)]
+    pub remaining: Vec<String>,
+}
+
+/// Re-inject text for a checkpoint; pure so it works with or without memory.
+pub fn checkpoint_text(p: &CheckpointPayload) -> String {
+    let mut t = String::from("[agentflare checkpoint]");
+    if let Some(i) = &p.item {
+        let n = i.seq.map_or_else(|| i.id.clone(), |s| format!("#{s}"));
+        t.push_str(&format!(
+            "
+item: {n} {}",
+            i.title
+        ));
+    }
+    if let Some(b) = &p.branch {
+        t.push_str(&format!(
+            "
+branch: {b}"
+        ));
+    }
+    if let Some(w) = &p.worktree {
+        t.push_str(&format!(
+            "
+worktree: {w}"
+        ));
+    }
+    t.push_str(&format!(
+        "
+gates: tests {}, review {}",
+        if p.verification_fresh {
+            "fresh"
+        } else {
+            "stale"
+        },
+        if p.review_fresh { "fresh" } else { "stale" }
+    ));
+    for (label, list) in [("decisions", &p.decisions), ("remaining", &p.remaining)] {
+        if !list.is_empty() {
+            t.push_str(&format!(
+                "
+{label}:"
+            ));
+            for x in list {
+                t.push_str(&format!(
+                    "
+- {x}"
+                ));
+            }
+        }
+    }
+    t
+}
+
 impl AgentflareMcp {
     pub fn autopilot_impl(&self, req: AutopilotRequest) -> Result<String, ErrorData> {
         match req.action.as_str() {
@@ -9,6 +84,7 @@ impl AgentflareMcp {
             "check" => Ok(Self::autopilot_check(&req).to_string()),
             "observe" => Ok(Self::autopilot_observe(&req).to_string()),
             "briefing" => Ok(self.autopilot_briefing(&req).to_string()),
+            "checkpoint" => Self::autopilot_checkpoint(&req).map(|v| v.to_string()),
             other => Err(ErrorData::invalid_params(
                 format!(
                     "unknown autopilot action `{other}` (expected check|observe|briefing|checkpoint|next_work|health)"
@@ -187,6 +263,40 @@ impl AgentflareMcp {
             return serde_json::json!({ "etag": etag, "unchanged": true });
         }
         serde_json::json!({ "etag": etag, "text": text })
+    }
+
+    /// Stores a memory handoff and returns the re-inject text. A failed
+    /// memory write yields `handoff_id: null` -- never an error, since the mod
+    /// must always get a checkpoint to re-inject. The id is the session id
+    /// (handoffs are keyed by it).
+    fn autopilot_checkpoint(req: &AutopilotRequest) -> Result<serde_json::Value, ErrorData> {
+        let bad = |m: &str| ErrorData::invalid_params(m.to_string(), None);
+        let sid = req
+            .session_id
+            .clone()
+            .ok_or_else(|| bad("session_id is required"))?;
+        let payload: CheckpointPayload = serde_json::from_value(
+            req.payload
+                .clone()
+                .ok_or_else(|| bad("payload is required"))?,
+        )
+        .map_err(|e| bad(&format!("invalid payload: {e}")))?;
+        let text = checkpoint_text(&payload);
+        let strs = |v: &[String]| Some(v.iter().map(|s| serde_json::json!(s)).collect());
+        let stored = crate::memory::mcp::handle_handoff(crate::memory::mcp::HandoffInput {
+            session_id: sid.clone(),
+            summary: text.clone(),
+            findings: None,
+            decisions: strs(&payload.decisions),
+            files_touched: None,
+            evidence: None,
+            completed: None,
+            remaining: strs(&payload.remaining),
+            source_ref: Some(format!("claude_code:{sid}")),
+            dropped_fields: None,
+        });
+        let handoff_id = stored.ok().map(|_| sid);
+        Ok(serde_json::json!({ "handoff_id": handoff_id, "text": text }))
     }
 
     /// Memory recall for "<repo> <cwd basename>"; any failure or empty result

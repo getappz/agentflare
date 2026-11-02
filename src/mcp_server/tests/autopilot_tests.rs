@@ -389,3 +389,96 @@ fn briefing_names_the_active_claim_for_cwd() {
         assert!(out["text"].as_str().unwrap().contains(&item_id), "{out}");
     });
 }
+
+fn checkpoint_req(session: Option<&str>, payload: Option<serde_json::Value>) -> AutopilotRequest {
+    AutopilotRequest {
+        action: "checkpoint".into(),
+        session_id: session.map(Into::into),
+        payload,
+        ..Default::default()
+    }
+}
+
+fn full_payload() -> serde_json::Value {
+    json!({
+        "item": {"id": "abc-123", "seq": 42, "title": "Do the thing"},
+        "branch": "feat/x",
+        "worktree": "/w/x",
+        "verification_fresh": true,
+        "review_fresh": false,
+        "decisions": ["use sqlite"],
+        "remaining": ["write docs"]
+    })
+}
+
+#[test]
+fn checkpoint_without_payload_or_session_is_invalid_params() {
+    let (_tmp, s) = harness();
+    for req in [
+        checkpoint_req(Some("s"), None),
+        checkpoint_req(None, Some(full_payload())),
+    ] {
+        let err = s.autopilot_impl(req).unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    }
+}
+
+#[test]
+fn checkpoint_text_lists_item_branch_gates_decisions_and_remaining() {
+    let p: super::super::autopilot::CheckpointPayload =
+        serde_json::from_value(full_payload()).unwrap();
+    let t = super::super::autopilot::checkpoint_text(&p);
+    assert!(t.starts_with("[agentflare checkpoint]"), "{t}");
+    for needle in [
+        "#42",
+        "feat/x",
+        "/w/x",
+        "tests fresh",
+        "review stale",
+        "use sqlite",
+        "write docs",
+    ] {
+        assert!(t.contains(needle), "missing {needle} in {t}");
+    }
+}
+
+#[test]
+fn checkpoint_stores_handoff_and_returns_text() {
+    crate::paths::test_support::with_temp_home(|| {
+        let (_tmp, s) = harness();
+        let sid = uniq_session("ckpt");
+        let out: serde_json::Value = serde_json::from_str(
+            &s.autopilot_impl(checkpoint_req(Some(&sid), Some(full_payload())))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["handoff_id"], sid.as_str());
+        assert!(
+            out["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("[agentflare checkpoint]")
+        );
+    });
+}
+
+#[test]
+fn checkpoint_still_returns_text_when_memory_write_fails() {
+    crate::paths::test_support::with_temp_home(|| {
+        let (_tmp, s) = harness();
+        // A directory where brain.db should be makes the memory open fail.
+        std::fs::create_dir_all(crate::memory::store::brain_db_path()).unwrap();
+        let out: serde_json::Value = serde_json::from_str(
+            &s.autopilot_impl(checkpoint_req(Some("s-fail"), Some(full_payload())))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(out["handoff_id"].is_null(), "{out}");
+        assert!(
+            out["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("[agentflare checkpoint]")
+        );
+    });
+}
