@@ -23,6 +23,16 @@ pub(crate) fn worktree_removal_detected(path: &Path) -> Option<bool> {
     }
 }
 
+/// Like `worktree_removal_detected`, but a root that still exists counts as removed once the
+/// `.git` marker it had at spawn is gone. On Windows the child's cwd pins the root directory, so
+/// removing the worktree deletes its contents yet leaves the empty directory behind.
+fn root_removed(path: &Path, had_git_marker: bool) -> Option<bool> {
+    match worktree_removal_detected(path) {
+        Some(false) if had_git_marker && !path.join(".git").exists() => Some(true),
+        other => other,
+    }
+}
+
 fn spawn_tethered_child(
     worktree_root: &Path,
     program: &std::ffi::OsStr,
@@ -70,6 +80,7 @@ pub fn run_tether(
     args: &[&std::ffi::OsStr],
 ) -> Result<i32, String> {
     let watch = worktree_removal_detected(worktree_root).is_some();
+    let had_git_marker = worktree_root.join(".git").exists();
     let mut child = spawn_tethered_child(worktree_root, program, args)?;
     if !watch {
         let status = child.wait().map_err(|e| format!("tether: wait: {e}"))?;
@@ -83,7 +94,7 @@ pub fn run_tether(
     let finished_reaper = Arc::clone(&finished);
     let reaper = std::thread::spawn(move || {
         while !finished_reaper.load(Ordering::Relaxed) {
-            match worktree_removal_detected(&root) {
+            match root_removed(&root, had_git_marker) {
                 Some(true) => {
                     kill_if_running(&slot_reaper);
                     break;

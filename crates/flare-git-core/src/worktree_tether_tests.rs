@@ -56,6 +56,13 @@ fn tether_spawn_failure_is_reported() {
 fn tether_kills_child_when_worktree_root_removed() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path().to_path_buf();
+    // A worktree root has a `.git` entry; on Windows the child's cwd keeps the emptied root alive.
+    std::fs::write(
+        root.join(".git"),
+        "gitdir: elsewhere
+",
+    )
+    .unwrap();
     let root_rm = root.clone();
     #[cfg(windows)]
     let (program, args): (&OsStr, Vec<&OsStr>) = (
@@ -64,10 +71,17 @@ fn tether_kills_child_when_worktree_root_removed() {
     );
     #[cfg(unix)]
     let (program, args): (&OsStr, Vec<&OsStr>) = (OsStr::new("sleep"), vec![OsStr::new("120")]);
+    let started = std::time::Instant::now();
     let handle = std::thread::spawn(move || run_tether(&root, program, &args));
     std::thread::sleep(Duration::from_millis(800));
     let _ = std::fs::remove_dir_all(&root_rm);
     let result = handle.join().expect("tether thread panicked");
+    // The child sleeps for 120 s: returning early proves it was killed, not outlived.
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "child was not killed: {:?}",
+        started.elapsed()
+    );
     assert!(result.is_ok(), "tether returned error: {result:?}");
     #[cfg(windows)]
     assert_no_surviving_process("ping.exe", "127.0.0.1");
