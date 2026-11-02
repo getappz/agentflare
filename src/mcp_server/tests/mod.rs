@@ -223,7 +223,7 @@ fn skill_load_auto_installs_from_a_configured_registry_and_says_so() {
     )
     .unwrap();
     let registry = reg.path().to_string_lossy().to_string();
-    let out = load_skill_isolated(&[registry.clone()], "zz-auto").unwrap();
+    let out = load_skill_isolated(std::slice::from_ref(&registry), "zz-auto").unwrap();
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["name"], "zz-auto");
     assert_eq!(v["installed_from_registry"], registry.as_str());

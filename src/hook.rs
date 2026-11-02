@@ -256,10 +256,6 @@ fn extract_prompt_raw(input: &str) -> String {
         .unwrap_or_default()
 }
 
-fn extract_prompt(input: &str) -> String {
-    extract_prompt_raw(input).to_lowercase()
-}
-
 struct PreToolUseInput {
     session_id: String,
     tool_name: String,
@@ -1109,6 +1105,10 @@ pub fn prompt_submit(agent: &str) {
 #[allow(unsafe_code)]
 mod tests {
     use super::*;
+
+    fn extract_prompt(input: &str) -> String {
+        extract_prompt_raw(input).to_lowercase()
+    }
 
     #[test]
     fn read_stdin_timeout_does_not_panic() {

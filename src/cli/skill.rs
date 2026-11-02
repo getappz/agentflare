@@ -211,11 +211,46 @@ pub(crate) async fn install_from_registries(
             Ok(true) => return Ok(Some(redact_url_credentials(url))),
             Ok(false) => {}
             Err(e) => {
-                first_err.get_or_insert(e);
+                first_err.get_or_insert(redact_skill_error(e));
             }
         }
     }
     first_err.map_or(Ok(None), Err)
+}
+
+fn redact_skill_error(e: skill::error::SkillError) -> skill::error::SkillError {
+    use skill::error::SkillError;
+    match e {
+        SkillError::GitClone { url, message } => SkillError::GitClone {
+            url: redact_url_credentials(&url),
+            message: redact_credentials_in_message(&message),
+        },
+        other => other,
+    }
+}
+
+fn redact_credentials_in_message(message: &str) -> String {
+    message
+        .split_whitespace()
+        .map(|w| {
+            let end = w
+                .char_indices()
+                .rev()
+                .find(|(_, c)| {
+                    c.is_ascii_alphanumeric()
+                        || matches!(c, '-' | '_' | '.' | '/' | ':' | '@')
+                })
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(0);
+            let (core, tail) = w.split_at(end);
+            if core.contains("://") {
+                format!("{}{}", redact_url_credentials(core), tail)
+            } else {
+                w.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// `url` without any `user[:password]@` in its authority, so a registry
