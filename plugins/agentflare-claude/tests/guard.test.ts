@@ -89,6 +89,13 @@ test('tool.check allows a read-only tool and denies on failure', async ($, on) =
   expect((await $.tool.check({ tool: 'Bash', command: 'ls' })).decision).not.toBe('allow')
 })
 
+test('read-only auto-allow upgrades an ask but never overrides a deny', async ($, on) => {
+  stubSession(on)
+  on('tool.check', () => ({ decision: 'deny' }))
+  await $.session.start(START)
+  expect((await $.tool.check({ tool: 'Grep', pattern: 'x' })).decision).toBe('deny')
+})
+
 function observeSetup(on: any, handler: () => unknown) {
   stubSession(on)
   const seen: any[] = []

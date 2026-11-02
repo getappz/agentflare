@@ -112,16 +112,20 @@ export function registerGuard(on: On, { client, agent, options }: GuardContext):
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'agentflare guard failed closed' }))
 
   // One unmatched hook (names are normalised, so a static matcher cannot list every spelling):
-  // 1. Read-only tools are allowed when readOnlyAutoAllow is on.
+  // 1. Read-only tools that would otherwise ask are allowed when readOnlyAutoAllow is on.
   // 2. The mod's own $.mcp.call rides the tool path and raises tool.check like any call, so headless
   //    auto mode's classifier refuses it and the guard then fails closed on every edit. Allowing it is
   //    not a policy decision: autopilot, memory and get_routing_suggestion on agentflare's server are
   //    the mod's control plane (verdicts, briefings, records), never a repo mutation. Only calls this
   //    plugin raised (next.origin) are allowed; the model's own calls to them keep the session's rules.
   //    No client is needed yet: connect's fallback health check runs before one exists.
-  on('tool.check', ($, e, next) => {
+  on('tool.check', async ($, e, next) => {
     const tool = normalise(e.tool, client()?.server ?? null)
-    if (options.readOnlyAutoAllow && readOnly.has(tool)) return { decision: 'allow' }
+    if (options.readOnlyAutoAllow && readOnly.has(tool)) {
+      // Session rules and earlier hooks decide first: a deny stays a deny, only an ask is upgraded.
+      const r = await next(e)
+      return r.decision === 'ask' ? { decision: 'allow' } : r
+    }
     const own = next.origin.plugin === PLUGIN && SELF_TOOLS.some(t => tool === `mcp__flare__${t}`)
     if (own) return { decision: 'allow' }
     // The model must not write the gate's evidence, checkpoints or claims itself: only health and

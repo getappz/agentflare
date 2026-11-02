@@ -316,9 +316,15 @@ pub fn duplicate_hook_coverage(settings: &serde_json::Value, installed: bool) ->
         .iter()
         .filter(|ev| {
             settings["hooks"][**ev].as_array().is_some_and(|entries| {
+                // Both markers must sit in the same handler command, not merely in the same entry.
                 entries.iter().any(|e| {
-                    let e = e.to_string();
-                    e.contains("agentflare") && e.contains(" hook ")
+                    e["hooks"].as_array().is_some_and(|handlers| {
+                        handlers.iter().any(|h| {
+                            h["command"]
+                                .as_str()
+                                .is_some_and(|c| c.contains("agentflare") && c.contains(" hook "))
+                        })
+                    })
                 })
             })
         })
@@ -511,6 +517,12 @@ mod tests {
             "PostToolUseFailure": [{"hooks": [{"type":"command","command":"\"agentflare\" hook post-tool-failure"}]}],
         }});
         assert!(duplicate_hook_coverage(&kept, true).is_empty());
+        // "agentflare" and " hook " in different handlers of one entry are not one agentflare hook.
+        let split = serde_json::json!({"hooks": {"PreToolUse": [{"hooks": [
+            {"type":"command","command":"agentflare-notes.sh"},
+            {"type":"command","command":"my-tool hook check"},
+        ]}]}});
+        assert!(duplicate_hook_coverage(&split, true).is_empty());
     }
 
     #[test]
