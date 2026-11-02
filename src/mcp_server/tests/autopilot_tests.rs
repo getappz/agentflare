@@ -310,30 +310,82 @@ fn observe_and_check_agree_on_the_request_cwd_tree() {
 #[test]
 fn autopilot_tests_do_not_touch_the_real_runtime_state() {
     // Real path built straight from the OS home, bypassing the override.
+    // A live agent session may rewrite this file, so prove isolation by the
+    // unique session id never appearing in it, not by mtime.
     let real_path = dirs::home_dir()
         .unwrap()
         .join(".agentflare")
         .join("runtime-state.json");
-    let snap = || {
-        std::fs::metadata(&real_path)
-            .ok()
-            .map(|m| (m.len(), m.modified().ok()))
-    };
-    let before = snap();
     let (_tmp, s) = harness();
     let repo = init_temp_repo("task/x");
+    let sid = uniq_session("iso");
     crate::paths::test_support::with_temp_home(|| {
         observe(
             &s,
-            &uniq_session("iso"),
+            &sid,
             repo.path(),
             "ReportFindings",
             json!({}),
             None,
             "{}",
         );
-        assert!(crate::optimize::runtime_state_path().exists());
-        assert_ne!(crate::optimize::runtime_state_path(), real_path);
+        let temp_path = crate::optimize::runtime_state_path();
+        assert_ne!(temp_path, real_path);
+        assert!(std::fs::read_to_string(&temp_path).unwrap().contains(&sid));
     });
-    assert_eq!(snap(), before);
+    let real = std::fs::read_to_string(&real_path).unwrap_or_default();
+    assert!(
+        !real.contains(&sid),
+        "test leaked into the real runtime state"
+    );
+}
+
+fn briefing_in(s: &AgentflareMcp, etag: Option<&str>, cwd: &std::path::Path) -> serde_json::Value {
+    let out = s
+        .autopilot_impl(AutopilotRequest {
+            action: "briefing".into(),
+            cwd: Some(cwd.display().to_string()),
+            agent: Some("claude-code".into()),
+            etag: etag.map(Into::into),
+            ..Default::default()
+        })
+        .unwrap();
+    serde_json::from_str(&out).unwrap()
+}
+
+fn briefing(s: &AgentflareMcp, etag: Option<&str>) -> serde_json::Value {
+    briefing_in(s, etag, std::env::temp_dir().as_path())
+}
+
+#[test]
+fn briefing_returns_text_and_stable_etag() {
+    crate::paths::test_support::with_temp_home(|| {
+        let (_tmp, s) = harness();
+        briefing(&s, None); // first call may apply one-time component setup lines
+        let a = briefing(&s, None);
+        let b = briefing(&s, None);
+        assert_eq!(a["etag"], b["etag"]);
+        assert!(a["text"].as_str().unwrap().contains("agentflare"));
+    });
+}
+
+#[test]
+fn briefing_with_matching_etag_is_unchanged() {
+    crate::paths::test_support::with_temp_home(|| {
+        let (_tmp, s) = harness();
+        briefing(&s, None); // first call may apply one-time component setup lines
+        let a = briefing(&s, None);
+        let b = briefing(&s, a["etag"].as_str());
+        assert_eq!(b["unchanged"], true);
+        assert!(b.get("text").is_none());
+    });
+}
+
+#[test]
+fn briefing_names_the_active_claim_for_cwd() {
+    crate::paths::test_support::with_temp_home(|| {
+        let (s, _tmp, _repo, item_id, _project, wt_path) = super::mcp_with_claimed_item("brief");
+        let out = briefing_in(&s, None, &wt_path);
+        assert!(out["text"].as_str().unwrap().contains(&item_id), "{out}");
+    });
 }

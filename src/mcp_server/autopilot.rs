@@ -8,6 +8,7 @@ impl AgentflareMcp {
             "health" => Ok(Self::autopilot_health().to_string()),
             "check" => Ok(Self::autopilot_check(&req).to_string()),
             "observe" => Ok(Self::autopilot_observe(&req).to_string()),
+            "briefing" => Ok(self.autopilot_briefing(&req).to_string()),
             other => Err(ErrorData::invalid_params(
                 format!(
                     "unknown autopilot action `{other}` (expected check|observe|briefing|checkpoint|next_work|health)"
@@ -162,6 +163,49 @@ impl AgentflareMcp {
             }
         }
         serde_json::json!({ "decision": "allow" })
+    }
+
+    /// Session briefing text with a content etag; `unchanged` when the caller's
+    /// etag still matches so the mod can skip re-injecting it.
+    fn autopilot_briefing(&self, req: &AutopilotRequest) -> serde_json::Value {
+        use sha2::{Digest, Sha256};
+        let agent = req.agent.as_deref().unwrap_or("claude");
+        let cwd = req.cwd.as_deref().map(std::path::Path::new);
+        let recall = Self::briefing_recall(cwd);
+        let db_path = self
+            .backend_db_override
+            .clone()
+            .unwrap_or_else(|| crate::paths::agentflare_dir().join("backend.db"));
+        let text = crate::hook::briefing_text_in(agent, cwd, recall.as_deref(), &db_path);
+        let etag = Sha256::digest(text.as_bytes())
+            .iter()
+            .fold(String::new(), |mut s, b| {
+                s.push_str(&format!("{b:02x}"));
+                s
+            });
+        if req.etag.as_deref() == Some(etag.as_str()) {
+            return serde_json::json!({ "etag": etag, "unchanged": true });
+        }
+        serde_json::json!({ "etag": etag, "text": text })
+    }
+
+    /// Memory recall for "<repo> <cwd basename>"; any failure or empty result
+    /// is silently omitted -- the briefing must never fail because memory is down.
+    fn briefing_recall(cwd: Option<&std::path::Path>) -> Option<String> {
+        let base = cwd?.file_name()?.to_string_lossy().into_owned();
+        let query = match crate::claims::resolve_repo(None) {
+            Some(repo) => format!("{repo} {base}"),
+            None => base,
+        };
+        crate::memory::mcp::handle_recall(crate::memory::mcp::RecallInput {
+            query: Some(query),
+            id: None,
+            r#type: None,
+            project: None,
+            limit: Some(5),
+        })
+        .ok()
+        .filter(|r| !matches!(r.trim(), "" | "[]"))
     }
 
     /// Resolve a relative target path against `cwd`; a mutating tool with no
