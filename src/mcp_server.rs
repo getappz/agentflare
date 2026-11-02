@@ -321,6 +321,23 @@ impl AgentflareMcp {
         &self,
         f: impl FnOnce(&skill_registry::Registry) -> T,
     ) -> crate::errors::Result<T> {
+        self.with_fresh_registry_inner(false, f)
+    }
+
+    /// Like `with_fresh_registry`, but bypasses `ensure_fresh`'s debounce so a
+    /// skill just written under `~/.agentflare/skills` is visible immediately.
+    fn with_forced_fresh_registry<T>(
+        &self,
+        f: impl FnOnce(&skill_registry::Registry) -> T,
+    ) -> crate::errors::Result<T> {
+        self.with_fresh_registry_inner(true, f)
+    }
+
+    fn with_fresh_registry_inner<T>(
+        &self,
+        force: bool,
+        f: impl FnOnce(&skill_registry::Registry) -> T,
+    ) -> crate::errors::Result<T> {
         let mut guard = self
             .skills_registry
             .lock()
@@ -334,6 +351,9 @@ impl AgentflareMcp {
             *guard = Some(reg);
         }
         let reg = guard.as_mut().expect("just initialized above");
+        if force {
+            reg.invalidate();
+        }
         reg.ensure_fresh(crate::components::detected_skill_agents)?;
         Ok(f(reg))
     }
