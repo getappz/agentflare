@@ -8,7 +8,6 @@ const reply = (body: unknown) => ({ value: { content: [{ type: 'text', text: JSO
 // Stubs every op the session.start and briefing hooks call; tests override mcp.call.
 function stubSession(on: any, connected = true) {
   mock.clock(on)
-  let stored: string | undefined
   on('command.list', () => ({ value: [] }))
   on('command.register', () => ({ value: { command: 'flare' } }))
   on('session.version', () => ({ value: { version: '2.1.316', base: '2.1.316' } }))
@@ -18,8 +17,7 @@ function stubSession(on: any, connected = true) {
   on('ui.toast', () => ({ value: {} }))
   on('mcp.connect', () => ({ value: connected ? { isConnected: true, server: 'agentflare' } : { isConnected: false, reason: 'down' } }))
   on('session.start', (_: any, e: any) => ({ cwd: e.cwd }))
-  on('state.get', () => ({ value: { value: stored, version: 1 } }))
-  on('state.set', (_: any, e: any) => { stored = e.value; return { value: { isSet: true, version: 2 } } })
+  on('state.set', () => ({ value: { isSet: true, version: 2 } }))
   on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'core', scope: 'shared' }] }))
 }
 

@@ -131,10 +131,10 @@ test('a review submit is observed with item_action and item_success', async ($, 
 test('a gateway call reaches check with every input field intact', async ($, on) => {
   const seen = observeSetup(on, () => ({ result: {} }))
   await $.session.start(START)
-  await $.tool.call({ tool: 'mcp__flare__tool', action: 'execute', server: 'leanctx', args: { path: 'C:\repo\a.rs' } })
+  await $.tool.call({ tool: 'mcp__flare__tool', action: 'execute', server: 'leanctx', args: { path: 'C:\\repo\\a.rs' } })
   const chk = seen.find(a => a.action === 'check')
   expect(chk.tool_name).toBe('mcp__flare__tool')
-  expect(chk.tool_input).toEqual({ action: 'execute', server: 'leanctx', args: { path: 'C:\repo\a.rs' } })
+  expect(chk.tool_input).toEqual({ action: 'execute', server: 'leanctx', args: { path: 'C:\\repo\\a.rs' } })
 })
 
 test('a gateway call checks the inner tool recovered from the transcript', async ($, on) => {

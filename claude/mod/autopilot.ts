@@ -110,10 +110,11 @@ function armIdleTimer($: EngineInterface): void {
   timer = $.clock.after(ctx.options.idleMinutes * 60_000, () => void pollAndRearm($))
 }
 
-// Anything but a wake re-polls after another idle period; a wake's own turn.complete re-arms.
+// Every result re-polls after another idle period. A wake re-arms too: its prompt may be rejected
+// (no turn.complete then), and a turn that does run cancels and re-arms the timer itself.
 async function pollAndRearm($: EngineInterface): Promise<void> {
-  const result = await guardedStep($)
-  if (mode !== 'off' && result !== 'woke') armIdleTimer($)
+  await guardedStep($)
+  if (mode !== 'off') armIdleTimer($)
 }
 
 export function registerAutopilot(on: On, context: AutopilotContext): { step($: EngineInterface): Promise<StepResult> } {

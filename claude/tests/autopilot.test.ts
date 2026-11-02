@@ -193,6 +193,18 @@ test('a rejected prompt.submit lets the next step retry', { options: { autopilot
   expect(seen.woke).toHaveLength(1)
 })
 
+test('a wake whose prompt is rejected still re-arms the idle timer', { options: { autopilot: 'on', idleMinutes: 1 } }, async ($, on) => {
+  const { clock, seen } = stub(on, { submitFailsOnce: true })
+  await $.session.start(START)
+  await $.turn.complete(TURN)
+  await clock.advance(60_000)
+  expect(seen.nextWork).toHaveLength(1)
+  expect(seen.woke).toHaveLength(0)
+  await clock.advance(60_000)
+  expect(seen.nextWork).toHaveLength(2)
+  expect(seen.woke).toHaveLength(1)
+})
+
 test('the budget toast is shown once while over budget', { options: { autopilot: 'on', idleMinutes: 0, maxCostUsd: 5 } }, async ($, on) => {
   const { seen } = stub(on, { usage: { cost: { usd: 6 }, rateLimits: [] } })
   await $.session.start(START)

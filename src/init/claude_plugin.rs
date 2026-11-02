@@ -75,14 +75,24 @@ fn listed_by_claude_cli() -> bool {
     static LISTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *LISTED.get_or_init(|| {
         let cwd = std::env::current_dir().unwrap_or_default();
-        flare_git_core::worktree::run_output_timeout_env(
-            "claude",
-            &["plugin", "list", "--json"],
-            &cwd,
-            2,
-            &[],
-        )
-        .is_ok_and(|out| {
+        let run = |program: &str| {
+            flare_git_core::worktree::run_output_timeout_env(
+                program,
+                &["plugin", "list", "--json"],
+                &cwd,
+                2,
+                &[],
+            )
+        };
+        let out = run("claude");
+        // An npm install leaves only a `claude.cmd` shim on PATH, which a bare
+        // `claude` spawn does not resolve on Windows. Still fail-open.
+        #[cfg(windows)]
+        let out = match out {
+            Err(e) if e.contains("spawn failed") => run("claude.cmd"),
+            other => other,
+        };
+        out.is_ok_and(|out| {
             out.status.success() && list_names_plugin(&String::from_utf8_lossy(&out.stdout))
         })
     })

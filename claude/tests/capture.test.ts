@@ -53,6 +53,13 @@ test('none skips the write', async ($, on) => {
   expect(seen.memory).toHaveLength(0)
 })
 
+test('an unknown label skips the write', async ($, on) => {
+  const { seen } = stubSession(on, 'Decision!')
+  await $.session.start(START)
+  await $.turn.complete({ reason: 'answer', answer: ANSWER, durationMs: 1, isAborted: false, turnId: 't1' })
+  expect(seen.memory).toHaveLength(0)
+})
+
 test('off mode never classifies', { options: { memoryCapture: 'off' } }, async ($, on) => {
   const { seen } = stubSession(on)
   await $.session.start(START)

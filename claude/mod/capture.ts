@@ -22,7 +22,8 @@ export function registerCapture(on: On, { server, options, current }: CaptureCon
     if (!name) return result
     try {
       const label = await $.model.classify(answer, LABELS)
-      if (!label || label === 'none') return result
+      // Only a known label becomes a memory type and topic key.
+      if (!label || label === 'none' || !LABELS.includes(label)) return result
       if (options.memoryCapture === 'ask' && (await $.ui.ask(`Remember this as a ${label}?`, ['yes', 'no'])) !== 'yes') return result
       const title = (answer.split('\n').find(l => l.trim()) ?? answer).trim().slice(0, TITLE_MAX)
       // No project source exists in the mod yet, so `project` is omitted.
