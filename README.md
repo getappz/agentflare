@@ -337,6 +337,43 @@ where the host supports it. Already-satisfied components are skipped; managed
 rules and existing hook configuration may be refreshed or merged. Persistent
 memory ships in the binary itself — nothing to install for it.
 
+## Claude plugin
+
+For Claude Code you can install agentflare as a plugin instead of wiring command
+hooks. The plugin's mod runs inside Claude Code and calls the `agentflare mcp`
+server's `autopilot` tool, so the hot paths no longer spawn an `agentflare hook`
+process per tool call.
+
+```text
+/plugin install agentflare --marketplace getappz/agentflare
+```
+
+It provides:
+
+- **In-process guards**: the branch guard and related checks run before each tool call; read-only calls can be auto-allowed.
+- **Cached briefing**: identity, active item and coaching are served as a system-prompt section and refreshed when the item changes.
+- **Compaction checkpoint**: a handoff is written before `/compact` and re-injected on the next turn.
+- **Subagent shaping**: every subagent spawn is shaped and routed.
+- **Turn-end memory capture**: learnings are classified and remembered when a turn ends.
+- **Attended autopilot**: pulls the next ready item when the session is idle.
+
+Control it with `/flare status|autopilot on|off|once|doctor|briefing refresh`.
+
+Settings (`userConfig`):
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `autopilot` | `off` | `off`, `once` (pull one item, then back to off) or `on` |
+| `idleMinutes` | `3` | Idle time before autopilot pulls work |
+| `maxCostUsd` | `25` | Session cost ceiling above which autopilot will not pull work |
+| `memoryCapture` | `auto` | `auto`, `ask` or `off` |
+| `readOnlyAutoAllow` | `true` | Let the guard allow read-only tool calls without a prompt |
+| `guardTimeoutMs` | `3000` | How long a guard check waits for the MCP server |
+
+When the plugin is installed, `agentflare init --agent claude-code` skips the
+hooks the mod already covers, and `agentflare doctor` flags any that are wired
+twice. Requires Claude Code 2.1.287 or newer.
+
 ## Inter-agent messaging
 
 Live sessions (Claude Code, Codex, Cursor, daemon-dispatched jobs) and humans
