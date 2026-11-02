@@ -241,7 +241,8 @@ fn session_start_message(agent: &str) -> String {
     lines.join("\n")
 }
 
-fn extract_prompt(input: &str) -> String {
+/// The prompt text exactly as typed (case preserved).
+fn extract_prompt_raw(input: &str) -> String {
     serde_json::from_str::<serde_json::Value>(input)
         .ok()
         .and_then(|v| {
@@ -250,9 +251,13 @@ fn extract_prompt(input: &str) -> String {
                 .or_else(|| v.get("message"))
                 .or_else(|| v.get("lastUserInput"))
                 .and_then(|p| p.as_str())
-                .map(str::to_lowercase)
+                .map(str::to_string)
         })
         .unwrap_or_default()
+}
+
+fn extract_prompt(input: &str) -> String {
+    extract_prompt_raw(input).to_lowercase()
 }
 
 struct PreToolUseInput {
@@ -821,7 +826,8 @@ pub fn prompt_submit(agent: &str) {
     let Some(input) = read_stdin_or_skip("UserPromptSubmit") else {
         return;
     };
-    let prompt = extract_prompt(&input);
+    let raw_prompt = extract_prompt_raw(&input);
+    let prompt = raw_prompt.to_lowercase();
     let prompt = prompt.trim();
 
     let session_id: Option<String> = serde_json::from_str::<serde_json::Value>(&input)
@@ -1064,7 +1070,8 @@ pub fn prompt_submit(agent: &str) {
             bits.push(injection);
         }
         // Detect "install <something> skill" patterns → suggest CLI command.
-        if let Some(hint) = crate::skill_detect::install_hint(prompt) {
+        // Registry lookup is case-sensitive, so hand it the original-case prompt.
+        if let Some(hint) = crate::skill_detect::install_hint(raw_prompt.trim()) {
             bits.push(hint);
         }
     }

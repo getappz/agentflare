@@ -233,16 +233,14 @@ fn skill_load_auto_installs_from_a_configured_registry_and_says_so() {
 fn skill_load_surfaces_auto_install_failure_instead_of_plain_not_found() {
     // A registry path that does not exist: install fails, and the caller must
     // be told an install was attempted rather than get a bare "not found".
-    let missing = std::env::temp_dir()
-        .join("agentflare-no-such-registry-dir")
-        .to_string_lossy()
-        .to_string();
-    let out = load_skill_isolated(&[missing], "zz-auto").unwrap_err();
+    // A missing *local* registry dir is just "no skills", not a failure, so use
+    // a git registry on a closed loopback port: the clone fails fast, offline.
+    let unreachable = "https://127.0.0.1:1/zz/registry.git".to_string();
+    let out = load_skill_isolated(&[unreachable], "zz-auto").unwrap_err();
     let msg = out.to_string();
-    assert!(
-        msg.contains("auto-install") || msg.contains("skill_search"),
-        "{msg}"
-    );
+    // The plain not-found hint also mentions skill_search, so require the
+    // auto-install wording specifically.
+    assert!(msg.contains("auto-install"), "{msg}");
 }
 
 #[tokio::test]
