@@ -12,49 +12,68 @@ pub(crate) const MOD_COVERED_EVENTS: &[&str] =
 
 const PLUGIN_NAME: &str = "agentflare";
 
-/// True when the agentflare Claude plugin is installed: its manifest sits in
-/// `~/.claude/plugins/cache`, or `claude plugin list --json` (2 s budget)
-/// lists it.
+/// True when the agentflare Claude plugin is installed AND enabled, so its
+/// mod (the guard) actually runs: a cached copy under
+/// `~/.claude/plugins/cache/<market>/agentflare` whose
+/// `enabledPlugins["agentflare@<market>"]` is `true` in
+/// `~/.claude/settings.json`, or an enabled entry in `claude plugin list
+/// --json` (2 s budget). A disabled or uninstalled-but-cached plugin does not
+/// count: `init` must then wire the hooks, or nothing guards the session.
 pub(crate) fn claude_plugin_installed() -> bool {
-    cache_has_plugin(&crate::paths::claude_dir().join("plugins").join("cache"), 0)
+    let claude = crate::paths::claude_dir();
+    let settings = std::fs::read_to_string(claude.join("settings.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .unwrap_or(Value::Null);
+    cached_markets(&claude.join("plugins").join("cache"))
+        .iter()
+        .any(|market| enabled_in_settings(&settings, market))
         || listed_by_claude_cli()
 }
 
-/// `<cache>/**/agentflare/[<version>/].claude-plugin/plugin.json`, searched at
-/// most four directories deep (marketplace/plugin/version).
-fn cache_has_plugin(dir: &Path, depth: u8) -> bool {
-    let named = |p: &Path| p.file_name().is_some_and(|n| n == PLUGIN_NAME);
-    if (named(dir) || dir.parent().is_some_and(named))
-        && dir.join(".claude-plugin").join("plugin.json").is_file()
-    {
-        return true;
-    }
-    if depth >= 4 {
-        return false;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return false;
+/// Marketplaces whose cache holds the plugin's manifest, flat
+/// (`<cache>/<market>/agentflare/.claude-plugin/plugin.json`) or versioned
+/// (`<cache>/<market>/agentflare/<version>/.claude-plugin/plugin.json`).
+fn cached_markets(cache: &Path) -> Vec<String> {
+    let has_manifest = |d: &Path| d.join(".claude-plugin").join("plugin.json").is_file();
+    let Ok(markets) = std::fs::read_dir(cache) else {
+        return Vec::new();
     };
-    entries
+    markets
         .flatten()
-        .any(|e| e.path().is_dir() && cache_has_plugin(&e.path(), depth + 1))
+        .filter(|m| {
+            let dir = m.path().join(PLUGIN_NAME);
+            has_manifest(&dir)
+                || std::fs::read_dir(&dir)
+                    .is_ok_and(|vs| vs.flatten().any(|v| has_manifest(&v.path())))
+        })
+        .filter_map(|m| m.file_name().to_str().map(str::to_string))
+        .collect()
+}
+
+/// `enabledPlugins["agentflare@<market>"] == true`; absent, false or an
+/// unreadable settings file all mean not enabled.
+fn enabled_in_settings(settings: &Value, market: &str) -> bool {
+    settings["enabledPlugins"][format!("{PLUGIN_NAME}@{market}")].as_bool() == Some(true)
 }
 
 /// Whether `claude plugin list --json` output names the plugin, as either a
-/// top-level array or `{ "plugins": [...] }`, by `name` or `<name>@<market>` id.
+/// top-level array or `{ "plugins": [...] }`, by `name` or `<name>@<market>`
+/// id, and does not mark it disabled (`"enabled": false`; absent = enabled).
 fn list_names_plugin(json: &str) -> bool {
     let Ok(v) = serde_json::from_str::<Value>(json) else {
         return false;
     };
     let items = v.get("plugins").unwrap_or(&v).as_array();
     items.into_iter().flatten().any(|p| {
-        ["name", "id"].iter().any(|k| {
+        let named = ["name", "id"].iter().any(|k| {
             p.get(k).and_then(Value::as_str).is_some_and(|s| {
                 s == PLUGIN_NAME
                     || s.strip_prefix(PLUGIN_NAME)
                         .is_some_and(|r| r.starts_with('@'))
             })
-        })
+        });
+        named && p.get("enabled").and_then(Value::as_bool) != Some(false)
     })
 }
 
@@ -98,23 +117,26 @@ fn listed_by_claude_cli() -> bool {
 mod tests {
     use super::*;
 
+    use crate::paths::test_support::with_temp_home;
+
+    fn cache_manifest(dir: &Path) {
+        std::fs::create_dir_all(dir.join(".claude-plugin")).unwrap();
+        std::fs::write(dir.join(".claude-plugin").join("plugin.json"), "{}").unwrap();
+    }
+
     #[test]
     fn cache_search_finds_plugin_dir_with_or_without_version() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("mkt").join("agentflare").join("1.0.0");
-        std::fs::create_dir_all(dir.join(".claude-plugin")).unwrap();
-        assert!(!cache_has_plugin(tmp.path(), 0));
-        std::fs::write(dir.join(".claude-plugin").join("plugin.json"), "{}").unwrap();
-        assert!(cache_has_plugin(tmp.path(), 0));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(cached_markets(tmp.path()).is_empty());
+        cache_manifest(&dir);
+        assert_eq!(cached_markets(tmp.path()), ["mkt"]);
         let flat = tempfile::tempdir().unwrap();
-        let other = flat.path().join("mkt").join("other");
-        std::fs::create_dir_all(other.join(".claude-plugin")).unwrap();
-        std::fs::write(other.join(".claude-plugin").join("plugin.json"), "{}").unwrap();
-        assert!(!cache_has_plugin(flat.path(), 0));
-        let direct = flat.path().join("mkt").join("agentflare");
-        std::fs::create_dir_all(direct.join(".claude-plugin")).unwrap();
-        std::fs::write(direct.join(".claude-plugin").join("plugin.json"), "{}").unwrap();
-        assert!(cache_has_plugin(flat.path(), 0));
+        cache_manifest(&flat.path().join("mkt").join("other"));
+        assert!(cached_markets(flat.path()).is_empty());
+        cache_manifest(&flat.path().join("mkt2").join("agentflare"));
+        assert_eq!(cached_markets(flat.path()), ["mkt2"]);
     }
 
     #[test]
@@ -122,7 +144,54 @@ mod tests {
         assert!(list_names_plugin(r#"[{"name":"agentflare"}]"#));
         assert!(list_names_plugin(r#"[{"id":"agentflare@market"}]"#));
         assert!(list_names_plugin(r#"{"plugins":[{"name":"agentflare"}]}"#));
+        assert!(list_names_plugin(
+            r#"[{"id":"agentflare@market","enabled":true}]"#
+        ));
+        assert!(!list_names_plugin(
+            r#"[{"id":"agentflare@market","enabled":false}]"#
+        ));
         assert!(!list_names_plugin(r#"[{"name":"agentflare-other"}]"#));
         assert!(!list_names_plugin("not json"));
+    }
+
+    /// Cached at `~/.claude/plugins/cache/mkt/agentflare/1.0.0`, with
+    /// `settings` (None = no file) as `~/.claude/settings.json`.
+    fn installed_with(settings: Option<&str>) -> bool {
+        let claude = crate::paths::claude_dir();
+        let cache = claude.join("plugins").join("cache");
+        cache_manifest(&cache.join("mkt").join("agentflare").join("1.0.0"));
+        if let Some(s) = settings {
+            std::fs::write(claude.join("settings.json"), s).unwrap();
+        }
+        claude_plugin_installed()
+    }
+
+    #[test]
+    fn claude_plugin_cached_and_enabled_is_installed() {
+        with_temp_home(|| {
+            assert!(installed_with(Some(
+                r#"{"enabledPlugins":{"agentflare@mkt":true}}"#
+            )));
+        });
+    }
+
+    #[test]
+    fn claude_plugin_cached_but_disabled_is_not_installed() {
+        with_temp_home(|| {
+            assert!(!installed_with(Some(
+                r#"{"enabledPlugins":{"agentflare@mkt":false}}"#
+            )));
+        });
+    }
+
+    #[test]
+    fn claude_plugin_cached_but_never_enabled_is_not_installed() {
+        with_temp_home(|| assert!(!installed_with(None)));
+        with_temp_home(|| {
+            assert!(!installed_with(Some(
+                r#"{"enabledPlugins":{"agentflare@other":true}}"#
+            )));
+        });
+        with_temp_home(|| assert!(!installed_with(Some("{ not json"))));
     }
 }
