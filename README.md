@@ -337,6 +337,70 @@ where the host supports it. Already-satisfied components are skipped; managed
 rules and existing hook configuration may be refreshed or merged. Persistent
 memory ships in the binary itself — nothing to install for it.
 
+## Claude plugin
+
+For Claude Code you can install agentflare as a plugin instead of wiring command
+hooks. The plugin's mod runs inside Claude Code and calls the `agentflare mcp`
+server's `autopilot` tool, so the hot paths no longer spawn an `agentflare hook`
+process per tool call.
+
+```text
+/plugin install agentflare --marketplace getappz/agentflare
+```
+
+The plugin lives in its own root, `plugins/agentflare-claude/` (manifest,
+`hooks.json`, the mod under `mod/`, its tests under `tests/`); the repository
+marketplace points there, so the repo-root `hooks/hooks.json` (the Codex
+plugin's) is never loaded into Claude Code. To work on it, run
+`claude --plugin-dir plugins/agentflare-claude`, and check it with
+`claude plugin validate plugins/agentflare-claude` and
+`claude plugin test plugins/agentflare-claude`.
+
+It provides:
+
+- **In-process guards**: the same checks as the `PreToolUse` hook, in the same order and with the same reasons (branch guard, destructive-data guard, claim guard, TodoWrite redirect, enforced coaching rules, completion gate), run before every mutating, shell, TodoWrite, ToolSearch, review and gateway call and fail closed; read-only calls can be auto-allowed. Enforced coaching rules apply only to those checked tools: a rule whose trigger is another tool (WebFetch, Grep, Task and so on) is not enforced in plugin mode. They key on agentflare's tools under whatever name its server runs (`mcp__flare__*`, or `mcp__plugin_agentflare_agentflare__*` in a plugin-only install).
+- **Cached briefing**: identity, active item and coaching are served as a system-prompt section and refreshed when the item changes.
+- **Compaction checkpoint**: a handoff is written before `/compact` and re-injected on the next turn.
+- **Subagent shaping**: every subagent spawn is shaped and routed.
+- **Turn-end memory capture**: learnings are classified and remembered when a turn ends.
+- **Attended autopilot**: pulls the next ready item when the session is idle.
+
+Control it with `/flare status|autopilot on|off|once|doctor|briefing refresh`.
+
+Settings (`userConfig`):
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `autopilot` | `off` | `off`, `once` (pull one item, then back to off) or `on` |
+| `idleMinutes` | `3` | Idle time before autopilot pulls work |
+| `maxCostUsd` | `25` | Session cost ceiling above which autopilot will not pull work |
+| `memoryCapture` | `auto` | `auto`, `ask` or `off` |
+| `readOnlyAutoAllow` | `true` | Let the guard allow read-only tool calls without a prompt |
+| `guardTimeoutMs` | `3000` | How long a guard check waits for the MCP server |
+
+When the plugin is installed, `agentflare init --agent claude-code` skips the
+`PreToolUse`, `PostToolUse`, `PreCompact` and `SubagentStart` hooks the mod
+covers, and `agentflare doctor` flags any of them that are wired twice. `Stop`
+(inter-agent mail, busy/idle liveness) and `PostToolUseFailure` (friction
+nudges, failure recall) stay wired: the mod does not cover them. The
+`PreToolUse` hook also delivered mid-turn mail, the batching and staleness
+nudges and per-tool coaching nudges; in plugin mode mail arrives at turn end
+through `Stop`, and the nudges are not produced. Requires Claude Code 2.1.287 or newer.
+
+Notes:
+
+- If you already configured an MCP server that runs the same `agentflare mcp`
+  command (for example one named `flare`), Claude Code drops the plugin's own
+  copy as a duplicate and the mod talks to yours. Nothing to change; just keep
+  that server pointing at an `agentflare` binary that has the `autopilot` tool.
+- The mod's own calls to that server (`autopilot`, `memory`,
+  `get_routing_suggestion`) are allowed at the permission check, so they work
+  in headless `claude -p` and auto mode without `--allowedTools`. The same tools
+  called by the model keep your normal permission rules.
+- Classic `PreToolUse`/`PostToolUse` command hooks you still have wired run on
+  the mod's own calls too, so leave them unwired (as `init` does) to keep the
+  spawn savings.
+
 ## Inter-agent messaging
 
 Live sessions (Claude Code, Codex, Cursor, daemon-dispatched jobs) and humans
