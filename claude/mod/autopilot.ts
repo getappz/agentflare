@@ -40,13 +40,19 @@ export const autopilotState = {
  * text is queued as a turn; $.command.run would only run a slash command. Not awaited: it resolves
  * with the turn, and this runs inside turn.complete.
  */
-export function wake($: EngineInterface, text: string): void {
-  $.prompt.submit({ text }).catch(err => $.ui.log(`agentflare: wake failed: ${String(err)}`))
+export async function wake($: EngineInterface, text: string): Promise<void> {
+  try {
+    await $.prompt.submit({ text })
+  } catch (err) {
+    // Forget the item so the next step can retry it instead of reporting 'working' forever.
+    ctx.setCurrent({})
+    $.ui.log(`agentflare: wake failed: ${String(err)}`)
+  }
 }
 
 async function pause($: EngineInterface, reason: string): Promise<'paused'> {
+  if (paused !== reason) $.ui.toast(`agentflare autopilot paused: ${reason}`)
   paused = reason
-  $.ui.toast(`agentflare autopilot paused: ${reason}`)
   await $.state.set({ plugin: 'agentflare', key: 'autopilotPaused' }, reason)
   return 'paused'
 }
@@ -81,19 +87,33 @@ async function step($: EngineInterface): Promise<StepResult> {
   const { id, seq, title } = r.item
   if (id === current().item?.id) return 'working'
   setCurrent({ item: { id, seq, title } })
-  wake($, `Work agentflare item #${seq} (${id}): ${title}. Read it with the item tool first, work in its bound worktree, run the gate before done.`)
+  void wake($, `Work agentflare item #${seq} (${id}): ${title}. Read it with the item tool first, work in its bound worktree, run the gate before done.`)
+  // Consume `once` right away: a throw below must not leave the mode armed for a second wake.
+  if (mode === 'once') mode = 'off'
   await $.state.set({ plugin: 'agentflare', key: 'lastWakeAt' }, await $.clock.now())
   await refreshBriefing($, { client, agent })
-  if (mode === 'once') mode = 'off'
   return 'woke'
 }
 
-async function guardedStep($: EngineInterface): Promise<void> {
+async function guardedStep($: EngineInterface): Promise<StepResult> {
   try {
-    await step($)
+    return await step($)
   } catch (err) {
     $.ui.log(`agentflare: autopilot step failed: ${String(err)}`)
+    return 'idle'
   }
+}
+
+// Cancel-before-arm keeps exactly one live timer.
+function armIdleTimer($: EngineInterface): void {
+  timer?.cancel()
+  timer = $.clock.after(ctx.options.idleMinutes * 60_000, () => void pollAndRearm($))
+}
+
+// Anything but a wake re-polls after another idle period; a wake's own turn.complete re-arms.
+async function pollAndRearm($: EngineInterface): Promise<void> {
+  const result = await guardedStep($)
+  if (mode !== 'off' && result !== 'woke') armIdleTimer($)
 }
 
 export function registerAutopilot(on: On, context: AutopilotContext): { step($: EngineInterface): Promise<StepResult> } {
@@ -106,9 +126,8 @@ export function registerAutopilot(on: On, context: AutopilotContext): { step($: 
     if (e.agentId !== undefined) return result
     timer?.cancel()
     timer = null
-    const { idleMinutes } = context.options
-    if (idleMinutes <= 0) await guardedStep($)
-    else timer = $.clock.after(idleMinutes * 60_000, () => void guardedStep($))
+    if (context.options.idleMinutes <= 0) await guardedStep($)
+    else armIdleTimer($)
     return result
   })
 

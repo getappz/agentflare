@@ -54,7 +54,7 @@ export const register: Register = (on, options) => {
   registerAutopilot(on, {
     client: () => client,
     agent: AGENT,
-    options: { autopilot, idleMinutes: Number(options.idleMinutes) || 0, maxCostUsd: Number(options.maxCostUsd) || Infinity },
+    options: { autopilot, idleMinutes: options.idleMinutes === undefined ? 3 : Number(options.idleMinutes), maxCostUsd: Number(options.maxCostUsd) || Infinity },
     current: () => current,
     setCurrent,
   })

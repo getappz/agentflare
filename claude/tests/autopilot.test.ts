@@ -5,7 +5,7 @@ const TURN = { reason: 'answer', answer: 'done', durationMs: 1, isAborted: false
 const ready = { item: { id: 'abc', seq: 12, title: 'Fix X', description: 'd' }, claimed: true }
 const HEALTH = { daemon: 'up', stale_binary: false, auth: 'ok', mcp_version: '1' }
 
-type Opts = { messages?: any[]; usage?: any; reply?: (a: any) => unknown; connected?: boolean }
+type Opts = { messages?: any[]; usage?: any; reply?: (a: any) => unknown; connected?: boolean; stateThrows?: boolean; submitFailsOnce?: boolean }
 
 // Stubs every op session.start, the turn.complete hooks and /flare call; returns what the tests assert on.
 function stub(on: any, o: Opts = {}) {
@@ -21,7 +21,8 @@ function stub(on: any, o: Opts = {}) {
   on('ui.toast', (_: any, e: any) => { seen.toasts.push(e.text ?? e.message ?? JSON.stringify(e)); return { value: {} } })
   on('ui.notify', (_: any, e: any) => { seen.notify.push(JSON.stringify(e)); return { value: {} } })
   on('ui.invalidate', () => ({ value: {} }))
-  on('state.set', (_: any, e: any) => { seen.state.push(e); return { value: { isSet: true, version: 1 } } })
+  let submits = 0
+  on('state.set', (_: any, e: any) => { if (o.stateThrows) throw new Error('boom'); seen.state.push(e); return { value: { isSet: true, version: 1 } } })
   on('mcp.connect', () => ({ value: o.connected === false ? { isConnected: false, reason: 'x' } : { isConnected: true, server: 'agentflare' } }))
   on('mcp.call', (_: any, e: any) => {
     if (e.args.action === 'next_work') seen.nextWork.push(e.args)
@@ -31,7 +32,7 @@ function stub(on: any, o: Opts = {}) {
   on('model.classify', () => ({ value: 'none' }))
   on('session.usage', () => ({ value: o.usage ?? { cost: { usd: 1 }, rateLimits: [] } }))
   on('session.messages', () => ({ value: o.messages ?? [{ role: 'assistant', text: 'done', toolUses: [] }] }))
-  on('prompt.submit', (_: any, e: any) => { seen.woke.push(e.text); return { text: e.text } })
+  on('prompt.submit', (_: any, e: any) => { if (o.submitFailsOnce && submits++ === 0) throw new Error('nope'); seen.woke.push(e.text); return { text: e.text } })
   on('session.start', (_: any, e: any) => ({ cwd: e.cwd }))
   on('turn.complete', (_: any, e: any) => ({ text: e.answer }))
   return { clock, seen }
@@ -156,4 +157,39 @@ test('only the latest turn.complete leaves a live idle timer', { options: { auto
   expect(seen.nextWork).toHaveLength(0)
   await clock.advance(60_000)
   expect(seen.nextWork).toHaveLength(1)
+})
+
+test('an empty queue is polled again every idle period', { options: { autopilot: 'on', idleMinutes: 1 } }, async ($, on) => {
+  const { clock, seen } = stub(on, { reply: a => (a.action === 'next_work' ? { claimed: false, blocked_reason: 'none_ready' } : {}) })
+  await $.session.start(START)
+  await $.turn.complete(TURN)
+  await clock.advance(60_000)
+  expect(seen.nextWork).toHaveLength(1)
+  await clock.advance(60_000)
+  expect(seen.nextWork).toHaveLength(2)
+})
+
+test('once is consumed even when a later step throws', { options: { autopilot: 'once', idleMinutes: 0 } }, async ($, on) => {
+  let n = 0
+  const { seen } = stub(on, { stateThrows: true, reply: a => (a.action === 'next_work' ? { ...ready, item: { ...ready.item, id: 'j' + n++ } } : {}) })
+  await $.session.start(START)
+  await $.turn.complete(TURN)
+  await $.turn.complete(TURN)
+  expect(seen.woke).toHaveLength(1)
+})
+
+test('a rejected prompt.submit lets the next step retry', { options: { autopilot: 'on', idleMinutes: 0 } }, async ($, on) => {
+  const { seen } = stub(on, { submitFailsOnce: true })
+  await $.session.start(START)
+  await $.turn.complete(TURN)
+  await $.turn.complete(TURN)
+  expect(seen.woke).toHaveLength(1)
+})
+
+test('the budget toast is shown once while over budget', { options: { autopilot: 'on', idleMinutes: 0, maxCostUsd: 5 } }, async ($, on) => {
+  const { seen } = stub(on, { usage: { cost: { usd: 6 }, rateLimits: [] } })
+  await $.session.start(START)
+  await $.turn.complete(TURN)
+  await $.turn.complete(TURN)
+  expect(seen.toasts.filter(t => t.includes('budget'))).toHaveLength(1)
 })
