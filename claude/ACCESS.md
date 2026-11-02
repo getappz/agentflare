@@ -1,1 +1,1 @@
-./mod/register.ts calls: $.clock.sleep (via connect), $.command.register, $.mcp.call (via connect), $.mcp.connect (via connect), $.session.version, $.ui.toast
+./mod/register.ts calls: $.clock.sleep (via connect), $.command.list, $.command.register, $.mcp.call (via connect), $.mcp.connect (via connect), $.session.version, $.ui.log, $.ui.toast
