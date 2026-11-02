@@ -112,6 +112,31 @@ pub fn session_start(agent: &str) {
 }
 
 fn session_start_message(agent: &str) -> String {
+    briefing_text(agent, None, None)
+}
+
+/// Pure session briefing builder shared by the SessionStart hook and the
+/// `autopilot` MCP tool. `cwd` adds the active item claim for that worktree;
+/// `recall` is a pre-fetched memory excerpt appended verbatim.
+pub(crate) fn briefing_text(
+    agent: &str,
+    cwd: Option<&std::path::Path>,
+    recall: Option<&str>,
+) -> String {
+    briefing_text_in(
+        agent,
+        cwd,
+        recall,
+        &crate::paths::agentflare_dir().join("backend.db"),
+    )
+}
+
+pub(crate) fn briefing_text_in(
+    agent: &str,
+    cwd: Option<&std::path::Path>,
+    recall: Option<&str>,
+    db_path: &std::path::Path,
+) -> String {
     let components = get_components(agent);
     let is_active = |id: &str| components.iter().any(|c| c.id == id && (c.check)());
     let mut lines = vec![];
@@ -154,9 +179,8 @@ fn session_start_message(agent: &str) -> String {
     // project happens to be oldest in backend.db", which is a single
     // shared database across every repo agentflare has ever touched on
     // this machine.
-    let db_path = crate::paths::agentflare_dir().join("backend.db");
     if db_path.exists()
-        && let Ok(conn) = agentflare_backend::db::open_db(&db_path)
+        && let Ok(conn) = agentflare_backend::db::open_db(db_path)
         && let Some(pid) = crate::mcp_server::AgentflareMcp::default()
             .resolve_project(&conn)
             .ok()
@@ -179,6 +203,22 @@ fn session_start_message(agent: &str) -> String {
         if items.len() > MAX_SHOWN {
             lines.push(format!("  ... and {} more", items.len() - MAX_SHOWN));
         }
+    }
+
+    if let Some(cwd) = cwd
+        && db_path.exists()
+        && let Ok(conn) = agentflare_backend::db::open_db(db_path)
+        && let Some(line) = crate::hook_claim_guard::active_claim_line(&conn, cwd)
+    {
+        lines.push(String::new());
+        lines.push(colorize(HEADING, "Active claim for this worktree:"));
+        lines.push(format!("  {line}"));
+    }
+
+    if let Some(recall) = recall.filter(|r| !r.trim().is_empty()) {
+        lines.push(String::new());
+        lines.push(colorize(HEADING, "Memory recall:"));
+        lines.push(recall.trim().to_string());
     }
 
     // Skill preload: detect project context and surface relevant skills.
@@ -453,7 +493,7 @@ pub use crate::hook_completion_gate::post_tool_use;
 /// a synchronous local SQLite read, precedented by `session_start_message`'s
 /// own unconditional `agentflare_backend::db::open_db` call above -- no
 /// timeout wrapper needed.
-fn resolve_item_task_type(
+pub(crate) fn resolve_item_task_type(
     tool_name: &str,
     tool_input: Option<&serde_json::Value>,
 ) -> Option<String> {
@@ -479,7 +519,9 @@ fn resolve_item_task_type(
         .map(String::from)
 }
 
-fn shell_command_from_tool_input(tool_input: Option<&serde_json::Value>) -> Option<String> {
+pub(crate) fn shell_command_from_tool_input(
+    tool_input: Option<&serde_json::Value>,
+) -> Option<String> {
     tool_input.and_then(|ti| {
         ti.get("command")
             .or_else(|| ti.get("cmd"))
@@ -490,7 +532,7 @@ fn shell_command_from_tool_input(tool_input: Option<&serde_json::Value>) -> Opti
     })
 }
 
-fn is_verification_shell_tool(tool_name: &str) -> bool {
+pub(crate) fn is_verification_shell_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
         "Bash" | "bash" | "PowerShell" | "powershell" | "shell" | "run_command"

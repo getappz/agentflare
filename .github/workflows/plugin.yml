@@ -1,0 +1,82 @@
+name: plugin
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - ".claude-plugin/**"
+      - "plugins/agentflare-claude/**"
+      - ".github/workflows/plugin.yml"
+  pull_request:
+    paths:
+      - ".claude-plugin/**"
+      - "plugins/agentflare-claude/**"
+      - ".github/workflows/plugin.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
+
+permissions:
+  contents: read
+
+jobs:
+  claude-plugin:
+    name: claude plugin (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+        # The Claude plugin has its own root so the repo-root Codex hooks/hooks.json
+        # is never loaded as Claude plugin hooks.
+        working-directory: plugins/agentflare-claude
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install Claude Code
+        run: npm i -g @anthropic-ai/claude-code@latest
+
+      - name: Validate marketplace
+        working-directory: .
+        run: claude plugin validate .
+
+      - name: Validate plugin
+        run: claude plugin validate .
+
+      - name: Test plugin
+        run: claude plugin test .
+
+      # No tsc step: the claude-code types tsconfig.json includes are written by the engine when it
+      # loads the plugin in a session, and neither `validate` nor `test` lays them on a runner, so a
+      # tsc step here could only ever skip. `claude plugin test` type-loads the mod and its tests.
+
+      - name: plugin.json version matches Cargo.toml
+        run: |
+          plugin=$(jq -r .version .claude-plugin/plugin.json)
+          cargo=$(sed -n 's/^version = "\(.*\)"$/\1/p' ../../Cargo.toml | head -n 1)
+          if [ "$plugin" != "$cargo" ]; then
+            echo "::error::plugin.json version $plugin != Cargo.toml version $cargo"
+            exit 1
+          fi
+
+      - name: Mod never uses fs.write, process or http
+        run: |
+          if grep -rE '\$\.(fs\.write|process|http)\b' mod; then
+            echo "::error::the mod references a forbidden capability"
+            exit 1
+          fi
+
+      - name: Access footprint matches ACCESS.md
+        run: |
+          claude plugin validate . --json \
+            | jq -r '.contents[] | select(.type == "hooks") | .notes[] | select(test("calls:"))' \
+            | tr -d '\r' > "$RUNNER_TEMP/access.txt"
+          diff <(tr -d '\r' < ACCESS.md) "$RUNNER_TEMP/access.txt"

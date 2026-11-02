@@ -454,7 +454,44 @@ pub fn redirect_decision(tool_name: &str, tool_input: Option<&Value>) -> Option<
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    /// `git init` a temp repo with one commit on `branch` -- enough to
+    /// exercise `redirect_decision`'s real git subprocess path
+    /// (`test_support` in flare-git-core is `pub(crate)`, so this binary
+    /// crate can't reuse it). Every path handed to `redirect_decision` in
+    /// these tests is absolute (anchored at the returned repo's own path),
+    /// so none of them need to touch the real process cwd -- mutating that
+    /// is global, process-wide state that a parallel test binary can't
+    /// safely share (a prior version of this test file did exactly that
+    /// and intermittently broke unrelated cwd-sensitive tests elsewhere in
+    /// the same binary).
+    pub(crate) fn init_temp_repo(branch: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-q", "-b", branch]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "test"]);
+        std::fs::write(dir.path().join("seed.txt"), "seed").unwrap();
+        run(&["add", "seed.txt"]);
+        run(&["commit", "-q", "-m", "seed"]);
+        dir
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use super::test_support::init_temp_repo;
     use super::*;
 
     const NOT_A_REPO: (Option<&str>, Option<&str>) = (None, None);
@@ -699,39 +736,6 @@ mod tests {
             out.is_none(),
             "a worker slower than the timeout must fail open to None"
         );
-    }
-
-    /// `git init` a temp repo with one commit on `branch` -- enough to
-    /// exercise `redirect_decision`'s real git subprocess path
-    /// (`test_support` in flare-git-core is `pub(crate)`, so this binary
-    /// crate can't reuse it). Every path handed to `redirect_decision` in
-    /// these tests is absolute (anchored at the returned repo's own path),
-    /// so none of them need to touch the real process cwd -- mutating that
-    /// is global, process-wide state that a parallel test binary can't
-    /// safely share (a prior version of this test file did exactly that
-    /// and intermittently broke unrelated cwd-sensitive tests elsewhere in
-    /// the same binary).
-    fn init_temp_repo(branch: &str) -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        let run = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .args(args)
-                .current_dir(dir.path())
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "git {args:?} failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        };
-        run(&["init", "-q", "-b", branch]);
-        run(&["config", "user.email", "test@example.com"]);
-        run(&["config", "user.name", "test"]);
-        std::fs::write(dir.path().join("seed.txt"), "seed").unwrap();
-        run(&["add", "seed.txt"]);
-        run(&["commit", "-q", "-m", "seed"]);
-        dir
     }
 
     #[test]

@@ -1,0 +1,16 @@
+{
+  "modules": ["./mod/register.ts"],
+  "hooks": {
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "agentflare hook session-end --agent claude-code",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
