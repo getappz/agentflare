@@ -358,7 +358,7 @@ plugin's) is never loaded into Claude Code. To work on it, run
 
 It provides:
 
-- **In-process guards**: the same checks as the `PreToolUse` hook, in the same order and with the same reasons (branch guard, destructive-data guard, claim guard, TodoWrite redirect, enforced coaching rules, completion gate), run before every mutating, shell and gateway call and fail closed; read-only calls can be auto-allowed. They key on agentflare's tools under whatever name its server runs (`mcp__flare__*`, or `mcp__plugin_agentflare_agentflare__*` in a plugin-only install).
+- **In-process guards**: the same checks as the `PreToolUse` hook, in the same order and with the same reasons (branch guard, destructive-data guard, claim guard, TodoWrite redirect, enforced coaching rules, completion gate), run before every mutating, shell, TodoWrite, ToolSearch, review and gateway call and fail closed; read-only calls can be auto-allowed. Enforced coaching rules apply only to those checked tools: a rule whose trigger is another tool (WebFetch, Grep, Task and so on) is not enforced in plugin mode. They key on agentflare's tools under whatever name its server runs (`mcp__flare__*`, or `mcp__plugin_agentflare_agentflare__*` in a plugin-only install).
 - **Cached briefing**: identity, active item and coaching are served as a system-prompt section and refreshed when the item changes.
 - **Compaction checkpoint**: a handoff is written before `/compact` and re-injected on the next turn.
 - **Subagent shaping**: every subagent spawn is shaped and routed.
@@ -382,7 +382,10 @@ When the plugin is installed, `agentflare init --agent claude-code` skips the
 `PreToolUse`, `PostToolUse`, `PreCompact` and `SubagentStart` hooks the mod
 covers, and `agentflare doctor` flags any of them that are wired twice. `Stop`
 (inter-agent mail, busy/idle liveness) and `PostToolUseFailure` (friction
-nudges, failure recall) stay wired: the mod does not cover them. Requires Claude Code 2.1.287 or newer.
+nudges, failure recall) stay wired: the mod does not cover them. The
+`PreToolUse` hook also delivered mid-turn mail, the batching and staleness
+nudges and per-tool coaching nudges; in plugin mode mail arrives at turn end
+through `Stop`, and the nudges are not produced. Requires Claude Code 2.1.287 or newer.
 
 Notes:
 
