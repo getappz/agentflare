@@ -1,4 +1,5 @@
 import type { Register } from 'claude-code'
+import { registerAutopilot } from './autopilot'
 import { refreshBriefing, registerBriefing } from './briefing'
 import { registerCapture } from './capture'
 import { registerCompaction, type Current } from './compaction'
@@ -49,6 +50,14 @@ export const register: Register = (on, options) => {
   registerSpawn(on, { server: () => client?.server ?? null, agent: AGENT })
   const memoryCapture = options.memoryCapture === 'ask' || options.memoryCapture === 'off' ? options.memoryCapture : 'auto'
   registerCapture(on, { server: () => client?.server ?? null, options: { memoryCapture }, current: () => current })
+  const autopilot = options.autopilot === 'on' || options.autopilot === 'once' ? options.autopilot : 'off'
+  registerAutopilot(on, {
+    client: () => client,
+    agent: AGENT,
+    options: { autopilot, idleMinutes: Number(options.idleMinutes) || 0, maxCostUsd: Number(options.maxCostUsd) || Infinity },
+    current: () => current,
+    setCurrent,
+  })
 
   on('session.start', async ($, e, next) => {
     // A hot reload resets the module flag, so the command list is the real guard against a second /flare.
