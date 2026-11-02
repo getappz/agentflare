@@ -1,4 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
+import { registerCompaction } from '../mod/compaction'
 
 const START = { cwd: '/', surface: 'terminal', isInteractive: true } as const
 const MSGS = [{ role: 'user', text: 'hi', toolUses: [] }]
@@ -76,4 +77,39 @@ test('a subagent compaction is left alone', async ($, on) => {
   const r = await compact($, { agentId: 'a1' })
   expect(r.messages).toHaveLength(1)
   expect(checkpoints).toBe(0)
+})
+
+test('precompute skips the server, passes instructions and appends the minimal text', async ($, on) => {
+  stubSession(on)
+  let checkpoints = 0
+  on('mcp.call', (_: any, e: any) => { if (e.args.action === 'checkpoint') checkpoints++; return reply({}) })
+  let seen = ''
+  on('session.compact', (_: any, e: any) => { seen = e.instructions ?? ''; return { messages: [{ role: 'assistant', text: 'summary', toolUses: [] }] } })
+  await $.session.start(START)
+  const r = await compact($, { trigger: 'precompute' })
+  expect(checkpoints).toBe(0)
+  expect(seen).toContain('Keep verbatim')
+  expect(r.messages?.at(-1)).toMatchObject({ role: 'user', text: '[agentflare checkpoint] item none; branch unknown; gate state unknown; re-run the gate before item done.' })
+})
+
+// The kit loads the mod in its own module graph, so register.ts's setCurrent is out of reach from a test;
+// these two drive registerCompaction directly with a capturing `on`, a stub client and a stub `$`.
+const NOW = { item: { id: 'abc', seq: 12, title: 'Fix X' }, branch: 'feat/x' }
+async function runDirect(checkpoint: (a: any) => Promise<any>) {
+  let hook: any
+  registerCompaction(((_: string, h: any) => { hook = h }) as any, { client: () => ({ checkpoint }) as any, agent: 'claude-code', current: () => NOW })
+  const $ = { session: { cwd: async () => '/', id: async () => 's1' } }
+  const e = { trigger: 'manual', messages: MSGS }
+  return hook($, e, async (x: any) => ({ messages: [...x.messages] }))
+}
+
+test('current() feeds the checkpoint payload', async () => {
+  let args: any
+  await runDirect(async a => { args = a; return { handoff_id: 'h', text: '[agentflare checkpoint] ok' } })
+  expect(args.payload).toMatchObject({ item: NOW.item, branch: 'feat/x' })
+})
+
+test('current() feeds the minimal text on failure', async () => {
+  const r = await runDirect(async () => { throw new Error('down') })
+  expect(r.messages.at(-1).text).toBe('[agentflare checkpoint] item 12; branch feat/x; gate state unknown; re-run the gate before item done.')
 })

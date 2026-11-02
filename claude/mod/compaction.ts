@@ -19,12 +19,12 @@ export function registerCompaction(on: On, { client, current }: CompactionContex
     const now = current()
     let text = minimalText(now)
     try {
-      const c = client()
+      const c = e.trigger === 'precompute' ? null : client()
       if (c) {
         const [cwd, session_id] = await Promise.all([$.session.cwd(), $.session.id()])
         // Gate freshness is left out on purpose: the server's session record is the only source, absent means stale.
-        const r = await c.checkpoint({ session_id, cwd, payload: { ...(now.item ? { item: now.item } : {}), ...(now.branch ? { branch: now.branch } : {}), ...(now.worktree ? { worktree: now.worktree } : {}), decisions: [], remaining: [] } })
-        if (typeof r.text === 'string' && r.text) text = r.text
+        const reply = await c.checkpoint({ session_id, cwd, payload: { ...(now.item ? { item: now.item } : {}), ...(now.branch ? { branch: now.branch } : {}), ...(now.worktree ? { worktree: now.worktree } : {}), decisions: [], remaining: [] } })
+        if (typeof reply.text === 'string' && reply.text) text = reply.text
       }
     } catch {
       // Keep the minimal text; a checkpoint failure must never block compaction.
