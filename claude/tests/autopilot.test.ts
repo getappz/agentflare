@@ -134,6 +134,13 @@ test('/flare briefing refresh refreshes the briefing', async ($, on) => {
   expect(seen.briefing).toBeGreaterThan(before)
 })
 
+test('/flare status answers with the error when the health call fails', async ($, on) => {
+  stub(on, { reply: a => { if (a.action === 'health') throw new Error('refused'); return { etag: 'e', text: 'B' } } })
+  await $.session.start(START)
+  const r = await $.command.run({ command: 'flare', args: 'status' })
+  expect(r.text).toContain('health check failed')
+})
+
 test('/flare with no MCP connection says so', async ($, on) => {
   stub(on, { connected: false })
   await $.session.start(START)

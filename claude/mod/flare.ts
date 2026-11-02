@@ -28,7 +28,14 @@ export function flareCommand(on: On, { client, current, agent }: FlareContext): 
       return { text: 'briefing refreshed' }
     }
     if (sub === 'status' || sub === 'doctor') {
-      const h = await c.health()
+      // A throwing hook is skipped and the engine then reports that no hook answered /flare (seen in
+      // -p when the health call was refused), so a failed call is answered as text instead.
+      let h
+      try {
+        h = await c.health()
+      } catch (err) {
+        return { text: `agentflare: health check failed: ${String(err)}` }
+      }
       if (sub === 'doctor') return { text: Object.entries(h).map(([k, v]) => `${k}: ${v}`).join('\n') }
       const item = current().item
       return {
