@@ -5,6 +5,7 @@
 mod artifact;
 mod asset;
 mod autopilot;
+mod autopilot_next_work;
 mod browser;
 mod builtin_tools;
 pub(crate) mod chat;

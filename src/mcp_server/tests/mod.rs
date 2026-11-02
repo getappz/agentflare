@@ -474,6 +474,7 @@ mod action_tests;
 mod artifact_tests;
 mod asset_tests;
 mod autopilot_tests;
+mod autopilot_next_work_tests;
 mod comment_tests;
 mod item_commit_failure_tests;
 mod item_doctor_tests;

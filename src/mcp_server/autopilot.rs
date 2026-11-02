@@ -85,6 +85,7 @@ impl AgentflareMcp {
             "observe" => Ok(Self::autopilot_observe(&req).to_string()),
             "briefing" => Ok(self.autopilot_briefing(&req).to_string()),
             "checkpoint" => Self::autopilot_checkpoint(&req).map(|v| v.to_string()),
+            "next_work" => self.autopilot_next_work(&req).map(|v| v.to_string()),
             other => Err(ErrorData::invalid_params(
                 format!(
                     "unknown autopilot action `{other}` (expected check|observe|briefing|checkpoint|next_work|health)"
