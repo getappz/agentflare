@@ -519,7 +519,9 @@ pub(crate) fn resolve_item_task_type(
         .map(String::from)
 }
 
-fn shell_command_from_tool_input(tool_input: Option<&serde_json::Value>) -> Option<String> {
+pub(crate) fn shell_command_from_tool_input(
+    tool_input: Option<&serde_json::Value>,
+) -> Option<String> {
     tool_input.and_then(|ti| {
         ti.get("command")
             .or_else(|| ti.get("cmd"))
@@ -530,7 +532,7 @@ fn shell_command_from_tool_input(tool_input: Option<&serde_json::Value>) -> Opti
     })
 }
 
-fn is_verification_shell_tool(tool_name: &str) -> bool {
+pub(crate) fn is_verification_shell_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
         "Bash" | "bash" | "PowerShell" | "powershell" | "shell" | "run_command"

@@ -288,6 +288,30 @@ fn observe_passing_cargo_test_records_verification_then_only_review_is_missing()
 }
 
 #[test]
+fn observe_successful_edit_invalidates_earlier_verification() {
+    crate::paths::test_support::with_temp_home(|| {
+        let (_tmp, s) = harness();
+        let repo = init_temp_repo("task/x");
+        let sid = uniq_session("obs-edit");
+        let bash = json!({"command":"cargo test"});
+        observe(
+            &s,
+            &sid,
+            repo.path(),
+            "Bash",
+            bash,
+            Some(0),
+            "test result: ok. 1 passed",
+        );
+        let edit = json!({"file_path": repo.path().join("a.rs")});
+        observe(&s, &sid, repo.path(), "Edit", edit, None, "");
+        let chk = check_done(&s, &sid, repo.path());
+        assert_eq!(chk["decision"], "deny");
+        assert!(chk["reason"].as_str().unwrap().contains("verif"), "{chk}");
+    });
+}
+
+#[test]
 fn observe_failing_test_is_recorded_as_a_failed_run_and_gate_stays_closed() {
     crate::paths::test_support::with_temp_home(|| {
         let (_tmp, s) = harness();

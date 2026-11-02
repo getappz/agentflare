@@ -55,7 +55,8 @@ type GuardContext = {
 export function registerGuard(on: On, { client, agent, options }: GuardContext): void {
   const mutating = new Set(MUTATING_TOOLS)
   const checked = new Set([...MUTATING_TOOLS, ...CHECKED_TOOLS])
-  const observed = new Set(OBSERVED_TOOLS)
+  // Mutating tools are observed too: a successful edit makes earlier verification stale.
+  const observed = new Set([...OBSERVED_TOOLS, ...MUTATING_TOOLS])
   const readOnly = new Set(READ_ONLY_TOOLS)
 
   // Unmatched, narrowed inside: agentflare's tools reach the model as `mcp__<server>__X` under

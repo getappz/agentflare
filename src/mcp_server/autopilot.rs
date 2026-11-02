@@ -153,13 +153,25 @@ impl AgentflareMcp {
             review_submitted: tool == "mcp__flare__review"
                 && req.item_action.as_deref() == Some("submit")
                 && req.item_success == Some(true),
-            trust_end_tree: true,
+            // The start tree is recorded by `check` before the command runs (as the hook does).
+            trust_end_tree: false,
         };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let mut runtime = crate::optimize::load_runtime();
+        // A successful edit makes earlier verification and review stale, as the PostToolUse hook does.
+        if crate::hook_redirect::MUTATING_TOOLS.contains(&tool.as_str())
+            && req.exit_code.is_none_or(|c| c == 0)
+            && req.item_success != Some(false)
+        {
+            let key = crate::optimize::scoped_session_key(obs.agent, obs.session_id);
+            crate::optimize::invalidate_verification(&mut runtime, &key);
+            crate::optimize::invalidate_review(&mut runtime, &key);
+            crate::optimize::save_runtime(&runtime);
+            return serde_json::json!({ "recorded": "none" });
+        }
         let recorded = crate::hook_completion_gate::record_observation(&mut runtime, &obs, now);
         if recorded != crate::hook_completion_gate::Recorded::None {
             crate::optimize::save_runtime(&runtime);
@@ -245,6 +257,39 @@ impl AgentflareMcp {
             ) {
                 return deny("completion_gate", reason);
             }
+        }
+        // Like the PreToolUse hook: fingerprint the tree before a verification command runs, so
+        // evidence only counts when the tree did not change underneath it.
+        if crate::hook::is_verification_shell_tool(&tool)
+            && crate::hook::shell_command_from_tool_input(input.as_ref())
+                .is_some_and(|cmd| crate::optimize::is_verification_command(&cmd))
+            && let Some(cwd) = req.cwd.as_deref()
+        {
+            let agent = req.agent.as_deref().unwrap_or("claude");
+            let key = crate::optimize::scoped_session_key(
+                agent,
+                req.session_id.as_deref().unwrap_or_default(),
+            );
+            let mut runtime = crate::optimize::load_runtime();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            runtime
+                .sessions
+                .entry(key)
+                .or_insert_with(|| crate::optimize::SessionRecord {
+                    start_ts: now,
+                    turn_count: 0,
+                    recent_tool_calls: vec![],
+                    last_verification: None,
+                    last_review: None,
+                    last_diagnosis: None,
+                    verification_start_tree: None,
+                })
+                .verification_start_tree =
+                crate::optimize::tree_fingerprint_in(std::path::Path::new(cwd));
+            crate::optimize::save_runtime(&runtime);
         }
         serde_json::json!({ "decision": "allow" })
     }
