@@ -23,24 +23,56 @@ export type AutopilotClient = {
 const TIMED_OUT = Symbol('timed out')
 const AUTOPILOT_TOOL = /^mcp__(.+)__autopilot$/
 
-/** The name the model and tool.check use for `tool` on `server` (`plugin:a:b` spells `plugin_a_b`). */
-export function toolName(server: string, tool: string): string {
-  return `mcp__${server.replace(/[^A-Za-z0-9_-]/g, '_')}__${tool}`
+/**
+ * The names agentflare's server runs under: the user's usual `flare`, a bare `agentflare`, and the
+ * plugin's own `plugin:agentflare:agentflare` (what connect answers in a plugin-only install).
+ */
+export const KNOWN_SERVERS: readonly string[] = ['flare', 'agentflare', 'plugin:agentflare:agentflare']
+
+/** A server name as tool names spell it: `plugin:a:b` is `plugin_a_b` (`mcp__plugin_a_b__tool`). */
+export function spelled(server: string): string {
+  return server.replace(/[^A-Za-z0-9_-]/g, '_')
 }
 
 /**
- * Connects the plugin's own `agentflare` MCP server; null when no server serves `autopilot`.
+ * `mcp__<agentflare server>__X` as `mcp__flare__X`, the one spelling the Rust policy keys on
+ * (gateway, item, review, coaching triggers), whatever name the server runs under. `server` is the
+ * connected name, which may be a user's own key for the same command; other tools pass unchanged.
+ */
+export function normalise(tool: string, server: string | null): string {
+  const names = server === null ? KNOWN_SERVERS : [...KNOWN_SERVERS, server]
+  const prefix = names.map(s => `mcp__${spelled(s)}__`).find(p => tool.startsWith(p))
+  return prefix === undefined ? tool : `mcp__flare__${tool.slice(prefix.length)}`
+}
+
+/**
+ * Connects the plugin's own `agentflare` MCP server; null when it is not reachable.
  * When the session already runs the same command under another key (a user's `flare`), the engine
  * suppresses the plugin's copy and connect answers with that key ("Or the name the session already
  * runs the same server under", claude-code.d.ts McpConnectResult.server). If connect refuses outright,
- * a connected server that lists an `autopilot` tool is used; $.mcp.call takes the tool-name spelling.
+ * a connected server is used only when it has one of the KNOWN_SERVERS names, lists an `autopilot`
+ * tool and answers `health` with a string `mcp_version`: any other server exposing a tool called
+ * `autopilot` could otherwise answer every guard check. $.mcp.call takes the tool-name spelling.
  */
 export async function connect($: EngineInterface, timeoutMs: number): Promise<AutopilotClient | null> {
   const conn = await $.mcp.connect('agentflare')
-  const server = conn.isConnected
-    ? conn.server
-    : (await $.tool.list()).map(t => (t.mcp ? AUTOPILOT_TOOL.exec(t.name)?.[1] : undefined)).find(s => s !== undefined)
+  if (conn.isConnected) return client($, conn.server, timeoutMs)
+  const known = new Set(KNOWN_SERVERS.map(spelled))
+  const server = (await $.tool.list())
+    .map(t => (t.mcp ? AUTOPILOT_TOOL.exec(t.name)?.[1] : undefined))
+    .find(s => s !== undefined && known.has(s))
   if (!server) return null
+  const c = client($, server, timeoutMs)
+  try {
+    const h: unknown = await c.health()
+    if (typeof h !== 'object' || h === null || typeof (h as { mcp_version?: unknown }).mcp_version !== 'string') return null
+  } catch {
+    return null
+  }
+  return c
+}
+
+function client($: EngineInterface, server: string, timeoutMs: number): AutopilotClient {
 
   // Every action replies with JSON in the first text block; a slow server is cut off at timeoutMs.
   async function call<T>(action: string, args: Record<string, unknown> = {}): Promise<T> {

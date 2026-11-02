@@ -96,16 +96,96 @@ fn check_unwraps_gateway_ctx_patch_and_windows_backslash_path() {
 
 #[test]
 fn check_allows_read_tools_without_touching_guards() {
-    let (_tmp, s) = harness();
-    assert_eq!(
-        check(
-            &s,
-            "Read",
-            json!({"file_path":"/x"}),
-            std::env::temp_dir().as_path()
-        )["decision"],
-        "allow"
-    );
+    crate::paths::test_support::with_temp_home(|| {
+        let (_tmp, s) = harness();
+        assert_eq!(
+            check(
+                &s,
+                "Read",
+                json!({"file_path":"/x"}),
+                std::env::temp_dir().as_path()
+            )["decision"],
+            "allow"
+        );
+    });
+}
+
+/// The reason the PreToolUse hook's redirect step gives for this call.
+fn hook_redirect_reason(tool: &str, input: &serde_json::Value) -> serde_json::Value {
+    let (tool, input) = crate::hook_redirect::unwrap_gateway_call(tool, Some(input));
+    crate::hook_redirect::redirect_decision(&tool, input.as_ref()).unwrap()["hookSpecificOutput"]
+        ["permissionDecisionReason"]
+        .clone()
+}
+
+#[test]
+fn check_runs_the_data_guard_for_every_shell_spelling_like_the_hook() {
+    crate::paths::test_support::with_temp_home(|| {
+        let (_tmp, s) = harness();
+        let cwd = std::env::temp_dir();
+        let rm = json!({"command": "rm -f ~/.agentflare/backend.db"});
+        let gateway =
+            json!({"action": "execute", "server": "leanctx", "tool": "ctx_shell", "args": rm});
+        for (tool, input) in [
+            ("Bash", rm.clone()),
+            ("PowerShell", rm.clone()),
+            ("mcp__lean-ctx__ctx_shell", rm.clone()),
+            ("mcp__flare__tool", gateway),
+        ] {
+            let out = check(&s, tool, input.clone(), &cwd);
+            assert_eq!(out["decision"], "deny", "{tool}");
+            assert_eq!(out["rule"], "data_guard", "{tool}");
+            assert_eq!(out["reason"], hook_redirect_reason(tool, &input), "{tool}");
+        }
+        let ls = check(&s, "Bash", json!({"command": "ls"}), &cwd);
+        assert_eq!(ls["decision"], "allow");
+    });
+}
+
+#[test]
+fn check_redirects_todowrite_with_the_hook_reason() {
+    crate::paths::test_support::with_temp_home(|| {
+        let (_tmp, s) = harness();
+        let input = json!({"todos": []});
+        let out = check(&s, "TodoWrite", input.clone(), &std::env::temp_dir());
+        assert_eq!(out["decision"], "deny");
+        assert_eq!(out["rule"], "redirect");
+        assert_eq!(out["reason"], hook_redirect_reason("TodoWrite", &input));
+    });
+}
+
+#[test]
+fn check_enforces_a_coaching_rule_on_a_non_mutating_tool() {
+    crate::paths::test_support::with_temp_home(|| {
+        let (_tmp, s) = harness();
+        crate::coaching::apply_rule(
+            "revfix",
+            "Reviews ship with fixes",
+            "Every finding needs a diff.",
+            Some(crate::coaching::test_support::trigger(
+                vec!["mcp__flare__review".into()],
+                false,
+            )),
+            crate::coaching::rule::RuleTier::Override,
+            vec![],
+        )
+        .unwrap();
+        let input = json!({"action": "submit"});
+        let cwd = std::env::temp_dir();
+        assert_eq!(
+            check(&s, "mcp__flare__review", input.clone(), &cwd)["decision"],
+            "allow"
+        );
+        crate::coaching::set_enforced("revfix", true).unwrap();
+        let out = check(&s, "mcp__flare__review", input.clone(), &cwd);
+        assert_eq!(out["decision"], "deny");
+        assert_eq!(out["rule"], "coaching");
+        assert_eq!(
+            out["reason"].as_str(),
+            crate::coaching::enforced_rule_reason_for_tool("mcp__flare__review", Some(&input))
+                .as_deref()
+        );
+    });
 }
 
 #[test]

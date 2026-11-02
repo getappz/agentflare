@@ -1,9 +1,11 @@
 import type { EngineInterface, On } from 'claude-code'
-import { toolName, type AutopilotClient } from './mcp'
-import { MUTATING_TOOLS, OBSERVED_TOOLS, READ_ONLY_TOOLS, SELF_TOOLS } from './policy'
+import { normalise, type AutopilotClient } from './mcp'
+import { CHECKED_TOOLS, GATEWAY_TOOL, MUTATING_TOOLS, OBSERVED_TOOLS, READ_ONLY_TOOLS, SELF_TOOLS } from './policy'
 
 const EXCERPT_MAX = 2000
 const UNAVAILABLE = 'agentflare MCP unavailable; mutating tool refused'
+const GATEWAY_UNREADABLE = "agentflare guard unavailable: this gateway call's inner tool could not be read back from the transcript; refused"
+const NO_ALLOW = 'agentflare guard returned no allow verdict; refused'
 const PLUGIN = 'agentflare'
 
 /** The last `max` chars of a tool result's text; an exit code is kept by the caller. */
@@ -22,7 +24,9 @@ let recoveryLogged = false
  * The model's own input for an MCP call, read back from the transcript. tool.call flattens an MCP
  * tool's arguments beside the reserved `tool` key (claude-code.d.ts McpToolCallInputFallback), so a
  * gateway's own `tool` argument (`mcp__flare__tool { tool: "ctx_patch" }`) is lost in `e`; the
- * assistant tool_use block with this id still holds it. Null when it cannot be found.
+ * assistant tool_use block with this id still holds it. Null when it cannot be found; the caller
+ * then refuses the call. A subagent's call carries `agentId` and is read from that agent's own
+ * transcript; one the session cannot read answers `{ deny }` (SessionMessagesDeny) and is refused.
  */
 async function originalInput($: EngineInterface, id: string, agentId: unknown): Promise<Record<string, unknown> | null> {
   try {
@@ -35,7 +39,7 @@ async function originalInput($: EngineInterface, id: string, agentId: unknown): 
     }
     throw new Error(`no tool_use block ${id}`)
   } catch (err) {
-    if (!recoveryLogged) $.ui.log(`agentflare: MCP input recovery failed, checking the flattened input: ${String(err)}`)
+    if (!recoveryLogged) $.ui.log(`agentflare: gateway input recovery failed, refusing the call: ${String(err)}`)
     recoveryLogged = true
     return null
   }
@@ -50,25 +54,43 @@ type GuardContext = {
 
 export function registerGuard(on: On, { client, agent, options }: GuardContext): void {
   const mutating = new Set(MUTATING_TOOLS)
+  const checked = new Set([...MUTATING_TOOLS, ...CHECKED_TOOLS])
   const observed = new Set(OBSERVED_TOOLS)
-  const tools = [...new Set([...MUTATING_TOOLS, ...OBSERVED_TOOLS])]
+  const readOnly = new Set(READ_ONLY_TOOLS)
 
-  on('tool.call', { tool: tools }, async ($, e, next) => {
+  // Unmatched, narrowed inside: agentflare's tools reach the model as `mcp__<server>__X` under
+  // whichever name the server runs (`flare`, the plugin's `plugin_agentflare_agentflare`, a user's own
+  // key), so names are normalised to `mcp__flare__X` before the sets and before Rust sees them.
+  on('tool.call', async ($, e, next) => {
     const c = client()
-    const { tool, tool_use_id, consent: _c, agentId, requestMeta: _m, ...flat } = e as { tool: string } & Record<string, unknown>
-    const recovered = tool.startsWith('mcp__') && typeof tool_use_id === 'string' ? await originalInput($, tool_use_id, agentId) : null
-    const tool_input = recovered ?? flat
+    const { tool: raw, tool_use_id, consent: _c, agentId, requestMeta: _m, ...flat } = e as { tool: string } & Record<string, unknown>
+    const tool = normalise(raw, c?.server ?? null)
+    if (!checked.has(tool) && !observed.has(tool)) return next(e)
+
+    // Only a gateway `execute` loses an argument (its inner `tool`); recover it from the transcript,
+    // let the flattened args (what actually runs) win, and refuse when it cannot be recovered: without
+    // the inner tool, Rust would see a bare gateway call and allow it.
+    let tool_input: Record<string, unknown> = flat
+    if (tool === GATEWAY_TOOL && flat.action === 'execute') {
+      const recovered = typeof tool_use_id === 'string' ? await originalInput($, tool_use_id, agentId) : null
+      if (!recovered) return { deny: GATEWAY_UNREADABLE }
+      tool_input = { ...recovered, ...flat }
+    }
     const [cwd, session_id] = await Promise.all([$.session.cwd(), $.session.id()])
 
-    if (mutating.has(tool)) {
+    // Same order and reasons as the PreToolUse hook (redirect, claim, coaching, completion gate),
+    // all in Rust. Without a connection only mutating tools are refused; with one, anything but an
+    // explicit allow refuses (a failed, timed-out or malformed check included).
+    if (checked.has(tool) && (c || mutating.has(tool))) {
       if (!c) return { deny: UNAVAILABLE }
-      let verdict
+      let verdict: unknown
       try {
         verdict = await c.check({ tool_name: tool, tool_input, cwd, session_id, agent })
       } catch {
         return { deny: UNAVAILABLE }
       }
-      if (verdict.decision === 'deny') return { deny: verdict.reason ?? 'denied by agentflare guard' }
+      const v = (typeof verdict === 'object' && verdict !== null ? verdict : {}) as { decision?: unknown; reason?: unknown }
+      if (v.decision !== 'allow') return { deny: typeof v.reason === 'string' && v.reason ? v.reason : NO_ALLOW }
     }
 
     const r = await next(e)
@@ -87,19 +109,18 @@ export function registerGuard(on: On, { client, agent, options }: GuardContext):
     return r
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'agentflare guard failed closed' }))
 
-  on('tool.check', { tool: [...READ_ONLY_TOOLS] }, ($, e, next) =>
-    options.readOnlyAutoAllow ? { decision: 'allow' } : next(e),
-  ).catch(() => ({ decision: 'deny' }))
-
-  // The mod's own $.mcp.call rides the tool path and raises tool.check like any call, so headless auto
-  // mode's classifier refuses it and the guard then fails closed on every edit. Allowing it is not a
-  // policy decision: autopilot, memory and get_routing_suggestion on the connected agentflare server are
-  // the mod's control plane (verdicts, briefings, records), never a repo mutation. Only calls this
-  // plugin raised (next.origin) are allowed; the model's own calls to them keep the session's rules.
-  // The name follows the server connect answered, so a deduplicated twin (`flare`) is covered.
+  // One unmatched hook (names are normalised, so a static matcher cannot list every spelling):
+  // 1. Read-only tools are allowed when readOnlyAutoAllow is on.
+  // 2. The mod's own $.mcp.call rides the tool path and raises tool.check like any call, so headless
+  //    auto mode's classifier refuses it and the guard then fails closed on every edit. Allowing it is
+  //    not a policy decision: autopilot, memory and get_routing_suggestion on agentflare's server are
+  //    the mod's control plane (verdicts, briefings, records), never a repo mutation. Only calls this
+  //    plugin raised (next.origin) are allowed; the model's own calls to them keep the session's rules.
+  //    No client is needed yet: connect's fallback health check runs before one exists.
   on('tool.check', ($, e, next) => {
-    const c = client()
-    const own = c !== null && next.origin.plugin === PLUGIN && SELF_TOOLS.some(t => toolName(c.server, t) === e.tool)
+    const tool = normalise(e.tool, client()?.server ?? null)
+    if (options.readOnlyAutoAllow && readOnly.has(tool)) return { decision: 'allow' }
+    const own = next.origin.plugin === PLUGIN && SELF_TOOLS.some(t => tool === `mcp__flare__${t}`)
     return own ? { decision: 'allow' } : next(e)
   }).catch(() => ({ decision: 'deny' }))
 }

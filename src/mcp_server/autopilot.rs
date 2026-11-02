@@ -171,14 +171,14 @@ impl AgentflareMcp {
     /// same reason strings. `cwd` is applied by absolutizing the tool's path
     /// (never `set_current_dir`).
     fn autopilot_check(req: &AutopilotRequest) -> serde_json::Value {
-        use crate::hook_redirect::{ITEM_TOOL_NAME, MUTATING_TOOLS};
+        use crate::hook_redirect::ITEM_TOOL_NAME;
         let raw_name = req.tool_name.as_deref().unwrap_or_default();
         let (tool, input) =
             crate::hook_redirect::unwrap_gateway_call(raw_name, req.tool_input.as_ref());
         let is_item = tool == ITEM_TOOL_NAME || tool == "item";
-        if !is_item && !MUTATING_TOOLS.contains(&tool.as_str()) {
-            return serde_json::json!({ "decision": "allow" });
-        }
+        // No early allow: like the hook, every tool runs the redirect, claim and
+        // coaching checks (the data guard, shell git-write targets, TodoWrite);
+        // only mutating tools make them spawn git.
         let input = Self::anchor_to_cwd(&tool, input, req.cwd.as_deref());
         let deny = |rule: &str, reason: String| serde_json::json!({ "decision": "deny", "rule": rule, "reason": reason });
         let hook_reason = |d: &serde_json::Value| {
@@ -200,6 +200,10 @@ impl AgentflareMcp {
         }
         if let Some(d) = crate::hook_claim_guard::claim_guard_decision(&tool, input.as_ref()) {
             return deny("claim_guard", hook_reason(&d));
+        }
+        if let Some(reason) = crate::coaching::enforced_rule_reason_for_tool(&tool, input.as_ref())
+        {
+            return deny("coaching", reason);
         }
         if is_item {
             let agent = req.agent.as_deref().unwrap_or("claude");
