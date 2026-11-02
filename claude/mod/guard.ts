@@ -1,4 +1,4 @@
-import type { On } from 'claude-code'
+import type { EngineInterface, On } from 'claude-code'
 import { toolName, type AutopilotClient } from './mcp'
 import { MUTATING_TOOLS, OBSERVED_TOOLS, READ_ONLY_TOOLS, SELF_TOOLS } from './policy'
 
@@ -16,6 +16,31 @@ export function excerpt(result: unknown, max = EXCERPT_MAX): string {
   return text.slice(-max)
 }
 
+let recoveryLogged = false
+
+/**
+ * The model's own input for an MCP call, read back from the transcript. tool.call flattens an MCP
+ * tool's arguments beside the reserved `tool` key (claude-code.d.ts McpToolCallInputFallback), so a
+ * gateway's own `tool` argument (`mcp__flare__tool { tool: "ctx_patch" }`) is lost in `e`; the
+ * assistant tool_use block with this id still holds it. Null when it cannot be found.
+ */
+async function originalInput($: EngineInterface, id: string, agentId: unknown): Promise<Record<string, unknown> | null> {
+  try {
+    const messages = await $.session.messages(typeof agentId === 'string' ? { agentId, as: 'api' } : { as: 'api' })
+    if (!Array.isArray(messages)) throw new Error(messages.deny)
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role !== 'assistant') continue
+      const block = messages[i].content.find(b => b.type === 'tool_use' && b.id === id)
+      if (block && typeof block.input === 'object' && block.input !== null) return block.input as Record<string, unknown>
+    }
+    throw new Error(`no tool_use block ${id}`)
+  } catch (err) {
+    if (!recoveryLogged) $.ui.log(`agentflare: MCP input recovery failed, checking the flattened input: ${String(err)}`)
+    recoveryLogged = true
+    return null
+  }
+}
+
 type GuardContext = {
   client: () => AutopilotClient | null
   agent: string
@@ -30,7 +55,9 @@ export function registerGuard(on: On, { client, agent, options }: GuardContext):
 
   on('tool.call', { tool: tools }, async ($, e, next) => {
     const c = client()
-    const { tool, tool_use_id: _id, consent: _consent, ...tool_input } = e as { tool: string } & Record<string, unknown>
+    const { tool, tool_use_id, consent: _c, agentId, requestMeta: _m, ...flat } = e as { tool: string } & Record<string, unknown>
+    const recovered = tool.startsWith('mcp__') && typeof tool_use_id === 'string' ? await originalInput($, tool_use_id, agentId) : null
+    const tool_input = recovered ?? flat
     const [cwd, session_id] = await Promise.all([$.session.cwd(), $.session.id()])
 
     if (mutating.has(tool)) {

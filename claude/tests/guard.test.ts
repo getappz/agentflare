@@ -137,6 +137,29 @@ test('a gateway call reaches check with every input field intact', async ($, on)
   expect(chk.tool_input).toEqual({ action: 'execute', server: 'leanctx', args: { path: 'C:\repo\a.rs' } })
 })
 
+test('a gateway call checks the inner tool recovered from the transcript', async ($, on) => {
+  const seen = observeSetup(on, () => ({ result: {} }))
+  const input = { action: 'execute', server: 'leanctx', tool: 'ctx_patch', args: { path: 'C:\\repo\\a.rs' } }
+  on('session.messages', (_: any, e: any) => ({
+    value: e.as === 'api'
+      ? [{ role: 'user', content: [{ type: 'text', text: 'go' }] }, { role: 'assistant', content: [{ type: 'tool_use', id: 'tu1', name: 'mcp__flare__tool', input }] }]
+      : [],
+  }))
+  await $.session.start(START)
+  await $.tool.call({ tool: 'mcp__flare__tool', tool_use_id: 'tu1', action: 'execute', server: 'leanctx', args: input.args } as any)
+  const chk = seen.find(a => a.action === 'check')
+  expect(chk.tool_input.tool).toBe('ctx_patch')
+  expect(seen.find(a => a.action === 'observe').tool_input.tool).toBe('ctx_patch')
+})
+
+test('an unrecoverable gateway input falls back to the flattened one', async ($, on) => {
+  const seen = observeSetup(on, () => ({ result: {} }))
+  on('session.messages', () => ({ value: [] }))
+  await $.session.start(START)
+  await $.tool.call({ tool: 'mcp__flare__tool', tool_use_id: 'tu9', action: 'execute', server: 'leanctx' } as any)
+  expect(seen.find(a => a.action === 'check').tool_input).toEqual({ action: 'execute', server: 'leanctx' })
+})
+
 test('tool.check leaves a self tool to the session rules when the plugin did not raise it', async ($, on) => {
   stubSession(on, true, 'flare')
   on('tool.check', () => ({ decision: 'ask' }))
