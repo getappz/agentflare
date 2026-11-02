@@ -11,6 +11,7 @@ export type NextWork = {
 export type Observed = { recorded: 'verification' | 'review' | 'diagnosis' | 'none' }
 
 export type AutopilotClient = {
+  server: string
   check(a: { tool_name: string; tool_input: unknown; cwd: string; session_id: string; agent: string }): Promise<Decision>
   observe(a: { session_id: string; cwd: string; agent: string; tool_name: string; tool_input: unknown; exit_code?: number; output_excerpt: string; item_action?: string; item_success?: boolean }): Promise<Observed>
   briefing(a: { cwd: string; session_id: string; agent: string; etag?: string }): Promise<Briefing>
@@ -40,6 +41,7 @@ export async function connect($: EngineInterface, timeoutMs: number): Promise<Au
   }
 
   return {
+    server,
     check: a => call('check', a),
     observe: a => call('observe', a),
     briefing: a => call('briefing', a),

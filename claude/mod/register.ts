@@ -3,6 +3,7 @@ import { refreshBriefing, registerBriefing } from './briefing'
 import { registerCompaction, type Current } from './compaction'
 import { registerGuard } from './guard'
 import { connect, type AutopilotClient } from './mcp'
+import { registerSpawn } from './spawn'
 
 export const AGENT = 'claude-code'
 
@@ -44,6 +45,7 @@ export const register: Register = (on, options) => {
   const briefingCtx = { client: () => client, agent: AGENT }
   registerBriefing(on, briefingCtx)
   registerCompaction(on, { ...briefingCtx, current: () => current })
+  registerSpawn(on, { server: () => client?.server ?? null, agent: AGENT })
 
   on('session.start', async ($, e, next) => {
     // A hot reload resets the module flag, so the command list is the real guard against a second /flare.

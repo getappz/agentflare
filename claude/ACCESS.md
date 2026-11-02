@@ -1,1 +1,1 @@
-./mod/register.ts calls: $.clock.sleep (via connect), $.command.list, $.command.register, $.mcp.call (via connect), $.mcp.connect (via connect), $.session.cwd, $.session.id, $.session.version, $.state.set (via refreshBriefing), $.ui.invalidate (via refreshBriefing), $.ui.log, $.ui.toast
+./mod/register.ts calls: $.clock.sleep, $.command.list, $.command.register, $.mcp.call, $.mcp.connect (via connect), $.session.cwd, $.session.id, $.session.version, $.state.set (via refreshBriefing), $.ui.invalidate (via refreshBriefing), $.ui.log, $.ui.toast
