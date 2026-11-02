@@ -1627,3 +1627,35 @@ pub(crate) struct BrowserRequest {
     #[serde(default)]
     pub(crate) redact: Option<Vec<String>>,
 }
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub(crate) struct AutopilotRequest {
+    #[schemars(description = "check|observe|briefing|checkpoint|next_work|health")]
+    pub(crate) action: String,
+    #[serde(default)]
+    pub(crate) session_id: Option<String>,
+    #[serde(default)]
+    pub(crate) cwd: Option<String>,
+    #[serde(default)]
+    pub(crate) agent: Option<String>,
+    #[serde(default)]
+    pub(crate) tool_name: Option<String>,
+    #[serde(default)]
+    pub(crate) tool_input: Option<serde_json::Value>,
+    #[serde(default)]
+    pub(crate) exit_code: Option<i32>,
+    #[serde(default)]
+    pub(crate) output_excerpt: Option<String>,
+    #[serde(default)]
+    pub(crate) item_action: Option<String>,
+    #[serde(default)]
+    pub(crate) item_success: Option<bool>,
+    #[serde(default)]
+    pub(crate) etag: Option<String>,
+    #[serde(default)]
+    pub(crate) payload: Option<serde_json::Value>,
+    #[serde(default)]
+    pub(crate) max_cost_usd: Option<f64>,
+    #[serde(default)]
+    pub(crate) rate_limit_pct: Option<f64>,
+}

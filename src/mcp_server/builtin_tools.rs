@@ -19,6 +19,10 @@
 /// servers only, agentflare's own tools aren't registered as one).
 const BUILTIN_TOOLS: &[(&str, &str)] = &[
     (
+        "autopilot",
+        "Autopilot support for the Claude plugin: guard check, observation recording, cached briefing, compaction checkpoint, next work, health. action=check|observe|briefing|checkpoint|next_work|health",
+    ),
+    (
         "check_session_health",
         "Check if a session should be refreshed based on turn count and elapsed time.",
     ),

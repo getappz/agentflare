@@ -4,6 +4,7 @@
 
 mod artifact;
 mod asset;
+mod autopilot;
 mod browser;
 mod builtin_tools;
 pub(crate) mod chat;
@@ -1274,6 +1275,15 @@ impl AgentflareMcp {
     )]
     fn claim(&self, Parameters(req): Parameters<ClaimRequest>) -> Result<String, ErrorData> {
         self.claim_impl(req)
+    }
+    #[tool(
+        description = "Autopilot support for the Claude plugin: guard check, observation recording, cached briefing, compaction checkpoint, next work, health. action=check|observe|briefing|checkpoint|next_work|health"
+    )]
+    fn autopilot(
+        &self,
+        Parameters(req): Parameters<AutopilotRequest>,
+    ) -> Result<String, ErrorData> {
+        self.autopilot_impl(req)
     }
     /// Opens the ledger db.
     fn claim_db() -> crate::errors::Result<rusqlite::Connection> {

@@ -473,6 +473,7 @@ pub(crate) fn mcp_with_claimed_item(
 mod action_tests;
 mod artifact_tests;
 mod asset_tests;
+mod autopilot_tests;
 mod comment_tests;
 mod item_commit_failure_tests;
 mod item_doctor_tests;
