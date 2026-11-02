@@ -68,7 +68,7 @@ gateway), the tool is called `docs` and takes an `action` of `search`, `get`, `l
 `refresh`, plus a package name and optional ecosystem/version.
 
 For the exact flags and parameters — from the terminal or from an MCP client — see the
-[CLI reference](/docs/cli/) and [MCP tools reference](/docs/mcp-tools/). For
+[CLI reference](/docs/reference/cli/) and [MCP tools reference](/docs/reference/mcp-tools/). For
 task-shaped walkthroughs, see [Guides](/docs/guides/).
 
 ## Why it's fast

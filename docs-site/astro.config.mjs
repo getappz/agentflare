@@ -9,6 +9,13 @@ import starlight from "@astrojs/starlight";
 export default defineConfig({
   site: "https://agentflare.dev",
   base: "/docs",
+  redirects: {
+    "/architecture": "/docs/reference/architecture/",
+    "/cli": "/docs/reference/cli/",
+    "/mcp-tools": "/docs/reference/mcp-tools/",
+    "/getting-started": "/docs/get-started/",
+    "/flare-docs": "/docs/concepts/flare-docs/",
+  },
   integrations: [
     starlight({
       title: "agentflare docs",
@@ -26,22 +33,58 @@ export default defineConfig({
       },
       sidebar: [
         {
-          label: "Guide",
+          label: "Get started",
           items: [
-            { label: "Overview", slug: "index" },
-            { label: "Getting started", slug: "getting-started" },
-            { label: "Concepts", slug: "concepts" },
-            { label: "Guides", slug: "guides" },
+            { label: "Overview", slug: "get-started" },
+            { label: "Installation", slug: "get-started/install" },
+            { label: "Wire into your agent", slug: "get-started/wire-into-agent" },
+          ],
+        },
+        {
+          label: "Concepts",
+          items: [
+            { label: "Overview", slug: "concepts" },
+            { label: "Optimization", slug: "concepts/optimization" },
+            { label: "Coordination", slug: "concepts/coordination" },
+            { label: "flare-docs", slug: "concepts/flare-docs" },
+          ],
+        },
+        {
+          label: "Guides",
+          items: [
+            { label: "Overview", slug: "guides" },
+            { label: "Use flare-docs", slug: "guides/flare-docs" },
+            { label: "Coordinate agents", slug: "guides/coordinate-agents" },
+            { label: "Channel notifications", slug: "guides/notifications" },
           ],
         },
         {
           label: "Reference",
           items: [
-            { label: "Architecture", slug: "architecture" },
-            { label: "CLI reference", slug: "cli" },
-            { label: "MCP tools reference", slug: "mcp-tools" },
-            { label: "flare-docs", slug: "flare-docs" },
+            { label: "CLI", slug: "reference/cli" },
+            { label: "MCP tools", slug: "reference/mcp-tools" },
+            {
+              label: "Architecture",
+              items: [
+                { label: "Start here", slug: "reference/architecture" },
+                { label: "Overview and capabilities", slug: "reference/architecture/overview" },
+                { label: "Installation and verification", slug: "reference/architecture/installation-and-verification" },
+                { label: "Internals", slug: "reference/architecture/internals" },
+                { label: "Checkout and ecosystem", slug: "reference/architecture/checkout-and-ecosystem" },
+                { label: "Blueprint", slug: "reference/architecture/blueprint" },
+              ],
+            },
+          ],
+        },
+        {
+          label: "Compare",
+          items: [
             { label: "How it compares", slug: "compare" },
+            { label: "Documentation lookup", slug: "compare/docs-lookup" },
+            { label: "Context and memory", slug: "compare/context-and-memory" },
+            { label: "Coordination and orchestration", slug: "compare/coordination-and-orchestration" },
+            { label: "Code review", slug: "compare/code-review" },
+            { label: "Supporting tools", slug: "compare/supporting-tools" },
           ],
         },
       ],
