@@ -48,7 +48,7 @@ mod evidence_tests {
     use super::*;
 
     #[test]
-    fn agent_sync_uses_git_root_while_manual_sync_stays_global() {
+    fn agent_sync_uses_git_root() {
         let repo = tempfile::tempdir().unwrap();
         assert!(
             std::process::Command::new("git")
@@ -60,16 +60,12 @@ mod evidence_tests {
         );
         let nested = repo.path().join("src");
         std::fs::create_dir(&nested).unwrap();
-        assert!(sync_project(false, &nested).is_none());
         assert_eq!(
-            sync_project(true, &nested).map(|p| dunce::canonicalize(p).unwrap()),
-            Some(dunce::canonicalize(repo.path()).unwrap())
+            dunce::canonicalize(sync_project(&nested)).unwrap(),
+            dunce::canonicalize(repo.path()).unwrap()
         );
         let non_git = tempfile::tempdir().unwrap();
-        assert_eq!(
-            sync_project(true, non_git.path()),
-            Some(non_git.path().to_path_buf())
-        );
+        assert_eq!(sync_project(non_git.path()), non_git.path().to_path_buf());
     }
 
     #[test]
@@ -184,9 +180,8 @@ fn open_store(db: PathBuf) -> flare_insights::store::InsightsStore {
     })
 }
 
-fn sync_project(from_agent: bool, cwd: &std::path::Path) -> Option<PathBuf> {
-    from_agent
-        .then(|| flare_git_core::branch::repo_toplevel(cwd).unwrap_or_else(|| cwd.to_path_buf()))
+fn sync_project(cwd: &std::path::Path) -> PathBuf {
+    flare_git_core::branch::repo_toplevel(cwd).unwrap_or_else(|| cwd.to_path_buf())
 }
 
 fn run_sync(db: PathBuf, args: SyncArgs) {
@@ -199,10 +194,9 @@ fn run_sync(db: PathBuf, args: SyncArgs) {
             crate::ui::error(&format!("cannot resolve sync project: {e}"));
             std::process::exit(1);
         });
-        config.project = sync_project(true, &cwd);
-        if let Some(project) = &config.project {
-            eprintln!("syncing project {}", project.display());
-        }
+        let project = sync_project(&cwd);
+        eprintln!("syncing project {}", project.display());
+        config.project = Some(project);
     }
     let mgr = flare_insights::ingest::IngestManager::new();
     let mut total_sessions = 0;

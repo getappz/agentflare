@@ -104,9 +104,11 @@ impl Adapter for OpenCodeAdapter {
             if let Ok(rows) =
                 stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
             {
+                let session_ids: std::collections::HashSet<String> =
+                    bundle.sessions.iter().map(|s| s.id.clone()).collect();
                 for row in rows.filter_map(|r| r.ok()) {
                     let (child_id, parent_id) = row;
-                    if !bundle.sessions.iter().any(|s| s.id == parent_id) {
+                    if !session_ids.contains(&parent_id) {
                         continue;
                     }
                     bundle.subagents.push(crate::model::Subagent {

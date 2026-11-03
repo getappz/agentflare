@@ -84,7 +84,11 @@ impl Adapter for AntigravityAdapter {
             if config.project.is_some() {
                 let project = match workspaces.get(&transcript_id(path)) {
                     Some(workspace) => Some(workspace.to_string_lossy().into_owned()),
-                    None => super::common::jsonl_project(path)?,
+                    None => match super::common::jsonl_project(path) {
+                        Ok(project) => project,
+                        // Unreadable file: skip it instead of failing the scan.
+                        Err(_) => continue,
+                    },
                 };
                 if !config.matches_project(project.as_deref()) {
                     if project.is_some() {
@@ -95,7 +99,10 @@ impl Adapter for AntigravityAdapter {
             }
             if let Some(mut b) = parse_antigravity_jsonl(path, &config.pricing) {
                 for session in &mut b.sessions {
-                    if let Some(workspace) = workspaces.get(&session.id) {
+                    if let Some(workspace) = workspaces
+                        .get(&session.id)
+                        .filter(|_| session.project_path.is_none())
+                    {
                         session.project = workspace
                             .file_name()
                             .map(|name| name.to_string_lossy().into_owned())
