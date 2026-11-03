@@ -28,8 +28,20 @@ pub(crate) fn worktree_removal_detected(path: &Path) -> Option<bool> {
 /// removing the worktree deletes its contents yet leaves the empty directory behind.
 fn root_removed(path: &Path, had_git_marker: bool) -> Option<bool> {
     match worktree_removal_detected(path) {
-        Some(false) if had_git_marker && !path.join(".git").exists() => Some(true),
+        // Only a definite "not there" counts; any other error leaves the answer open.
+        Some(false) if had_git_marker => git_marker_present(path).map(|present| !present),
         other => other,
+    }
+}
+
+/// `Some(false)` only when the `.git` entry is definitely absent; `None` on any other error.
+fn git_marker_present(root: &Path) -> Option<bool> {
+    match std::fs::symlink_metadata(root.join(".git")) {
+        Ok(_) => Some(true),
+        Err(e) if e.kind() == ErrorKind::NotFound || e.kind() == ErrorKind::NotADirectory => {
+            Some(false)
+        }
+        Err(_) => None,
     }
 }
 
@@ -79,13 +91,8 @@ pub fn run_tether(
     program: &std::ffi::OsStr,
     args: &[&std::ffi::OsStr],
 ) -> Result<i32, String> {
-    let watch = worktree_removal_detected(worktree_root).is_some();
-    let had_git_marker = worktree_root.join(".git").exists();
-    let mut child = spawn_tethered_child(worktree_root, program, args)?;
-    if !watch {
-        let status = child.wait().map_err(|e| format!("tether: wait: {e}"))?;
-        return Ok(status.code().unwrap_or(1));
-    }
+    let had_git_marker = git_marker_present(worktree_root) == Some(true);
+    let child = spawn_tethered_child(worktree_root, program, args)?;
 
     let child_slot = Arc::new(Mutex::new(Some(child)));
     let finished = Arc::new(AtomicBool::new(false));
