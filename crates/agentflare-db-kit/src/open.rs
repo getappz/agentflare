@@ -210,9 +210,20 @@ mod tests {
 
     #[test]
     fn a_missing_parent_fails_fast_without_retrying() {
+        // Parent is a regular file so create_dir_all cannot invent a directory.
+        // `/proc/...` only fails on Linux; Windows happily creates `\proc\...`.
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, b"x").unwrap();
+        let path = blocker.join("t.db");
+
         let start = std::time::Instant::now();
-        let err = open_file(Path::new("/proc/nope/t.db"), &migrations());
-        assert!(err.is_err());
+        let err = open_file(&path, &migrations());
+        assert!(err.is_err(), "{err:?}");
+        assert!(
+            !is_transient_lock_error(&err.unwrap_err()),
+            "CannotOpen must not be retried as a lock"
+        );
         assert!(start.elapsed() < std::time::Duration::from_secs(2));
     }
 
