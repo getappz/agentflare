@@ -1406,12 +1406,12 @@ enum PassingPrOutcome {
 /// creation needs an explicit project, unlike every other mutation here,
 /// which is addressed by an existing item's own id).
 pub(crate) struct ReviewBatch {
-    folder_path: String,
-    project_id: String,
+    pub(crate) folder_path: String,
+    pub(crate) project_id: String,
     in_review_state_id: String,
     known_pr_numbers: std::collections::HashSet<u64>,
     pub(crate) items: Vec<agentflare_backend::item::Item>,
-    label_id_by_name: std::collections::HashMap<String, String>,
+    pub(crate) label_id_by_name: std::collections::HashMap<String, String>,
     /// Items #234's self-heal: items that regressed out of "in_review" (e.g.
     /// an orphaned self-repair job's claim getting reconciled) while still
     /// carrying a tracked, untouched `metadata.pr.number`, with no live
@@ -1466,7 +1466,7 @@ fn repo_matches_project(expected_key: Option<&str>, repo: &crate::github::RepoId
 /// One batch per project dir. A failing lookup in one project is logged and
 /// that project skipped, so it can't blind the sweep for every other project
 /// (same isolation as `batch_pr_status` per chunk).
-fn collect_review_batches(
+pub(crate) fn collect_review_batches(
     conn: &rusqlite::Connection,
     dirs: Vec<agentflare_backend::project_dir::ProjectDir>,
 ) -> Vec<ReviewBatch> {
@@ -1842,7 +1842,7 @@ pub(crate) fn run_review_sweep(
 /// liveness before dispatching, guarding the one branch here that starts new
 /// work rather than just re-attempting an idempotent GitHub operation.
 #[allow(clippy::too_many_arguments)]
-fn handle_pr_status(
+pub(crate) fn handle_pr_status(
     mcp: &AgentflareMcp,
     queue: &agentflare_jobs::Queue,
     auth_conn: &rusqlite::Connection,
