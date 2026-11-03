@@ -66,3 +66,6 @@ node_modules/
 
 # Branch build dir for the autopilot plugin probes; never staged
 /target-autopilot/
+
+# local npm cache created by sandboxed agent runs
+.npm-cache/
