@@ -828,15 +828,16 @@ pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {
             // each agent's autonomy/streaming defaults at invocation time.
             let boot_mcp = std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default());
             let boot_definition = crate::work_item_pipeline::build_work_item_pipeline(
-                boot_mcp,
+                boot_mcp.clone(),
                 std::time::Duration::from_secs(crate::cli::work::DEFAULT_TIMEOUT_SECS),
                 std::time::Duration::from_secs(crate::cli::work::DEFAULT_IDLE_TIMEOUT_SECS),
                 Vec::new(),
             );
-            // A registration/recovery failure means the pipeline's own
-            // resume state is untrustworthy, so dispatch stays disabled
-            // here too -- same "fail closed, dashboard stays up" contract
-            // as the smoke-test gate this block is already nested inside.
+            // Registration/recovery failure → keep dispatch off (fail closed).
+            crate::pr_lifecycle_workflow::register_at_boot_if_enabled_or_log(
+                boot_mcp,
+                queue.clone(),
+            );
             match crate::work_item_pipeline::engine().register_workflow(boot_definition) {
                 Ok(()) => match crate::work_item_pipeline::engine()
                     .recover_with(crate::work_item_pipeline::should_recover_at_boot)
