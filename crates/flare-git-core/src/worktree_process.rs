@@ -9,7 +9,7 @@ use std::time::Duration;
 
 /// Kills `child` and its whole process tree — not just the direct child —
 /// so a grandchild (e.g. a `git` credential helper) can't outlive a timeout.
-pub(super) fn kill_tree(child: &mut std::process::Child) {
+pub(crate) fn kill_tree(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
         // `kill -KILL -<pid>` packs the signal and the (negative, i.e.
@@ -48,6 +48,22 @@ pub(super) fn kill_tree(child: &mut std::process::Child) {
     {
         let _ = child.kill();
     }
+}
+
+/// SIGTERM (Unix) then [`kill_tree`] — used when a tethered worktree disappears.
+pub(crate) fn terminate_tree_gracefully(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .arg("-s")
+            .arg("TERM")
+            .arg("--")
+            .arg(format!("-{}", child.id()))
+            .status();
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    kill_tree(child);
+    let _ = child.wait();
 }
 
 /// Runs `program` with a deadline, returning its output. Puts the child in

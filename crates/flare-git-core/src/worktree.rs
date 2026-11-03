@@ -21,6 +21,8 @@ mod heal;
 mod orphans;
 #[path = "worktree_process.rs"]
 mod process;
+#[path = "worktree_tether.rs"]
+mod tether;
 #[path = "worktree_wipe_guard.rs"]
 mod wipe_guard;
 
@@ -32,6 +34,7 @@ use orphans::{is_structurally_broken, remove_worktree_dir};
 pub(crate) use process::run_output_timeout;
 pub use process::run_output_timeout_env;
 use process::*;
+pub use tether::run_tether;
 use wipe_guard::restore_mass_deleted_worktree;
 
 /// Bounded `git` invocation for hook-time work (tree fingerprint, etc.).
@@ -1432,3 +1435,7 @@ mod rebase_tests;
 #[cfg(test)]
 #[path = "worktree_process_tests.rs"]
 mod process_tests;
+
+#[cfg(test)]
+#[path = "worktree_tether_tests.rs"]
+mod tether_tests;
