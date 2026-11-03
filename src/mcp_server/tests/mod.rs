@@ -499,3 +499,51 @@ mod project_tests;
 mod review_verify_tests;
 mod search_tests;
 mod state_tests;
+
+#[tokio::test]
+async fn run_stdio_filtered_handles_pre_init_server_discover() {
+    let (client_write, server_read) = tokio::io::duplex(4096);
+    let (server_write, client_read) = tokio::io::duplex(4096);
+
+    let server_handle = tokio::spawn(async move {
+        crate::mcp_server::run_stdio_filtered(server_read, server_write).await
+    });
+
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let mut client_write = client_write;
+    let mut client_read = BufReader::new(client_read);
+
+    // 1. Send pre-init "server/discover" probe
+    client_write
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{}}\n")
+        .await
+        .unwrap();
+
+    let mut response_line = String::new();
+    client_read.read_line(&mut response_line).await.unwrap();
+
+    let resp: serde_json::Value = serde_json::from_str(&response_line).unwrap();
+    assert_eq!(resp["id"], 1);
+    assert_eq!(resp["error"]["code"], -32601);
+    assert_eq!(resp["error"]["message"], "Method not found");
+
+    // 2. Send standard "initialize" request
+    client_write
+        .write_all(
+            b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test-client\",\"version\":\"1.0.0\"}}}\n"
+        )
+        .await
+        .unwrap();
+
+    response_line.clear();
+    client_read.read_line(&mut response_line).await.unwrap();
+
+    let init_resp: serde_json::Value = serde_json::from_str(&response_line).unwrap();
+    assert_eq!(init_resp["id"], 2);
+    assert!(init_resp["result"]["serverInfo"]["name"].is_string());
+
+    // 3. Drop client write to trigger clean shutdown
+    drop(client_write);
+    let _ = server_handle.await;
+}
+

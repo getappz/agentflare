@@ -2218,10 +2218,83 @@ impl AgentflareMcp {
     }
 }
 
-pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let service = AgentflareMcp::from_env().serve(stdio()).await?;
+/// Filter pre-initialization messages on stdio to support dual-era clients (such as
+/// Antigravity CLI / Go MCP SDK >= 1.7) that send probe requests like `server/discover`
+/// before `initialize`. Legacy/pinned `rmcp` expects `initialize` or `ping` as the first
+/// request and exits with an error on unhandled pre-init requests.
+///
+/// By replying with JSON-RPC `-32601` (`Method not found`) and staying in the loop,
+/// dual-era clients gracefully fall back to the standard `initialize` handshake.
+pub async fn run_stdio_filtered<R, W>(
+    reader: R,
+    mut writer: W,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    R: tokio::io::AsyncRead + Send + Unpin + 'static,
+    W: tokio::io::AsyncWrite + Send + Unpin + 'static,
+{
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    let mut buffered_reader = BufReader::new(reader);
+    let mut line_buf = String::new();
+    let buffered_init_bytes: Vec<u8>;
+
+    loop {
+        line_buf.clear();
+        let bytes_read = buffered_reader.read_line(&mut line_buf).await?;
+        if bytes_read == 0 {
+            return Ok(());
+        }
+
+        let trimmed = line_buf.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            let method = json.get("method").and_then(|m| m.as_str());
+            if method == Some("initialize") {
+                buffered_init_bytes = line_buf.into_bytes();
+                break;
+            }
+
+            if let Some(id) = json.get("id") {
+                let resp = if method == Some("ping") {
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {}
+                    })
+                } else {
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": -32601,
+                            "message": "Method not found"
+                        }
+                    })
+                };
+                let mut resp_str = serde_json::to_string(&resp)?;
+                resp_str.push('\n');
+                writer.write_all(resp_str.as_bytes()).await?;
+                writer.flush().await?;
+                continue;
+            }
+        }
+
+        buffered_init_bytes = line_buf.into_bytes();
+        break;
+    }
+
+    let combined_reader = std::io::Cursor::new(buffered_init_bytes).chain(buffered_reader);
+    let service = AgentflareMcp::from_env().serve((combined_reader, writer)).await?;
     service.waiting().await?;
     Ok(())
+}
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_stdio_filtered(tokio::io::stdin(), tokio::io::stdout()).await
 }
 
 /// Serve the MCP server over Streamable HTTP/SSE so one persistent agentflare
