@@ -39,7 +39,7 @@ impl RepoId {
     }
 
     pub fn resolve_from_remote(repo_root: &Path) -> Option<RepoId> {
-        let url = flare_git_core::branch::remote_url(repo_root, "origin")?;
+        let url = flare_git_core::shell::run_in_opt(repo_root, &["remote", "get-url", "origin"])?;
         RepoId::parse(&url)
     }
 }

@@ -14,9 +14,10 @@ impl AgentflareMcp {
     /// Derives a project name from the git remote (`getappz/agentflare` →
     /// `agentflare`) or, outside a repo, the directory basename.
     pub(crate) fn resolve_project_name() -> String {
-        let cwd = std::env::current_dir().ok();
-        let origin = cwd.as_deref().and_then(|d| flare_git_core::branch::remote_url(d, "origin"));
-        Self::project_name_from(origin, cwd)
+        Self::project_name_from(
+            Self::run_git(&["remote", "get-url", "origin"]),
+            std::env::current_dir().ok(),
+        )
     }
 
     fn project_name_from(origin: Option<String>, dir: Option<std::path::PathBuf>) -> String {
@@ -47,7 +48,7 @@ impl AgentflareMcp {
     /// `git remote get-url origin` for `resolution_root`.
     fn resolution_origin(&self) -> Option<String> {
         let root = self.resolution_root();
-        flare_git_core::branch::remote_url(&root, "origin")
+        flare_git_core::shell::run_in_opt(&root, &["remote", "get-url", "origin"])
     }
 
     /// `resolve_project_name`, scoped the same way as `resolution_root`.

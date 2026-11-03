@@ -120,17 +120,6 @@ pub fn staleness_reason(default_branch: &str, commits_behind: u64) -> Option<Str
 /// correctly, works regardless of subdirectory. `None` outside a git repo.
 #[must_use]
 pub fn repo_toplevel(start: &Path) -> Option<PathBuf> {
-    let mut cur = start;
-    loop {
-        let dot_git = cur.join(".git");
-        if dot_git.is_dir() || dot_git.is_file() {
-            return Some(cur.to_path_buf());
-        }
-        match cur.parent() {
-            Some(p) => cur = p,
-            None => break,
-        }
-    }
     run_in_opt(start, &["rev-parse", "--show-toplevel"]).map(PathBuf::from)
 }
 
@@ -197,13 +186,6 @@ pub fn is_protected_branch(branch: &str, default: Option<&str>) -> bool {
 /// much broader and more surprising deny surface than intended.
 #[must_use]
 pub fn is_linked_worktree(repo_root: &Path) -> bool {
-    let dot_git = repo_root.join(".git");
-    if dot_git.is_dir() {
-        return false;
-    }
-    if dot_git.is_file() {
-        return true;
-    }
     match (
         run_in_opt(repo_root, &["rev-parse", "--git-dir"]),
         run_in_opt(repo_root, &["rev-parse", "--git-common-dir"]),
@@ -211,58 +193,6 @@ pub fn is_linked_worktree(repo_root: &Path) -> bool {
         (Some(git_dir), Some(common_dir)) => git_dir != common_dir,
         _ => false,
     }
-}
-
-/// Read the remote URL for `remote` (e.g. "origin") directly from `.git/config`
-/// without spawning a git subprocess. Falls back to `git remote get-url <remote>`.
-#[must_use]
-pub fn remote_url(repo_root: &Path, remote: &str) -> Option<String> {
-    if let Some(url) = fast_remote_url(repo_root, remote) {
-        return Some(url);
-    }
-    run_in_opt(repo_root, &["remote", "get-url", remote])
-}
-
-fn fast_remote_url(repo_root: &Path, remote: &str) -> Option<String> {
-    let dot_git = repo_root.join(".git");
-    let config_path = if dot_git.is_dir() {
-        dot_git.join("config")
-    } else if dot_git.is_file() {
-        let content = std::fs::read_to_string(&dot_git).ok()?;
-        let gitdir_line = content.lines().find(|l| l.trim_start().starts_with("gitdir:"))?;
-        let gitdir_path = gitdir_line.trim_start().strip_prefix("gitdir:")?.trim();
-        let path = Path::new(gitdir_path);
-        let gitdir = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            repo_root.join(path)
-        };
-        let direct_config = gitdir.join("config");
-        if direct_config.is_file() {
-            direct_config
-        } else {
-            gitdir.parent()?.parent()?.join("config")
-        }
-    } else {
-        return None;
-    };
-
-    let text = std::fs::read_to_string(config_path).ok()?;
-    let target_header = format!("[remote \"{remote}\"]");
-    let mut in_target = false;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            in_target = trimmed.eq_ignore_ascii_case(&target_header);
-            continue;
-        }
-        if in_target && let Some((k, v)) = trimmed.split_once('=') {
-            if k.trim().eq_ignore_ascii_case("url") {
-                return Some(v.trim().to_string());
-            }
-        }
-    }
-    None
 }
 
 /// The main checkout's root when `repo_root` is a linked worktree, or the
