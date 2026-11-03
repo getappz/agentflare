@@ -202,6 +202,7 @@ impl AgentflareMcp {
             .into_iter()
             .filter(|p| {
                 p.deleted_at.is_none()
+                    && p.external_source.as_deref() == Some(Self::REPO_EXTERNAL_SOURCE)
                     && (p.external_id.as_deref() == Some(repo_key.as_str())
                         || (legacy_repo_key.is_some()
                             && p.external_id.as_deref() == legacy_repo_key.as_deref()))

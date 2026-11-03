@@ -122,3 +122,73 @@ fn project_rename_and_delete() {
     assert_eq!(deleted["status"], "deleted");
     assert_eq!(deleted["id"], project_id);
 }
+
+#[test]
+fn project_rename_explicit_identifier_collision_errors() {
+    let (tmp, s) = harness();
+    let conn = backend_conn(&tmp);
+    let first = s.resolve_project(&conn).unwrap();
+    let ws = first.workspace_id.clone();
+    let taken = agentflare_backend::project::create(
+        &conn,
+        agentflare_backend::project::CreateProject {
+            workspace_id: ws,
+            name: "other-project".into(),
+            identifier: "TAKEN".into(),
+            external_source: None,
+            external_id: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(taken.identifier, "TAKEN");
+
+    let err = s
+        .project(Parameters(ProjectRequest {
+            action: "rename".into(),
+            project: Some(first.id.clone()),
+            name: Some("renamed-first".into()),
+            identifier: Some("TAKEN".into()),
+        }))
+        .unwrap_err();
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+
+    let still = agentflare_backend::project::get(&conn, &first.id).unwrap();
+    assert_eq!(still.name, first.name, "failed rename must not change name");
+    assert_eq!(
+        still.identifier, first.identifier,
+        "failed rename must not change identifier"
+    );
+}
+
+#[test]
+fn project_rename_derived_identifier_collision_keeps_existing() {
+    let (tmp, s) = harness();
+    let conn = backend_conn(&tmp);
+    let first = s.resolve_project(&conn).unwrap();
+    let ws = first.workspace_id.clone();
+    agentflare_backend::project::create(
+        &conn,
+        agentflare_backend::project::CreateProject {
+            workspace_id: ws,
+            name: "holder".into(),
+            identifier: "COLLIDE".into(),
+            external_source: None,
+            external_id: None,
+        },
+    )
+    .unwrap();
+
+    // Name "collide" derives to "COLLIDE"; collision fallback keeps first's identifier.
+    let renamed: serde_json::Value = serde_json::from_str(
+        &s.project(Parameters(ProjectRequest {
+            action: "rename".into(),
+            project: Some(first.id.clone()),
+            name: Some("collide".into()),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(renamed["name"], "collide");
+    assert_eq!(renamed["identifier"], first.identifier);
+}

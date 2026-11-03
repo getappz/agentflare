@@ -1956,10 +1956,12 @@ impl AgentflareMcp {
                             None,
                         )
                     })?;
-                let target_ident = req
+                let caller_ident = req
                     .identifier
                     .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
+                    .filter(|s| !s.is_empty());
+                let target_ident = caller_ident
+                    .clone()
                     .unwrap_or_else(|| Self::derive_project_identifier(&new_name));
 
                 let project = match agentflare_backend::project::update(
@@ -1971,7 +1973,9 @@ impl AgentflareMcp {
                     },
                 ) {
                     Ok(p) => p,
-                    Err(agentflare_backend::Error::Duplicate(_)) => {
+                    // Derived collision: keep the existing identifier and rename only.
+                    // Caller-supplied collision: surface the duplicate error.
+                    Err(agentflare_backend::Error::Duplicate(_)) if caller_ident.is_none() => {
                         agentflare_backend::project::update(
                             conn,
                             &target.id,
