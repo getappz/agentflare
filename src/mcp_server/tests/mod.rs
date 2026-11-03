@@ -556,4 +556,3 @@ async fn run_stdio_filtered_handles_pre_init_server_discover() {
         .unwrap();
     assert!(result.is_ok(), "server exited with error: {result:?}");
 }
-

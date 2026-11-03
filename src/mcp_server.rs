@@ -1951,7 +1951,10 @@ impl AgentflareMcp {
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| {
-                        ErrorData::invalid_params("name is required for project action=rename", None)
+                        ErrorData::invalid_params(
+                            "name is required for project action=rename",
+                            None,
+                        )
                     })?;
                 let target_ident = req
                     .identifier
@@ -1988,7 +1991,10 @@ impl AgentflareMcp {
                     && link.project_id == project.id
                 {
                     link.identifier = project.identifier.clone();
-                    let _ = std::fs::write(&link_path, serde_json::to_vec_pretty(&link).unwrap_or_default());
+                    let _ = std::fs::write(
+                        &link_path,
+                        serde_json::to_vec_pretty(&link).unwrap_or_default(),
+                    );
                 }
 
                 Ok(serde_json::to_string_pretty(&project).unwrap_or_default())
@@ -2000,10 +2006,13 @@ impl AgentflareMcp {
                     "status": "deleted",
                     "id": target.id,
                     "name": target.name,
-                }).to_string())
+                })
+                .to_string())
             })?,
             other => Err(ErrorData::invalid_params(
-                format!("unknown project action: '{other}' — expected info|list|archive|unarchive|rename|delete"),
+                format!(
+                    "unknown project action: '{other}' — expected info|list|archive|unarchive|rename|delete"
+                ),
                 None,
             )),
         }
@@ -2332,9 +2341,7 @@ impl<T: rmcp::transport::Transport<RoleServer>> rmcp::transport::Transport<RoleS
         }
     }
 
-    fn close(
-        &mut self,
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+    fn close(&mut self) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
         self.inner.close()
     }
 }
@@ -2350,9 +2357,7 @@ where
     W: tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
     let transport = PreInitFilter {
-        inner: rmcp::transport::async_rw::AsyncRwTransport::<RoleServer, _, _>::new(
-            reader, writer,
-        ),
+        inner: rmcp::transport::async_rw::AsyncRwTransport::<RoleServer, _, _>::new(reader, writer),
         initialized: false,
     };
     let service = AgentflareMcp::from_env().serve(transport).await?;

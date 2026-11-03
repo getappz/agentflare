@@ -122,4 +122,3 @@ fn project_rename_and_delete() {
     assert_eq!(deleted["status"], "deleted");
     assert_eq!(deleted["id"], project_id);
 }
-
