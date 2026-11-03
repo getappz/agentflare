@@ -1722,6 +1722,7 @@ dependencies = [
  "dirs",
  "flare-process",
  "fs2",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
@@ -1731,6 +1732,7 @@ dependencies = [
  "toml",
  "walkdir",
  "which",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

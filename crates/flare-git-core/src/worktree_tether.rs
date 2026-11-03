@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::process::terminate_tree_gracefully;
+use super::tether_signal as signal;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -92,7 +93,13 @@ pub fn run_tether(
     args: &[&std::ffi::OsStr],
 ) -> Result<i32, String> {
     let had_git_marker = git_marker_present(worktree_root) == Some(true);
+    // Ctrl+C / SIGTERM / SIGHUP must tear the child tree down, not orphan it (#827).
+    // Installed before the spawn so a signal in between cannot orphan the child; declared
+    // before `_foreground` so the terminal is handed back first on drop.
+    let _signals = signal::Guard::install();
     let child = spawn_tethered_child(worktree_root, program, args)?;
+    #[cfg(unix)]
+    let _foreground = signal::Foreground::hand_to(child.id());
 
     let child_slot = Arc::new(Mutex::new(Some(child)));
     let finished = Arc::new(AtomicBool::new(false));
@@ -114,6 +121,13 @@ pub fn run_tether(
     });
 
     let exit_code = loop {
+        if let Some(sig) = signal::take_pending() {
+            // Before taking the child lock: `kill_if_running` locks it too.
+            finished.store(true, Ordering::Relaxed);
+            kill_if_running(&child_slot);
+            signal::teardown_done();
+            break 128 + sig;
+        }
         let mut guard = child_slot
             .lock()
             .map_err(|e| format!("tether: lock child: {e}"))?;

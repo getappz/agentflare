@@ -23,6 +23,8 @@ mod orphans;
 mod process;
 #[path = "worktree_tether.rs"]
 mod tether;
+#[path = "worktree_tether_signal.rs"]
+mod tether_signal;
 #[path = "worktree_wipe_guard.rs"]
 mod wipe_guard;
 
