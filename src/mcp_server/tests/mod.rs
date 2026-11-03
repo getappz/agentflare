@@ -527,6 +527,12 @@ async fn run_stdio_filtered_handles_pre_init_server_discover() {
     assert_eq!(resp["error"]["code"], -32601);
     assert_eq!(resp["error"]["message"], "Method not found");
 
+    // A pre-init notification (client cancelling its probe) must not abort the handshake.
+    client_write
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":1}}\n")
+        .await
+        .unwrap();
+
     // 2. Send standard "initialize" request
     client_write
         .write_all(
@@ -544,6 +550,10 @@ async fn run_stdio_filtered_handles_pre_init_server_discover() {
 
     // 3. Drop client write to trigger clean shutdown
     drop(client_write);
-    let _ = server_handle.await;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), server_handle)
+        .await
+        .expect("server did not shut down after client EOF")
+        .unwrap();
+    assert!(result.is_ok(), "server exited with error: {result:?}");
 }
 

@@ -2217,77 +2217,87 @@ impl AgentflareMcp {
     }
 }
 
-/// Filter pre-initialization messages on stdio to support dual-era clients (such as
-/// Antigravity CLI / Go MCP SDK >= 1.7) that send probe requests like `server/discover`
-/// before `initialize`. Legacy/pinned `rmcp` expects `initialize` or `ping` as the first
-/// request and exits with an error on unhandled pre-init requests.
-///
-/// By replying with JSON-RPC `-32601` (`Method not found`) and staying in the loop,
-/// dual-era clients gracefully fall back to the standard `initialize` handshake.
-pub async fn run_stdio_filtered<R, W>(
+/// Transport wrapper that keeps rmcp's handshake alive for dual-era clients
+/// (Antigravity CLI / Go MCP SDK >= 1.7) that probe with requests such as
+/// `server/discover` before `initialize`. rmcp accepts only `ping` before
+/// `initialize` and aborts the session on any other message, so until
+/// `initialize` arrives this answers other requests with JSON-RPC `-32601`
+/// (Method not found), which makes those clients fall back to the standard
+/// handshake, and drops notifications (e.g. a client cancelling its own probe).
+/// Line framing, BOM stripping and parse errors stay with rmcp's own codec.
+struct PreInitFilter<T> {
+    inner: T,
+    initialized: bool,
+}
+
+impl<T: rmcp::transport::Transport<RoleServer>> rmcp::transport::Transport<RoleServer>
+    for PreInitFilter<T>
+{
+    type Error = T::Error;
+
+    fn send(
+        &mut self,
+        item: rmcp::service::TxJsonRpcMessage<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + 'static {
+        self.inner.send(item)
+    }
+
+    async fn receive(&mut self) -> Option<rmcp::service::RxJsonRpcMessage<RoleServer>> {
+        use rmcp::model::{ClientJsonRpcMessage, ClientRequest, ErrorCode, ServerJsonRpcMessage};
+        loop {
+            let msg = self.inner.receive().await?;
+            if self.initialized {
+                return Some(msg);
+            }
+            let probe_id = match &msg {
+                ClientJsonRpcMessage::Request(req) => match &req.request {
+                    ClientRequest::InitializeRequest(_) => {
+                        self.initialized = true;
+                        None
+                    }
+                    ClientRequest::PingRequest(_) => None,
+                    _ => Some(req.id.clone()),
+                },
+                ClientJsonRpcMessage::Notification(_) => continue,
+                _ => None,
+            };
+            let Some(id) = probe_id else {
+                return Some(msg);
+            };
+            let reply = ServerJsonRpcMessage::error(
+                ErrorData::new(ErrorCode::METHOD_NOT_FOUND, "Method not found", None),
+                Some(id),
+            );
+            if self.inner.send(reply).await.is_err() {
+                return None;
+            }
+        }
+    }
+
+    fn close(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+        self.inner.close()
+    }
+}
+
+/// Serve MCP over a line-delimited reader/writer pair, tolerating dual-era
+/// pre-`initialize` probes (see [`PreInitFilter`]).
+pub(crate) async fn run_stdio_filtered<R, W>(
     reader: R,
-    mut writer: W,
+    writer: W,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     R: tokio::io::AsyncRead + Send + Unpin + 'static,
     W: tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-
-    let mut buffered_reader = BufReader::new(reader);
-    let mut line_buf = String::new();
-    let buffered_init_bytes: Vec<u8>;
-
-    loop {
-        line_buf.clear();
-        let bytes_read = buffered_reader.read_line(&mut line_buf).await?;
-        if bytes_read == 0 {
-            return Ok(());
-        }
-
-        let trimmed = line_buf.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            let method = json.get("method").and_then(|m| m.as_str());
-            if method == Some("initialize") {
-                buffered_init_bytes = line_buf.into_bytes();
-                break;
-            }
-
-            if let Some(id) = json.get("id") {
-                let resp = if method == Some("ping") {
-                    serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {}
-                    })
-                } else {
-                    serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "error": {
-                            "code": -32601,
-                            "message": "Method not found"
-                        }
-                    })
-                };
-                let mut resp_str = serde_json::to_string(&resp)?;
-                resp_str.push('\n');
-                writer.write_all(resp_str.as_bytes()).await?;
-                writer.flush().await?;
-                continue;
-            }
-        }
-
-        buffered_init_bytes = line_buf.into_bytes();
-        break;
-    }
-
-    let combined_reader = std::io::Cursor::new(buffered_init_bytes).chain(buffered_reader);
-    let service = AgentflareMcp::from_env().serve((combined_reader, writer)).await?;
+    let transport = PreInitFilter {
+        inner: rmcp::transport::async_rw::AsyncRwTransport::<RoleServer, _, _>::new(
+            reader, writer,
+        ),
+        initialized: false,
+    };
+    let service = AgentflareMcp::from_env().serve(transport).await?;
     service.waiting().await?;
     Ok(())
 }
