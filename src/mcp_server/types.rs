@@ -500,6 +500,11 @@ pub(crate) struct MemoryRequest {
     #[schemars(description = "Stable topic key for upsert dedup (remember)")]
     #[serde(default)]
     pub(crate) topic_key: Option<String>,
+    #[schemars(
+        description = "Idempotency key: same key within a project is a no-op returning the existing id with status=duplicate (remember)"
+    )]
+    #[serde(default)]
+    pub(crate) idempotency_key: Option<String>,
     #[schemars(description = "Scope: project (default) or personal (remember)")]
     #[serde(default)]
     pub(crate) scope: Option<String>,

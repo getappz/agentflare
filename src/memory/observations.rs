@@ -52,11 +52,40 @@ pub fn save(
     scope: Option<&str>,
     topic_key: Option<&str>,
 ) -> rusqlite::Result<SaveOutcome> {
+    save_keyed(
+        conn, session_id, r#type, title, content, tool_name, project, scope, topic_key, None,
+    )
+}
+
+/// `save` with an optional idempotency key: a key already used in this
+/// project returns `Duplicate(existing id)` without writing anything.
+#[allow(clippy::too_many_arguments)]
+pub fn save_keyed(
+    conn: &Connection,
+    session_id: Option<&str>,
+    r#type: &str,
+    title: &str,
+    content: &str,
+    tool_name: Option<&str>,
+    project: Option<&str>,
+    scope: Option<&str>,
+    topic_key: Option<&str>,
+    idempotency_key: Option<&str>,
+) -> rusqlite::Result<SaveOutcome> {
     if is_lesson(r#type) {
         return Err(lesson_write_error());
     }
     save_inner(
-        conn, session_id, r#type, title, content, tool_name, project, scope, topic_key,
+        conn,
+        session_id,
+        r#type,
+        title,
+        content,
+        tool_name,
+        project,
+        scope,
+        topic_key,
+        idempotency_key.filter(|k| !k.is_empty()),
     )
 }
 
@@ -78,6 +107,7 @@ pub(super) fn save_lesson(
         Some(project),
         Some("project"),
         topic_key,
+        None,
     )
 }
 
@@ -92,12 +122,29 @@ fn save_inner(
     project: Option<&str>,
     scope: Option<&str>,
     topic_key: Option<&str>,
+    idempotency_key: Option<&str>,
 ) -> rusqlite::Result<SaveOutcome> {
     let hash = hash_normalized(title, content);
     let now = now_iso();
     let scope = scope.unwrap_or("project");
 
-    if let Some((id, _)) = find_duplicate(conn, &hash, project)? {
+    if let Some(key) = idempotency_key
+        && let Some(id) = conn
+            .query_row(
+                "SELECT id FROM observations
+                 WHERE idempotency_key = ?1 AND COALESCE(project, '') = COALESCE(?2, '')",
+                params![key, project],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+    {
+        return Ok(SaveOutcome::Duplicate(id));
+    }
+
+    // An explicit, unseen key is a deliberate distinct write: skip text dedup.
+    if idempotency_key.is_none()
+        && let Some((id, _)) = find_duplicate(conn, &hash, project)?
+    {
         conn.execute(
             "UPDATE observations SET duplicate_count = duplicate_count + 1, last_seen_at = ?2, updated_at = ?2 WHERE id = ?1",
             params![id, now],
@@ -129,10 +176,20 @@ fn save_inner(
     conn.execute(
         "INSERT INTO observations
             (session_id, type, title, content, tool_name, project, scope,
-             topic_key, normalized_hash, created_at, updated_at, last_seen_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?10)",
+             topic_key, normalized_hash, created_at, updated_at, last_seen_at, idempotency_key)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?10, ?11)",
         params![
-            session_id, r#type, title, content, tool_name, project, scope, topic_key, &hash, now
+            session_id,
+            r#type,
+            title,
+            content,
+            tool_name,
+            project,
+            scope,
+            topic_key,
+            &hash,
+            now,
+            idempotency_key
         ],
     )?;
     let id = conn.last_insert_rowid();

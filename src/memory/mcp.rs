@@ -22,6 +22,9 @@ pub struct RememberInput {
     pub project: Option<String>,
     pub topic_key: Option<String>,
     pub scope: Option<String>,
+    /// Same key within a project = no-op returning the existing id.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 /// Best-effort semantic index of one observation; failure never fails the write.
@@ -137,7 +140,7 @@ pub fn handle_remember(input: RememberInput) -> Result<String, String> {
 }
 
 fn remember_in(conn: &rusqlite::Connection, input: RememberInput) -> Result<String, String> {
-    let outcome = observations::save(
+    let outcome = observations::save_keyed(
         conn,
         input.session_id.as_deref(),
         &input.r#type,
@@ -147,6 +150,7 @@ fn remember_in(conn: &rusqlite::Connection, input: RememberInput) -> Result<Stri
         input.project.as_deref(),
         input.scope.as_deref(),
         input.topic_key.as_deref(),
+        input.idempotency_key.as_deref(),
     )
     .map_err(|e| format!("save failed: {e}"))?;
     let (status, id) = match outcome {
@@ -754,6 +758,38 @@ pub fn handle_curate(input: CurateInput) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn idempotency_key_dedups_per_project() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        super::super::schema::migrate(&mut conn).unwrap();
+        let input = |content: &str, project: &str, key: &str| RememberInput {
+            title: "t".into(),
+            content: content.into(),
+            r#type: "note".into(),
+            session_id: None,
+            project: Some(project.into()),
+            topic_key: None,
+            scope: None,
+            idempotency_key: Some(key.into()),
+        };
+        let run = |i| -> serde_json::Value {
+            serde_json::from_str(&remember_in(&conn, i).unwrap()).unwrap()
+        };
+        let a = run(input("one", "p", "k1"));
+        assert_eq!(a["status"], "created");
+        let b = run(input("two", "p", "k1"));
+        assert_eq!(
+            (b["status"].as_str(), &b["id"]),
+            (Some("duplicate"), &a["id"])
+        );
+        assert_eq!(run(input("one", "p", "k2"))["status"], "created");
+        assert_eq!(run(input("two", "q", "k1"))["status"], "created");
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM observations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 3);
+    }
+
+    #[test]
     fn remember_warns_on_vague_text_but_still_saves() {
         let conn = {
             let mut c = rusqlite::Connection::open_in_memory().unwrap();
@@ -768,6 +804,7 @@ mod tests {
             project: None,
             topic_key: None,
             scope: None,
+            idempotency_key: None,
         };
         let vague: serde_json::Value = serde_json::from_str(
             &remember_in(&conn, input("deadlock fix", "fixed deadlock")).unwrap(),
