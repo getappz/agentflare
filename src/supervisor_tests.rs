@@ -1921,6 +1921,7 @@ pub(crate) fn coderabbit_finding(id: u64, login: &str) -> BotFinding {
         login: login.to_string(),
         path: "src/lib.rs".to_string(),
         line: Some(42),
+        diff_side: crate::github::review_threads::DiffSide::Right,
         is_outdated: false,
         outside_diff: false,
         parsed: parse_finding_body(&body),
