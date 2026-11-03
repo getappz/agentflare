@@ -129,7 +129,14 @@ pub fn run_tether(
                 drop(guard);
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return Err(format!("tether: try_wait: {e}")),
+            Err(e) => {
+                // Do not leave the child tree or the reaper thread running behind an error.
+                drop(guard);
+                finished.store(true, Ordering::Relaxed);
+                kill_if_running(&child_slot);
+                let _ = reaper.join();
+                return Err(format!("tether: try_wait: {e}"));
+            }
         }
     };
 
