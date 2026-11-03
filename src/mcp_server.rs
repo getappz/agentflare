@@ -53,7 +53,6 @@ use rmcp::{
     schemars,
     service::{RequestContext, RoleServer},
     tool, tool_handler, tool_router,
-    transport::stdio,
 };
 use rusqlite::OptionalExtension;
 use serde::Deserialize;
