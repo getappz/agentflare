@@ -1,13 +1,13 @@
 ---
 title: MCP tools reference
-description: The full first-party mcp__flare__* tool surface — 25 tools plus MCP Prompts.
+description: The full first-party mcp__flare__* tool surface — 32 tools plus MCP Prompts.
 ---
 
 Everything below is a first-party tool your agent gets once it's connected to
 agentflare's MCP server (wired by `agentflare init`) — reached as `mcp__flare__<name>`.
 Most are **consolidated tools**: one tool name, an `action` field selecting the
 operation, so the tool list stays short instead of growing one entry per verb. See the
-[CLI reference](/docs/cli/) for the equivalent command-line surface where one exists.
+[CLI reference](/docs/reference/cli/) for the equivalent command-line surface where one exists.
 
 ## Coordination
 
@@ -19,8 +19,10 @@ how agents divide and hand off work.
 Manage work items in the repo's linked project (auto-created/linked on first use).
 
 `action`: `create`, `get`, `list`, `search`, `update`, `update_state`, `delete`, `claim`,
-`heartbeat`, `release`, `done`, `cancel`, `add_label`, `remove_label`, `groom`,
-`standup`, `health`.
+`heartbeat`, `release`, `done`, `check_merge`, `cancel`, `pause`, `resume`, `redispatch`,
+`add_label`, `remove_label`, `add_relation`, `remove_relation`, `list_relations`,
+`review_result`, `submit_plan`, `approve_plan`, `reject_plan`, `status`, `doctor`,
+`groom`, `standup`, `health`, `clear_parent`.
 
 ```text
 mcp__flare__item(action="list", state_group="backlog,unstarted,started")
@@ -99,14 +101,28 @@ Register, list, or delete webhooks on the repo's linked workspace.
 mcp__flare__webhook(action="list")
 ```
 
+### `message`
+
+Realtime messaging between live agent sessions and humans. `to` accepts a session key or
+name, `item:<id>`, `agent:<name>`, `team:<name>`, or `*`; messages addressed to you are
+delivered into context automatically.
+
+`action`: `send`, `list`, `inbox`, `read`, `whoami`, `history`.
+
+```text
+mcp__flare__message(action="send", to="agent:codex", body="claim 42 is free", marker="status")
+mcp__flare__message(action="inbox", unread_only=true)
+```
+
 ### `project`
 
-Info about the workspace/project this repo is currently linked to.
+The workspace project this repo is linked to, or every project in the workspace.
 
-`action`: `info` (only one for now).
+`action`: `info`, `list`, `archive`, `unarchive`.
 
 ```text
 mcp__flare__project(action="info")
+mcp__flare__project(action="list")
 ```
 
 ### `review`
@@ -114,7 +130,7 @@ mcp__flare__project(action="info")
 Multi-agent review consensus: submit findings, verify citations against the diff,
 dedup, and tag CONFIRMED/UNIQUE/DISPUTED/UNVERIFIED; track per-agent accuracy over time.
 
-`action`: `submit`, `consensus`, `list`, `clear`, `record`, `scores`.
+`action`: `submit`, `consensus`, `list`, `clear`, `record`, `scores`, `scan`, `verify`.
 
 ```text
 mcp__flare__review(action="submit", pr="123", findings=[{"file":"src/lib.rs","line":42,"message":"unwrap on user input"}])
@@ -155,7 +171,8 @@ mcp__flare__docs(action="search", query="hono routing")
 The built-in persistent memory store — compact session history, recall past
 observations, curate what's kept, relate entries, and hand memory off across sessions.
 
-`action`: `compact`, `context`, `curate`, `handoff`, `recall`, `relate`, `remember`.
+`action`: `compact`, `context`, `curate`, `handoff`, `promote`, `recall`, `relate`,
+`remember`.
 
 ```text
 mcp__flare__memory(action="remember", title="db choice", content="chose sqlite over postgres for single-writer simplicity")
@@ -192,6 +209,33 @@ proactive skill suggestions.
 
 ```text
 mcp__flare__skill_detect(prompt="my disk is full, need to clean up")
+```
+
+### `skill_recommend`
+
+Recommend skills from the project's actual toolchain (detects `Cargo.toml`,
+`package.json`, `pyproject.toml`, and similar) rather than from a prompt.
+
+```text
+mcp__flare__skill_recommend(cwd=".")
+```
+
+### `skill_create`
+
+Scaffold a new skill from a template (`base`, `web-development`, `api-development`,
+or `testing`). Writes to `.claude/skills/<name>/` by default.
+
+```text
+mcp__flare__skill_create(name="release-notes", template="base", description="Draft release notes from merged PRs")
+```
+
+### `skill_categories`
+
+List skill categories derived from frontmatter, or the skills inside one category.
+
+```text
+mcp__flare__skill_categories()
+mcp__flare__skill_categories(category="testing")
 ```
 
 ### `browser`
@@ -263,6 +307,36 @@ signal behind the "close the session, start fresh" guidance in long-running work
 
 ```text
 mcp__flare__check_session_health()
+```
+
+## Planning and workflows
+
+### `pm`
+
+Product-management reporting and a PM-mode toggle that works from any MCP client.
+
+`action`: `standup`, `groom`, `plan`, `health`, `portfolio`, `mode_on`, `mode_off`,
+`mode_status`.
+
+```text
+mcp__flare__pm(action="groom", limit=15)
+mcp__flare__pm(action="health", window_weeks=4)
+```
+
+### `workflow`
+
+Durable agent pipelines: run a definition (inline JSON or a project-local
+`.agentflare/workflows/<name>.json`), inspect status, resolve a human-in-the-loop event,
+or manage schedules.
+
+`action`: `run`, `status`, `report`, `complete_event`, `cancel`, `list`,
+`list_definitions`, `metrics`, `schedule_create`, `schedule_list`, `schedule_show`,
+`schedule_update`, `schedule_enable`, `schedule_disable`, `schedule_remove`,
+`schedule_fire`, `schedule_runs`.
+
+```text
+mcp__flare__workflow(action="run", workflow_name="release-check")
+mcp__flare__workflow(action="status", run_id="<uuid>")
 ```
 
 ## Git / GitHub
