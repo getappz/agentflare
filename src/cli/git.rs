@@ -1808,6 +1808,7 @@ fn remember_shipped(
         project: Some(repo.repo.clone()),
         topic_key: Some(format!("pr-{}", pr.number)),
         scope: None,
+        idempotency_key: None,
     };
     if let Err(e) = crate::memory::mcp::handle_remember(input) {
         crate::ui::warning(&format!("PR shipped, but memory remember failed: {e}"));

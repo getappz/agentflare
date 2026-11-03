@@ -52,6 +52,9 @@ pub enum MemoryCommands {
         topic_key: Option<String>,
         #[arg(long)]
         scope: Option<String>,
+        /// Same key within a project is a no-op returning the existing id
+        #[arg(long)]
+        idempotency_key: Option<String>,
     },
     /// Compute embeddings for observations missing them.
     /// Requires a build with --features semantic and a downloaded model.
@@ -106,6 +109,7 @@ impl MemoryArgs {
                 project,
                 topic_key,
                 scope,
+                idempotency_key,
             } => {
                 let input = crate::memory::mcp::RememberInput {
                     title,
@@ -115,6 +119,7 @@ impl MemoryArgs {
                     project,
                     topic_key,
                     scope,
+                    idempotency_key,
                 };
                 match crate::memory::mcp::handle_remember(input) {
                     Ok(out) => println!("{out}"),

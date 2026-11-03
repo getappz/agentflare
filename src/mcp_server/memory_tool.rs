@@ -37,6 +37,7 @@ impl AgentflareMcp {
                     project: req.project,
                     topic_key: req.topic_key,
                     scope: req.scope,
+                    idempotency_key: req.idempotency_key,
                 };
                 crate::memory::mcp::handle_remember(input)
                     .map_err(|e| ErrorData::internal_error(e, None))
