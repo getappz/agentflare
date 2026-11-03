@@ -27,9 +27,12 @@ struct BridgeTarget {
 ///
 /// Read fresh every tick, not just at startup, so a project linked (or
 /// re-linked) after the daemon started shows up without a restart.
-fn bridge_targets(conn: &rusqlite::Connection) -> Vec<BridgeTarget> {
+///
+/// Propagates items-DB read errors so the loop can drop a bad held connection
+/// instead of treating corruption / I/O failure as "no repos registered".
+fn bridge_targets(conn: &rusqlite::Connection) -> Result<Vec<BridgeTarget>, String> {
     let mut targets: Vec<BridgeTarget> = agentflare_backend::bridge_repo::list(conn)
-        .unwrap_or_default()
+        .map_err(|e| e.to_string())?
         .into_iter()
         .filter_map(|row| {
             let repo = RepoId::parse(&row.repo)?;
@@ -51,7 +54,7 @@ fn bridge_targets(conn: &rusqlite::Connection) -> Vec<BridgeTarget> {
                 "github bridge: AGENTFLARE_BRIDGE_REPO={explicit:?} is not a \
                  GitHub owner/repo; ignoring"
             );
-            return targets;
+            return Ok(targets);
         };
         if !targets.iter().any(|t| t.repo == repo) {
             // Same resolution `build_ctx` used to do unconditionally: cwd-based,
@@ -76,7 +79,13 @@ fn bridge_targets(conn: &rusqlite::Connection) -> Vec<BridgeTarget> {
             }
         }
     }
-    targets
+    Ok(targets)
+}
+
+/// Shared-handle failures must abort the rest of the targets loop; other
+/// hard errors stay per-repo so one bad GitHub response does not stall the rest.
+fn should_abort_targets_loop(err: &str) -> bool {
+    is_bad_items_handle(err) || is_credential_failure(err)
 }
 
 /// Starts the poll loop if the bridge is enabled.
@@ -241,8 +250,19 @@ fn run_forever(config: BridgeConfig) {
                 failures = failures.saturating_add(1);
                 continue;
             };
-            let targets = bridge_targets(conn_ref);
-            if targets.is_empty() {
+            let targets = match bridge_targets(conn_ref) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!(
+                        "github bridge: reading registered repos failed ({e}); reopening items db"
+                    );
+                    tick_ok = false;
+                    // Prefix so is_bad_items_handle clears the retained connection.
+                    tick_err = Some(format!("unable to open database: {e}"));
+                    Vec::new()
+                }
+            };
+            if tick_err.is_none() && targets.is_empty() {
                 if had_targets {
                     eprintln!(
                         "github bridge: no repos registered — link a project from inside a repo \
@@ -255,69 +275,74 @@ fn run_forever(config: BridgeConfig) {
                 std::thread::sleep(interval);
                 continue;
             }
-            had_targets = true;
+            if tick_err.is_none() {
+                had_targets = true;
 
-            for target in targets {
-                // The claim ledger lives in its own database (agentflare.db),
-                // separate from the backend db that holds items. Reopened per
-                // repo per tick (a local sqlite open is cheap) rather than
-                // shared, so one repo's failure here only skips that repo
-                // instead of taking down the whole loop for the rest of the tick.
-                let ledger = match crate::db::open() {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!(
-                            "github bridge: claim ledger unavailable ({e}); skipping remaining \
-                             repos this tick"
-                        );
-                        break;
-                    }
-                };
-                let mut repo_config = config.clone();
-                repo_config.queue_label = target.queue_label;
-                repo_config.work_agent = target.work_agent.or(repo_config.work_agent);
-                let ctx = Ctx {
-                    client: client_ref.clone(),
-                    repo: target.repo,
-                    config: repo_config,
-                    project_id: target.project_id,
-                    ledger,
-                };
-                let now = crate::claims::now();
-                let repo_key = ctx.repo.to_string();
-                match run_once(&ctx, conn_ref, now) {
-                    Ok(report) => {
-                        if !report.claimed.is_empty() || !report.ceded.is_empty() {
+                for target in targets {
+                    // The claim ledger lives in its own database (agentflare.db),
+                    // separate from the backend db that holds items. Reopened per
+                    // repo per tick (a local sqlite open is cheap) rather than
+                    // shared, so one repo's failure here only skips that repo
+                    // instead of taking down the whole loop for the rest of the tick.
+                    let ledger = match crate::db::open() {
+                        Ok(c) => c,
+                        Err(e) => {
                             eprintln!(
-                                "github bridge: {repo_key} claimed {:?} ceded {:?}",
-                                report.claimed, report.ceded
+                                "github bridge: claim ledger unavailable ({e}); skipping remaining \
+                             repos this tick"
                             );
+                            break;
                         }
-                        let prev = last_soft.get(&repo_key).cloned();
-                        if report.soft_error != prev {
-                            match &report.soft_error {
-                                Some(e) => {
-                                    eprintln!(
-                                        "github bridge: {repo_key} ticks are ending early: {e}"
-                                    );
-                                    last_soft.insert(repo_key, e.clone());
-                                }
-                                None => {
-                                    eprintln!(
-                                        "github bridge: {repo_key} recovered; ticks completing again"
-                                    );
-                                    last_soft.remove(&repo_key);
+                    };
+                    let mut repo_config = config.clone();
+                    repo_config.queue_label = target.queue_label;
+                    repo_config.work_agent = target.work_agent.or(repo_config.work_agent);
+                    let ctx = Ctx {
+                        client: client_ref.clone(),
+                        repo: target.repo,
+                        config: repo_config,
+                        project_id: target.project_id,
+                        ledger,
+                    };
+                    let now = crate::claims::now();
+                    let repo_key = ctx.repo.to_string();
+                    match run_once(&ctx, conn_ref, now) {
+                        Ok(report) => {
+                            if !report.claimed.is_empty() || !report.ceded.is_empty() {
+                                eprintln!(
+                                    "github bridge: {repo_key} claimed {:?} ceded {:?}",
+                                    report.claimed, report.ceded
+                                );
+                            }
+                            let prev = last_soft.get(&repo_key).cloned();
+                            if report.soft_error != prev {
+                                match &report.soft_error {
+                                    Some(e) => {
+                                        eprintln!(
+                                            "github bridge: {repo_key} ticks are ending early: {e}"
+                                        );
+                                        last_soft.insert(repo_key, e.clone());
+                                    }
+                                    None => {
+                                        eprintln!(
+                                            "github bridge: {repo_key} recovered; ticks completing again"
+                                        );
+                                        last_soft.remove(&repo_key);
+                                    }
                                 }
                             }
                         }
-                    }
-                    Err(e) => {
-                        eprintln!("github bridge: {repo_key} tick failed: {e}");
-                        tick_ok = false;
-                        tick_err = Some(e);
-                        // Stop using a known-bad handle for the rest of this tick;
-                        // Options are cleared after this borrow ends.
-                        break;
+                        Err(e) => {
+                            eprintln!("github bridge: {repo_key} tick failed: {e}");
+                            tick_ok = false;
+                            let abort = should_abort_targets_loop(&e);
+                            tick_err = Some(e);
+                            if abort {
+                                // Shared handle is unusable for the rest of this tick;
+                                // Options are cleared after this borrow ends.
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -417,13 +442,38 @@ mod tests {
         )
         .unwrap();
 
-        let targets = bridge_targets(&conn);
+        let targets = bridge_targets(&conn).expect("list should succeed on a migrated db");
         assert_eq!(targets.len(), 2);
         assert_eq!(targets[0].repo.to_string(), "getappz/one");
         assert_eq!(targets[0].project_id, p1.id);
         assert_eq!(targets[0].work_agent, None);
         assert_eq!(targets[1].repo.to_string(), "getappz/two");
         assert_eq!(targets[1].work_agent.as_deref(), Some("claude-code"));
+    }
+
+    #[test]
+    fn bridge_targets_surfaces_list_errors_instead_of_empty() {
+        // Bare connection has no bridge_repos table — list must Err, not [].
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let err = match bridge_targets(&conn) {
+            Err(e) => e,
+            Ok(_) => panic!("missing schema is a read failure, not an empty list"),
+        };
+        assert!(
+            err.to_ascii_lowercase().contains("no such table")
+                || err.to_ascii_lowercase().contains("bridge_repos"),
+            "unexpected list error: {err}"
+        );
+        // Runner prefixes this so invalidate_handles_for_tick_err drops conn.
+        let as_tick_err = format!("unable to open database: {err}");
+        let mut held: Option<rusqlite::Connection> = rusqlite::Connection::open_in_memory().ok();
+        let mut client: Option<crate::github::Client> = None;
+        assert!(invalidate_handles_for_tick_err(
+            &as_tick_err,
+            &mut held,
+            &mut client
+        ));
+        assert!(held.is_none());
     }
 
     #[test]
@@ -499,5 +549,18 @@ mod tests {
             interval * 8,
             "acquire path uses the same schedule"
         );
+    }
+
+    #[test]
+    fn only_shared_handle_errors_abort_the_targets_loop() {
+        assert!(should_abort_targets_loop(
+            "response parse error: file is not a database"
+        ));
+        assert!(should_abort_targets_loop(
+            "GitHub rejected the credential (401). Refresh it."
+        ));
+        // Repo-local / HTTP failures must not skip remaining targets.
+        assert!(!should_abort_targets_loop("GitHub HTTP 500: boom"));
+        assert!(!should_abort_targets_loop("database is locked"));
     }
 }
