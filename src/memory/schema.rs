@@ -126,6 +126,12 @@ pub fn migrations() -> Migrations<'static> {
                 updated_at TEXT NOT NULL
             );",
         ),
+        M::up(
+            "ALTER TABLE observations ADD COLUMN idempotency_key TEXT;
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_obs_idem
+                 ON observations(COALESCE(project, ''), idempotency_key)
+                 WHERE idempotency_key IS NOT NULL;",
+        ),
     ])
 }
 
