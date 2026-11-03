@@ -305,6 +305,9 @@ pub(crate) fn parse_duration(input: &str) -> Result<std::time::Duration, String>
 }
 
 #[cfg(test)]
+mod doc_command_tests;
+
+#[cfg(test)]
 mod duration_tests {
     use super::parse_duration;
     use std::time::Duration;
