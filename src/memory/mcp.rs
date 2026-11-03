@@ -790,6 +790,93 @@ mod tests {
     }
 
     #[test]
+    fn keyless_same_text_dedups_but_scope_and_text_differ() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        super::super::schema::migrate(&mut conn).unwrap();
+        let input = |content: &str, scope: Option<&str>, key: Option<&str>, tk: Option<&str>| {
+            RememberInput {
+                title: "t".into(),
+                content: content.into(),
+                r#type: "note".into(),
+                session_id: None,
+                project: Some("p".into()),
+                topic_key: tk.map(Into::into),
+                scope: scope.map(Into::into),
+                idempotency_key: key.map(Into::into),
+            }
+        };
+        let run = |i| -> serde_json::Value {
+            serde_json::from_str(&remember_in(&conn, i).unwrap()).unwrap()
+        };
+        let a = run(input("same", None, None, None));
+        assert_eq!(a["status"], "created");
+        let b = run(input("same", None, None, None));
+        assert_eq!(
+            (b["status"].as_str(), &b["id"]),
+            (Some("duplicate"), &a["id"])
+        );
+        assert_eq!(
+            run(input("same", Some("personal"), None, None))["status"],
+            "created"
+        );
+        assert_eq!(run(input("other", None, None, None))["status"], "created");
+        // keyed write with already-existing text still writes
+        assert_eq!(
+            run(input("same", None, Some("kx"), None))["status"],
+            "created"
+        );
+        // topic_key path stores the key, so a retry is a no-op
+        assert_eq!(
+            run(input("v1", None, None, Some("tk")))["status"],
+            "created"
+        );
+        let u = run(input("v2", None, Some("kt"), Some("tk")));
+        assert_eq!(u["status"], "updated");
+        let again = run(input("v3", None, Some("kt"), Some("tk")));
+        assert_eq!(
+            (again["status"].as_str(), &again["id"]),
+            (Some("duplicate"), &u["id"])
+        );
+        let rev: i64 = conn
+            .query_row(
+                "SELECT revision_count FROM observations WHERE topic_key='tk'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rev, 1);
+    }
+
+    #[test]
+    fn migration_adds_nullable_key_to_legacy_rows() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        let m = super::super::schema::migrations();
+        m.to_version(&mut conn, 2).unwrap();
+        conn.execute(
+            "INSERT INTO observations (type,title,content,created_at,updated_at) VALUES ('note','t','c','x','x')",
+            [],
+        )
+        .unwrap();
+        m.to_latest(&mut conn).unwrap();
+        let (n, nulls): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), SUM(idempotency_key IS NULL) FROM observations",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((n, nulls), (1, 1));
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='idx_obs_idem'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1);
+    }
+
+    #[test]
     fn remember_warns_on_vague_text_but_still_saves() {
         let conn = {
             let mut c = rusqlite::Connection::open_in_memory().unwrap();
