@@ -24,12 +24,17 @@ go/no-go decision, an unanswerable question, or a CI self-repair cap.
    ```
 
 3. Get the chat id to send to: open a chat with your bot (or add it to a group) and send
-   it any message, then fetch (reuse the same shell variable; do not paste the token
-   into the command line):
+   it any message. If the agentflare daemon/supervisor is running, stop it first —
+   Telegram allows only one `getUpdates` poller per bot token, and a second poll
+   can return HTTP 409 or steal the setup message. Then fetch via a curl config on
+   stdin so the token never appears in `curl`'s process arguments:
 
    ```bash
-   curl "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates"
+   agentflare daemon stop   # skip if the daemon is not running
+   printf 'url = "https://api.telegram.org/bot%s/getUpdates"\n' "$TELEGRAM_BOT_TOKEN" \
+     | curl -K -
    unset TELEGRAM_BOT_TOKEN
+   agentflare daemon start  # only if you stopped it above
    ```
 
    and read `result[].message.chat.id` from the response.

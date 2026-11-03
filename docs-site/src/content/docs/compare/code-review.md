@@ -34,11 +34,11 @@ It coordinates reviewers — human or agent — that you already run.
 
 | | agentflare | CodeRabbit | Greptile | Graphite Diamond | Cursor BugBot | GitHub Copilot | PR-Agent |
 |---|---|---|---|---|---|---|---|
-| Where it runs | Locally, alongside your agents | Hosted app | Hosted app | Hosted, inside Graphite | Cursor / cloud | Hosted, on GitHub | Your CI, Docker, or CLI |
-| Trigger | You call it | Webhook on PR events | Webhook on PR events | Graphite review flow | PR events in Cursor | PR review request | Comment command or action |
-| Context | Whatever the reviewers gather | Diff plus retrieved context and linters | Full-repo code graph | PR inside a stacked-PR workflow | Diff plus `BUGBOT.md` rules | Diff in GitHub | Diff plus configurable context |
+| Where it runs | Locally, alongside your agents | Hosted app | Hosted app | Hosted, inside Graphite | Cursor / cloud | Hosted on GitHub.com; also CLI, Mobile, and IDEs | Your CI, Docker, or CLI |
+| Trigger | You call it | Webhook on PR events | Webhook on PR events | Graphite review flow | PR events in Cursor | Manual review request or automatic reviews (rulesets / settings) | Comment command or action |
+| Context | Whatever the reviewers gather | Diff plus retrieved context and linters | Full-repo code graph | PR inside a stacked-PR workflow | Diff plus `BUGBOT.md` rules | Diff plus optional full-project context (agentic) | Diff plus configurable context |
 | Deterministic checks | None built in | Bundled linters and analyzers | None documented | None documented | None documented | None documented | Depends on your CI |
-| Multi-agent consensus | Yes | Single product verdict | Single product verdict | Single product verdict | Single product verdict | Single product verdict | Single model call per tool |
+| Multi-agent consensus | Yes | Single product verdict | Single product verdict | Single product verdict | Single product verdict | Single product verdict | No built-in multi-agent consensus (may use multiple model calls) |
 | Open source | Yes | No | No | No | No | No | Yes |
 
 **CodeRabbit** ([coderabbit.ai](https://www.coderabbit.ai)) posts a PR summary
@@ -58,13 +58,17 @@ Its value is concentrated in teams already using Graphite.
 editor-native: review rules can live in `BUGBOT.md` next to the code, and the
 tight loop with Cursor is the draw.
 
-**GitHub Copilot code review** is native to GitHub with almost no setup, which
-makes it the default baseline many teams compare against.
+**GitHub Copilot code review**
+([docs](https://docs.github.com/en/copilot/concepts/agents/code-review)) is
+native to GitHub.com (also CLI, Mobile, and IDEs). Reviews can be requested
+manually or run automatically; agentic mode can gather full-project context.
+That makes it the default baseline many teams compare against.
 
 **PR-Agent** ([The-PR-Agent/pr-agent](https://github.com/The-PR-Agent/pr-agent))
 is the open-source reference implementation: command-driven (`/review`,
 `/improve`, `/ask`), runs as a GitHub Action, CLI, or self-hosted webhook, and
-routes to any LiteLLM-supported model.
+routes to any LiteLLM-supported model. Large-PR and multi-model configs can
+issue several model calls; it still has no built-in multi-agent consensus.
 
 ## Honest trade-offs
 

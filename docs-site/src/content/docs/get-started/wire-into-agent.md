@@ -48,7 +48,7 @@ agentflare doctor
 
 `doctor` reports missing or conflicting configuration per host; it does not
 repair wiring. To fix a host, rerun `agentflare init --agent <host>` for that
-host. `agentflare agents` lists detected agent installs.
+host. `agentflare agents list` lists detected agent installs.
 
 ## Next
 

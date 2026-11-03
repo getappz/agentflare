@@ -16,11 +16,14 @@ tracker. Pick **one** of these paths — do not manually claim an item and then 
 `agentflare work` on it; the CLI claims under its own process identity and will refuse
 if your session already holds the claim.
 
-**Work it yourself** — claim, do the work in your session, then release or mark done:
+**Work it yourself** — claim, do the work in the returned worktree, then release or mark done:
 
 ```text
 item(action="claim", id="42")
-# … implement …
+# claim returns worktree_path — open that checkout and implement there.
+# Edits in the original repo leave the claimed worktree empty, so done
+# can publish nothing.
+# … implement in worktree_path …
 item(action="done", id="42")   # or item(action="release", id="42")
 ```
 
