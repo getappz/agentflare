@@ -42,6 +42,7 @@ fn config_with_fixture() -> GatewayConfig {
             args: vec![],
             auth_ref: None,
             auth_env: None,
+            timeout_secs: None,
         },
     );
     GatewayConfig { servers }

@@ -241,6 +241,7 @@ fn build_backends(
                 args,
                 auth_ref,
                 auth_env,
+                timeout_secs,
             } => {
                 let mut env = HashMap::new();
                 if let (Some(auth_ref), Some(auth_env)) = (auth_ref, auth_env) {
@@ -261,17 +262,29 @@ fn build_backends(
                         ),
                     }
                 }
-                Backend::McpStdio(McpStdioBackend::new(command.clone(), args.clone(), env))
+                let timeout = timeout_secs
+                    .map(Duration::from_secs)
+                    .unwrap_or(crate::mcp_stdio::DEFAULT_TIMEOUT);
+                Backend::McpStdio(McpStdioBackend::with_timeout(
+                    command.clone(),
+                    args.clone(),
+                    env,
+                    timeout,
+                ))
             }
             ServerConfig::McpHttp {
                 url,
                 auth_ref,
                 auth_env,
                 auth_header,
+                timeout_secs,
             } => {
                 let resolved =
                     resolve_mcp_http_auth_header(name, auth_ref, auth_env, auth_header, secrets);
-                Backend::McpHttp(McpHttpBackend::new(url.clone(), resolved))
+                let timeout = timeout_secs
+                    .map(Duration::from_secs)
+                    .unwrap_or(crate::mcp_stdio::DEFAULT_TIMEOUT);
+                Backend::McpHttp(McpHttpBackend::with_timeout(url.clone(), resolved, timeout))
             }
         };
         out.insert(name.clone(), backend);

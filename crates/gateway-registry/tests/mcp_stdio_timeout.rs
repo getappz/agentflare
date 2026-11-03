@@ -11,7 +11,7 @@
 //! short test-only timeout fires — proving the mechanism without waiting out
 //! the crate's real 30s `DEFAULT_TIMEOUT`.
 
-use agentflare_gateway_registry::{GatewayError, McpStdioBackend};
+use agentflare_gateway_registry::{GatewayError, McpStdioBackend, Registry, parse_config};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -99,5 +99,131 @@ async fn timeout_on_a_cached_connection_clears_it_so_the_next_call_reconnects() 
         spawn_count, 2,
         "expected exactly 2 child-process spawns (initial connect + post-timeout \
          reconnect), got {spawn_count}: {marker_contents:?}"
+    );
+}
+
+#[tokio::test]
+async fn configured_timeout_secs_allows_calls_longer_than_short_timeout_and_keeps_same_child() {
+    let marker = tempfile::NamedTempFile::new().unwrap();
+    let marker_path = marker.path().to_path_buf();
+    let fixture = env!("CARGO_BIN_EXE_gateway-fixture-server").to_string();
+    let fixture_escaped = fixture.replace('\\', "/");
+
+    let toml = format!(
+        r#"
+        [servers.custom]
+        kind = "mcp_stdio"
+        command = "{fixture_escaped}"
+        auth_ref = "marker"
+        auth_env = "GATEWAY_FIXTURE_MARKER_FILE"
+        timeout_secs = 3
+        "#
+    );
+    let config = parse_config(&toml).unwrap();
+    let mut secrets = HashMap::new();
+    secrets.insert(
+        "marker".to_string(),
+        marker_path.to_string_lossy().to_string(),
+    );
+
+    let reg = Registry::open_in_memory(&config, &secrets).await.unwrap();
+
+    // Call 1: connects and calls echo (spawn #1)
+    let res = reg
+        .execute("custom", "echo", serde_json::json!({"text": "first"}))
+        .await
+        .unwrap();
+    let text = res
+        .get(0)
+        .and_then(|c| c.get("text"))
+        .and_then(|t| t.as_str());
+    assert_eq!(text, Some("echo: first"));
+
+    // Call 2: sleeps 1200ms. With default 1s this would time out, but timeout_secs = 3 allows it.
+    let res = reg
+        .execute("custom", "sleep", serde_json::json!({"ms": 1200}))
+        .await
+        .unwrap();
+    let text = res
+        .get(0)
+        .and_then(|c| c.get("text"))
+        .and_then(|t| t.as_str());
+    assert_eq!(text, Some("slept"));
+
+    // Call 3: subsequent call reuses the exact same child process.
+    let res = reg
+        .execute("custom", "echo", serde_json::json!({"text": "second"}))
+        .await
+        .unwrap();
+    let text = res
+        .get(0)
+        .and_then(|c| c.get("text"))
+        .and_then(|t| t.as_str());
+    assert_eq!(text, Some("echo: second"));
+
+    let marker_contents = std::fs::read_to_string(&marker_path).unwrap();
+    let spawn_count = marker_contents.lines().filter(|l| !l.is_empty()).count();
+    assert_eq!(
+        spawn_count, 1,
+        "expected exactly 1 child-process spawn throughout, got {spawn_count}: {marker_contents:?}"
+    );
+}
+
+#[tokio::test]
+async fn configured_timeout_secs_times_out_when_exceeded_and_names_timeout_value() {
+    let marker = tempfile::NamedTempFile::new().unwrap();
+    let marker_path = marker.path().to_path_buf();
+    let fixture = env!("CARGO_BIN_EXE_gateway-fixture-server").to_string();
+    let fixture_escaped = fixture.replace('\\', "/");
+
+    let toml = format!(
+        r#"
+        [servers.custom]
+        kind = "mcp_stdio"
+        command = "{fixture_escaped}"
+        auth_ref = "marker"
+        auth_env = "GATEWAY_FIXTURE_MARKER_FILE"
+        timeout_secs = 1
+        "#
+    );
+    let config = parse_config(&toml).unwrap();
+    let mut secrets = HashMap::new();
+    secrets.insert(
+        "marker".to_string(),
+        marker_path.to_string_lossy().to_string(),
+    );
+
+    let reg = Registry::open_in_memory(&config, &secrets).await.unwrap();
+
+    // Call 1: succeeds (spawn #1)
+    reg.execute("custom", "echo", serde_json::json!({"text": "first"}))
+        .await
+        .unwrap();
+
+    // Call 2: sleep 2000ms exceeds timeout_secs = 1
+    let err = reg
+        .execute("custom", "sleep", serde_json::json!({"ms": 2000}))
+        .await
+        .unwrap_err();
+    match err {
+        GatewayError::Timeout(msg) => {
+            assert!(
+                msg.contains("1s"),
+                "expected timeout message to name configured 1s timeout, got: {msg}"
+            );
+        }
+        other => panic!("expected Timeout, got {other:?}"),
+    }
+
+    // Call 3: post-timeout reconnect respawns a new child process (spawn #2)
+    reg.execute("custom", "echo", serde_json::json!({"text": "third"}))
+        .await
+        .unwrap();
+
+    let marker_contents = std::fs::read_to_string(&marker_path).unwrap();
+    let spawn_count = marker_contents.lines().filter(|l| !l.is_empty()).count();
+    assert_eq!(
+        spawn_count, 2,
+        "expected exactly 2 child-process spawns after timeout, got {spawn_count}: {marker_contents:?}"
     );
 }

@@ -17,6 +17,12 @@ struct EchoRequest {
     text: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SleepRequest {
+    #[schemars(description = "Milliseconds to sleep before returning")]
+    ms: u64,
+}
+
 #[derive(Clone, Default)]
 struct FixtureServer;
 
@@ -25,6 +31,12 @@ impl FixtureServer {
     #[tool(description = "Echoes the given text back, prefixed with 'echo: '.")]
     fn echo(&self, Parameters(EchoRequest { text }): Parameters<EchoRequest>) -> String {
         format!("echo: {text}")
+    }
+
+    #[tool(description = "Sleeps for ms milliseconds then returns ok.")]
+    async fn sleep(&self, Parameters(SleepRequest { ms }): Parameters<SleepRequest>) -> String {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        "slept".to_string()
     }
 
     /// Never returns — simulates one specific downstream tool call wedging
