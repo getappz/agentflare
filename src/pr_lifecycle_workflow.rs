@@ -195,39 +195,131 @@ pub(crate) fn build_pr_lifecycle_definitions(
     (reconcile, lifecycle)
 }
 
+async fn load_batches(mcp: Arc<AgentflareMcp>) -> Result<Vec<StoredReviewBatch>, String> {
+    let batches = tokio::task::spawn_blocking(move || {
+        mcp.with_backend_db(
+            |conn| -> Result<Vec<crate::supervisor::ReviewBatch>, String> {
+                let dirs =
+                    agentflare_backend::project_dir::list(conn).map_err(|e| e.to_string())?;
+                Ok(crate::supervisor::collect_review_batches(conn, dirs))
+            },
+        )
+    })
+    .await
+    .map_err(|e| format!("load_batches task: {e}"))?
+    .map_err(|e| format!("load_batches db: {e}"))?
+    .map_err(|e| format!("load_batches: {e}"))?;
+    Ok(batches.iter().map(stored_batch).collect())
+}
+
 fn build_load_batches_step(mcp: Arc<AgentflareMcp>) -> StepDefinition<PrLifecycleData> {
     let executor = Arc::new(FunctionStep::new(
         move |ctx: &mut WorkflowContext<PrLifecycleData>| {
             let mcp = mcp.clone();
             Box::pin(async move {
-                let batches = match tokio::task::spawn_blocking(move || {
-                    mcp.with_backend_db(
-                        |conn| -> Result<Vec<crate::supervisor::ReviewBatch>, String> {
-                            let dirs = agentflare_backend::project_dir::list(conn)
-                                .map_err(|e| e.to_string())?;
-                            Ok(crate::supervisor::collect_review_batches(conn, dirs))
-                        },
-                    )
-                })
-                .await
-                {
-                    Ok(Ok(Ok(batches))) => batches,
-                    Ok(Ok(Err(e))) => {
-                        return Ok(StepResult::Failed(format!("load_batches: {e}")));
+                match load_batches(mcp).await {
+                    Ok(batches) => {
+                        ctx.data.batches = batches;
+                        Ok(StepResult::Success)
                     }
-                    Ok(Err(e)) => {
-                        return Ok(StepResult::Failed(format!("load_batches db: {e}")));
-                    }
-                    Err(e) => {
-                        return Ok(StepResult::Failed(format!("load_batches task: {e}")));
-                    }
-                };
-                ctx.data.batches = batches.iter().map(stored_batch).collect();
-                Ok(StepResult::Success)
+                    Err(e) => Ok(StepResult::Failed(e)),
+                }
             })
         },
     ));
     StepDefinition::new("load_batches", "load_batches", executor)
+}
+
+/// Whether a schedule's `workflow_name` is a builtin Rust workflow rather
+/// than a JSON file under `.agentflare/workflows`.
+pub(crate) fn is_builtin_schedule_workflow(name: &str) -> bool {
+    name == WORKFLOW_RECONCILE_ID
+}
+
+/// Schedule-fire definition for `pr-reconcile`. The scheduler's engine is
+/// `WorkflowEngine<PipelineData>`, so this single step runs the same
+/// load-batches + fan-out as the registered definition, with fan-out going to
+/// the PR engine's `pr-lifecycle` runs.
+pub(crate) fn scheduled_reconcile_definition(
+    mcp: Arc<AgentflareMcp>,
+) -> WorkflowDefinition<flare_workflow::json::PipelineData> {
+    let executor = Arc::new(FunctionStep::new(
+        move |ctx: &mut WorkflowContext<flare_workflow::json::PipelineData>| {
+            let mcp = mcp.clone();
+            let params = ctx.params.clone();
+            Box::pin(async move {
+                let owner = crate::github::bridge::config::stable_instance_id();
+                let batches = match load_batches(mcp).await {
+                    Ok(b) => b,
+                    Err(e) => return Ok(StepResult::Failed(e)),
+                };
+                fan_out_lifecycle_from_batches(&batches, &owner, params).await?;
+                Ok(StepResult::Success)
+            })
+        },
+    ));
+    WorkflowDefinition::new(WORKFLOW_RECONCILE_ID, "pr reconcile").add_step(StepDefinition::new(
+        "reconcile",
+        "reconcile",
+        executor,
+    ))
+}
+
+/// Ensure one `pr-reconcile` schedule (`overlap=skip`, 60 s) per repo root.
+/// Only meaningful when `engine = workflow`. Returns the number created.
+pub(crate) async fn sync_reconcile_schedules(
+    store: &crate::schedule::ScheduleStore,
+    repo_roots: &[String],
+) -> usize {
+    let mut created = 0;
+    for root in repo_roots {
+        if matches!(
+            store.get_by_name(root, WORKFLOW_RECONCILE_ID).await,
+            Ok(Some(_))
+        ) {
+            continue;
+        }
+        let input = crate::schedule::store::CreateInput {
+            name: WORKFLOW_RECONCILE_ID.into(),
+            repo_root: root.clone(),
+            workflow_name: WORKFLOW_RECONCILE_ID.into(),
+            params: None,
+            every_secs: crate::schedule::MIN_EVERY_SECS,
+            grace_secs: None,
+            overlap: "skip".into(),
+        };
+        match store
+            .create_schedule(input, chrono::Utc::now().timestamp())
+            .await
+        {
+            Ok(_) => created += 1,
+            Err(e) => eprintln!("agentflare-schedule: pr-reconcile sync for {root}: {e}"),
+        }
+    }
+    created
+}
+
+/// Drop the `pr-lifecycle` start receipts for an item whose PR merged or
+/// closed, so a later PR for the same item can start a fresh run. No-op in
+/// `tick` mode; soft-fails (a stale receipt only delays a restart).
+pub(crate) fn clear_lifecycle_receipts(project_id: &str, item_id: &str) {
+    if review_sweep_engine() != ReviewSweepEngine::Workflow {
+        return;
+    }
+    clear_receipts_in(&crate::workflow::default_db_path(), project_id, item_id);
+}
+
+fn clear_receipts_in(db: &std::path::Path, project_id: &str, item_id: &str) {
+    let pattern = format!("pr-lifecycle:{project_id}:{item_id}:%");
+    let res = rusqlite::Connection::open(db).and_then(|c| {
+        c.execute(
+            "DELETE FROM workflow_start_receipts WHERE start_key LIKE ?1",
+            [pattern],
+        )
+    });
+    if let Err(e) = res {
+        eprintln!("agentflare-supervisor: clear pr-lifecycle receipts for {item_id}: {e}");
+    }
 }
 
 fn build_fan_out_step() -> StepDefinition<PrLifecycleData> {

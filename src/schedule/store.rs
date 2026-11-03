@@ -119,6 +119,9 @@ fn select_schedule(tx: &Connection, id: &str) -> Result<Option<ScheduleRow>, Str
 /// Resolve, parse, and structurally validate the named workflow: the create/
 /// update gate and the execution-time revalidation share it.
 fn check_workflow(repo_root: &str, workflow_name: &str) -> Result<(), String> {
+    if crate::pr_lifecycle_workflow::is_builtin_schedule_workflow(workflow_name) {
+        return Ok(());
+    }
     let definition =
         crate::workflow::resolve_named_definition(std::path::Path::new(repo_root), workflow_name)?;
     let json: JsonWorkflow =

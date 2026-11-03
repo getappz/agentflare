@@ -339,16 +339,23 @@ async fn fire_one(
             return Ok(());
         }
         // Execution-time revalidation: current file contents, every fire.
-        let definition_json = crate::workflow::resolve_named_definition(
-            std::path::Path::new(&spec.repo_root),
-            &spec.workflow_name,
-        )
-        .map_err(|e| format!("definition: {e}"))?;
-        let json: JsonWorkflow =
-            serde_json::from_str(&definition_json).map_err(|e| format!("definition: {e}"))?;
         let repo_root = std::path::PathBuf::from(&spec.repo_root);
-        let mut definition = compile_workflow_in(&json, send.clone(), Some(repo_root))
-            .map_err(|e| format!("definition: {e}"))?;
+        let mut definition =
+            if crate::pr_lifecycle_workflow::is_builtin_schedule_workflow(&spec.workflow_name) {
+                crate::pr_lifecycle_workflow::scheduled_reconcile_definition(std::sync::Arc::new(
+                    crate::mcp_server::AgentflareMcp::default(),
+                ))
+            } else {
+                let definition_json = crate::workflow::resolve_named_definition(
+                    std::path::Path::new(&spec.repo_root),
+                    &spec.workflow_name,
+                )
+                .map_err(|e| format!("definition: {e}"))?;
+                let json: JsonWorkflow = serde_json::from_str(&definition_json)
+                    .map_err(|e| format!("definition: {e}"))?;
+                compile_workflow_in(&json, send.clone(), Some(repo_root))
+                    .map_err(|e| format!("definition: {e}"))?
+            };
         let definition_id =
             flare_workflow::WorkflowId::new(format!("schedule:{}", occ.schedule_id));
         definition.id = definition_id.clone();

@@ -162,3 +162,52 @@ async fn fan_out_with_engine(
     }
     Ok(keys)
 }
+
+#[test]
+fn engine_workflow_is_the_only_mode_without_the_sweep_loop() {
+    // dispatch_boot spawns `spawn_supervisor_review_sweep` only for Tick.
+    assert_eq!(
+        parse_review_sweep_engine("workflow"),
+        ReviewSweepEngine::Workflow
+    );
+    assert_eq!(parse_review_sweep_engine("tick"), ReviewSweepEngine::Tick);
+    assert!(is_builtin_schedule_workflow(WORKFLOW_RECONCILE_ID));
+    assert!(!is_builtin_schedule_workflow("release-check"));
+}
+
+#[tokio::test]
+async fn sync_creates_one_skip_overlap_reconcile_schedule_per_repo_idempotently() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let store = crate::schedule::ScheduleStore::open(&dir.path().join("wf.db")).unwrap();
+    let roots = vec![repo.path().to_string_lossy().into_owned()];
+    assert_eq!(sync_reconcile_schedules(&store, &roots).await, 1);
+    assert_eq!(sync_reconcile_schedules(&store, &roots).await, 0);
+    let rows = store.list_all().await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].workflow_name, WORKFLOW_RECONCILE_ID);
+    assert_eq!(rows[0].overlap, "skip");
+    assert_eq!(rows[0].every_secs, crate::schedule::MIN_EVERY_SECS);
+}
+
+#[test]
+fn clear_receipts_removes_only_that_items_lifecycle_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("wf.db");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE workflow_start_receipts (start_key TEXT PRIMARY KEY, run_id TEXT, created_at INTEGER);
+         INSERT INTO workflow_start_receipts VALUES ('pr-lifecycle:p:i1:5','r1',0),
+           ('pr-lifecycle:p:i2:6','r2',0), ('schedule:x','r3',0);",
+    )
+    .unwrap();
+    clear_receipts_in(&db, "p", "i1");
+    let keys: Vec<String> = conn
+        .prepare("SELECT start_key FROM workflow_start_receipts ORDER BY 1")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(keys, ["pr-lifecycle:p:i2:6", "schedule:x"]);
+}

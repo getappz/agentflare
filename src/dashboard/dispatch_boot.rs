@@ -33,11 +33,17 @@ pub(super) fn start_work_dispatch(queue: &agentflare_jobs::Queue) {
         std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default()),
         SUPERVISOR_DISCOVERY_INTERVAL,
     );
-    spawn_supervisor_review_sweep(
-        queue.clone(),
-        std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default()),
-        SUPERVISOR_REVIEW_SWEEP_INTERVAL,
-    );
+    if crate::pr_lifecycle_workflow::review_sweep_engine()
+        == crate::pr_lifecycle_workflow::ReviewSweepEngine::Tick
+    {
+        spawn_supervisor_review_sweep(
+            queue.clone(),
+            std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default()),
+            SUPERVISOR_REVIEW_SWEEP_INTERVAL,
+        );
+    } else {
+        eprintln!("agentflare-supervisor: review sweep loop off (engine = workflow)");
+    }
     spawn_supervisor_telegram_approvals(
         std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default()),
         SUPERVISOR_TELEGRAM_POLL_INTERVAL,
@@ -53,6 +59,27 @@ pub(super) fn start_work_dispatch(queue: &agentflare_jobs::Queue) {
 /// linkage goes through start receipts, and resuming here would break
 /// at-most-once fire semantics.
 pub(super) fn spawn_schedule_ticker() -> tokio::task::JoinHandle<()> {
+    if crate::pr_lifecycle_workflow::review_sweep_engine()
+        == crate::pr_lifecycle_workflow::ReviewSweepEngine::Workflow
+    {
+        tokio::spawn(async {
+            let roots = tokio::task::spawn_blocking(|| {
+                crate::mcp_server::AgentflareMcp::default()
+                    .with_backend_db(|conn| agentflare_backend::project_dir::list(conn))
+                    .ok()
+                    .and_then(Result::ok)
+                    .map(|dirs| dirs.into_iter().map(|d| d.folder_path).collect::<Vec<_>>())
+                    .unwrap_or_default()
+            })
+            .await
+            .unwrap_or_default();
+            if let Ok(store) =
+                crate::schedule::ScheduleStore::open(&crate::workflow::default_db_path())
+            {
+                crate::pr_lifecycle_workflow::sync_reconcile_schedules(&store, &roots).await;
+            }
+        });
+    }
     spawn_schedule_ticker_every(
         crate::workflow::default_db_path(),
         crate::workflow::agent_send_hook(),
