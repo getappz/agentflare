@@ -1146,7 +1146,7 @@ pub(crate) fn nudge_posted(comments: &[Comment], head_sha: &str) -> bool {
 #[cfg(test)]
 #[path = "tests/review_finding_summary_tests.rs"]
 mod summary_tests;
-
+#[cfg(test)]
 mod fix_task_diff_tests {
     use super::*;
     struct FnDiffProvider<F: Fn(&BotFinding) -> FixTaskDiff>(F);
