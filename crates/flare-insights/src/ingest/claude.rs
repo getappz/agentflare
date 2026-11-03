@@ -52,6 +52,12 @@ impl Adapter for ClaudeAdapter {
             if cursors.get(path) == Some(&cursor) {
                 continue; // unchanged since last sync
             }
+            if config.project.is_some()
+                && !config.matches_project(super::common::jsonl_project(path)?.as_deref())
+            {
+                bundle.file_cursors.push((path.clone(), cursor.0, cursor.1));
+                continue;
+            }
             if let Some(b) = parse_claude_jsonl(path) {
                 bundle.sessions.extend(b.sessions);
                 bundle.turns.extend(b.turns);

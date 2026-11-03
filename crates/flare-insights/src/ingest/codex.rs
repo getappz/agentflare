@@ -45,6 +45,12 @@ impl Adapter for CodexAdapter {
             if cursors.get(path) == Some(&cursor) {
                 continue; // unchanged since last sync
             }
+            if config.project.is_some()
+                && !config.matches_project(super::common::jsonl_project(path)?.as_deref())
+            {
+                bundle.file_cursors.push((path.clone(), cursor.0, cursor.1));
+                continue;
+            }
             if let Some((s, turns, tools)) = parse_codex_jsonl(path) {
                 bundle.sessions.push(s);
                 bundle.turns.extend(turns);

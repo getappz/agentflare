@@ -58,6 +58,18 @@ agentflare insights serve --port 3456             # 127.0.0.1 REST + WS
 
 Uses `agentflare-flare-insights` as lib: `flare_insights::store::InsightsStore::open_in_memory()` etc.
 
+When an AI agent runs `insights sync`, it automatically selects the invoking
+Git worktree's project root (the current folder outside Git). Session project
+paths must match that root or a directory below it; sessions without project
+metadata are left for a manual global sync. OpenCode and Cursor check project
+metadata before loading messages or bubbles, and JSONL readers inspect project
+hints before parsing the transcript. Manual terminal sync remains global.
+
+Project and global syncs keep separate cursors, so syncing one project cannot
+hide another project's history. Unchanged SQLite databases and WAL files are
+skipped. A changed database still reloads the eligible sessions; this is not
+row-level incremental ingestion. `--force` refreshes the selected scope.
+
 ## Design decisions
 
 - **Local-first**: reads only, never writes to `~/.claude` transcripts; binds 127.0.0.1.

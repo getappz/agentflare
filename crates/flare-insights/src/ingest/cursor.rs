@@ -15,7 +15,7 @@ use serde_json::Value;
 use crate::config::InsightsConfig;
 use crate::config::PricingTable;
 use crate::ingest::{
-    common::{extract_file_path, file_cursor, file_kind_for_tool, parse_timestamp},
+    common::{extract_file_path, file_kind_for_tool, parse_timestamp, sqlite_file_cursors},
     Adapter, FileCursors, IngestBundle, IngestError,
 };
 use crate::model::{
@@ -44,29 +44,19 @@ impl Adapter for CursorAdapter {
             return Ok(IngestBundle::default());
         }
 
-        // Single SQLite file — use the file-cursor skip cache like JSONL adapters.
-        // Bypass while state.vscdb-wal is non-empty: SQLite can land new composer
-        // rows in the WAL without changing the main DB mtime/size that file_cursor
-        // tracks, so a cached skip would miss live Cursor writes.
-        let Some(cursor) = file_cursor(db_path) else {
-            on_progress(0, 0);
-            return Ok(IngestBundle::default());
-        };
-        let wal_path = db_path.with_extension("vscdb-wal");
-        let wal_nonempty = std::fs::metadata(&wal_path)
-            .map(|metadata| metadata.len() > 0)
-            .unwrap_or(false);
-        if !wal_nonempty && cursors.get(db_path) == Some(&cursor) {
+        let file_cursors = sqlite_file_cursors(db_path)?;
+        if file_cursors
+            .iter()
+            .all(|(path, mtime, size)| cursors.get(path) == Some(&(*mtime, *size)))
+        {
             on_progress(1, 1);
             return Ok(IngestBundle::default());
         }
 
         on_progress(0, 1);
         let (_keepalive, conn) = open_vscdb(db_path)?;
-        let mut bundle = ingest_from_conn(&conn)?;
-        bundle
-            .file_cursors
-            .push((db_path.clone(), cursor.0, cursor.1));
+        let mut bundle = ingest_from_conn(&conn, config)?;
+        bundle.file_cursors = file_cursors;
         on_progress(1, 1);
         Ok(bundle)
     }
@@ -100,10 +90,14 @@ fn open_vscdb(path: &Path) -> Result<(Keepalive, Connection), IngestError> {
     }
 }
 
-fn ingest_from_conn(conn: &Connection) -> Result<IngestBundle, IngestError> {
+fn ingest_from_conn(
+    conn: &Connection,
+    config: &InsightsConfig,
+) -> Result<IngestBundle, IngestError> {
     let mut bundle = IngestBundle::default();
     let mut stmt = match conn
-        .prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%' ORDER BY key")
+        // Binary prefix bounds use the key index; case-insensitive LIKE scans it in full.
+        .prepare("SELECT key, value FROM cursorDiskKV WHERE key >= 'composerData:' AND key < 'composerData;' ORDER BY key")
     {
         Ok(s) => s,
         // Missing table = nothing to ingest; other prepare failures must propagate
@@ -129,6 +123,9 @@ fn ingest_from_conn(conn: &Connection) -> Result<IngestBundle, IngestError> {
             Ok(v) => v,
             Err(_) => continue,
         };
+        if !config.matches_project(workspace_fs_path(&data).as_deref()) {
+            continue;
+        }
         let headers = data
             .get("fullConversationHeadersOnly")
             .and_then(|v| v.as_array())
@@ -536,11 +533,17 @@ fn bubble_created_at(bubble: &Value) -> Option<DateTime<Utc>> {
 }
 
 fn workspace_fs_path(data: &Value) -> Option<String> {
-    data.get("workspaceIdentifier")
-        .and_then(|w| w.get("uri"))
-        .and_then(|u| u.get("fsPath").or_else(|| u.get("path")))
-        .and_then(|p| p.as_str())
-        .map(|s| s.to_string())
+    let uri = data.get("workspaceIdentifier")?.get("uri")?;
+    if let Some(path) = uri.get("fsPath").and_then(Value::as_str) {
+        return Some(path.to_string());
+    }
+    let path = uri.get("path")?.as_str()?;
+    let authority = uri.get("authority").and_then(Value::as_str).unwrap_or("");
+    url::Url::parse(&format!("file://{authority}{path}"))
+        .ok()
+        .and_then(|url| url.to_file_path().ok())
+        .map(|path| path.to_string_lossy().into_owned())
+        .or_else(|| Some(path.to_string()))
 }
 
 fn tool_from_bubble(
@@ -668,6 +671,7 @@ pub fn default_state_vscdb_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ingest::common::file_cursor;
     use tempfile::TempDir;
 
     fn write_fixture(path: &Path) {
@@ -866,7 +870,7 @@ mod tests {
         assert!(bundle.file_events[0].path.contains("Cargo.toml"));
         assert!(s.tokens.input >= 10);
         assert!(s.tokens.output >= 5);
-        assert_eq!(bundle.file_cursors.len(), 1);
+        assert_eq!(bundle.file_cursors.len(), 2);
         assert_eq!(bundle.file_cursors[0].0, db);
     }
 
@@ -892,31 +896,142 @@ mod tests {
             sources: [("cursor".into(), db.clone())].into(),
             ..Default::default()
         };
-        let cursor = file_cursor(&db).unwrap();
-        let mut cursors = FileCursors::default();
-        cursors.insert(db, cursor);
+        let first = CursorAdapter
+            .scan(&cfg, &FileCursors::default(), &mut |_, _| {})
+            .unwrap();
+        let cursors = first
+            .file_cursors
+            .into_iter()
+            .map(|(path, mtime, size)| (path, (mtime, size)))
+            .collect();
         let bundle = CursorAdapter.scan(&cfg, &cursors, &mut |_, _| {}).unwrap();
         assert!(bundle.sessions.is_empty());
         assert!(bundle.file_cursors.is_empty());
     }
 
     #[test]
-    fn nonempty_wal_bypasses_file_cursor_skip() {
+    fn project_scope_accepts_file_uri_path() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("state.vscdb");
+        let project = dir.path().join("project with spaces");
+        write_fixture(&db);
+        let conn = Connection::open(&db).unwrap();
+        let text: String = conn
+            .query_row(
+                "SELECT CAST(value AS TEXT) FROM cursorDiskKV WHERE key='composerData:comp-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let mut data: Value = serde_json::from_str(&text).unwrap();
+        data["workspaceIdentifier"]["uri"] = serde_json::json!({"scheme":"file", "path":url::Url::from_directory_path(&project).unwrap().path()});
+        conn.execute(
+            "UPDATE cursorDiskKV SET value=?1 WHERE key='composerData:comp-1'",
+            [data.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+        let cfg = InsightsConfig {
+            sources: [("cursor".into(), db)].into(),
+            project: Some(project.clone()),
+            ..Default::default()
+        };
+        let bundle = CursorAdapter
+            .scan(&cfg, &FileCursors::default(), &mut |_, _| {})
+            .unwrap();
+        assert_eq!(bundle.sessions.len(), 1);
+        assert_eq!(
+            PathBuf::from(bundle.sessions[0].cwd.as_ref().unwrap()),
+            project
+        );
+    }
+
+    #[test]
+    fn project_scope_excludes_other_composers() {
         let dir = TempDir::new().unwrap();
         let db = dir.path().join("state.vscdb");
         write_fixture(&db);
-        // Sibling WAL with bytes — main-file cursor is unchanged, but ingest must re-read.
-        std::fs::write(db.with_extension("vscdb-wal"), b"wal-bytes").unwrap();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("INSERT INTO cursorDiskKV SELECT replace(key, 'comp-1', 'comp-2'), replace(replace(CAST(value AS TEXT), 'comp-1', 'comp-2'), 'my-app', 'my-app-other') FROM cursorDiskKV WHERE key LIKE '%comp-1%';").unwrap();
+        drop(conn);
+        let mut cfg = InsightsConfig {
+            sources: [("cursor".into(), db)].into(),
+            project: Some(PathBuf::from("C:/Users/me/proj/my-app")),
+            ..Default::default()
+        };
+        let scoped = CursorAdapter
+            .scan(&cfg, &FileCursors::default(), &mut |_, _| {})
+            .unwrap();
+        assert_eq!(scoped.sessions.len(), 1);
+        assert_eq!(scoped.sessions[0].id, "comp-1");
+        cfg.project = None;
+        assert_eq!(
+            CursorAdapter
+                .scan(&cfg, &FileCursors::default(), &mut |_, _| {})
+                .unwrap()
+                .sessions
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn unchanged_database_skips_reparse_with_live_wal() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("state.vscdb");
+        write_fixture(&db);
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+            UPDATE cursorDiskKV SET value=replace(CAST(value AS TEXT), 'Fix the adapter', 'Live WAL title') WHERE key='composerData:comp-1';").unwrap();
+        assert!(
+            std::fs::metadata(db.with_extension("vscdb-wal"))
+                .unwrap()
+                .len()
+                > 0
+        );
         let cfg = InsightsConfig {
             sources: [("cursor".into(), db.clone())].into(),
             ..Default::default()
         };
-        let cursor = file_cursor(&db).unwrap();
-        let mut cursors = FileCursors::default();
-        cursors.insert(db, cursor);
-        let bundle = CursorAdapter.scan(&cfg, &cursors, &mut |_, _| {}).unwrap();
-        assert_eq!(bundle.sessions.len(), 1);
-        assert_eq!(bundle.file_cursors.len(), 1);
+        let store = crate::store::InsightsStore::open_in_memory().unwrap();
+        let first = CursorAdapter
+            .scan(&cfg, &FileCursors::default(), &mut |_, _| {})
+            .unwrap();
+        assert_eq!(first.sessions.len(), 1);
+        store
+            .upsert_file_cursors_batch("cursor", &first.file_cursors)
+            .unwrap();
+        let cursors = store.load_file_cursors("cursor").unwrap();
+        let unchanged = CursorAdapter.scan(&cfg, &cursors, &mut |_, _| {}).unwrap();
+        assert!(
+            unchanged.sessions.is_empty(),
+            "unchanged DB and WAL must skip ingestion"
+        );
+        assert!(unchanged.file_cursors.is_empty());
+
+        let main_before = file_cursor(&db).unwrap();
+        conn.execute("UPDATE cursorDiskKV SET value=replace(CAST(value AS TEXT), 'Live WAL title', 'Updated in WAL') WHERE key='composerData:comp-1'", []).unwrap();
+        assert_eq!(file_cursor(&db), Some(main_before));
+        let changed = CursorAdapter.scan(&cfg, &cursors, &mut |_, _| {}).unwrap();
+        assert_eq!(changed.sessions[0].title.as_deref(), Some("Updated in WAL"));
+        store
+            .upsert_file_cursors_batch("cursor", &changed.file_cursors)
+            .unwrap();
+        let cursors = store.load_file_cursors("cursor").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        drop(conn);
+        let checkpointed = CursorAdapter.scan(&cfg, &cursors, &mut |_, _| {}).unwrap();
+        assert_eq!(checkpointed.sessions.len(), 1);
+        store
+            .upsert_file_cursors_batch("cursor", &checkpointed.file_cursors)
+            .unwrap();
+        let cursors = store.load_file_cursors("cursor").unwrap();
+        assert!(CursorAdapter
+            .scan(&cfg, &cursors, &mut |_, _| {})
+            .unwrap()
+            .sessions
+            .is_empty());
     }
 
     #[test]

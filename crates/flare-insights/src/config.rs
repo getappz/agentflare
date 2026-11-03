@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct InsightsConfig {
@@ -8,6 +8,7 @@ pub struct InsightsConfig {
     pub retention_days: u32,
     pub sources: HashMap<String, PathBuf>,
     pub pricing: PricingTable,
+    pub project: Option<PathBuf>,
 }
 
 impl Default for InsightsConfig {
@@ -19,8 +20,56 @@ impl Default for InsightsConfig {
             retention_days: 30,
             sources: default_sources(),
             pricing: PricingTable::default(),
+            project: None,
         }
     }
+}
+
+impl InsightsConfig {
+    pub fn matches_project(&self, path: Option<&str>) -> bool {
+        self.project.as_ref().is_none_or(|root| {
+            path.is_some_and(|path| {
+                normalized_path(Path::new(path)).starts_with(normalized_path(root))
+            })
+        })
+    }
+
+    pub fn cursor_source(&self, source: &str) -> String {
+        match &self.project {
+            Some(root) => format!("{source}:project:{}", normalized_path(root).display()),
+            None => source.to_string(),
+        }
+    }
+}
+
+fn normalized_path(path: &Path) -> PathBuf {
+    // Do not open unrelated or unavailable project paths just to compare them.
+    let path = path.to_string_lossy().into_owned();
+    let path = if cfg!(windows) {
+        path.replace('\\', "/")
+    } else {
+        path
+    };
+    let path = if let Some(unc) = path.strip_prefix("//?/UNC/") {
+        format!("//{unc}")
+    } else {
+        path.strip_prefix("//?/").unwrap_or(&path).to_string()
+    };
+    let path = if cfg!(windows) {
+        path.to_lowercase()
+    } else {
+        path
+    };
+    let mut normalized = PathBuf::new();
+    for component in Path::new(&path).components() {
+        match component {
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
 }
 
 /// Home for source discovery. Prefer `$HOME`, then `$USERPROFILE` (Windows),

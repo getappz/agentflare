@@ -115,17 +115,13 @@ impl InsightsWatcher {
         let mut tools = 0;
         for (source, res) in mgr.scan_all(config, store, |_, _, _| {}) {
             let Ok(bundle) = res else { continue };
+            if let Err(e) = store.upsert_ingest_bundle(&config.cursor_source(&source), &bundle) {
+                eprintln!("{source}: store error {e}");
+                continue;
+            }
             sess += bundle.sessions.len();
             turns += bundle.turns.len();
             tools += bundle.tool_calls.len();
-            let _ = store.upsert_sessions_batch(&bundle.sessions);
-            let _ = store.upsert_turns_batch(&bundle.turns);
-            let _ = store.upsert_tool_calls_batch(&bundle.tool_calls);
-            let _ = store.upsert_file_events_batch(&bundle.file_events);
-            let _ = store.upsert_subagents_batch(&bundle.subagents);
-            if !bundle.file_cursors.is_empty() {
-                let _ = store.upsert_file_cursors_batch(&source, &bundle.file_cursors);
-            }
         }
         (sess, turns, tools)
     }
