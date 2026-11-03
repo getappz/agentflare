@@ -1398,14 +1398,14 @@ pub(crate) struct ProjectRequest {
     #[schemars(description = "Action: info|list|archive|unarchive|rename|delete")]
     pub(crate) action: String,
     #[schemars(
-        description = "Target project (name or UUID from `project action=list`) for archive/unarchive/rename/delete. Defaults to the project this repo is linked to."
+        description = "Target project (name or UUID from `project action=list`) for archive/unarchive/rename/delete. Defaults to the project this repo is linked to, except for delete, where it is required."
     )]
     #[serde(default)]
     pub(crate) project: Option<String>,
     #[schemars(description = "New name for the project (required for action=rename)")]
     #[serde(default)]
     pub(crate) name: Option<String>,
-    #[schemars(description = "Optional new identifier (e.g. 'CLI', 'PROJ') for action=rename")]
+    #[schemars(description = "Optional new identifier (e.g. 'CLI', 'PROJ') for action=rename; omitted keeps the current identifier")]
     #[serde(default)]
     pub(crate) identifier: Option<String>,
 }

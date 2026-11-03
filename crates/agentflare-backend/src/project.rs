@@ -160,6 +160,12 @@ pub fn delete(conn: &Connection, id: &str) -> Result<()> {
         return Err(crate::error::Error::NotFound(id.to_string()));
     }
     crate::project_dir::remove(&tx, id)?;
+    // Same reason for the GitHub bridge registry: the daemon polls every
+    // `bridge_repos` row and would keep importing issues into this project.
+    tx.execute(
+        "DELETE FROM bridge_repos WHERE project_id = ?1",
+        rusqlite::params![id],
+    )?;
     tx.commit()?;
     events::emit(
         conn,

@@ -120,18 +120,34 @@ pub fn staleness_reason(default_branch: &str, commits_behind: u64) -> Option<Str
 /// correctly, works regardless of subdirectory. `None` outside a git repo.
 #[must_use]
 pub fn repo_toplevel(start: &Path) -> Option<PathBuf> {
-    let mut cur = start;
-    loop {
-        let dot_git = cur.join(".git");
-        if dot_git.is_dir() || dot_git.is_file() {
-            return Some(cur.to_path_buf());
-        }
-        match cur.parent() {
-            Some(p) => cur = p,
-            None => break,
-        }
+    // Absolute first: walking a relative `start` (e.g. `.` or `src`) stops at
+    // `""`, which would return `""`/`"."` instead of the toplevel git reports.
+    if let Ok(abs) = std::path::absolute(start)
+        && let Some(top) = abs.ancestors().find(|d| d.join(".git").exists())
+    {
+        return Some(top.to_path_buf());
     }
     run_in_opt(start, &["rev-parse", "--show-toplevel"]).map(PathBuf::from)
+}
+
+/// The git dir a `.git` *file* points at (linked worktree, submodule,
+/// `--separate-git-dir` checkout). `None` when `.git` is not such a file.
+fn gitfile_target(repo_root: &Path) -> Option<PathBuf> {
+    let content = std::fs::read_to_string(repo_root.join(".git")).ok()?;
+    let raw = content
+        .lines()
+        .find_map(|l| l.trim_start().strip_prefix("gitdir:"))?
+        .trim();
+    // `join` replaces the base when `raw` is absolute.
+    Some(repo_root.join(raw))
+}
+
+/// A linked worktree's common git dir, from the `commondir` file only linked
+/// worktrees' git dirs carry. `None` for submodules and separate-git-dir
+/// checkouts, whose git dir is its own common dir.
+fn linked_common_dir(gitdir: &Path) -> Option<PathBuf> {
+    let raw = std::fs::read_to_string(gitdir.join("commondir")).ok()?;
+    Some(gitdir.join(raw.trim()))
 }
 
 /// `true` if `pattern` matches `branch` -- exact match, or a prefix match
@@ -201,8 +217,11 @@ pub fn is_linked_worktree(repo_root: &Path) -> bool {
     if dot_git.is_dir() {
         return false;
     }
-    if dot_git.is_file() {
-        return true;
+    // A `.git` file alone is not enough: submodules and `--separate-git-dir`
+    // checkouts have one too, and treating those as linked worktrees would
+    // switch off the canonical-checkout guards for them.
+    if let Some(gitdir) = gitfile_target(repo_root) {
+        return linked_common_dir(&gitdir).is_some();
     }
     match (
         run_in_opt(repo_root, &["rev-parse", "--git-dir"]),
@@ -227,27 +246,25 @@ fn fast_remote_url(repo_root: &Path, remote: &str) -> Option<String> {
     let dot_git = repo_root.join(".git");
     let config_path = if dot_git.is_dir() {
         dot_git.join("config")
-    } else if dot_git.is_file() {
-        let content = std::fs::read_to_string(&dot_git).ok()?;
-        let gitdir_line = content.lines().find(|l| l.trim_start().starts_with("gitdir:"))?;
-        let gitdir_path = gitdir_line.trim_start().strip_prefix("gitdir:")?.trim();
-        let path = Path::new(gitdir_path);
-        let gitdir = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            repo_root.join(path)
-        };
-        let direct_config = gitdir.join("config");
-        if direct_config.is_file() {
-            direct_config
-        } else {
-            gitdir.parent()?.parent()?.join("config")
-        }
     } else {
-        return None;
+        let gitdir = gitfile_target(repo_root)?;
+        linked_common_dir(&gitdir).unwrap_or(gitdir).join("config")
     };
 
     let text = std::fs::read_to_string(config_path).ok()?;
+    // `git remote get-url` applies `url.<base>.insteadOf` rewrites (from any
+    // config level) and follows includes; a plain section scan would return
+    // the unrewritten URL, so defer to git whenever either may be in play.
+    let global = dirs::home_dir()
+        .into_iter()
+        .flat_map(|h| [h.join(".gitconfig"), h.join(".config").join("git").join("config")]);
+    if may_rewrite_urls(&text)
+        || global
+            .filter_map(|p| std::fs::read_to_string(p).ok())
+            .any(|t| may_rewrite_urls(&t))
+    {
+        return None;
+    }
     let target_header = format!("[remote \"{remote}\"]");
     let mut in_target = false;
     for line in text.lines() {
@@ -256,13 +273,21 @@ fn fast_remote_url(repo_root: &Path, remote: &str) -> Option<String> {
             in_target = trimmed.eq_ignore_ascii_case(&target_header);
             continue;
         }
-        if in_target && let Some((k, v)) = trimmed.split_once('=') {
-            if k.trim().eq_ignore_ascii_case("url") {
-                return Some(v.trim().to_string());
-            }
+        if in_target
+            && let Some((k, v)) = trimmed.split_once('=')
+            && k.trim().eq_ignore_ascii_case("url")
+        {
+            return Some(v.trim().trim_matches('"').to_string());
         }
     }
     None
+}
+
+/// `true` when a git config may rewrite or extend remote URLs beyond what a
+/// plain `[remote "..."]` scan sees.
+fn may_rewrite_urls(config: &str) -> bool {
+    let lower = config.to_ascii_lowercase();
+    lower.contains("insteadof") || lower.contains("[include")
 }
 
 /// The main checkout's root when `repo_root` is a linked worktree, or the

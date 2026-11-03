@@ -199,8 +199,9 @@ impl AgentflareMcp {
         let existing = agentflare_backend::project::list_by_workspace(conn, &workspace_id)
             .map_err(map_backend_err)?
             .into_iter()
+            // `list_by_workspace` already excludes soft-deleted projects.
             .filter(|p| {
-                p.deleted_at.is_none()
+                p.external_source.as_deref() == Some(Self::REPO_EXTERNAL_SOURCE)
                     && (p.external_id.as_deref() == Some(repo_key.as_str())
                         || (legacy_repo_key.is_some()
                             && p.external_id.as_deref() == legacy_repo_key.as_deref()))
