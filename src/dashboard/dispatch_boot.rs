@@ -33,9 +33,7 @@ pub(super) fn start_work_dispatch(queue: &agentflare_jobs::Queue) {
         std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default()),
         SUPERVISOR_DISCOVERY_INTERVAL,
     );
-    if crate::pr_lifecycle_workflow::review_sweep_engine()
-        == crate::pr_lifecycle_workflow::ReviewSweepEngine::Tick
-    {
+    if crate::pr_lifecycle_workflow::review_sweep_loop_enabled() {
         spawn_supervisor_review_sweep(
             queue.clone(),
             std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default()),
@@ -59,24 +57,13 @@ pub(super) fn start_work_dispatch(queue: &agentflare_jobs::Queue) {
 /// linkage goes through start receipts, and resuming here would break
 /// at-most-once fire semantics.
 pub(super) fn spawn_schedule_ticker() -> tokio::task::JoinHandle<()> {
-    if crate::pr_lifecycle_workflow::review_sweep_engine()
-        == crate::pr_lifecycle_workflow::ReviewSweepEngine::Workflow
-    {
+    if !crate::pr_lifecycle_workflow::review_sweep_loop_enabled() {
+        // Re-synced periodically so projects registered after boot get a schedule.
         tokio::spawn(async {
-            let roots = tokio::task::spawn_blocking(|| {
-                crate::mcp_server::AgentflareMcp::default()
-                    .with_backend_db(|conn| agentflare_backend::project_dir::list(conn))
-                    .ok()
-                    .and_then(Result::ok)
-                    .map(|dirs| dirs.into_iter().map(|d| d.folder_path).collect::<Vec<_>>())
-                    .unwrap_or_default()
-            })
-            .await
-            .unwrap_or_default();
-            if let Ok(store) =
-                crate::schedule::ScheduleStore::open(&crate::workflow::default_db_path())
-            {
-                crate::pr_lifecycle_workflow::sync_reconcile_schedules(&store, &roots).await;
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
+            loop {
+                ticker.tick().await;
+                sync_pr_reconcile_schedules_once().await;
             }
         });
     }
@@ -85,6 +72,27 @@ pub(super) fn spawn_schedule_ticker() -> tokio::task::JoinHandle<()> {
         crate::workflow::agent_send_hook(),
         crate::schedule::TICK_INTERVAL_SECS,
     )
+}
+
+async fn sync_pr_reconcile_schedules_once() {
+    let roots = tokio::task::spawn_blocking(|| {
+        crate::mcp_server::AgentflareMcp::default()
+            .with_backend_db(|conn| agentflare_backend::project_dir::list(conn))
+    })
+    .await;
+    let roots: Vec<String> = match roots {
+        Ok(Ok(Ok(dirs))) => dirs.into_iter().map(|d| d.folder_path).collect(),
+        other => {
+            eprintln!("agentflare-schedule: pr-reconcile sync: project list failed: {other:?}");
+            return;
+        }
+    };
+    match crate::schedule::ScheduleStore::open(&crate::workflow::default_db_path()) {
+        Ok(store) => {
+            crate::pr_lifecycle_workflow::sync_reconcile_schedules(&store, &roots).await;
+        }
+        Err(e) => eprintln!("agentflare-schedule: pr-reconcile sync: store open failed: {e}"),
+    }
 }
 
 /// Test seam: same ticker over an isolated database with an injectable send

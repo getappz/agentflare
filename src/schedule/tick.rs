@@ -342,6 +342,13 @@ async fn fire_one(
         let repo_root = std::path::PathBuf::from(&spec.repo_root);
         let mut definition =
             if crate::pr_lifecycle_workflow::is_builtin_schedule_workflow(&spec.workflow_name) {
+                // Never run alongside the tick-mode sweep loop (spec §Overlap).
+                if crate::pr_lifecycle_workflow::review_sweep_loop_enabled() {
+                    return Err(
+                        "definition: pr-reconcile requires [review_sweep].engine = \"workflow\""
+                            .to_string(),
+                    );
+                }
                 crate::pr_lifecycle_workflow::scheduled_reconcile_definition(std::sync::Arc::new(
                     crate::mcp_server::AgentflareMcp::default(),
                 ))

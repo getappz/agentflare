@@ -230,6 +230,12 @@ fn build_load_batches_step(mcp: Arc<AgentflareMcp>) -> StepDefinition<PrLifecycl
     StepDefinition::new("load_batches", "load_batches", executor)
 }
 
+/// Whether the tick-mode `spawn_supervisor_review_sweep` loop should run.
+/// The workflow engine replaces it; never both (spec §Overlap).
+pub(crate) fn review_sweep_loop_enabled() -> bool {
+    review_sweep_engine() == ReviewSweepEngine::Tick
+}
+
 /// Whether a schedule's `workflow_name` is a builtin Rust workflow rather
 /// than a JSON file under `.agentflare/workflows`.
 pub(crate) fn is_builtin_schedule_workflow(name: &str) -> bool {
@@ -310,10 +316,10 @@ pub(crate) fn clear_lifecycle_receipts(project_id: &str, item_id: &str) {
 }
 
 fn clear_receipts_in(db: &std::path::Path, project_id: &str, item_id: &str) {
-    let pattern = format!("pr-lifecycle:{project_id}:{item_id}:%");
+    let pattern = format!("pr-lifecycle:{project_id}:{item_id}:");
     let res = rusqlite::Connection::open(db).and_then(|c| {
         c.execute(
-            "DELETE FROM workflow_start_receipts WHERE start_key LIKE ?1",
+            "DELETE FROM workflow_start_receipts WHERE substr(start_key, 1, length(?1)) = ?1",
             [pattern],
         )
     });

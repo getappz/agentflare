@@ -211,3 +211,14 @@ fn clear_receipts_removes_only_that_items_lifecycle_keys() {
         .collect();
     assert_eq!(keys, ["pr-lifecycle:p:i2:6", "schedule:x"]);
 }
+
+#[test]
+fn sweep_loop_runs_only_in_tick_engine() {
+    crate::paths::test_support::with_temp_home(|| {
+        unsafe { std::env::remove_var("AGENTFLARE_REVIEW_SWEEP_ENGINE") };
+        assert!(review_sweep_loop_enabled());
+        unsafe { std::env::set_var("AGENTFLARE_REVIEW_SWEEP_ENGINE", "workflow") };
+        assert!(!review_sweep_loop_enabled());
+        unsafe { std::env::remove_var("AGENTFLARE_REVIEW_SWEEP_ENGINE") };
+    });
+}
