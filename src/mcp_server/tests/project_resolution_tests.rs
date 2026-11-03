@@ -268,3 +268,51 @@ fn register_project_dir_refuses_to_steal_a_folder_path_claimed_by_another_projec
 // depend on what markers happen to exist above the OS temp directory on
 // whatever machine runs this — not a property this test can control. The
 // fallback itself is a single trivial `None => return start`.
+
+#[test]
+fn resolve_project_in_linked_worktree_reconnects_to_main_project() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_root = dunce::canonicalize(repo_dir.path()).unwrap();
+
+    let run_git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo_root)
+            .output()
+            .unwrap()
+    };
+    run_git(&["init", "-b", "master"]);
+    run_git(&["config", "user.email", "test@test.com"]);
+    run_git(&["config", "user.name", "Test"]);
+    run_git(&["commit", "--allow-empty", "-m", "initial"]);
+    run_git(&[
+        "remote",
+        "add",
+        "origin",
+        "https://github.com/getappz/cli.git",
+    ]);
+
+    let scratch = tempfile::tempdir().unwrap();
+    let db_path = scratch.path().join("backend.db");
+    let main_s = AgentflareMcp {
+        backend_db_override: Some(db_path.clone()),
+        backend_project_link_override: Some(repo_root.join(".agentflare").join("project.json")),
+        worktree_repo_root_override: Some(repo_root.clone()),
+        ..Default::default()
+    };
+    let conn = agentflare_backend::db::open_db(&db_path).unwrap();
+    let main_project = main_s.resolve_project(&conn).unwrap();
+
+    // Worktree instance shares worktree_repo_root (main checkout) and has no link file in worktree
+    let wt_s = AgentflareMcp {
+        backend_db_override: Some(db_path.clone()),
+        worktree_repo_root_override: Some(repo_root.clone()),
+        ..Default::default()
+    };
+
+    let wt_project = wt_s.resolve_project(&conn).unwrap();
+    assert_eq!(
+        wt_project.id, main_project.id,
+        "worktree session must resolve to the main project, never fork a duplicate"
+    );
+}

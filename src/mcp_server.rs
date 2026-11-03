@@ -1944,15 +1944,73 @@ impl AgentflareMcp {
                 .map_err(map_backend_err)?;
                 Ok(serde_json::to_string_pretty(&project).unwrap_or_default())
             })?,
+            "rename" => self.with_backend_db(|conn| {
+                let target = self.resolve_project_for_read(conn, req.project.as_deref())?;
+                let new_name = req
+                    .name
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        ErrorData::invalid_params("name is required for project action=rename", None)
+                    })?;
+                let target_ident = req
+                    .identifier
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| Self::derive_project_identifier(&new_name));
+
+                let project = match agentflare_backend::project::update(
+                    conn,
+                    &target.id,
+                    agentflare_backend::project::UpdateProject {
+                        name: Some(new_name.clone()),
+                        identifier: Some(target_ident),
+                    },
+                ) {
+                    Ok(p) => p,
+                    Err(agentflare_backend::Error::Duplicate(_)) => {
+                        agentflare_backend::project::update(
+                            conn,
+                            &target.id,
+                            agentflare_backend::project::UpdateProject {
+                                name: Some(new_name),
+                                identifier: None,
+                            },
+                        )
+                        .map_err(map_backend_err)?
+                    }
+                    Err(e) => return Err(map_backend_err(e)),
+                };
+
+                let link_path = self.project_link_path();
+                if let Ok(bytes) = std::fs::read(&link_path)
+                    && let Ok(mut link) = serde_json::from_slice::<types::ProjectLink>(&bytes)
+                    && link.project_id == project.id
+                {
+                    link.identifier = project.identifier.clone();
+                    let _ = std::fs::write(&link_path, serde_json::to_vec_pretty(&link).unwrap_or_default());
+                }
+
+                Ok(serde_json::to_string_pretty(&project).unwrap_or_default())
+            })?,
+            "delete" => self.with_backend_db(|conn| {
+                let target = self.resolve_project_for_read(conn, req.project.as_deref())?;
+                agentflare_backend::project::delete(conn, &target.id).map_err(map_backend_err)?;
+                Ok(serde_json::json!({
+                    "status": "deleted",
+                    "id": target.id,
+                    "name": target.name,
+                }).to_string())
+            })?,
             other => Err(ErrorData::invalid_params(
-                format!("unknown project action: '{other}' — expected info|list|archive|unarchive"),
+                format!("unknown project action: '{other}' — expected info|list|archive|unarchive|rename|delete"),
                 None,
             )),
         }
     }
 
     #[tool(
-        description = "Workspace/project linkage. `info` shows the project this repo is linked to (auto-created/linked on first use); `list` shows every project in the linked workspace — the valid targets for the item tool's read-only `project` override (portfolio roll-ups). `archive` parks a project (`project` = name or UUID, default: this repo's): it stays listed with `archived_at` set and its items stay readable, but the daemon stops dispatching its ready-for-work items and sweeping its PRs; `unarchive` reverses that with no re-registration needed."
+        description = "Workspace/project linkage. `info` shows the project this repo is linked to (auto-created/linked on first use); `list` shows every project in the linked workspace — the valid targets for the item tool's read-only `project` override (portfolio roll-ups). `archive` parks a project (`project` = name or UUID, default: this repo's): it stays listed with `archived_at` set and its items stay readable, but the daemon stops dispatching its ready-for-work items and sweeping its PRs; `unarchive` reverses that with no re-registration needed. `rename` renames a project (`name` = new name, `project` = target name or UUID). `delete` soft-deletes a project."
     )]
     fn project(&self, Parameters(req): Parameters<ProjectRequest>) -> Result<String, ErrorData> {
         self.project_inner(req)

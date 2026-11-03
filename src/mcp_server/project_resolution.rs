@@ -5,7 +5,7 @@ impl AgentflareMcp {
         self.backend_project_link_override
             .clone()
             .unwrap_or_else(|| {
-                Self::repo_root()
+                self.worktree_repo_root()
                     .join(Self::LINK_MARKER)
                     .join("project.json")
             })
@@ -42,16 +42,13 @@ impl AgentflareMcp {
     fn resolution_root(&self) -> std::path::PathBuf {
         self.worktree_repo_root_override
             .clone()
-            .unwrap_or_else(Self::repo_root)
+            .unwrap_or_else(|| self.worktree_repo_root())
     }
 
-    /// `git remote get-url origin` for `resolution_root`. Unscoped
-    /// instances keep running it in the raw cwd, exactly as before.
+    /// `git remote get-url origin` for `resolution_root`.
     fn resolution_origin(&self) -> Option<String> {
-        match &self.worktree_repo_root_override {
-            Some(root) => flare_git_core::shell::run_in_opt(root, &["remote", "get-url", "origin"]),
-            None => Self::run_git(&["remote", "get-url", "origin"]),
-        }
+        let root = self.resolution_root();
+        flare_git_core::shell::run_in_opt(&root, &["remote", "get-url", "origin"])
     }
 
     /// `resolve_project_name`, scoped the same way as `resolution_root`.
@@ -64,7 +61,7 @@ impl AgentflareMcp {
 
     /// Short uppercase alnum identifier for a project (used for issue-key
     /// prefixes like `AGENTFLARE-42`).
-    fn derive_project_identifier(name: &str) -> String {
+    pub(crate) fn derive_project_identifier(name: &str) -> String {
         let ident: String = name
             .chars()
             .filter(|c| c.is_ascii_alphanumeric())
@@ -200,16 +197,17 @@ impl AgentflareMcp {
         let identifier = Self::derive_project_identifier(&name);
         let repo_key = self.resolve_repo_key();
         let legacy_repo_key = self.legacy_repo_key();
-
         let existing = agentflare_backend::project::list_by_workspace(conn, &workspace_id)
             .map_err(map_backend_err)?
             .into_iter()
-            .find(|p| {
-                p.external_source.as_deref() == Some(Self::REPO_EXTERNAL_SOURCE)
+            .filter(|p| {
+                p.deleted_at.is_none()
                     && (p.external_id.as_deref() == Some(repo_key.as_str())
                         || (legacy_repo_key.is_some()
                             && p.external_id.as_deref() == legacy_repo_key.as_deref()))
-            });
+            })
+            .min_by_key(|p| p.archived_at.is_some());
+
         let project = if let Some(project) = existing {
             project
         } else {
