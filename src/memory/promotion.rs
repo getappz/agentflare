@@ -404,6 +404,7 @@ mod tests {
             project: None,
             topic_key: None,
             scope: None,
+            idempotency_key: None,
         })
         .unwrap_err();
         assert!(err.contains("promote"));

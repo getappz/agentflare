@@ -643,6 +643,7 @@ impl AgentflareMcp {
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string()),
                         scope: None,
+                        idempotency_key: None,
                     };
                     if let Err(e) = crate::memory::mcp::handle_remember(input) {
                         eprintln!("[handoff] fact import failed: {e}");
