@@ -3,8 +3,8 @@
 //! `sessions.source` / `sessions.status` are stored via `serde_json::to_string`,
 //! so filters must compare against the JSON-quoted form (e.g. `"codex"`).
 
-use rusqlite::types::Value;
 use rusqlite::params_from_iter;
+use rusqlite::types::Value;
 use serde::Serialize;
 
 use crate::model::Session;
