@@ -242,17 +242,12 @@ fn run_sync(db: PathBuf, args: SyncArgs) {
 fn run_list(db: PathBuf, args: ListArgs) {
     let store = open_store(db);
     let sessions = store
-        .list_sessions(args.limit, args.offset)
+        .list_sessions_filtered(args.source.as_deref(), None, args.limit, args.offset)
         .unwrap_or_default();
     if args.json {
         println!("{}", serde_json::to_string_pretty(&sessions).unwrap());
     } else {
         for s in sessions {
-            if let Some(filter) = &args.source
-                && s.source.as_str() != filter
-            {
-                continue;
-            }
             let cost = s
                 .cost
                 .as_ref()
