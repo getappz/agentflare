@@ -13,6 +13,7 @@ pub mod deps;
 pub mod doctor;
 pub mod policy_config;
 pub mod provenance;
+pub mod review_attest;
 pub mod scope;
 pub mod shell;
 pub mod snapshot;

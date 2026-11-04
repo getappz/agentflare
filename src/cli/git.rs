@@ -13,9 +13,10 @@
 //! shell-agnostic enforcement boundary. See item #132 follow-up.
 
 use clap::{Args, Subcommand};
+use flare_git_core::review_attest::ReviewStatus;
 use flare_git_core::shell::BoundedLinesError;
 use flare_git_core::{
-    audit, branch, classify, doctor, provenance, scope, shell, snapshot, worktree,
+    audit, branch, classify, doctor, provenance, review_attest, scope, shell, snapshot, worktree,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -66,6 +67,23 @@ pub enum GitCommand {
     /// Browse commits annotated with their agent/session provenance, and
     /// restore the working tree to how one of them looked.
     Rewind(RewindArgs),
+    /// Attest the review status of the currently staged tree; the next
+    /// commit of exactly that tree gets an `Agentflare-Review` trailer.
+    /// Self-reported, not tamper-proof.
+    Review(ReviewArgs),
+}
+
+#[derive(Args)]
+pub struct ReviewArgs {
+    /// A review of the staged change completed.
+    #[arg(long, group = "status")]
+    pub agent_reviewed: bool,
+    /// A human vouches for the staged change.
+    #[arg(long, group = "status")]
+    pub vouch: bool,
+    /// Review deliberately skipped.
+    #[arg(long, group = "status")]
+    pub skip: bool,
 }
 
 #[derive(Args)]
@@ -299,6 +317,7 @@ pub fn run(args: GitArgs) {
         GitCommand::Ship(opts) => ship_cmd(opts),
         GitCommand::Explain(opts) => explain_cmd(opts),
         GitCommand::Rewind(opts) => rewind_cmd(opts),
+        GitCommand::Review(opts) => review_cmd(&opts),
     }
 }
 
@@ -868,6 +887,31 @@ fn trailer_inject(msg_file: &Path) {
     let updated = provenance::append_trailers(&original, &trailers);
     if updated != original {
         let _ = fs::write(msg_file, updated);
+        if trailers.review.is_some() {
+            review_attest::reset_iter(&repo_root, trailers.branch.as_deref());
+        }
+    }
+}
+
+/// `agentflare git review --agent-reviewed|--vouch|--skip`.
+fn review_cmd(opts: &ReviewArgs) {
+    let status = if opts.agent_reviewed {
+        ReviewStatus::AgentReviewed
+    } else if opts.vouch {
+        ReviewStatus::Vouched
+    } else if opts.skip {
+        ReviewStatus::Skipped
+    } else {
+        crate::ui::error("agentflare git review: pass --agent-reviewed, --vouch or --skip");
+        return;
+    };
+    let Some(repo_root) = resolve_repo_root("review") else {
+        return;
+    };
+    let t = provenance::build_trailers(&repo_root);
+    match review_attest::record(&repo_root, status, t.agent, t.branch.as_deref()) {
+        Ok(iter) => crate::ui::success(&format!("recorded {} (iter:{iter})", status.as_str())),
+        Err(e) => crate::ui::error(&format!("agentflare git review: {e}")),
     }
 }
 
@@ -907,6 +951,7 @@ fn explain_cmd(opts: ExplainArgs) {
     let trailers = provenance::parse_trailers(msg);
 
     println!("commit  {} ({date})", short_id(&sha, 12));
+    println!("review  {}", trailers.review.as_deref().unwrap_or("(none)"));
     println!("subject {subject}");
     println!(
         "agent   {}",
