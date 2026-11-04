@@ -88,6 +88,7 @@ impl AgentflareMcp {
         let projects_json = self.project_inner(ProjectRequest {
             action: "list".into(),
             project: None,
+            ..Default::default()
         })?;
         let projects: Vec<agentflare_backend::project::Project> =
             serde_json::from_str(&projects_json).map_err(|e| {
