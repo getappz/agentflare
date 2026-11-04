@@ -4,6 +4,7 @@ pub mod mcp;
 pub mod observations;
 mod promotion;
 pub mod prompts;
+pub mod quality;
 pub mod relations;
 pub mod schema;
 pub mod search;
