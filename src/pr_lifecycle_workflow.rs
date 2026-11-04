@@ -305,6 +305,31 @@ pub(crate) async fn sync_reconcile_schedules(
     created
 }
 
+/// Remove every `pr-reconcile` schedule (`engine = tick`): the sweep loop
+/// owns reconciliation then, and leftover rows would only fail each fire.
+/// Returns the number removed.
+pub(crate) async fn prune_reconcile_schedules(store: &crate::schedule::ScheduleStore) -> usize {
+    let rows = match store.list_all().await {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("agentflare-schedule: pr-reconcile prune: {e}");
+            return 0;
+        }
+    };
+    let mut removed = 0;
+    for row in rows
+        .iter()
+        .filter(|r| r.workflow_name == WORKFLOW_RECONCILE_ID)
+    {
+        match store.remove_schedule(&row.id).await {
+            Ok(true) => removed += 1,
+            Ok(false) => {}
+            Err(e) => eprintln!("agentflare-schedule: pr-reconcile prune {}: {e}", row.id),
+        }
+    }
+    removed
+}
+
 /// Drop the `pr-lifecycle` start receipts for an item whose PR merged or
 /// closed, so a later PR for the same item can start a fresh run. No-op in
 /// `tick` mode; soft-fails (a stale receipt only delays a restart).
@@ -316,13 +341,17 @@ pub(crate) fn clear_lifecycle_receipts(project_id: &str, item_id: &str) {
 }
 
 fn clear_receipts_in(db: &std::path::Path, project_id: &str, item_id: &str) {
-    let pattern = format!("pr-lifecycle:{project_id}:{item_id}:");
-    let res = rusqlite::Connection::open(db).and_then(|c| {
-        c.execute(
-            "DELETE FROM workflow_start_receipts WHERE substr(start_key, 1, length(?1)) = ?1",
-            [pattern],
+    let prefix = format!("pr-lifecycle:{project_id}:{item_id}:");
+    let res =
+        flare_workflow::sqlite_store::SqliteStore::<flare_workflow::json::PipelineData>::open_file(
+            db,
         )
-    });
+        .map_err(|e| e.to_string())
+        .and_then(|store| {
+            store
+                .purge_start_receipts_with_prefix(&prefix)
+                .map_err(|e| e.to_string())
+        });
     if let Err(e) = res {
         eprintln!("agentflare-supervisor: clear pr-lifecycle receipts for {item_id}: {e}");
     }

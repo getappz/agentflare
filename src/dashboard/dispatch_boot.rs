@@ -33,15 +33,13 @@ pub(super) fn start_work_dispatch(queue: &agentflare_jobs::Queue) {
         std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default()),
         SUPERVISOR_DISCOVERY_INTERVAL,
     );
-    if crate::pr_lifecycle_workflow::review_sweep_loop_enabled() {
+    spawn_review_sweep_if_tick(|| {
         spawn_supervisor_review_sweep(
             queue.clone(),
             std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default()),
             SUPERVISOR_REVIEW_SWEEP_INTERVAL,
         );
-    } else {
-        eprintln!("agentflare-supervisor: review sweep loop off (engine = workflow)");
-    }
+    });
     spawn_supervisor_telegram_approvals(
         std::sync::Arc::new(crate::mcp_server::AgentflareMcp::default()),
         SUPERVISOR_TELEGRAM_POLL_INTERVAL,
@@ -57,16 +55,15 @@ pub(super) fn start_work_dispatch(queue: &agentflare_jobs::Queue) {
 /// linkage goes through start receipts, and resuming here would break
 /// at-most-once fire semantics.
 pub(super) fn spawn_schedule_ticker() -> tokio::task::JoinHandle<()> {
-    if !crate::pr_lifecycle_workflow::review_sweep_loop_enabled() {
-        // Re-synced periodically so projects registered after boot get a schedule.
-        tokio::spawn(async {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
-            loop {
-                ticker.tick().await;
-                sync_pr_reconcile_schedules_once().await;
-            }
-        });
-    }
+    // Re-synced periodically: projects registered after boot get a schedule
+    // (workflow) and an engine switch back to tick prunes the rows (tick).
+    tokio::spawn(async {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
+        loop {
+            ticker.tick().await;
+            sync_pr_reconcile_schedules_once().await;
+        }
+    });
     spawn_schedule_ticker_every(
         crate::workflow::default_db_path(),
         crate::workflow::agent_send_hook(),
@@ -74,24 +71,43 @@ pub(super) fn spawn_schedule_ticker() -> tokio::task::JoinHandle<()> {
     )
 }
 
+/// Runs `spawn` (the interval review-sweep loop) only under `engine = tick`;
+/// the workflow engine replaces it. Returns whether it ran.
+fn spawn_review_sweep_if_tick(spawn: impl FnOnce()) -> bool {
+    if crate::pr_lifecycle_workflow::review_sweep_loop_enabled() {
+        spawn();
+        true
+    } else {
+        eprintln!("agentflare-supervisor: review sweep loop off (engine = workflow)");
+        false
+    }
+}
+
 async fn sync_pr_reconcile_schedules_once() {
+    let store = match crate::schedule::ScheduleStore::open(&crate::workflow::default_db_path()) {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("agentflare-schedule: pr-reconcile sync: store open failed: {e}");
+            return;
+        }
+    };
+    if crate::pr_lifecycle_workflow::review_sweep_loop_enabled() {
+        crate::pr_lifecycle_workflow::prune_reconcile_schedules(&store).await;
+        return;
+    }
     let roots = tokio::task::spawn_blocking(|| {
         crate::mcp_server::AgentflareMcp::default()
             .with_backend_db(agentflare_backend::project_dir::list)
     })
     .await;
-    let roots: Vec<String> = match roots {
-        Ok(Ok(Ok(dirs))) => dirs.into_iter().map(|d| d.folder_path).collect(),
-        other => {
-            eprintln!("agentflare-schedule: pr-reconcile sync: project list failed: {other:?}");
-            return;
-        }
-    };
-    match crate::schedule::ScheduleStore::open(&crate::workflow::default_db_path()) {
-        Ok(store) => {
+    match roots {
+        Ok(Ok(Ok(dirs))) => {
+            let roots: Vec<String> = dirs.into_iter().map(|d| d.folder_path).collect();
             crate::pr_lifecycle_workflow::sync_reconcile_schedules(&store, &roots).await;
         }
-        Err(e) => eprintln!("agentflare-schedule: pr-reconcile sync: store open failed: {e}"),
+        other => {
+            eprintln!("agentflare-schedule: pr-reconcile sync: project list failed: {other:?}")
+        }
     }
 }
 
@@ -214,4 +230,39 @@ pub(super) fn work_max_concurrency() -> usize {
             agentflare_resource_gate::pool_size::memory_budget_bytes(),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Acceptance: `engine = workflow` never starts the interval review
+    /// sweep; `tick` does. Re-sync prunes leftover rows on tick and creates
+    /// none until a project exists.
+    #[test]
+    fn sweep_loop_spawn_follows_engine_and_resync_prunes_in_tick() {
+        crate::paths::test_support::with_temp_home(|| {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            unsafe { std::env::set_var("AGENTFLARE_REVIEW_SWEEP_ENGINE", "workflow") };
+            let mut calls = 0;
+            assert!(!spawn_review_sweep_if_tick(|| calls += 1));
+            assert_eq!(calls, 0, "workflow engine must not spawn the sweep");
+
+            // Seed a reconcile row, then switch to tick: the sync prunes it.
+            let db = crate::workflow::default_db_path();
+            std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+            let repo = tempfile::tempdir().unwrap();
+            let store = crate::schedule::ScheduleStore::open(&db).unwrap();
+            rt.block_on(crate::pr_lifecycle_workflow::sync_reconcile_schedules(
+                &store,
+                &[repo.path().to_string_lossy().into_owned()],
+            ));
+            assert_eq!(rt.block_on(store.list_all()).unwrap().len(), 1);
+            unsafe { std::env::remove_var("AGENTFLARE_REVIEW_SWEEP_ENGINE") };
+            assert!(spawn_review_sweep_if_tick(|| calls += 1));
+            assert_eq!(calls, 1);
+            rt.block_on(sync_pr_reconcile_schedules_once());
+            assert!(rt.block_on(store.list_all()).unwrap().is_empty());
+        });
+    }
 }

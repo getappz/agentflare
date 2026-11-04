@@ -190,26 +190,57 @@ async fn sync_creates_one_skip_overlap_reconcile_schedule_per_repo_idempotently(
     assert_eq!(rows[0].every_secs, crate::schedule::MIN_EVERY_SECS);
 }
 
-#[test]
-fn clear_receipts_removes_only_that_items_lifecycle_keys() {
+#[tokio::test]
+async fn clear_receipts_removes_only_that_items_lifecycle_keys() {
+    use flare_workflow::json::PipelineData;
+    use flare_workflow::sqlite_store::SqliteStore;
+    use flare_workflow::types::*;
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("wf.db");
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE workflow_start_receipts (start_key TEXT PRIMARY KEY, run_id TEXT, created_at INTEGER);
-         INSERT INTO workflow_start_receipts VALUES ('pr-lifecycle:p:i1:5','r1',0),
-           ('pr-lifecycle:p:i2:6','r2',0), ('schedule:x','r3',0);",
-    )
-    .unwrap();
-    clear_receipts_in(&db, "p", "i1");
-    let keys: Vec<String> = conn
-        .prepare("SELECT start_key FROM workflow_start_receipts ORDER BY 1")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
-    assert_eq!(keys, ["pr-lifecycle:p:i2:6", "schedule:x"]);
+    let store = SqliteStore::<PipelineData>::open_file(&db).unwrap();
+    for k in [
+        "pr-lifecycle:p_:i1:5",
+        "pr-lifecycle:pX:i1:5",
+        "pr-lifecycle:p_:i2:6",
+        "schedule:x",
+    ] {
+        let st = WorkflowState::new(WorkflowRunId::new(), WorkflowId::new("w"), PipelineData);
+        store
+            .create_start_once(k.into(), st, JournalEntry::Input { value: vec![] })
+            .await
+            .unwrap();
+    }
+    clear_receipts_in(&db, "p_", "i1");
+    for (k, present) in [
+        ("pr-lifecycle:p_:i1:5", false),
+        ("pr-lifecycle:pX:i1:5", true),
+        ("pr-lifecycle:p_:i2:6", true),
+        ("schedule:x", true),
+    ] {
+        assert_eq!(
+            store.lookup_start(k).await.unwrap().is_some(),
+            present,
+            "{k}"
+        );
+    }
+}
+
+#[test]
+fn prune_removes_only_reconcile_schedules_and_runs_in_tick_mode() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::schedule::ScheduleStore::open(&dir.path().join("s.db")).unwrap();
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let roots = vec![
+            a.path().to_string_lossy().into_owned(),
+            b.path().to_string_lossy().into_owned(),
+        ];
+        assert_eq!(sync_reconcile_schedules(&store, &roots).await, 2);
+        assert_eq!(prune_reconcile_schedules(&store).await, 2);
+        assert!(store.list_all().await.unwrap().is_empty());
+        assert_eq!(prune_reconcile_schedules(&store).await, 0);
+    });
 }
 
 #[test]
