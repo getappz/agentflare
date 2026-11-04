@@ -698,6 +698,13 @@ mod tests {
     }
 
     #[test]
+    fn branch_guard_reason_does_not_suggest_checkout_b() {
+        let reason = branch_guard_reason_for(Some("main"), Some("main")).unwrap();
+        assert!(reason.contains("git worktree add"));
+        assert!(!reason.contains("checkout -b"));
+    }
+
+    #[test]
     fn branch_guard_reason_for_prefers_default_over_hardcoded_names() {
         // A repo whose default branch is deliberately named neither
         // main nor master must still be caught via the resolved default.
