@@ -1,3 +1,4 @@
+mod bench;
 pub mod embeddings;
 pub mod engine;
 pub mod mcp;
