@@ -4,6 +4,9 @@
 //! off a commit to link it to the agent session (and, transitively, the
 //! prompt) that produced it.
 //!
+//! An optional `Agentflare-Review:` trailer carries the review status of the
+//! staged tree (see `review_attest`); it is self-reported, not tamper-proof.
+//!
 //! Deliberately NOT cryptographically attested: agentflare has no
 //! signing/binding system for this, so a trailer is a bare string an agent
 //! could misreport — the same trust level as every other
@@ -20,6 +23,8 @@ pub struct Trailers {
     pub branch: Option<String>,
     pub item_id: Option<String>,
     pub session_id: Option<String>,
+    /// `<status> (iter:N)` from a staged-tree attestation (`review_attest`).
+    pub review: Option<String>,
 }
 
 /// Extracts the `<sequence_id>` from a `task/<sequence_id>` or
@@ -90,6 +95,7 @@ pub fn build_trailers(repo_root: &Path) -> Trailers {
         branch,
         item_id,
         session_id,
+        review: crate::review_attest::current_review(repo_root),
     }
 }
 
@@ -104,6 +110,7 @@ pub fn append_trailers(msg: &str, t: &Trailers) -> String {
         || msg.contains("Agentflare-Branch:")
         || msg.contains("Agentflare-Item:")
         || msg.contains("Agentflare-Session:")
+        || msg.contains("Agentflare-Review:")
     {
         return msg.to_string();
     }
@@ -119,6 +126,9 @@ pub fn append_trailers(msg: &str, t: &Trailers) -> String {
     }
     if let Some(session_id) = &t.session_id {
         lines.push(format!("Agentflare-Session: {session_id}"));
+    }
+    if let Some(review) = &t.review {
+        lines.push(format!("Agentflare-Review: {review}"));
     }
     if lines.is_empty() {
         return msg.to_string();
@@ -148,6 +158,8 @@ pub fn parse_trailers(msg: &str) -> Trailers {
             t.item_id = Some(v.to_string());
         } else if let Some(v) = line.strip_prefix("Agentflare-Session: ") {
             t.session_id = Some(v.to_string());
+        } else if let Some(v) = line.strip_prefix("Agentflare-Review: ") {
+            t.review = Some(v.to_string());
         }
     }
     t
@@ -163,6 +175,7 @@ mod tests {
             branch: Some("task/42".to_string()),
             item_id: Some("42".to_string()),
             session_id: Some("sess-abc".to_string()),
+            review: Some("agent-reviewed (iter:3)".to_string()),
         }
     }
 
@@ -171,7 +184,7 @@ mod tests {
         let out = append_trailers("fix: thing\n", &trailers());
         assert_eq!(
             out,
-            "fix: thing\n\nAgentflare-Agent: claude-code\nAgentflare-Branch: task/42\nAgentflare-Item: 42\nAgentflare-Session: sess-abc\n"
+            "fix: thing\n\nAgentflare-Agent: claude-code\nAgentflare-Branch: task/42\nAgentflare-Item: 42\nAgentflare-Session: sess-abc\nAgentflare-Review: agent-reviewed (iter:3)\n"
         );
     }
 
@@ -182,6 +195,7 @@ mod tests {
             branch: None,
             item_id: None,
             session_id: None,
+            review: None,
         };
         let out = append_trailers("fix: thing\n", &t);
         assert_eq!(out, "fix: thing\n\nAgentflare-Agent: claude-code\n");
