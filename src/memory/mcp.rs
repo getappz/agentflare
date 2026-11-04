@@ -343,6 +343,10 @@ fn recall_with_fetch(
                     .is_some_and(|op| op.eq_ignore_ascii_case(p.trim()))
             })
         });
+        if let Some(ref o) = obs {
+            observations::touch_last_seen(conn, &[o.id])
+                .map_err(|e| format!("touch last_seen failed: {e}"))?;
+        }
         return obs
             .as_ref()
             .map(|o| observation_view(conn, o))
@@ -356,6 +360,7 @@ fn recall_with_fetch(
         if let Ok(mut cache) = recall_cache().lock()
             && let Some(hit) = cache.get(&key)
         {
+            // Cached hit: do not re-touch last_seen_at.
             return Ok(hit);
         }
         let mut results = fetch(
@@ -370,6 +375,9 @@ fn recall_with_fetch(
         // (FTS/vector merge paths can overlap).
         let mut seen = HashSet::new();
         results.retain(|o| seen.insert(o.id));
+        let ids: Vec<i64> = results.iter().map(|o| o.id).collect();
+        observations::touch_last_seen(conn, &ids)
+            .map_err(|e| format!("touch last_seen failed: {e}"))?;
         let response = observations_view(conn, &results)?.to_string();
         if !results.is_empty()
             && let Ok(mut cache) = recall_cache().lock()
@@ -389,6 +397,9 @@ fn recall_with_fetch(
         limit,
     )
     .map_err(|e| format!("list failed: {e}"))?;
+    let ids: Vec<i64> = results.iter().map(|o| o.id).collect();
+    observations::touch_last_seen(conn, &ids)
+        .map_err(|e| format!("touch last_seen failed: {e}"))?;
     Ok(observations_view(conn, &results)?.to_string())
 }
 
@@ -1155,6 +1166,40 @@ mod tests {
         let arr = v.as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["type"], "decision");
+    }
+
+    // Item 382: recall-by-id bumps last_seen_at (not updated_at).
+    #[test]
+    fn recall_touches_last_seen_at() {
+        let conn = new_db();
+        let id = match observations::save(
+            &conn, None, "note", "touch marker", "body", None, Some("p"), None, None,
+        )
+        .unwrap()
+        {
+            observations::SaveOutcome::Created(id) => id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+        let old = "2000-01-01T00:00:00.000Z";
+        conn.execute(
+            "UPDATE observations SET last_seen_at = ?2, updated_at = ?2 WHERE id = ?1",
+            rusqlite::params![id, old],
+        )
+        .unwrap();
+        recall_with_conn(
+            &conn,
+            RecallInput { query: None, id: Some(id), r#type: None, project: None, limit: None },
+        )
+        .unwrap();
+        let (seen, updated): (String, String) = conn
+            .query_row(
+                "SELECT last_seen_at, updated_at FROM observations WHERE id = ?1",
+                rusqlite::params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_ne!(seen, old);
+        assert_eq!(updated, old);
     }
 
     // Item 217: repeated identical recalls within the TTL must run a single

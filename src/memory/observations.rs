@@ -385,6 +385,23 @@ pub fn pin(conn: &Connection, id: i64, pinned: bool) -> rusqlite::Result<bool> {
     Ok(n > 0)
 }
 
+/// Bump `last_seen_at` for live observations returned by recall (not `updated_at`).
+/// No-op when `ids` is empty.
+pub fn touch_last_seen(conn: &Connection, ids: &[i64]) -> rusqlite::Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let now = now_iso();
+    let mut stmt = conn.prepare(
+        "UPDATE observations SET last_seen_at = ?2
+         WHERE id = ?1 AND deleted_at IS NULL",
+    )?;
+    for id in ids {
+        stmt.execute(params![id, now])?;
+    }
+    Ok(())
+}
+
 pub fn list_recent(
     conn: &Connection,
     project: Option<&str>,
