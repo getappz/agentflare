@@ -1,6 +1,8 @@
 //! End-to-end: the real `prepare-commit-msg` hook + the built binary stamp an
 //! `Agentflare-Review` trailer only when the exact committed tree was attested.
 
+#![cfg(unix)]
+
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
