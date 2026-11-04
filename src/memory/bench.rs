@@ -12,6 +12,8 @@ const PROJECT: &str = "bench";
 
 /// (dimension, type, title, content). Titles are unique ids.
 type Obs = (&'static str, &'static str, &'static str, &'static str);
+/// Optional query embedder; `None` runs the lexical-only path.
+type EmbedFn = fn(&str) -> Option<Vec<f32>>;
 
 const UNIVERSE: &[Obs] = &[
     (
@@ -194,7 +196,7 @@ fn seed(extra: &[Obs]) -> Connection {
 /// Mirrors `memory_nudge::recall_with`: project=None, limit TOP_K*3, then
 /// the project/global scope filter, then top K. (The session dedup ledger
 /// is a process-global file and is deliberately not exercised.)
-fn run(embed: Option<fn(&str) -> Option<Vec<f32>>>, extra: &[Obs]) -> Vec<(&'static str, Score)> {
+fn run(embed: Option<EmbedFn>, extra: &[Obs]) -> Vec<(&'static str, Score)> {
     let conn = seed(extra);
     let embed = embed.unwrap_or(|_| None);
     let mut out: Vec<(&'static str, Score)> = Vec::new();
