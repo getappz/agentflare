@@ -55,20 +55,65 @@ fn dir(repo_root: &Path) -> Option<PathBuf> {
     )
 }
 
+/// `git write-tree` against the index git is committing. `shell::run_in`
+/// scrubs `GIT_INDEX_FILE`, but under `git commit -a`/`<paths>` the hook
+/// runs with a temporary index in it, so carry that one var through.
 fn tree_hash(repo_root: &Path) -> Option<String> {
-    run_in_opt(repo_root, &["write-tree"]).filter(|h| !h.is_empty())
+    let mut cmd = std::process::Command::new(crate::shell::git_binary());
+    cmd.arg("write-tree").current_dir(repo_root);
+    crate::shell::apply_filtered_path(&mut cmd);
+    if let Some(idx) = std::env::var_os("GIT_INDEX_FILE") {
+        cmd.env("GIT_INDEX_FILE", idx);
+    }
+    let out = cmd.output().ok().filter(|o| o.status.success())?;
+    let h = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!h.is_empty()).then_some(h)
 }
 
 fn counter_path(dir: &Path, branch: Option<&str>) -> PathBuf {
     let b: String = branch
         .unwrap_or("detached")
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .bytes()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                (c as char).to_string()
+            } else {
+                format!("_{c:02x}")
+            }
+        })
         .collect();
     dir.join(format!("iter-{b}"))
 }
 
+/// Write via tmp + rename so a crash never leaves a half-written file.
+fn write_atomic(path: &Path, body: &str) -> Result<(), String> {
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    fs::write(&tmp, body).map_err(|e| e.to_string())?;
+    fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
+/// Drops attestations untouched for a week (tree hashes are single-use).
+fn prune(dir: &Path) {
+    const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let old = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > MAX_AGE);
+        if old {
+            let _ = fs::remove_file(e.path());
+        }
+    }
+}
+
 /// Records `status` for the currently staged tree; returns the iteration.
+///
+/// The counter file holds `<HEAD sha> <n>`: it only counts while HEAD is
+/// unchanged, so a new commit restarts it at 1 with no post-commit hook and
+/// an aborted commit loses nothing.
 ///
 /// # Errors
 /// If the repo, index tree, or attestation directory can't be resolved/written.
@@ -81,10 +126,15 @@ pub fn record(
     let dir = dir(repo_root).ok_or("not a git repository")?;
     let tree = tree_hash(repo_root).ok_or("could not compute staged tree")?;
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    prune(&dir);
+    let head = run_in_opt(repo_root, &["rev-parse", "HEAD"]).unwrap_or_else(|| "none".into());
     let counter = counter_path(&dir, branch);
     let iter = fs::read_to_string(&counter)
         .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
+        .and_then(|s| {
+            let (h, n) = s.trim().split_once(' ')?;
+            (h == head).then(|| n.parse::<u32>().ok())?
+        })
         .unwrap_or(0)
         + 1;
     let ts = std::time::SystemTime::now()
@@ -97,8 +147,9 @@ pub fn record(
         agent,
     })
     .map_err(|e| e.to_string())?;
-    fs::write(&counter, iter.to_string()).map_err(|e| e.to_string())?;
-    fs::write(dir.join(format!("{tree}.json")), body).map_err(|e| e.to_string())?;
+    // Attestation first: if it fails the counter must not advance.
+    write_atomic(&dir.join(format!("{tree}.json")), &body)?;
+    write_atomic(&counter, &format!("{head} {iter}"))?;
     Ok(iter)
 }
 
@@ -109,13 +160,6 @@ pub fn current_review(repo_root: &Path) -> Option<String> {
     let path = dir(repo_root)?.join(format!("{}.json", tree_hash(repo_root)?));
     let a: Attestation = serde_json::from_str(&fs::read_to_string(path).ok()?).ok()?;
     Some(format!("{} (iter:{})", a.status.as_str(), a.iter))
-}
-
-/// Resets the per-branch iteration counter after a commit was stamped.
-pub fn reset_iter(repo_root: &Path, branch: Option<&str>) {
-    if let Some(dir) = dir(repo_root) {
-        let _ = fs::remove_file(counter_path(&dir, branch));
-    }
 }
 
 #[cfg(test)]
@@ -170,20 +214,34 @@ mod tests {
     }
 
     #[test]
-    fn iter_increments_then_resets() {
+    fn iter_increments_then_restarts_after_a_commit() {
         let d = repo();
-        assert_eq!(
-            record(d.path(), ReviewStatus::Vouched, None, Some("b")),
-            Ok(1)
+        let rec = || record(d.path(), ReviewStatus::Vouched, None, Some("b"));
+        assert_eq!(rec(), Ok(1));
+        assert_eq!(rec(), Ok(2));
+        git(
+            d.path(),
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "x",
+            ],
         );
-        assert_eq!(
-            record(d.path(), ReviewStatus::Vouched, None, Some("b")),
-            Ok(2)
-        );
-        reset_iter(d.path(), Some("b"));
-        assert_eq!(
-            record(d.path(), ReviewStatus::Vouched, None, Some("b")),
-            Ok(1)
+        fs::write(d.path().join("a.txt"), "two").unwrap();
+        git(d.path(), &["add", "a.txt"]);
+        assert_eq!(rec(), Ok(1));
+    }
+
+    #[test]
+    fn branch_names_do_not_collide() {
+        let d = std::path::Path::new("/x");
+        assert_ne!(
+            counter_path(d, Some("task/1")),
+            counter_path(d, Some("task_1"))
         );
     }
 }

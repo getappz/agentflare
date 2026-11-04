@@ -887,9 +887,6 @@ fn trailer_inject(msg_file: &Path) {
     let updated = provenance::append_trailers(&original, &trailers);
     if updated != original {
         let _ = fs::write(msg_file, updated);
-        if trailers.review.is_some() {
-            review_attest::reset_iter(&repo_root, trailers.branch.as_deref());
-        }
     }
 }
 
@@ -951,7 +948,6 @@ fn explain_cmd(opts: ExplainArgs) {
     let trailers = provenance::parse_trailers(msg);
 
     println!("commit  {} ({date})", short_id(&sha, 12));
-    println!("review  {}", trailers.review.as_deref().unwrap_or("(none)"));
     println!("subject {subject}");
     println!(
         "agent   {}",
@@ -977,6 +973,7 @@ fn explain_cmd(opts: ExplainArgs) {
             println!("session (none -- commit predates session trailers, or wasn't agent-made)")
         }
     }
+    println!("review  {}", trailers.review.as_deref().unwrap_or("(none)"));
 }
 
 /// Best-effort item name lookup for `explain`'s `item    #<id> (<name>)`
