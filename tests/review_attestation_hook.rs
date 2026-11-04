@@ -121,15 +121,77 @@ fn restaging_after_attesting_yields_no_trailer() {
     assert!(review_lines(&head_msg(&r)).is_empty());
 }
 
+/// `git commit <path>` runs the hook with a temporary index (HEAD + that
+/// path), which differs from the real index when something else is staged.
+/// The attestation is for the temporary index's tree, so the trailer only
+/// appears if `tree_hash` honours `GIT_INDEX_FILE`.
 #[test]
-fn commit_all_uses_the_temporary_index_tree() {
+fn partial_commit_hashes_the_temporary_index_not_the_real_one() {
     let r = repo();
     stage_change(&r, "two");
     review(&r, "--vouch");
-    // Nothing further to stage: `-a` runs the hook with a temp GIT_INDEX_FILE
-    // whose tree equals the attested one.
-    git(&r, &["commit", "-aqm", "change"]);
+    // Real index now differs from the attested tree; the path commit's
+    // temporary index (HEAD + a.txt) still equals it.
+    write(&r, "b.txt", "b");
+    git(&r, &["add", "b.txt"]);
+    git(&r, &["commit", "-qm", "only a", "--", "a.txt"]);
     assert_eq!(review_lines(&head_msg(&r)).len(), 1);
+}
+
+fn out(r: &Repo, args: &[&str]) -> String {
+    String::from_utf8(git_in(r, args).stdout)
+        .unwrap()
+        .trim()
+        .to_string()
+}
+
+#[test]
+fn cherry_pick_replay_gets_no_review_trailer() {
+    let r = repo();
+    git(&r, &["checkout", "-qb", "side"]);
+    stage_change(&r, "two");
+    // No hook: the replayed message must carry no trailers of its own, or
+    // append_trailers' already-stamped guard would mask the sequencer guard.
+    git(
+        &r,
+        &["-c", "core.hooksPath=/dev/null", "commit", "-qm", "x"],
+    );
+    review(&r, "--vouch"); // clean index == the tree the pick will produce
+    git(&r, &["checkout", "-q", "main"]);
+    git(&r, &["cherry-pick", "side"]);
+    assert_eq!(
+        out(&r, &["rev-parse", "HEAD^{tree}"]),
+        out(&r, &["rev-parse", "side^{tree}"])
+    );
+    assert!(review_lines(&head_msg(&r)).is_empty());
+}
+
+#[test]
+fn rebase_replay_gets_no_review_trailer() {
+    let r = repo();
+    git(&r, &["checkout", "-qb", "side"]);
+    stage_change(&r, "two");
+    // No hook: the replayed message must carry no trailers of its own, or
+    // append_trailers' already-stamped guard would mask the sequencer guard.
+    git(
+        &r,
+        &["-c", "core.hooksPath=/dev/null", "commit", "-qm", "x"],
+    );
+    git(&r, &["checkout", "-q", "main"]);
+    write(&r, "c.txt", "c");
+    git(&r, &["add", "c.txt"]);
+    git(&r, &["commit", "-qm", "main moves"]);
+    // Attest the exact tree the rebase will produce (main + x), without
+    // committing, then throw the scratch state away.
+    git(&r, &["checkout", "-qb", "scratch"]);
+    git(&r, &["cherry-pick", "-n", "side"]);
+    review(&r, "--vouch");
+    let expected = out(&r, &["write-tree"]);
+    git(&r, &["reset", "-q", "--hard"]);
+    git(&r, &["checkout", "-q", "side"]);
+    git(&r, &["rebase", "-q", "main"]);
+    assert_eq!(out(&r, &["rev-parse", "HEAD^{tree}"]), expected);
+    assert!(review_lines(&head_msg(&r)).is_empty());
 }
 
 #[test]
