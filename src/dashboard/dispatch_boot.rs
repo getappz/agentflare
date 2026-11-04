@@ -77,7 +77,7 @@ pub(super) fn spawn_schedule_ticker() -> tokio::task::JoinHandle<()> {
 async fn sync_pr_reconcile_schedules_once() {
     let roots = tokio::task::spawn_blocking(|| {
         crate::mcp_server::AgentflareMcp::default()
-            .with_backend_db(|conn| agentflare_backend::project_dir::list(conn))
+            .with_backend_db(agentflare_backend::project_dir::list)
     })
     .await;
     let roots: Vec<String> = match roots {
