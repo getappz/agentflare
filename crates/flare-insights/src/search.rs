@@ -118,6 +118,8 @@ mod tests {
                 reasoning: 0,
             },
             cost: None,
+            cost_basis: crate::model::CostBasis::Unknown,
+            pricing_key: None,
             turn_count: 1,
             tool_call_count: 0,
             subagent_count: 0,
