@@ -319,6 +319,17 @@ pub(super) fn recall_with_conn(
     })
 }
 
+/// Bump `last_seen_at` without letting bookkeeping hurt recall: a short busy
+/// timeout (the connection default is 5 s, see db-kit `open`) so a held writer
+/// lock can't stall results, restored afterwards; failures are logged only.
+fn touch_best_effort(conn: &rusqlite::Connection, ids: &[i64]) {
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(100));
+    if let Err(e) = observations::touch_last_seen(conn, ids) {
+        eprintln!("agentflare-memory: recall touch_last_seen failed: {e}");
+    }
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(5000));
+}
+
 /// `recall_with_conn` with the underlying search injected, so tests can
 /// count invocations and prove repeated identical recalls do one search.
 /// Production passes `search::search_hybrid` (+ the real embedder).
@@ -344,7 +355,7 @@ fn recall_with_fetch(
             })
         });
         if let Some(ref o) = obs {
-            let _ = observations::touch_last_seen(conn, &[o.id]); // best-effort
+            touch_best_effort(conn, &[o.id]);
         }
         return obs
             .as_ref()
@@ -375,7 +386,7 @@ fn recall_with_fetch(
         let mut seen = HashSet::new();
         results.retain(|o| seen.insert(o.id));
         let ids: Vec<i64> = results.iter().map(|o| o.id).collect();
-        let _ = observations::touch_last_seen(conn, &ids); // best-effort
+        touch_best_effort(conn, &ids);
         let response = observations_view(conn, &results)?.to_string();
         if !results.is_empty()
             && let Ok(mut cache) = recall_cache().lock()
@@ -396,7 +407,7 @@ fn recall_with_fetch(
     )
     .map_err(|e| format!("list failed: {e}"))?;
     let ids: Vec<i64> = results.iter().map(|o| o.id).collect();
-    let _ = observations::touch_last_seen(conn, &ids); // best-effort
+    touch_best_effort(conn, &ids);
     Ok(observations_view(conn, &results)?.to_string())
 }
 
