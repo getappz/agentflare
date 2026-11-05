@@ -609,3 +609,68 @@ async fn t49b_ticker_runs_independently() {
     let occ = store.get_occurrence(&occ_id).await.unwrap().unwrap();
     assert_eq!(occ.status, "completed");
 }
+
+/// `pr-reconcile` resolves to the builtin Rust definition under
+/// `engine = workflow`, and is refused (dispatch_failed) under `tick`.
+#[test]
+fn pr_reconcile_schedule_fires_builtin_only_in_workflow_engine() {
+    crate::paths::test_support::with_temp_home(|| {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let h = Harness::new();
+            let repo = h.repo("r");
+            let t0 = Utc::now().timestamp();
+            let s = h.mk(&repo, "pr-reconcile", "pr-reconcile", 300, t0).await;
+
+            // SAFETY: with_temp_home holds the global state lock.
+            unsafe { std::env::remove_var("AGENTFLARE_REVIEW_SWEEP_ENGINE") };
+            let r = h.sched.store().enqueue_manual(&s.id, t0).await.unwrap();
+            h.tick(h.at(t0, 1)).await;
+            let occ = h.wait_occ(&r.occurrence_id).await;
+            assert_eq!(occ.status, "dispatch_failed");
+
+            unsafe { std::env::set_var("AGENTFLARE_REVIEW_SWEEP_ENGINE", "workflow") };
+            let r = h.sched.store().enqueue_manual(&s.id, t0).await.unwrap();
+            h.tick(h.at(t0, 2)).await;
+            let occ = h.wait_occ(&r.occurrence_id).await;
+            unsafe { std::env::remove_var("AGENTFLARE_REVIEW_SWEEP_ENGINE") };
+            assert_eq!(occ.status, "completed");
+            assert!(occ.run_id.is_some());
+        });
+    });
+}
+
+/// Finding 6: a finished `pr-reconcile` run converges its `schedule_runs`
+/// occurrence (shared `reconcile_linked_run`; failed/cancelled/interrupted
+/// copies are covered by t26/t28), so under `overlap=skip` the next slot is
+/// admitted instead of being blocked by a stuck occurrence.
+#[test]
+fn pr_reconcile_run_converges_and_does_not_block_next_slot() {
+    crate::paths::test_support::with_temp_home(|| {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let h = Harness::new();
+            let repo = h.repo("r");
+            let t0 = Utc::now().timestamp();
+            let s = h.mk(&repo, "pr-reconcile", "pr-reconcile", 300, t0).await;
+            unsafe { std::env::set_var("AGENTFLARE_REVIEW_SWEEP_ENGINE", "workflow") };
+            let r1 = h.sched.store().enqueue_manual(&s.id, t0).await.unwrap();
+            h.tick(h.at(t0, 1)).await;
+            let o1 = h.wait_occ(&r1.occurrence_id).await;
+            assert_eq!(o1.status, "completed");
+            assert!(
+                h.sched
+                    .store()
+                    .list_open("dispatched")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let r2 = h.sched.store().enqueue_manual(&s.id, t0).await.unwrap();
+            h.tick(h.at(t0, 2)).await;
+            let o2 = h.wait_occ(&r2.occurrence_id).await;
+            unsafe { std::env::remove_var("AGENTFLARE_REVIEW_SWEEP_ENGINE") };
+            assert_eq!(o2.status, "completed");
+        });
+    });
+}
