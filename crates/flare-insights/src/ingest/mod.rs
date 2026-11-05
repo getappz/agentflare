@@ -74,6 +74,14 @@ impl IngestManager {
         }
     }
 
+    /// Names of the registered adapters, without scanning source logs.
+    pub fn source_names(&self) -> Vec<&'static str> {
+        self.adapters
+            .iter()
+            .map(|adapter| adapter.source_name())
+            .collect()
+    }
+
     /// DRY: scan all adapters, fail-open per source. `on_progress` is called
     /// as `(source, files_done, files_total)` while each adapter walks its
     /// files, so callers can render live sync progress.
