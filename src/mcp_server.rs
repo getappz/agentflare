@@ -53,7 +53,6 @@ use rmcp::{
     schemars,
     service::{RequestContext, RoleServer},
     tool, tool_handler, tool_router,
-    transport::stdio,
 };
 use rusqlite::OptionalExtension;
 use serde::Deserialize;
@@ -1945,15 +1944,86 @@ impl AgentflareMcp {
                 .map_err(map_backend_err)?;
                 Ok(serde_json::to_string_pretty(&project).unwrap_or_default())
             })?,
+            "rename" => self.with_backend_db(|conn| {
+                let target = self.resolve_project_for_read(conn, req.project.as_deref())?;
+                let new_name = req
+                    .name
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        ErrorData::invalid_params(
+                            "name is required for project action=rename",
+                            None,
+                        )
+                    })?;
+                let caller_ident = req
+                    .identifier
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                let target_ident = caller_ident
+                    .clone()
+                    .unwrap_or_else(|| Self::derive_project_identifier(&new_name));
+
+                let project = match agentflare_backend::project::update(
+                    conn,
+                    &target.id,
+                    agentflare_backend::project::UpdateProject {
+                        name: Some(new_name.clone()),
+                        identifier: Some(target_ident),
+                    },
+                ) {
+                    Ok(p) => p,
+                    // Derived collision: keep the existing identifier and rename only.
+                    // Caller-supplied collision: surface the duplicate error.
+                    Err(agentflare_backend::Error::Duplicate(_)) if caller_ident.is_none() => {
+                        agentflare_backend::project::update(
+                            conn,
+                            &target.id,
+                            agentflare_backend::project::UpdateProject {
+                                name: Some(new_name),
+                                identifier: None,
+                            },
+                        )
+                        .map_err(map_backend_err)?
+                    }
+                    Err(e) => return Err(map_backend_err(e)),
+                };
+
+                let link_path = self.project_link_path();
+                if let Ok(bytes) = std::fs::read(&link_path)
+                    && let Ok(mut link) = serde_json::from_slice::<types::ProjectLink>(&bytes)
+                    && link.project_id == project.id
+                {
+                    link.identifier = project.identifier.clone();
+                    let _ = std::fs::write(
+                        &link_path,
+                        serde_json::to_vec_pretty(&link).unwrap_or_default(),
+                    );
+                }
+
+                Ok(serde_json::to_string_pretty(&project).unwrap_or_default())
+            })?,
+            "delete" => self.with_backend_db(|conn| {
+                let target = self.resolve_project_for_read(conn, req.project.as_deref())?;
+                agentflare_backend::project::delete(conn, &target.id).map_err(map_backend_err)?;
+                Ok(serde_json::json!({
+                    "status": "deleted",
+                    "id": target.id,
+                    "name": target.name,
+                })
+                .to_string())
+            })?,
             other => Err(ErrorData::invalid_params(
-                format!("unknown project action: '{other}' — expected info|list|archive|unarchive"),
+                format!(
+                    "unknown project action: '{other}' — expected info|list|archive|unarchive|rename|delete"
+                ),
                 None,
             )),
         }
     }
 
     #[tool(
-        description = "Workspace/project linkage. `info` shows the project this repo is linked to (auto-created/linked on first use); `list` shows every project in the linked workspace — the valid targets for the item tool's read-only `project` override (portfolio roll-ups). `archive` parks a project (`project` = name or UUID, default: this repo's): it stays listed with `archived_at` set and its items stay readable, but the daemon stops dispatching its ready-for-work items and sweeping its PRs; `unarchive` reverses that with no re-registration needed."
+        description = "Workspace/project linkage. `info` shows the project this repo is linked to (auto-created/linked on first use); `list` shows every project in the linked workspace — the valid targets for the item tool's read-only `project` override (portfolio roll-ups). `archive` parks a project (`project` = name or UUID, default: this repo's): it stays listed with `archived_at` set and its items stay readable, but the daemon stops dispatching its ready-for-work items and sweeping its PRs; `unarchive` reverses that with no re-registration needed. `rename` renames a project (`name` = new name, `project` = target name or UUID). `delete` soft-deletes a project."
     )]
     fn project(&self, Parameters(req): Parameters<ProjectRequest>) -> Result<String, ErrorData> {
         self.project_inner(req)
@@ -2218,10 +2288,89 @@ impl AgentflareMcp {
     }
 }
 
-pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let service = AgentflareMcp::from_env().serve(stdio()).await?;
+/// Transport wrapper that keeps rmcp's handshake alive for dual-era clients
+/// (Antigravity CLI / Go MCP SDK >= 1.7) that probe with requests such as
+/// `server/discover` before `initialize`. rmcp accepts only `ping` before
+/// `initialize` and aborts the session on any other message, so until
+/// `initialize` arrives this answers other requests with JSON-RPC `-32601`
+/// (Method not found), which makes those clients fall back to the standard
+/// handshake, and drops notifications (e.g. a client cancelling its own probe).
+/// Line framing, BOM stripping and parse errors stay with rmcp's own codec.
+struct PreInitFilter<T> {
+    inner: T,
+    initialized: bool,
+}
+
+impl<T: rmcp::transport::Transport<RoleServer>> rmcp::transport::Transport<RoleServer>
+    for PreInitFilter<T>
+{
+    type Error = T::Error;
+
+    fn send(
+        &mut self,
+        item: rmcp::service::TxJsonRpcMessage<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + 'static {
+        self.inner.send(item)
+    }
+
+    async fn receive(&mut self) -> Option<rmcp::service::RxJsonRpcMessage<RoleServer>> {
+        use rmcp::model::{ClientJsonRpcMessage, ClientRequest, ErrorCode, ServerJsonRpcMessage};
+        loop {
+            let msg = self.inner.receive().await?;
+            if self.initialized {
+                return Some(msg);
+            }
+            let probe_id = match &msg {
+                ClientJsonRpcMessage::Request(req) => match &req.request {
+                    ClientRequest::InitializeRequest(_) => {
+                        self.initialized = true;
+                        None
+                    }
+                    ClientRequest::PingRequest(_) => None,
+                    _ => Some(req.id.clone()),
+                },
+                ClientJsonRpcMessage::Notification(_) => continue,
+                _ => None,
+            };
+            let Some(id) = probe_id else {
+                return Some(msg);
+            };
+            let reply = ServerJsonRpcMessage::error(
+                ErrorData::new(ErrorCode::METHOD_NOT_FOUND, "Method not found", None),
+                Some(id),
+            );
+            if self.inner.send(reply).await.is_err() {
+                return None;
+            }
+        }
+    }
+
+    fn close(&mut self) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+        self.inner.close()
+    }
+}
+
+/// Serve MCP over a line-delimited reader/writer pair, tolerating dual-era
+/// pre-`initialize` probes (see [`PreInitFilter`]).
+pub(crate) async fn run_stdio_filtered<R, W>(
+    reader: R,
+    writer: W,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    R: tokio::io::AsyncRead + Send + Unpin + 'static,
+    W: tokio::io::AsyncWrite + Send + Unpin + 'static,
+{
+    let transport = PreInitFilter {
+        inner: rmcp::transport::async_rw::AsyncRwTransport::<RoleServer, _, _>::new(reader, writer),
+        initialized: false,
+    };
+    let service = AgentflareMcp::from_env().serve(transport).await?;
     service.waiting().await?;
     Ok(())
+}
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_stdio_filtered(tokio::io::stdin(), tokio::io::stdout()).await
 }
 
 /// Serve the MCP server over Streamable HTTP/SSE so one persistent agentflare

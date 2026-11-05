@@ -13,6 +13,8 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("migration: {0}")]
+    Migration(#[from] rusqlite_migration::Error),
 }
 
 pub struct InsightsStore {
@@ -31,135 +33,15 @@ impl InsightsStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(path)?;
-        let s = Self { conn };
-        s.migrate()?;
-        Ok(s)
+        let mut conn = Connection::open(path)?;
+        migrate(&mut conn)?;
+        Ok(Self { conn })
     }
 
     pub fn open_in_memory() -> Result<Self, StoreError> {
-        let conn = Connection::open_in_memory()?;
-        let s = Self { conn };
-        s.migrate()?;
-        Ok(s)
-    }
-
-    fn migrate(&self) -> Result<(), StoreError> {
-        self.conn.execute_batch(
-            r#"
-            PRAGMA journal_mode=WAL;
-            PRAGMA foreign_keys=ON;
-
-            CREATE TABLE IF NOT EXISTS sessions (
-                id TEXT PRIMARY KEY,
-                source TEXT NOT NULL,
-                project TEXT NOT NULL,
-                project_path TEXT,
-                title TEXT,
-                model TEXT,
-                status TEXT NOT NULL,
-                awaiting_reason TEXT,
-                started_at TEXT,
-                updated_at TEXT NOT NULL,
-                ended_at TEXT,
-                duration_secs INTEGER,
-                input_tokens INTEGER NOT NULL DEFAULT 0,
-                output_tokens INTEGER NOT NULL DEFAULT 0,
-                cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-                cache_write_tokens INTEGER NOT NULL DEFAULT 0,
-                reasoning_tokens INTEGER NOT NULL DEFAULT 0,
-                cost_usd REAL,
-                turn_count INTEGER NOT NULL DEFAULT 0,
-                tool_call_count INTEGER NOT NULL DEFAULT 0,
-                subagent_count INTEGER NOT NULL DEFAULT 0,
-                tags TEXT NOT NULL DEFAULT '[]',
-                starred INTEGER NOT NULL DEFAULT 0,
-                pid INTEGER,
-                cwd TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS turns (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                seq INTEGER NOT NULL,
-                user_text TEXT,
-                assistant_text TEXT,
-                started_at TEXT,
-                ended_at TEXT,
-                input_tokens INTEGER,
-                output_tokens INTEGER,
-                cost_usd REAL,
-                UNIQUE(session_id, seq)
-            );
-
-            CREATE TABLE IF NOT EXISTS tool_calls (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                turn_seq INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                input TEXT NOT NULL,
-                output TEXT,
-                status TEXT NOT NULL,
-                duration_ms INTEGER,
-                created_at TEXT
-            );
-
-            CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(
-                session_id, user_text, assistant_text,
-                content='turns', content_rowid='rowid',
-                tokenize='trigram'
-            );
-            CREATE TRIGGER IF NOT EXISTS turns_ai AFTER INSERT ON turns BEGIN
-                INSERT INTO turns_fts(rowid, session_id, user_text, assistant_text)
-                VALUES (new.rowid, new.session_id, new.user_text, new.assistant_text);
-            END;
-            CREATE TRIGGER IF NOT EXISTS turns_ad AFTER DELETE ON turns BEGIN
-                INSERT INTO turns_fts(turns_fts, rowid, session_id, user_text, assistant_text)
-                VALUES('delete', old.rowid, old.session_id, old.user_text, old.assistant_text);
-            END;
-            CREATE TRIGGER IF NOT EXISTS turns_au AFTER UPDATE ON turns BEGIN
-                INSERT INTO turns_fts(turns_fts, rowid, session_id, user_text, assistant_text)
-                VALUES('delete', old.rowid, old.session_id, old.user_text, old.assistant_text);
-                INSERT INTO turns_fts(rowid, session_id, user_text, assistant_text)
-                VALUES (new.rowid, new.session_id, new.user_text, new.assistant_text);
-            END;
-
-            CREATE TABLE IF NOT EXISTS file_events (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                path TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS subagents (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                parent_tool_call_id TEXT,
-                kind TEXT NOT NULL,
-                status TEXT NOT NULL,
-                task TEXT
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at);
-            CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project);
-            CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
-            CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id);
-            CREATE INDEX IF NOT EXISTS idx_tool_calls_session ON tool_calls(session_id);
-            CREATE INDEX IF NOT EXISTS idx_tool_calls_name ON tool_calls(name);
-            CREATE INDEX IF NOT EXISTS idx_file_events_session ON file_events(session_id);
-            CREATE INDEX IF NOT EXISTS idx_file_events_path ON file_events(path);
-
-            CREATE TABLE IF NOT EXISTS ingest_file_cursors (
-                source TEXT NOT NULL,
-                path TEXT NOT NULL,
-                mtime_ms INTEGER NOT NULL,
-                size INTEGER NOT NULL,
-                PRIMARY KEY (source, path)
-            );
-            "#,
-        )?;
-        Ok(())
+        let mut conn = Connection::open_in_memory()?;
+        migrate(&mut conn)?;
+        Ok(Self { conn })
     }
 
     // ---- sessions ----
@@ -287,21 +169,10 @@ impl InsightsStore {
 
     pub fn upsert_turn(&self, t: &Turn) -> Result<(), StoreError> {
         self.conn.execute(
-            r#"INSERT INTO turns(id, session_id, seq, user_text, assistant_text, started_at, ended_at, input_tokens, output_tokens, cost_usd)
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
-               ON CONFLICT(id) DO UPDATE SET session_id=excluded.session_id, seq=excluded.seq, user_text=excluded.user_text, assistant_text=excluded.assistant_text, started_at=excluded.started_at, ended_at=excluded.ended_at, input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens, cost_usd=excluded.cost_usd"#,
-            params![
-                t.id,
-                t.session_id,
-                t.seq as i64,
-                t.user_text,
-                t.assistant_text,
-                t.started_at.map(|v| v.to_rfc3339()),
-                t.ended_at.map(|v| v.to_rfc3339()),
-                t.tokens.as_ref().map(|tok| tok.input as i64),
-                t.tokens.as_ref().map(|tok| tok.output as i64),
-                t.cost_usd,
-            ],
+            r#"INSERT INTO turns(id, session_id, seq, user_text, assistant_text, started_at, ended_at, input_tokens, output_tokens, cost_usd, cache_read_tokens, cache_write_tokens, reasoning_tokens)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+               ON CONFLICT(id) DO UPDATE SET session_id=excluded.session_id, seq=excluded.seq, user_text=excluded.user_text, assistant_text=excluded.assistant_text, started_at=excluded.started_at, ended_at=excluded.ended_at, input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens, cost_usd=excluded.cost_usd, cache_read_tokens=excluded.cache_read_tokens, cache_write_tokens=excluded.cache_write_tokens, reasoning_tokens=excluded.reasoning_tokens"#,
+            rusqlite::params_from_iter(turn_params(t)),
         )?;
         Ok(())
     }
@@ -310,21 +181,10 @@ impl InsightsStore {
         let tx = self.conn.unchecked_transaction()?;
         for t in turns {
             tx.execute(
-                r#"INSERT INTO turns(id, session_id, seq, user_text, assistant_text, started_at, ended_at, input_tokens, output_tokens, cost_usd)
-                   VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
-                   ON CONFLICT(id) DO UPDATE SET user_text=excluded.user_text, assistant_text=excluded.assistant_text, input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens, cost_usd=excluded.cost_usd"#,
-                params![
-                    t.id,
-                    t.session_id,
-                    t.seq as i64,
-                    t.user_text,
-                    t.assistant_text,
-                    t.started_at.map(|v| v.to_rfc3339()),
-                    t.ended_at.map(|v| v.to_rfc3339()),
-                    t.tokens.as_ref().map(|tok| tok.input as i64),
-                    t.tokens.as_ref().map(|tok| tok.output as i64),
-                    t.cost_usd,
-                ],
+                r#"INSERT INTO turns(id, session_id, seq, user_text, assistant_text, started_at, ended_at, input_tokens, output_tokens, cost_usd, cache_read_tokens, cache_write_tokens, reasoning_tokens)
+                   VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+                   ON CONFLICT(id) DO UPDATE SET session_id=excluded.session_id, seq=excluded.seq, user_text=excluded.user_text, assistant_text=excluded.assistant_text, started_at=excluded.started_at, ended_at=excluded.ended_at, input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens, cost_usd=excluded.cost_usd, cache_read_tokens=excluded.cache_read_tokens, cache_write_tokens=excluded.cache_write_tokens, reasoning_tokens=excluded.reasoning_tokens"#,
+                rusqlite::params_from_iter(turn_params(t)),
             )?;
         }
         tx.commit()?;
@@ -550,6 +410,32 @@ impl InsightsStore {
     }
 }
 
+fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    crate::migrations::migrations().to_latest(conn)?;
+    Ok(())
+}
+
+/// Positional params shared by the single and batch turn upserts (`?1..?13`).
+fn turn_params(t: &Turn) -> [Box<dyn rusqlite::ToSql + '_>; 13] {
+    let tok = t.tokens.as_ref();
+    [
+        Box::new(&t.id),
+        Box::new(&t.session_id),
+        Box::new(t.seq as i64),
+        Box::new(&t.user_text),
+        Box::new(&t.assistant_text),
+        Box::new(t.started_at.map(|v| v.to_rfc3339())),
+        Box::new(t.ended_at.map(|v| v.to_rfc3339())),
+        Box::new(tok.map(|v| v.input as i64)),
+        Box::new(tok.map(|v| v.output as i64)),
+        Box::new(t.cost_usd),
+        Box::new(tok.map(|v| v.cache_read as i64)),
+        Box::new(tok.map(|v| v.cache_write as i64)),
+        Box::new(tok.map(|v| v.reasoning as i64)),
+    ]
+}
+
 fn exec_upsert_session(conn: &Connection, s: &Session) -> Result<(), StoreError> {
     let tags = serde_json::to_string(&s.tags)?;
     conn.execute(
@@ -656,24 +542,19 @@ fn row_to_turn(row: &rusqlite::Row) -> rusqlite::Result<Turn> {
     let started: Option<String> = row.get("started_at")?;
     let ended: Option<String> = row.get("ended_at")?;
     let parse_dt = |s: String| s.parse::<DateTime<Utc>>().ok();
-    let input: Option<i64> = row.get("input_tokens")?;
-    let output: Option<i64> = row.get("output_tokens")?;
-    let tokens = match (input, output) {
-        (Some(i), Some(o)) => Some(TokenUsage {
+    let col = |name: &str| {
+        row.get::<_, Option<i64>>(name)
+            .map(|v| v.unwrap_or(0) as u64)
+    };
+    let tokens = match row.get::<_, Option<i64>>("input_tokens")? {
+        Some(i) => Some(TokenUsage {
             input: i as u64,
-            output: o as u64,
-            cache_read: 0,
-            cache_write: 0,
-            reasoning: 0,
+            output: col("output_tokens")?,
+            cache_read: col("cache_read_tokens")?,
+            cache_write: col("cache_write_tokens")?,
+            reasoning: col("reasoning_tokens")?,
         }),
-        (Some(i), None) => Some(TokenUsage {
-            input: i as u64,
-            output: 0,
-            cache_read: 0,
-            cache_write: 0,
-            reasoning: 0,
-        }),
-        _ => None,
+        None => None,
     };
     Ok(Turn {
         id: row.get("id")?,

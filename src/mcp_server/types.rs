@@ -500,6 +500,11 @@ pub(crate) struct MemoryRequest {
     #[schemars(description = "Stable topic key for upsert dedup (remember)")]
     #[serde(default)]
     pub(crate) topic_key: Option<String>,
+    #[schemars(
+        description = "Idempotency key: same key within a project is a no-op returning the existing id with status=duplicate (remember)"
+    )]
+    #[serde(default)]
+    pub(crate) idempotency_key: Option<String>,
     #[schemars(description = "Scope: project (default) or personal (remember)")]
     #[serde(default)]
     pub(crate) scope: Option<String>,
@@ -1390,13 +1395,19 @@ pub(crate) struct WebhookRequest {
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ProjectRequest {
-    #[schemars(description = "Action: info|list|archive|unarchive")]
+    #[schemars(description = "Action: info|list|archive|unarchive|rename|delete")]
     pub(crate) action: String,
     #[schemars(
-        description = "Target project (name or UUID from `project action=list`) for archive/unarchive. Defaults to the project this repo is linked to."
+        description = "Target project (name or UUID from `project action=list`) for archive/unarchive/rename/delete. Defaults to the project this repo is linked to."
     )]
     #[serde(default)]
     pub(crate) project: Option<String>,
+    #[schemars(description = "New name for the project (required for action=rename)")]
+    #[serde(default)]
+    pub(crate) name: Option<String>,
+    #[schemars(description = "Optional new identifier (e.g. 'CLI', 'PROJ') for action=rename")]
+    #[serde(default)]
+    pub(crate) identifier: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]

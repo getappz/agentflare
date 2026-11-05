@@ -332,6 +332,7 @@ fn asset_attach_to_project() {
             &s.project(Parameters(ProjectRequest {
                 action: "info".into(),
                 project: None,
+                ..Default::default()
             }))
             .unwrap(),
         )

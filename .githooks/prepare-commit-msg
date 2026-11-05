@@ -2,7 +2,8 @@
 # agentflare provenance trailers (prepare-commit-msg).
 #
 # Appends Agentflare-Agent/Agentflare-Branch/Agentflare-Item/
-# Agentflare-Session trailers to every commit message, so it's clear
+# Agentflare-Session trailers (plus Agentflare-Review when `agentflare git
+# review` attested the exact staged tree) to every commit message, so it's clear
 # afterward which agent (if any) made it, what work item it belongs to, and
 # which agent session/prompt produced it (`agentflare git explain`/
 # `rewind` read these back). Self-reported, not cryptographically

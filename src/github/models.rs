@@ -214,6 +214,9 @@ pub struct ReviewComment {
     #[serde(default)]
     pub line: Option<u64>,
     pub body: String,
+    /// Commit the comment was left against (REST `commit_id`).
+    #[serde(default)]
+    pub commit_id: Option<String>,
 }
 
 /// One file in a pull request's diff, as GitHub reports it.
