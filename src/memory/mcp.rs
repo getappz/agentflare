@@ -344,8 +344,7 @@ fn recall_with_fetch(
             })
         });
         if let Some(ref o) = obs {
-            observations::touch_last_seen(conn, &[o.id])
-                .map_err(|e| format!("touch last_seen failed: {e}"))?;
+            let _ = observations::touch_last_seen(conn, &[o.id]); // best-effort
         }
         return obs
             .as_ref()
@@ -376,8 +375,7 @@ fn recall_with_fetch(
         let mut seen = HashSet::new();
         results.retain(|o| seen.insert(o.id));
         let ids: Vec<i64> = results.iter().map(|o| o.id).collect();
-        observations::touch_last_seen(conn, &ids)
-            .map_err(|e| format!("touch last_seen failed: {e}"))?;
+        let _ = observations::touch_last_seen(conn, &ids); // best-effort
         let response = observations_view(conn, &results)?.to_string();
         if !results.is_empty()
             && let Ok(mut cache) = recall_cache().lock()
@@ -398,8 +396,7 @@ fn recall_with_fetch(
     )
     .map_err(|e| format!("list failed: {e}"))?;
     let ids: Vec<i64> = results.iter().map(|o| o.id).collect();
-    observations::touch_last_seen(conn, &ids)
-        .map_err(|e| format!("touch last_seen failed: {e}"))?;
+    let _ = observations::touch_last_seen(conn, &ids); // best-effort
     Ok(observations_view(conn, &results)?.to_string())
 }
 
@@ -1173,7 +1170,15 @@ mod tests {
     fn recall_touches_last_seen_at() {
         let conn = new_db();
         let id = match observations::save(
-            &conn, None, "note", "touch marker", "body", None, Some("p"), None, None,
+            &conn,
+            None,
+            "note",
+            "touch marker",
+            "body",
+            None,
+            Some("p"),
+            None,
+            None,
         )
         .unwrap()
         {
@@ -1188,7 +1193,13 @@ mod tests {
         .unwrap();
         recall_with_conn(
             &conn,
-            RecallInput { query: None, id: Some(id), r#type: None, project: None, limit: None },
+            RecallInput {
+                query: None,
+                id: Some(id),
+                r#type: None,
+                project: None,
+                limit: None,
+            },
         )
         .unwrap();
         let (seen, updated): (String, String) = conn
