@@ -51,6 +51,23 @@ impl<D: WorkflowData> SqliteStore<D> {
         .await
     }
 
+    /// Explicitly purge start receipts whose key begins with `prefix`
+    /// (literal match: `_`/`%` are not wildcards). Distinct from run
+    /// deletion/eviction, which never removes receipts: callers use this only
+    /// when a key space is intentionally restartable (e.g. a merged/closed
+    /// PR's `pr-lifecycle:` keys). Synchronous; returns rows removed.
+    pub fn purge_start_receipts_with_prefix(&self, prefix: &str) -> WorkflowResult<usize> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
+        conn.execute(
+            "DELETE FROM workflow_start_receipts WHERE substr(start_key, 1, length(?1)) = ?1",
+            params![prefix],
+        )
+        .map_err(|e| WorkflowError::Store(format!("purge_start_receipts: {e}")))
+    }
+
     /// Atomically commit a start receipt, the run's initial state (+ child
     /// rows), and its initial input journal entry — or return the pre-existing
     /// receipt's run when this key already started. Runs under the store's
