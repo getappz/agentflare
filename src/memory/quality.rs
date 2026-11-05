@@ -24,8 +24,9 @@ pub struct MemoryQualityReport {
     /// Live observations that share a `normalized_hash` or near-identical title
     /// with at least one other live observation.
     pub duplicate_candidates: u64,
-    /// Live observations whose latest activity (`last_seen_at` else `updated_at`)
-    /// is older than `stale_after_days`.
+    /// Live observations where both effective last-seen
+    /// (`COALESCE(last_seen_at, updated_at)`) and `updated_at` are older than
+    /// `stale_after_days`.
     pub stale_observations: u64,
     /// Live observations with NULL or empty `project`.
     pub no_project: u64,
@@ -99,7 +100,24 @@ fn collect_at(path: &Path, stale_after_days: i64) -> MemoryQualityReport {
             stale_after_days,
         };
     }
-    match open_readonly(path).and_then(|conn| analyze(&conn, stale_after_days)) {
+    // Reachability is open success only — analyze failures must not flip it.
+    let conn = match open_readonly(path) {
+        Ok(conn) => conn,
+        Err(_) => {
+            return MemoryQualityReport {
+                db_reachable: false,
+                embedding_ready,
+                embedding_unavailable_reason,
+                duplicate_candidates: 0,
+                stale_observations: 0,
+                no_project: 0,
+                missing_embeddings: 0,
+                total_observations: 0,
+                stale_after_days,
+            };
+        }
+    };
+    match analyze(&conn, stale_after_days) {
         Ok(mut report) => {
             report.db_reachable = true;
             report.embedding_ready = embedding_ready;
@@ -107,7 +125,7 @@ fn collect_at(path: &Path, stale_after_days: i64) -> MemoryQualityReport {
             report
         }
         Err(_) => MemoryQualityReport {
-            db_reachable: false,
+            db_reachable: true,
             embedding_ready,
             embedding_unavailable_reason,
             duplicate_candidates: 0,
@@ -137,18 +155,16 @@ pub fn analyze(conn: &Connection, stale_after_days: i64) -> rusqlite::Result<Mem
         [],
         |r| r.get::<_, i64>(0).map(|n| n as u64),
     )?;
-    let missing_embeddings: u64 = conn.query_row(
-        "SELECT COUNT(*) FROM observations o
-         LEFT JOIN observations_vec v ON v.obs_id = o.id
-         WHERE o.deleted_at IS NULL AND v.obs_id IS NULL",
-        [],
-        |r| r.get::<_, i64>(0).map(|n| n as u64),
-    )?;
+    let missing_embeddings = count_missing_embeddings(conn)?;
     let cutoff = (chrono::Utc::now() - chrono::Duration::days(stale_after_days)).to_rfc3339();
+    // Stale only when *both* effective last-seen and updated_at are old.
+    // `update`/`pin` bump updated_at without touching last_seen_at; COALESCE
+    // alone would keep counting those as stale after a recent edit/pin.
     let stale_observations: u64 = conn.query_row(
         "SELECT COUNT(*) FROM observations
          WHERE deleted_at IS NULL
-           AND COALESCE(last_seen_at, updated_at) < ?1",
+           AND COALESCE(last_seen_at, updated_at) < ?1
+           AND updated_at < ?1",
         params![cutoff],
         |r| r.get::<_, i64>(0).map(|n| n as u64),
     )?;
@@ -165,6 +181,31 @@ pub fn analyze(conn: &Connection, stale_after_days: i64) -> rusqlite::Result<Mem
         total_observations,
         stale_after_days,
     })
+}
+
+/// Live observations with no `observations_vec` row. Pre-migration-2 DBs
+/// lack that table — treat every live observation as missing an embedding.
+fn count_missing_embeddings(conn: &Connection) -> rusqlite::Result<u64> {
+    let has_vec: bool = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'table' AND name = 'observations_vec'",
+        [],
+        |r| r.get::<_, i64>(0).map(|n| n > 0),
+    )?;
+    if !has_vec {
+        return conn.query_row(
+            "SELECT COUNT(*) FROM observations WHERE deleted_at IS NULL",
+            [],
+            |r| r.get::<_, i64>(0).map(|n| n as u64),
+        );
+    }
+    conn.query_row(
+        "SELECT COUNT(*) FROM observations o
+         LEFT JOIN observations_vec v ON v.obs_id = o.id
+         WHERE o.deleted_at IS NULL AND v.obs_id IS NULL",
+        [],
+        |r| r.get::<_, i64>(0).map(|n| n as u64),
+    )
 }
 
 fn count_duplicate_candidates(conn: &Connection) -> rusqlite::Result<u64> {
@@ -398,5 +439,52 @@ mod tests {
         let report = analyze(&conn, DEFAULT_STALE_DAYS).unwrap();
         assert_eq!(report.duplicate_candidates, 0);
         assert_eq!(report.total_observations, 1);
+    }
+
+    #[test]
+    fn recent_update_with_old_last_seen_is_not_stale() {
+        let conn = new_db();
+        let old = "2000-01-01T00:00:00.000Z";
+        let recent = chrono::Utc::now().to_rfc3339();
+        // Pin/update-style row: last_seen_at stuck in the past, updated_at fresh.
+        insert_raw(&conn, "edited", "x", Some("p"), "h1", &recent, Some(old));
+        // Truly stale: both timestamps old.
+        insert_raw(&conn, "stale", "y", Some("p"), "h2", old, Some(old));
+        let report = analyze(&conn, DEFAULT_STALE_DAYS).unwrap();
+        assert_eq!(report.stale_observations, 1);
+    }
+
+    #[test]
+    fn missing_vec_table_counts_all_as_missing_embeddings() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type TEXT NOT NULL, title TEXT NOT NULL, content TEXT NOT NULL,
+                project TEXT, scope TEXT, normalized_hash TEXT,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                last_seen_at TEXT, deleted_at TEXT
+             );",
+        )
+        .unwrap();
+        let recent = chrono::Utc::now().to_rfc3339();
+        insert_raw(&conn, "a", "b", Some("p"), "h", &recent, None);
+        let report = analyze(&conn, DEFAULT_STALE_DAYS).unwrap();
+        assert_eq!(report.total_observations, 1);
+        assert_eq!(report.missing_embeddings, 1);
+        assert!(report.db_reachable);
+    }
+
+    #[test]
+    fn open_ok_analyze_err_still_reachable() {
+        with_temp_home(|| {
+            let path = store::brain_db_path();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            // Valid sqlite file with no observations schema → analyze fails.
+            Connection::open(&path).unwrap();
+            let report = collect_at(&path, DEFAULT_STALE_DAYS);
+            assert!(report.db_reachable);
+            assert_eq!(report.total_observations, 0);
+        });
     }
 }
