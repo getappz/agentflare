@@ -15,9 +15,18 @@ pub fn column_json<T: Serialize>(v: &T) -> String {
     serde_json::to_string(v).expect("serialize JSON column")
 }
 
-/// Map a logical source name (`"codex"`) to the on-disk JSON column value (`"\"codex\""`).
-pub fn source_column(logical: &str) -> String {
-    column_json(&logical)
+/// Map a logical source name (`"codex"`) to every on-disk JSON column value it may
+/// have been stored as, including legacy aliases (`"open_code"`, `"open_claw"`).
+pub fn source_columns(logical: &str) -> Vec<String> {
+    let aliases: &[&str] = match logical {
+        "opencode" => &["open_code"],
+        "openclaw" => &["open_claw"],
+        _ => &[],
+    };
+    std::iter::once(logical)
+        .chain(aliases.iter().copied())
+        .map(|s| column_json(&s))
+        .collect()
 }
 
 impl InsightsStore {
@@ -36,23 +45,31 @@ impl InsightsStore {
         let mut binds: Vec<Value> = Vec::new();
 
         if let Some(src) = source {
-            sql.push_str(" AND source = ?");
-            binds.push(Value::Text(source_column(src)));
+            let cols = source_columns(src);
+            let marks = vec!["?"; cols.len()].join(",");
+            sql.push_str(&format!(" AND source IN ({marks})"));
+            binds.extend(cols.into_iter().map(Value::Text));
         }
 
         if let Some(prefix) = project_prefix {
-            // Exact match or child path under prefix/; sibling `/h/proj2` excluded.
-            sql.push_str(
-                " AND (\
-                    cwd = ? OR cwd LIKE ? OR \
-                    project_path = ? OR project_path LIKE ?\
-                )",
-            );
-            let child = format!("{prefix}/%");
-            binds.push(Value::Text(prefix.to_string()));
-            binds.push(Value::Text(child.clone()));
-            binds.push(Value::Text(prefix.to_string()));
-            binds.push(Value::Text(child));
+            // Literal, case-sensitive comparison (LIKE would treat `_`/`%` as wildcards
+            // and fold ASCII case). Trailing separators are ignored; children may use
+            // `/` or `\\`.
+            let base = prefix.trim_end_matches(['/', '\\']);
+            let n = base.chars().count() as i64 + 1;
+            let mut clause = String::from(" AND (");
+            for (i, col) in ["cwd", "project_path"].iter().enumerate() {
+                if i > 0 {
+                    clause.push_str(" OR ");
+                }
+                clause.push_str(&format!("{col} = ? OR (substr({col}, 1, ?) IN (?, ?))"));
+                binds.push(Value::Text(base.to_string()));
+                binds.push(Value::Integer(n));
+                binds.push(Value::Text(format!("{base}/")));
+                binds.push(Value::Text(format!("{base}\\")));
+            }
+            clause.push(')');
+            sql.push_str(&clause);
         }
 
         sql.push_str(" ORDER BY updated_at DESC LIMIT ? OFFSET ?");
@@ -159,5 +176,52 @@ mod tests {
         let mut ids: Vec<_> = rows.iter().map(|s| s.id.as_str()).collect();
         ids.sort();
         assert_eq!(ids, vec!["child", "self"]);
+    }
+
+    #[test]
+    fn source_filter_matches_legacy_and_irregular_names() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        store
+            .upsert_session(&sample_session("oc", SessionSource::OpenCode, None))
+            .unwrap();
+        store
+            .upsert_session(&sample_session("claw", SessionSource::OpenClaw, None))
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET source = '\"open_code\"' WHERE id = 'oc'",
+                [],
+            )
+            .unwrap();
+        let oc = store
+            .list_sessions_filtered(Some("opencode"), None, 10, 0)
+            .unwrap();
+        assert_eq!(oc.len(), 1);
+        let claw = store
+            .list_sessions_filtered(Some("openclaw"), None, 10, 0)
+            .unwrap();
+        assert_eq!(claw.len(), 1);
+    }
+
+    #[test]
+    fn project_prefix_is_literal_case_sensitive_and_ignores_trailing_sep() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        for (id, cwd) in [
+            ("wild", "/w/myXproj/sub"),
+            ("case", "/w/MY_PROJ"),
+            ("hit", "/w/my_proj/sub"),
+        ] {
+            store
+                .upsert_session(&sample_session(id, SessionSource::Codex, Some(cwd)))
+                .unwrap();
+        }
+        for prefix in ["/w/my_proj", "/w/my_proj/"] {
+            let rows = store
+                .list_sessions_filtered(None, Some(prefix), 10, 0)
+                .unwrap();
+            let ids: Vec<_> = rows.iter().map(|s| s.id.as_str()).collect();
+            assert_eq!(ids, vec!["hit"], "prefix {prefix}");
+        }
     }
 }
