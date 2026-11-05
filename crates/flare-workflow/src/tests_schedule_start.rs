@@ -598,3 +598,43 @@ async fn deletion_never_removes_start_receipts() {
     store.delete(run).await.unwrap();
     assert_eq!(store.lookup_start("k").await.unwrap(), Some(run));
 }
+
+/// Explicit prefix purge is literal (`_`/`%` not wildcards), removes only
+/// matching receipts, and leaves other keys intact.
+#[tokio::test]
+async fn purge_start_receipts_with_prefix_is_literal_and_scoped() {
+    let store = SqliteStore::<PipelineData>::open_memory().unwrap();
+    for k in [
+        "pr-lifecycle:p_1:i:5",
+        "pr-lifecycle:pX1:i:5",
+        "pr-lifecycle:p_1:i:6",
+        "other",
+    ] {
+        let state = WorkflowState::new(WorkflowRunId::new(), WorkflowId::new("w"), PipelineData);
+        store
+            .create_start_once(k.to_string(), state, JournalEntry::Input { value: vec![] })
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        store
+            .purge_start_receipts_with_prefix("pr-lifecycle:p_1:i:")
+            .unwrap(),
+        2
+    );
+    assert!(
+        store
+            .lookup_start("pr-lifecycle:p_1:i:5")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .lookup_start("pr-lifecycle:pX1:i:5")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(store.lookup_start("other").await.unwrap().is_some());
+}
