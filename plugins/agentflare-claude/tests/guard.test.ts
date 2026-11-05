@@ -81,7 +81,7 @@ test('a throwing guard fails closed', async ($, on) => {
   expect((await $.tool.call({ tool: 'Edit', file_path: '/r/a', old_string: 'a', new_string: 'b' })).deny).toBeDefined()
 })
 
-test('tool.check allows a read-only tool and denies on failure', async ($, on) => {
+test('tool.check allows a read-only tool and denies on failure', { options: { readOnlyAutoAllow: true } }, async ($, on) => {
   stubSession(on)
   on('tool.check', () => ({ decision: 'ask' }))
   await $.session.start(START)
@@ -89,7 +89,7 @@ test('tool.check allows a read-only tool and denies on failure', async ($, on) =
   expect((await $.tool.check({ tool: 'Bash', command: 'ls' })).decision).not.toBe('allow')
 })
 
-test('read-only auto-allow upgrades an ask but never overrides a deny', async ($, on) => {
+test('read-only auto-allow upgrades an ask but never overrides a deny', { options: { readOnlyAutoAllow: true } }, async ($, on) => {
   stubSession(on)
   on('tool.check', () => ({ decision: 'deny' }))
   await $.session.start(START)
@@ -241,7 +241,7 @@ test('a plugin-spelled review submit is observed as mcp__flare__review', async (
   expect(obs.item_action).toBe('submit')
 })
 
-test('plugin-spelled self and read-only tools are allowed at tool.check', async ($, on) => {
+test('plugin-spelled self and read-only tools are allowed at tool.check', { options: { readOnlyAutoAllow: true } }, async ($, on) => {
   stubSession(on, true, PLUGIN_SERVER)
   on('tool.check', () => ({ decision: 'ask' }))
   await $.session.start(START)
@@ -355,3 +355,10 @@ test('the fallback rejects a known server whose health is invalid', async ($, on
   expect(actions).toEqual(['health'])
 })
 
+
+test('by default a user ask on a read-only tool stays an ask', async ($, on) => {
+  stubSession(on)
+  on('tool.check', () => ({ decision: 'ask' }))
+  await $.session.start(START)
+  expect((await $.tool.check({ tool: 'Grep', pattern: 'x' })).decision).toBe('ask')
+})

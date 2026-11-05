@@ -375,7 +375,7 @@ Settings (`userConfig`):
 | `idleMinutes` | `3` | Idle time before autopilot pulls work |
 | `maxCostUsd` | `25` | Session cost ceiling above which autopilot will not pull work |
 | `memoryCapture` | `auto` | `auto`, `ask` or `off` |
-| `readOnlyAutoAllow` | `true` | Let the guard allow read-only tool calls without a prompt |
+| `readOnlyAutoAllow` | `false` | Let the guard turn a prompt on a read-only tool into an allow. Off by default because it also overrides your own `ask` rules; `deny` is always kept |
 | `guardTimeoutMs` | `3000` | How long a guard check waits for the MCP server |
 
 When the plugin is installed, `agentflare init --agent claude-code` skips the
