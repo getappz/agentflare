@@ -395,6 +395,7 @@ fn read_only_reporting_actions_accept_a_project_override() {
         &s.project(Parameters(ProjectRequest {
             action: "list".into(),
             project: None,
+            ..Default::default()
         }))
         .unwrap(),
     )
