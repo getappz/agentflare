@@ -97,6 +97,8 @@ mod tests {
                 reasoning: 0,
             },
             cost: None,
+            cost_basis: CostBasis::Unknown,
+            pricing_key: None,
             turn_count: 0,
             tool_call_count: 0,
             subagent_count: 0,
