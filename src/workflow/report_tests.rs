@@ -41,6 +41,8 @@ fn session(id: &str) -> Session {
             cache_read_usd: 0.0,
             cache_write_usd: 0.0,
         }),
+        cost_basis: flare_insights::model::CostBasis::Provider,
+        pricing_key: None,
         turn_count: 0,
         tool_call_count: 0,
         subagent_count: 0,

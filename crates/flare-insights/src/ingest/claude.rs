@@ -273,15 +273,11 @@ fn parse_claude_jsonl(path: &Path) -> Option<IngestBundle> {
         }
     }
 
-    let cost_for_session = {
-        let pricing = PricingTable::default();
-        let c = pricing.cost_for(model.as_deref(), &tokens);
-        if c.total_usd > 0.0 {
-            Some(c)
-        } else {
-            None
-        }
-    };
+    let (cost, cost_basis, pricing_key) =
+        match PricingTable::default().cost_for(model.as_deref(), &tokens) {
+            Some((cost, key)) => (Some(cost), crate::model::CostBasis::Estimated, Some(key)),
+            None => (None, crate::model::CostBasis::Unknown, None),
+        };
     let session = Session {
         id: id.clone(),
         source: SessionSource::ClaudeCode,
@@ -296,7 +292,9 @@ fn parse_claude_jsonl(path: &Path) -> Option<IngestBundle> {
         ended_at: updated_at,
         duration_secs: None,
         tokens: tokens.clone(),
-        cost: cost_for_session,
+        cost,
+        cost_basis,
+        pricing_key,
         turn_count: turns.len() as u32,
         tool_call_count,
         subagent_count: subagents.len() as u32,
@@ -342,6 +340,38 @@ fn extract_text_from_message(msg: Option<&serde_json::Value>) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn claude_cost_basis_tracks_model_availability() {
+        for (model, expected_key) in [
+            (None, None),
+            (Some("totally-new"), None),
+            (Some("claude-sonnet-4-20250514"), Some("claude-sonnet-4")),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("session.jsonl");
+            let record = serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "model": model,
+                    "content": [{"type": "text", "text": "Answer"}],
+                    "usage": {"input_tokens": 1000000}
+                }
+            });
+            std::fs::write(&path, record.to_string()).unwrap();
+            let bundle = parse_claude_jsonl(&path).unwrap();
+            let session = &bundle.sessions[0];
+            assert_eq!(session.pricing_key.as_deref(), expected_key);
+            if expected_key.is_some() {
+                assert_eq!(session.cost_basis, crate::model::CostBasis::Estimated);
+                assert_eq!(session.cost.as_ref().unwrap().total_usd, 3.0);
+            } else {
+                assert_eq!(session.cost_basis, crate::model::CostBasis::Unknown);
+                assert!(session.cost.is_none());
+            }
+        }
+    }
+
     #[test]
     fn tool_results_preserve_output_errors_and_unfinished_calls() {
         let dir = TempDir::new().unwrap();
