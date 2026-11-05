@@ -70,6 +70,7 @@ impl AgentflareMcp {
         let req = ProjectRequest {
             action: "info".into(),
             project: None,
+            ..Default::default()
         };
         match self.project_inner(req).and_then(|json| {
             serde_json::from_str::<serde_json::Value>(&json)

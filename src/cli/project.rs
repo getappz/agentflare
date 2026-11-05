@@ -8,6 +8,8 @@ pub struct ProjectArgs {
 
 #[derive(Subcommand)]
 pub enum ProjectCommands {
+    /// Show the project this repo is linked to
+    Info,
     /// List projects in workspace (JSON)
     List {
         #[arg(long, default_value_t = true)]
@@ -24,13 +26,66 @@ pub enum ProjectCommands {
         /// Project name or UUID (see `agentflare project list`)
         project: String,
     },
+    /// Rename a project
+    Rename {
+        /// New project name
+        name: String,
+        /// Project name or UUID to rename (defaults to linked project)
+        #[arg(long)]
+        project: Option<String>,
+        /// Optional new identifier prefix
+        #[arg(long)]
+        identifier: Option<String>,
+    },
+    /// Soft-delete a project
+    Delete {
+        /// Project name or UUID to delete
+        project: String,
+    },
 }
 
 impl ProjectArgs {
     pub fn run(self) {
         match self.command {
+            ProjectCommands::Info => {
+                let mcp = crate::mcp_server::AgentflareMcp::default();
+                match mcp.project_inner(crate::mcp_server::types::ProjectRequest {
+                    action: "info".into(),
+                    ..Default::default()
+                }) {
+                    Ok(json) => println!("{json}"),
+                    Err(e) => crate::ui::error(&e.to_string()),
+                }
+            }
             ProjectCommands::Archive { project } => set_archived("archive", project),
             ProjectCommands::Unarchive { project } => set_archived("unarchive", project),
+            ProjectCommands::Rename {
+                name,
+                project,
+                identifier,
+            } => {
+                let mcp = crate::mcp_server::AgentflareMcp::default();
+                match mcp.project_inner(crate::mcp_server::types::ProjectRequest {
+                    action: "rename".into(),
+                    project,
+                    name: Some(name),
+                    identifier,
+                }) {
+                    Ok(json) => println!("{json}"),
+                    Err(e) => crate::ui::error(&e.to_string()),
+                }
+            }
+            ProjectCommands::Delete { project } => {
+                let mcp = crate::mcp_server::AgentflareMcp::default();
+                match mcp.project_inner(crate::mcp_server::types::ProjectRequest {
+                    action: "delete".into(),
+                    project: Some(project),
+                    ..Default::default()
+                }) {
+                    Ok(json) => println!("{json}"),
+                    Err(e) => crate::ui::error(&e.to_string()),
+                }
+            }
             ProjectCommands::List { json: _ } => {
                 let mcp = crate::mcp_server::AgentflareMcp::default();
                 let res = mcp.with_backend_db(|conn| {
@@ -72,6 +127,7 @@ fn set_archived(action: &str, project: String) {
     match mcp.project_inner(crate::mcp_server::types::ProjectRequest {
         action: action.into(),
         project: Some(project),
+        ..Default::default()
     }) {
         Ok(json) => println!("{json}"),
         Err(e) => crate::ui::error(&e.to_string()),
