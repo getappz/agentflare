@@ -273,15 +273,11 @@ fn parse_claude_jsonl(path: &Path) -> Option<IngestBundle> {
         }
     }
 
-    let cost_for_session = {
-        let pricing = PricingTable::default();
-        let c = pricing.cost_for(model.as_deref(), &tokens);
-        if c.total_usd > 0.0 {
-            Some(c)
-        } else {
-            None
-        }
-    };
+    let (cost, cost_basis, pricing_key) =
+        match PricingTable::default().cost_for(model.as_deref(), &tokens) {
+            Some((cost, key)) => (Some(cost), crate::model::CostBasis::Estimated, Some(key)),
+            None => (None, crate::model::CostBasis::Unknown, None),
+        };
     let session = Session {
         id: id.clone(),
         source: SessionSource::ClaudeCode,
@@ -296,7 +292,9 @@ fn parse_claude_jsonl(path: &Path) -> Option<IngestBundle> {
         ended_at: updated_at,
         duration_secs: None,
         tokens: tokens.clone(),
-        cost: cost_for_session,
+        cost,
+        cost_basis,
+        pricing_key,
         turn_count: turns.len() as u32,
         tool_call_count,
         subagent_count: subagents.len() as u32,

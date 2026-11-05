@@ -455,15 +455,11 @@ fn ingest_composer(
         }
     }
 
-    let cost = {
-        let pricing = PricingTable::default();
-        let c = pricing.cost_for(model.as_deref(), &tokens);
-        if c.total_usd > 0.0 {
-            Some(c)
-        } else {
-            None
-        }
-    };
+    let (cost, cost_basis, pricing_key) =
+        match PricingTable::default().cost_for(model.as_deref(), &tokens) {
+            Some((cost, key)) => (Some(cost), crate::model::CostBasis::Estimated, Some(key)),
+            None => (None, crate::model::CostBasis::Unknown, None),
+        };
     let ended_at = if matches!(status, SessionStatus::Completed | SessionStatus::Abandoned) {
         Some(updated)
     } else {
@@ -486,6 +482,8 @@ fn ingest_composer(
             duration_secs: created.map(|c| (updated - c).num_seconds().max(0) as u64),
             tokens,
             cost,
+            cost_basis,
+            pricing_key,
             turn_count: turns.len() as u32,
             tool_call_count: tools.len() as u32,
             subagent_count: subagents.len() as u32,

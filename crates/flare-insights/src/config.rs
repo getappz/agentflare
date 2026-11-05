@@ -220,32 +220,34 @@ impl Default for PricingTable {
 impl PricingTable {
     /// Real session `model` fields are dated identifiers (e.g. "claude-opus-4-20250514"),
     /// so fall back to a prefix match against the family key when there's no exact hit.
-    fn lookup(&self, model: &str) -> Option<&ModelPricing> {
-        self.models.get(model).or_else(|| {
-            self.models
-                .iter()
-                .find(|(key, _)| model.starts_with(key.as_str()))
-                .map(|(_, p)| p)
-        })
+    fn lookup(&self, model: &str) -> Option<(&str, &ModelPricing)> {
+        self.models
+            .iter()
+            .filter(|(key, _)| model.starts_with(key.as_str()))
+            .max_by_key(|(key, _)| key.len())
+            .map(|(key, pricing)| (key.as_str(), pricing))
     }
 
     pub fn cost_for(
         &self,
         model: Option<&str>,
         tokens: &crate::model::TokenUsage,
-    ) -> crate::model::Cost {
-        let p = model.and_then(|m| self.lookup(m)).unwrap_or(&self.default);
+    ) -> Option<(crate::model::Cost, String)> {
+        let (key, p) = self.lookup(model?)?;
         let input_usd = tokens.input as f64 / 1_000_000.0 * p.input_per_mtok;
         let output_usd = tokens.output as f64 / 1_000_000.0 * p.output_per_mtok;
         let cache_read_usd = tokens.cache_read as f64 / 1_000_000.0 * p.cache_read_per_mtok;
         let cache_write_usd = tokens.cache_write as f64 / 1_000_000.0 * p.cache_write_per_mtok;
-        crate::model::Cost {
-            total_usd: input_usd + output_usd + cache_read_usd + cache_write_usd,
-            input_usd,
-            output_usd,
-            cache_read_usd,
-            cache_write_usd,
-        }
+        Some((
+            crate::model::Cost {
+                total_usd: input_usd + output_usd + cache_read_usd + cache_write_usd,
+                input_usd,
+                output_usd,
+                cache_read_usd,
+                cache_write_usd,
+            },
+            key.to_string(),
+        ))
     }
 }
 
@@ -253,6 +255,46 @@ impl PricingTable {
 mod tests {
     use super::*;
     use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn unknown_model_costs_none() {
+        let usage = crate::model::TokenUsage {
+            input: 100,
+            output: 20,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+        };
+        let table = PricingTable::default();
+        assert!(table.cost_for(Some("totally-new"), &usage).is_none());
+        assert!(table.cost_for(None, &usage).is_none());
+    }
+
+    #[test]
+    fn longest_prefix_wins_deterministically() {
+        let usage = crate::model::TokenUsage {
+            input: 1_000_000,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+        };
+        for _ in 0..100 {
+            let mut table = PricingTable::default();
+            table.models.clear();
+            table.models.insert("claude".into(), table.default.clone());
+            table.models.insert(
+                "claude-opus".into(),
+                ModelPricing {
+                    input_per_mtok: 15.0,
+                    ..table.default.clone()
+                },
+            );
+            let (cost, key) = table.cost_for(Some("claude-opus-4-1"), &usage).unwrap();
+            assert_eq!(key, "claude-opus");
+            assert_eq!(cost.total_usd, 15.0);
+        }
+    }
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();

@@ -161,6 +161,8 @@ mod tests {
                 reasoning: 0,
             },
             cost: None,
+            cost_basis: crate::model::CostBasis::Unknown,
+            pricing_key: None,
             turn_count: 0,
             tool_call_count: 0,
             subagent_count: 0,
@@ -169,6 +171,45 @@ mod tests {
             pid: None,
             cwd: None,
         }
+    }
+
+    #[test]
+    fn session_cost_basis_round_trips_as_plain_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("insights.db");
+        let store = InsightsStore::open(&path).unwrap();
+        let raw = Connection::open(&path).unwrap();
+        let mut s = session("priced");
+        for (basis, text, key) in [
+            (CostBasis::Provider, "provider", None),
+            (
+                CostBasis::Estimated,
+                "estimated",
+                Some("claude-sonnet-4".to_string()),
+            ),
+            (CostBasis::Unknown, "unknown", None),
+        ] {
+            s.cost_basis = basis.clone();
+            s.pricing_key = key.clone();
+            store.upsert_session(&s).unwrap();
+            let loaded = store.get_session(&s.id).unwrap().unwrap();
+            assert_eq!(loaded.cost_basis, basis);
+            assert_eq!(loaded.pricing_key, key);
+            let stored: String = raw
+                .query_row(
+                    "SELECT cost_basis FROM sessions WHERE id='priced'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored, text);
+        }
+        raw.execute("UPDATE sessions SET cost_basis=NULL WHERE id='priced'", [])
+            .unwrap();
+        assert_eq!(
+            store.get_session(&s.id).unwrap().unwrap().cost_basis,
+            CostBasis::Unknown
+        );
     }
 
     #[test]
