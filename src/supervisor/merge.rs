@@ -347,7 +347,12 @@ pub(super) fn requeue_closed_pr_item_with(
         Ok(true)
     });
     match outcome {
-        Ok(Ok(moved)) => moved,
+        Ok(Ok(moved)) => {
+            if moved {
+                crate::pr_lifecycle_workflow::clear_lifecycle_receipts(&item.project_id, &item.id);
+            }
+            moved
+        }
         Ok(Err(e)) => {
             eprintln!(
                 "agentflare-supervisor: could not requeue item #{} ({}) after its PR #{number} \
@@ -405,6 +410,7 @@ pub(crate) fn promote_merged_item(
         .and_then(|v| v["promoted"].as_bool())
         .unwrap_or(false);
     if promoted {
+        crate::pr_lifecycle_workflow::clear_lifecycle_receipts(&item.project_id, &item.id);
         delete_merged_head_branch(item, repo_root);
     }
     promoted
