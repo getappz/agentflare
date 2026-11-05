@@ -322,3 +322,147 @@ fn item_done_without_push_completes_an_item_with_no_pr() {
             .all(|r| !r.path.contains("/pulls/"))
     );
 }
+
+#[test]
+fn coding_agent_hands_existing_pr_to_reviewer_for_fixes_and_completion() {
+    crate::paths::test_support::with_temp_home(|| {
+        let author = "claude-code:lifecycle-author";
+        let reviewer = "codex:lifecycle-reviewer";
+        let open_pr = r#"{"number":77,"html_url":"https://github.com/o/r/pull/77","state":"open","title":"t","head":{"ref":"task/1-x","sha":"abc"}}"#;
+        let (mut s, item_id, worktree, server, _keep) =
+            crate::claims::with_owner_override(author, || {
+                claimed_item_with_commit(
+                    Some(77),
+                    std::iter::repeat_n(open_pr, 16)
+                        .map(|body| crate::github::test_support::MockResponse::json(200, body))
+                        .collect(),
+                )
+            });
+        s.agent = Some("claude-code".into());
+        crate::claims::with_owner_override(author, || {
+            assert_eq!(done_without_push(&s, &item_id)["status"], "in_review");
+        });
+        crate::claims::with_owner_override(reviewer, || {
+            let err = s
+                .item_claim(ItemRequest {
+                    action: "claim".into(),
+                    id: Some(item_id.clone()),
+                    ..Default::default()
+                })
+                .unwrap_err();
+            assert!(err.to_string().contains(author), "{err}");
+        });
+        crate::claims::with_owner_override(author, || {
+            s.handoff_impl(serde_json::from_value(serde_json::json!({
+                "recipient": "codex",
+                "item_id": item_id,
+                "name": "Review and fix existing PR",
+                "content": "Review PR #77, commit fixes to its existing branch, then complete after merge.",
+                "completed": "Implementation committed; PR #77 is open.",
+                "remaining": "Review, fix, verify, and complete after merge.",
+                "task_type": "bugfix"
+            })).unwrap()).unwrap();
+        });
+        s.with_backend_db(|conn| {
+            assert_eq!(
+                agentflare_backend::claim::current_owner(conn, &item_id),
+                None
+            );
+            let item = agentflare_backend::item::get(conn, &item_id).unwrap();
+            assert_eq!(item.assignee_agent.as_deref(), Some("codex"));
+            let meta: serde_json::Value = serde_json::from_str(&item.metadata).unwrap();
+            assert_eq!(meta["pr"]["number"], 77);
+            assert_eq!(meta["pr"]["branch"], "task/1-x");
+        })
+        .unwrap();
+        // GitHub is mocked; keep claim-time fetch/rebase entirely local too.
+        let repo_root = s.worktree_repo_root();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        git(&repo_root, &["remote", "remove", "origin"]);
+        crate::claims::with_owner_override(reviewer, || {
+            let claimed: serde_json::Value = serde_json::from_str(
+                &s.item_claim(ItemRequest {
+                    action: "claim".into(),
+                    id: Some(item_id.clone()),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(claimed["status"], "acquired", "{claimed}");
+            assert!(claimed.get("worktree_error").is_none(), "{claimed}");
+            assert_eq!(claimed["worktree_path"], worktree.to_str().unwrap());
+        });
+        git(
+            &repo_root,
+            &["remote", "add", "origin", "https://github.com/o/r.git"],
+        );
+        let implementation = git(&worktree, &["rev-parse", "HEAD"]);
+        std::fs::write(worktree.join("b.txt"), "reviewed and fixed\n").unwrap();
+        git(&worktree, &["add", "b.txt"]);
+        git(&worktree, &["commit", "-m", "fix: address review finding"]);
+        assert_ne!(git(&worktree, &["rev-parse", "HEAD"]), implementation);
+        assert_eq!(git(&worktree, &["branch", "--show-current"]), "task/1-x");
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("b.txt")).unwrap(),
+            "reviewed and fixed\n"
+        );
+        crate::claims::with_owner_override(reviewer, || {
+            assert_eq!(done_without_push(&s, &item_id)["status"], "in_review");
+            assert!(worktree.exists());
+        });
+        let reviewed_head = git(&worktree, &["rev-parse", "HEAD"]);
+        let merged_pr = serde_json::json!({
+            "number": 77, "html_url": "https://github.com/o/r/pull/77",
+            "state": "closed", "title": "t",
+            "merged_at": "2026-11-04T00:00:00Z",
+            "head": {"ref": "task/1-x", "sha": reviewed_head}
+        })
+        .to_string();
+        let merged_server = crate::github::test_support::MockServer::start(vec![
+            crate::github::test_support::MockResponse::json(200, &merged_pr),
+        ]);
+        s.github_client_override = Some(merged_server.client(Some("tok")));
+        crate::claims::with_owner_override(reviewer, || {
+            let completed: serde_json::Value = serde_json::from_str(
+                &s.item(Parameters(ItemRequest {
+                    action: "done".into(),
+                    id: Some(item_id.clone()),
+                    push: Some(false),
+                    ..Default::default()
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(completed["status"], "completed", "{completed}");
+        });
+        s.with_backend_db(|conn| {
+            let item = agentflare_backend::item::get(conn, &item_id).unwrap();
+            assert!(item.completed_at.is_some());
+            assert_eq!(
+                agentflare_backend::claim::current_owner(conn, &item_id),
+                None
+            );
+            let meta: serde_json::Value = serde_json::from_str(&item.metadata).unwrap();
+            assert_eq!(meta["pr"]["number"], 77);
+        })
+        .unwrap();
+        assert!(!worktree.exists(), "completed item's worktree is removed");
+        let requests = server.requests();
+        assert!(requests.len() >= 4);
+        assert!(requests.iter().any(|r| r.path == "/repos/o/r/pulls/77"));
+        assert_eq!(merged_server.requests().len(), 1);
+    });
+}
