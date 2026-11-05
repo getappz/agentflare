@@ -2,6 +2,7 @@ use clap::{Args, Subcommand};
 use serde_json::json;
 use std::collections::BTreeMap;
 
+use crate::decide::bench;
 use crate::decide::{self, Question};
 
 /// Typed-decision layer (Jev): check that the connection works.
@@ -21,7 +22,34 @@ enum DecideCmd {
     /// Benchmark the offline flare-decide engines on the built-in cases.
     /// The "Jev" row is simulated, and the cases overlap the rules, so
     /// treat the numbers as a smoke test, not a quality comparison.
-    Bench,
+    Bench {
+        /// Replay a decision site (router, skill_rerank, sdd_judge, or all)
+        /// through Jev and its non-Jev baseline; omit for the offline engines.
+        site: Option<String>,
+        /// Labeled/adversarial JSONL fixtures (default: the built-in set).
+        #[arg(long)]
+        fixtures: Vec<std::path::PathBuf>,
+        /// Replay the captured dataset (AGENTFLARE_DECIDE_CAPTURE=1) instead.
+        #[arg(long)]
+        captured: bool,
+        /// Go/no-go thresholds TOML (see docs/decide-bench-thresholds.toml).
+        #[arg(long)]
+        thresholds: Option<std::path::PathBuf>,
+        /// Exit 1 when any row is NO-GO.
+        #[arg(long)]
+        enforce: bool,
+        #[arg(long)]
+        json: bool,
+        /// Fake backend: virtual cold / warm latency, jitter (ms) and seed.
+        #[arg(long, default_value_t = 1200)]
+        fake_cold_ms: u64,
+        #[arg(long, default_value_t = 350)]
+        fake_warm_ms: u64,
+        #[arg(long, default_value_t = 100)]
+        fake_jitter_ms: u64,
+        #[arg(long, default_value_t = 7)]
+        seed: u64,
+    },
     /// Show how often Jev agrees with the current decision, per site
     /// (router, skill_rerank, sdd_judge), from the shadow log.
     Report {
@@ -74,12 +102,47 @@ impl DecideArgs {
     pub fn run(self) {
         match self.cmd {
             DecideCmd::Ping => ping(),
-            DecideCmd::Bench => print!(
+            DecideCmd::Bench { site: None, .. } => print!(
                 "{}",
                 flare_decide::bench::format_markdown_table(
                     &flare_decide::bench::run_all_benchmarks()
                 )
             ),
+            DecideCmd::Bench {
+                site: Some(site),
+                fixtures,
+                captured,
+                thresholds,
+                enforce,
+                json,
+                fake_cold_ms,
+                fake_warm_ms,
+                fake_jitter_ms,
+                seed,
+            } => {
+                let profile = bench::Profile {
+                    cold_ms: fake_cold_ms,
+                    warm_ms: fake_warm_ms,
+                    jitter_ms: fake_jitter_ms,
+                    seed,
+                    ..bench::Profile::default()
+                };
+                match bench_site(
+                    &site,
+                    &fixtures,
+                    captured,
+                    thresholds.as_deref(),
+                    profile,
+                    json,
+                ) {
+                    Ok(go) if go || !enforce => {}
+                    Ok(_) => std::process::exit(1),
+                    Err(e) => {
+                        eprintln!("decide bench: {e}");
+                        std::process::exit(2);
+                    }
+                }
+            }
             DecideCmd::Report { site, json } => {
                 let report = decide::report::load(
                     &decide::shadow::log_path(),
@@ -191,4 +254,63 @@ fn ping() {
             decide::exit(1);
         }
     }
+}
+
+/// Returns whether every row is GO.
+fn bench_site(
+    site: &str,
+    fixtures: &[std::path::PathBuf],
+    captured: bool,
+    thresholds: Option<&std::path::Path>,
+    profile: bench::Profile,
+    json: bool,
+) -> Result<bool, String> {
+    let sites: Vec<&str> = if site == "all" {
+        bench::SITES.to_vec()
+    } else if bench::SITES.contains(&site) {
+        vec![site]
+    } else {
+        return Err(format!(
+            "unknown site '{site}' (router, skill_rerank, sdd_judge, all)"
+        ));
+    };
+    let thresholds = match thresholds {
+        Some(p) => bench::Thresholds::parse(
+            &std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?,
+        )
+        .map_err(|e| format!("{}: {e}", p.display()))?,
+        None => bench::Thresholds::default(),
+    };
+    let mut cases = vec![];
+    if captured {
+        cases.extend(
+            decide::capture::load(&decide::capture::dataset_path())
+                .into_iter()
+                .filter_map(|r| serde_json::from_value(serde_json::to_value(r).ok()?).ok()),
+        );
+    }
+    for p in fixtures {
+        let text = std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
+        cases.extend(bench::parse_cases(&text).0);
+    }
+    if !captured && fixtures.is_empty() {
+        for s in &sites {
+            cases.extend(bench::builtin_cases(s));
+        }
+    }
+    let mut backend = bench::FakeBackend::new(profile);
+    let report = bench::Report {
+        schema: bench::REPORT_SCHEMA,
+        backend: bench::Backend::name(&backend),
+        sites: sites
+            .iter()
+            .flat_map(|s| bench::run_site(s, &cases, &mut backend, &thresholds))
+            .collect(),
+    };
+    if json {
+        println!("{}", bench::render_json(&report));
+    } else {
+        print!("{}", bench::render_table(&report));
+    }
+    Ok(report.sites.iter().all(|s| s.verdict.go))
 }

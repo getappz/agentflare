@@ -1,0 +1,29 @@
+# Go/no-go thresholds for `agentflare decide bench <site> --thresholds <this file>`.
+# Set these BEFORE measuring (epic #793 / #700). Every key is optional; an
+# unset key is not checked, and a set key with no measurement behind it
+# (e.g. min_precision with no labeled cases) counts as a violation.
+# Unknown keys are rejected. `[sites.<name>]` overrides `[default]` key by key.
+# `--enforce` makes the command exit 1 on any NO-GO row.
+
+[default]
+min_agreement = 0.60        # share of cases where the final decision equals the baseline
+min_precision = 0.70        # macro precision of the final decision vs `expected`
+min_recall = 0.70           # macro recall of the final decision vs `expected`
+max_cold_p95_ms = 3000      # first `cold_calls` calls of a set
+max_warm_p95_ms = 1500
+max_usd_per_1k = 0.05       # dollars per 1000 decisions
+max_overhead_pct = 5.0      # harness time outside backend calls / summed backend latency
+require_fail_open = true    # down/timeout/402/low_confidence must all fall back to baseline
+min_confidence = 0.7        # Jev answers below this are ignored (baseline wins)
+llm_tokens_avoided = 0      # LLM tokens saved per applied Jev decision (see token method in bench/mod.rs)
+
+[sites.router]
+llm_tokens_avoided = 400
+
+[sites.skill_rerank]
+llm_tokens_avoided = 1200
+
+[sites.sdd_judge]
+llm_tokens_avoided = 3000
+min_precision = 0.60        # alphabetical-first bias is documented for this site
+min_recall = 0.60
