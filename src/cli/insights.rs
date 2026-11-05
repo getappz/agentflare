@@ -554,6 +554,7 @@ fn run_doctor(db: PathBuf, args: DoctorArgs) {
             serde_json::to_string_pretty(&serde_json::json!({
                 "db_path": db.display().to_string(),
                 "db_ok": db_ok,
+                "capabilities": flare_insights::capability::capabilities(),
                 "sources": sources.iter().map(|(name, present)| serde_json::json!({
                     "name": name,
                     "present": present,

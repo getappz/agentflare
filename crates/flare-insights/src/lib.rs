@@ -15,6 +15,7 @@
 //! - api: REST + WebSocket push
 
 pub mod analytics;
+pub mod capability;
 pub mod config;
 pub mod export;
 pub mod handoff;
