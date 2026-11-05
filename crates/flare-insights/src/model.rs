@@ -90,6 +90,25 @@ pub struct Cost {
     pub cache_write_usd: f64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CostBasis {
+    Provider,
+    Estimated,
+    #[default]
+    Unknown,
+}
+
+impl CostBasis {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Provider => "provider",
+            Self::Estimated => "estimated",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -106,6 +125,10 @@ pub struct Session {
     pub duration_secs: Option<u64>,
     pub tokens: TokenUsage,
     pub cost: Option<Cost>,
+    #[serde(default)]
+    pub cost_basis: CostBasis,
+    #[serde(default)]
+    pub pricing_key: Option<String>,
     pub turn_count: u32,
     pub tool_call_count: u32,
     pub subagent_count: u32,
