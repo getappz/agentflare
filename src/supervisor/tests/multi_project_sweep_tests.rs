@@ -230,6 +230,65 @@ fn closed_pr_requeue_keeps_a_replacement_attached_after_its_guard() {
     }
 }
 
+/// Closing an item's PR purges its `pr-lifecycle:` start receipts under
+/// `engine = workflow` (so a later PR can start a fresh run), and leaves
+/// other items' and other keyspaces' receipts alone.
+#[test]
+fn closed_pr_requeue_purges_only_that_items_lifecycle_receipts() {
+    use flare_workflow::json::PipelineData;
+    use flare_workflow::sqlite_store::SqliteStore;
+    use flare_workflow::types::*;
+    crate::paths::test_support::with_temp_home(|| {
+        let repo = throwaway_repo();
+        let mcp = test_mcp();
+        let item_id =
+            seed_in_review_item_in_project(&mcp, "proj-receipts", &repo.path().to_string_lossy());
+        let item = mcp
+            .with_backend_db(|conn| agentflare_backend::item::get(conn, &item_id).unwrap())
+            .unwrap();
+        let mine = format!("pr-lifecycle:{}:{}:501", item.project_id, item.id);
+        let other = format!("pr-lifecycle:{}:other-item:7", item.project_id);
+        let db = crate::workflow::default_db_path();
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let store = SqliteStore::<PipelineData>::open_file(&db).unwrap();
+        for k in [&mine, &other, &"schedule:x".to_string()] {
+            let st = WorkflowState::new(WorkflowRunId::new(), WorkflowId::new("w"), PipelineData);
+            rt.block_on(store.create_start_once(
+                k.clone(),
+                st,
+                JournalEntry::Input { value: vec![] },
+            ))
+            .unwrap();
+        }
+        unsafe { std::env::set_var("AGENTFLARE_REVIEW_SWEEP_ENGINE", "workflow") };
+        let item = mcp
+            .with_backend_db(|conn| {
+                agentflare_backend::item::update(
+                    conn,
+                    &item_id,
+                    agentflare_backend::item::UpdateItem {
+                        metadata: Some(r#"{"pr":{"number":501,"branch":"task/501"}}"#.into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                agentflare_backend::item::get(conn, &item_id).unwrap()
+            })
+            .unwrap();
+        let moved = requeue_closed_pr_item_with(&mcp, &item, 501, |_| {});
+        unsafe { std::env::remove_var("AGENTFLARE_REVIEW_SWEEP_ENGINE") };
+        assert!(moved);
+        assert!(rt.block_on(store.lookup_start(&mine)).unwrap().is_none());
+        assert!(rt.block_on(store.lookup_start(&other)).unwrap().is_some());
+        assert!(
+            rt.block_on(store.lookup_start("schedule:x"))
+                .unwrap()
+                .is_some()
+        );
+    });
+}
+
 #[test]
 fn job_in_flight_sees_an_active_job_older_than_the_newest_hundred() {
     let queue = test_queue();
