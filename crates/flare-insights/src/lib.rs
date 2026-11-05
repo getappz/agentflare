@@ -19,6 +19,7 @@ pub mod config;
 pub mod export;
 pub mod handoff;
 pub mod ingest;
+pub mod migrations;
 pub mod model;
 pub mod replay;
 pub mod search;
