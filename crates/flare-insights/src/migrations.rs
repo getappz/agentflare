@@ -189,7 +189,7 @@ mod tests {
             ),
             (CostBasis::Unknown, "unknown", None),
         ] {
-            s.cost_basis = basis.clone();
+            s.cost_basis = basis;
             s.pricing_key = key.clone();
             store.upsert_session(&s).unwrap();
             let loaded = store.get_session(&s.id).unwrap().unwrap();

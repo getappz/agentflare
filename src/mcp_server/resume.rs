@@ -485,7 +485,7 @@ mod tests {
             .scan(&Default::default(), &Default::default(), &mut |_, _| {})
             .unwrap();
         let session = &bundle.sessions[0];
-        assert!(session.cwd.is_none());
+        assert_eq!(session.cwd, session.project_path);
         assert!(session.project_path.is_some());
         let store =
             flare_insights::store::InsightsStore::open(&tmp.path().join("observatory.db")).unwrap();
