@@ -1,4 +1,5 @@
 import type { EngineInterface, On, Timer } from 'claude-code'
+import { captureTurn, type CaptureContext } from './capture'
 import { flareCommand } from './flare'
 import type { AutopilotClient } from './mcp'
 import { refreshBriefing } from './briefing'
@@ -13,10 +14,12 @@ export type AutopilotContext = {
   options: { autopilot: Mode; idleMinutes: number; maxCostUsd: number }
   current: () => Current
   setCurrent: (next: Current) => void
+  capture?: CaptureContext
 }
 
 const RATE_LIMIT_PAUSE_PCT = 90
 const CURRENT_ITEM = { plugin: 'agentflare', key: 'currentItemId' } as const
+const AUTOPILOT_MODE = { plugin: 'agentflare', key: 'autopilotMode' } as const
 
 // Module state resets on hot reload (the timer is cancelled before it is re-armed, so at most one is live).
 let mode: Mode = 'off'
@@ -41,7 +44,18 @@ export function setAutopilotMode($: EngineInterface, next: Mode): void {
   paused = null
   timer?.cancel()
   timer = null
+  void $.state.set(AUTOPILOT_MODE, next).catch(() => {})
   if (next !== 'off') armIdleTimer($)
+}
+
+/** Clears the current item state when marked done or released. */
+export async function clearCurrentItem($: EngineInterface): Promise<void> {
+  ctx?.setCurrent?.({})
+  try {
+    await $.state.set(CURRENT_ITEM, null)
+  } catch {
+    // The module state is already cleared; state write is best-effort.
+  }
 }
 
 /**
@@ -75,7 +89,20 @@ async function pause($: EngineInterface, reason: string): Promise<'paused'> {
 async function step($: EngineInterface): Promise<StepResult> {
   const { client, agent, options, current, setCurrent } = ctx
   const c = client()
+
+  // A hot reload resets the module's mode; check persisted mode if set.
+  try {
+    const saved = (await $.state.get(AUTOPILOT_MODE)).value as Mode | undefined
+    if (saved && (saved === 'on' || saved === 'once' || saved === 'off')) mode = saved
+  } catch {
+    // Non-fatal if state read fails.
+  }
   if (mode === 'off' || !c) return 'idle'
+
+  // Never switch items while one is in progress (no next_work call while currentItemId is set).
+  const held = current().item?.id ?? (await $.state.get(CURRENT_ITEM)).value
+  if (held) return 'working'
+
   const last = (await $.session.messages()).at(-1)
   if (last?.role === 'user' && last.text.trim()) return 'blocked'
 
@@ -100,14 +127,14 @@ async function step($: EngineInterface): Promise<StepResult> {
   }
   if (!r.item || !r.claimed) return 'idle'
   const { id, seq, title } = r.item
-  // A hot reload empties the module's current item; the persisted id still names the one already woken.
-  const held = current().item?.id ?? (await $.state.get(CURRENT_ITEM)).value
-  if (id === held) return 'working'
   setCurrent({ item: { id, seq, title } })
   await $.state.set(CURRENT_ITEM, id)
   void wake($, `Work agentflare item #${seq} (${id}): ${title}. Read it with the item tool first, work in its bound worktree, run the gate before done.`)
   // Consume `once` right away: a throw below must not leave the mode armed for a second wake.
-  if (mode === 'once') mode = 'off'
+  if (mode === 'once') {
+    mode = 'off'
+    await $.state.set(AUTOPILOT_MODE, 'off')
+  }
   await $.state.set({ plugin: 'agentflare', key: 'lastWakeAt' }, await $.clock.now())
   await refreshBriefing($, { client, agent })
   return 'woke'
@@ -124,6 +151,7 @@ async function guardedStep($: EngineInterface): Promise<StepResult> {
 
 // Cancel-before-arm keeps exactly one live timer.
 function armIdleTimer($: EngineInterface): void {
+  if (mode === 'off') return
   timer?.cancel()
   timer = $.clock.after(Math.max(0, ctx.options.idleMinutes) * 60_000, () => void pollAndRearm($))
 }
@@ -141,14 +169,35 @@ export function registerAutopilot(on: On, context: AutopilotContext): { step($: 
   ctx = context
   mode = context.options.autopilot
 
-  // The session must be idle for idleMinutes before a pull: each finished main-loop turn restarts the wait.
-  on('turn.complete', { reason: 'answer' }, async ($, e, next) => {
+  // Cancel the idle timer at turn start so it cannot fire while a turn runs.
+  on('turn.start', async ($, e, next) => {
+    if (e.agentId === undefined) {
+      timer?.cancel()
+      timer = null
+    }
+    return next(e)
+  })
+
+  // The session must be idle for idleMinutes before a pull: finished, aborted, or errored turns restart the wait.
+  on('turn.complete', async ($, e, next) => {
     const result = await next(e)
+    if (context.capture) {
+      await captureTurn($, e, context.capture)
+    }
     if (e.agentId !== undefined) return result
+    try {
+      const saved = (await $.state.get(AUTOPILOT_MODE)).value as Mode | undefined
+      if (saved && (saved === 'on' || saved === 'once' || saved === 'off')) mode = saved
+    } catch {}
     timer?.cancel()
     timer = null
-    if (context.options.idleMinutes <= 0) await guardedStep($)
-    else armIdleTimer($)
+    if (mode !== 'off') {
+      if (e.reason === 'answer' && context.options.idleMinutes <= 0) {
+        await guardedStep($)
+      } else {
+        armIdleTimer($)
+      }
+    }
     return result
   })
 
