@@ -94,20 +94,33 @@ fn project_rename_and_delete() {
     )
     .unwrap();
     let project_id = info["id"].as_str().unwrap().to_string();
+    let link_path = s.project_link_path();
+    assert!(link_path.is_file(), "info links this repo to the project");
 
-    // 1. Rename project
+    // 1. Rename project: the identifier is the issue-key prefix baked into
+    // PRs and commits, so it survives a rename that passes none.
     let renamed: serde_json::Value = serde_json::from_str(
         &s.project(Parameters(ProjectRequest {
             action: "rename".into(),
             project: Some(project_id.clone()),
-            name: Some("appz-cli-renamed".into()),
+            name: Some("zz-totally-new".into()),
             ..Default::default()
         }))
         .unwrap(),
     )
     .unwrap();
     assert_eq!(renamed["id"], project_id);
-    assert_eq!(renamed["name"], "appz-cli-renamed");
+    assert_eq!(renamed["name"], "zz-totally-new");
+    assert_eq!(renamed["identifier"], info["identifier"]);
+
+    // Destructive, so it never defaults to the linked project.
+    let err = s
+        .project(Parameters(ProjectRequest {
+            action: "delete".into(),
+            ..Default::default()
+        }))
+        .unwrap_err();
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
 
     // 2. Delete project
     let deleted: serde_json::Value = serde_json::from_str(
@@ -121,6 +134,10 @@ fn project_rename_and_delete() {
     .unwrap();
     assert_eq!(deleted["status"], "deleted");
     assert_eq!(deleted["id"], project_id);
+    assert!(
+        !link_path.exists(),
+        "deleting the linked project drops this repo's stale link"
+    );
 }
 
 #[test]
@@ -161,7 +178,7 @@ fn project_rename_explicit_identifier_collision_errors() {
 }
 
 #[test]
-fn project_rename_derived_identifier_collision_keeps_existing() {
+fn project_rename_without_identifier_keeps_existing_even_when_derived_collides() {
     let (tmp, s) = harness();
     let conn = backend_conn(&tmp);
     let first = s.resolve_project(&conn).unwrap();
@@ -178,7 +195,8 @@ fn project_rename_derived_identifier_collision_keeps_existing() {
     )
     .unwrap();
 
-    // Name "collide" derives to "COLLIDE"; collision fallback keeps first's identifier.
+    // Name "collide" would derive to the taken "COLLIDE"; no identifier was
+    // passed, so the rename never touches it and cannot collide.
     let renamed: serde_json::Value = serde_json::from_str(
         &s.project(Parameters(ProjectRequest {
             action: "rename".into(),

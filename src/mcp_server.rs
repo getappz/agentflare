@@ -837,12 +837,28 @@ impl AgentflareMcp {
             return root;
         }
         let root = Self::repo_root();
-        if flare_git_core::branch::is_linked_worktree(&root)
-            && let Some(main_root) = flare_git_core::branch::main_worktree_root(&root)
+        // Cached per root like `repo_root()`: `is_linked_worktree` +
+        // `main_worktree_root` spawn several git processes, and project
+        // resolution asks for this root repeatedly (link path, resolution
+        // root, bridge/dir registration).
+        static CACHE: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, std::path::PathBuf>>,
+        > = std::sync::OnceLock::new();
+        let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        if let Ok(guard) = cache.lock()
+            && let Some(main) = guard.get(&root)
         {
-            return main_root;
+            return main.clone();
         }
-        root
+        let main = if flare_git_core::branch::is_linked_worktree(&root) {
+            flare_git_core::branch::main_worktree_root(&root).unwrap_or_else(|| root.clone())
+        } else {
+            root.clone()
+        };
+        if let Ok(mut guard) = cache.lock() {
+            guard.insert(root, main.clone());
+        }
+        main
     }
 
     /// Test-only constructor: an isolated instance backed entirely by the
@@ -1956,38 +1972,22 @@ impl AgentflareMcp {
                             None,
                         )
                     })?;
-                let caller_ident = req
+                // The identifier is the issue-key prefix (AGENTFLARE-42) baked
+                // into PRs and commits, so a rename keeps it unless the caller
+                // explicitly asks for a new one.
+                let identifier = req
                     .identifier
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty());
-                let target_ident = caller_ident
-                    .clone()
-                    .unwrap_or_else(|| Self::derive_project_identifier(&new_name));
-
-                let project = match agentflare_backend::project::update(
+                let project = agentflare_backend::project::update(
                     conn,
                     &target.id,
                     agentflare_backend::project::UpdateProject {
-                        name: Some(new_name.clone()),
-                        identifier: Some(target_ident),
+                        name: Some(new_name),
+                        identifier,
                     },
-                ) {
-                    Ok(p) => p,
-                    // Derived collision: keep the existing identifier and rename only.
-                    // Caller-supplied collision: surface the duplicate error.
-                    Err(agentflare_backend::Error::Duplicate(_)) if caller_ident.is_none() => {
-                        agentflare_backend::project::update(
-                            conn,
-                            &target.id,
-                            agentflare_backend::project::UpdateProject {
-                                name: Some(new_name),
-                                identifier: None,
-                            },
-                        )
-                        .map_err(map_backend_err)?
-                    }
-                    Err(e) => return Err(map_backend_err(e)),
-                };
+                )
+                .map_err(map_backend_err)?;
 
                 let link_path = self.project_link_path();
                 if let Ok(bytes) = std::fs::read(&link_path)
@@ -2004,8 +2004,28 @@ impl AgentflareMcp {
                 Ok(serde_json::to_string_pretty(&project).unwrap_or_default())
             })?,
             "delete" => self.with_backend_db(|conn| {
-                let target = self.resolve_project_for_read(conn, req.project.as_deref())?;
+                // Destructive: never default to the repo's linked project.
+                let name = req
+                    .project
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| {
+                        ErrorData::invalid_params(
+                            "project is required for project action=delete",
+                            None,
+                        )
+                    })?;
+                let target = self.resolve_project_for_read(conn, Some(name))?;
                 agentflare_backend::project::delete(conn, &target.id).map_err(map_backend_err)?;
+                // Drop this repo's link if it pointed at the deleted project, so
+                // the next call starts clean instead of chasing a dead id.
+                let link_path = self.project_link_path();
+                if let Ok(bytes) = std::fs::read(&link_path)
+                    && let Ok(link) = serde_json::from_slice::<types::ProjectLink>(&bytes)
+                    && link.project_id == target.id
+                {
+                    let _ = std::fs::remove_file(&link_path);
+                }
                 Ok(serde_json::json!({
                     "status": "deleted",
                     "id": target.id,

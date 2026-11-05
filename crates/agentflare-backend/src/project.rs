@@ -160,6 +160,12 @@ pub fn delete(conn: &Connection, id: &str) -> Result<()> {
         return Err(crate::error::Error::NotFound(id.to_string()));
     }
     crate::project_dir::remove(&tx, id)?;
+    // Same reason for the GitHub bridge registry: the daemon polls every
+    // `bridge_repos` row and would keep importing issues into this project.
+    tx.execute(
+        "DELETE FROM bridge_repos WHERE project_id = ?1",
+        rusqlite::params![id],
+    )?;
     tx.commit()?;
     events::emit(
         conn,
@@ -370,6 +376,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(proj2.name, "Test");
+    }
+
+    #[test]
+    fn delete_drops_the_bridge_repo_rows_of_the_project() {
+        let conn = db::open_in_memory().unwrap();
+        let wid = seed_workspace(&conn);
+        let proj = create(
+            &conn,
+            CreateProject {
+                workspace_id: wid,
+                name: "Test".into(),
+                identifier: "T".into(),
+                external_source: None,
+                external_id: None,
+            },
+        )
+        .unwrap();
+        crate::bridge_repo::upsert(&conn, "org/repo", &proj.id, "/tmp/repo", "q", None, 1).unwrap();
+        assert_eq!(crate::bridge_repo::list(&conn).unwrap().len(), 1);
+
+        delete(&conn, &proj.id).unwrap();
+        // Soft delete never fires the schema's ON DELETE CASCADE, so without
+        // the explicit DELETE the daemon would keep importing into a project
+        // nobody can see anymore.
+        assert!(crate::bridge_repo::list(&conn).unwrap().is_empty());
     }
 
     #[test]
