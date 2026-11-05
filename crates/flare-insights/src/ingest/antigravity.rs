@@ -505,6 +505,23 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_known_model_records_estimate_and_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        std::fs::write(&path, concat!(
+            "{\"type\":\"USER_INPUT\",\"content\":\"Active Workspaces: /tmp/project\"}\n",
+            "{\"type\":\"PLANNER_RESPONSE\",\"model\":\"gemini-test\",\"content\":\"Answer\",\"input_tokens\":1000000}"
+        )).unwrap();
+        let bundle = parse_antigravity_jsonl(&path, &PricingTable::default()).unwrap();
+        let session = &bundle.sessions[0];
+        assert_eq!(session.cost_basis, crate::model::CostBasis::Estimated);
+        assert_eq!(session.pricing_key.as_deref(), Some("gemini"));
+        assert_eq!(session.cost.as_ref().unwrap().total_usd, 1.25);
+        assert_eq!(session.project_path.as_deref(), Some("/tmp/project"));
+        assert_eq!(session.cwd, session.project_path);
+    }
+
+    #[test]
     fn empty_dir_returns_empty() {
         let tmp = TempDir::new().unwrap();
         let mut config = InsightsConfig::default();

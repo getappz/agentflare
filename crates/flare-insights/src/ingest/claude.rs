@@ -340,6 +340,38 @@ fn extract_text_from_message(msg: Option<&serde_json::Value>) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn claude_cost_basis_tracks_model_availability() {
+        for (model, expected_key) in [
+            (None, None),
+            (Some("totally-new"), None),
+            (Some("claude-sonnet-4-20250514"), Some("claude-sonnet-4")),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("session.jsonl");
+            let record = serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "model": model,
+                    "content": [{"type": "text", "text": "Answer"}],
+                    "usage": {"input_tokens": 1000000}
+                }
+            });
+            std::fs::write(&path, record.to_string()).unwrap();
+            let bundle = parse_claude_jsonl(&path).unwrap();
+            let session = &bundle.sessions[0];
+            assert_eq!(session.pricing_key.as_deref(), expected_key);
+            if expected_key.is_some() {
+                assert_eq!(session.cost_basis, crate::model::CostBasis::Estimated);
+                assert_eq!(session.cost.as_ref().unwrap().total_usd, 3.0);
+            } else {
+                assert_eq!(session.cost_basis, crate::model::CostBasis::Unknown);
+                assert!(session.cost.is_none());
+            }
+        }
+    }
+
     #[test]
     fn tool_results_preserve_output_errors_and_unfinished_calls() {
         let dir = TempDir::new().unwrap();
