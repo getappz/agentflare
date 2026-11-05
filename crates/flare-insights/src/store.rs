@@ -457,8 +457,8 @@ fn exec_upsert_session(conn: &Connection, s: &Session) -> Result<(), StoreError>
             id,source,project,project_path,title,model,status,awaiting_reason,
             started_at,updated_at,ended_at,duration_secs,
             input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,reasoning_tokens,
-            cost_usd,turn_count,tool_call_count,subagent_count,tags,starred,pid,cwd
-        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)
+            cost_usd,turn_count,tool_call_count,subagent_count,tags,starred,pid,cwd,cost_basis,pricing_key
+        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27)
         ON CONFLICT(id) DO UPDATE SET
             source=excluded.source, project=excluded.project, project_path=excluded.project_path,
             title=excluded.title, model=excluded.model, status=excluded.status,
@@ -469,7 +469,7 @@ fn exec_upsert_session(conn: &Connection, s: &Session) -> Result<(), StoreError>
             reasoning_tokens=excluded.reasoning_tokens, cost_usd=excluded.cost_usd,
             turn_count=excluded.turn_count, tool_call_count=excluded.tool_call_count,
             subagent_count=excluded.subagent_count, tags=excluded.tags, starred=excluded.starred,
-            pid=excluded.pid, cwd=excluded.cwd
+            pid=excluded.pid, cwd=excluded.cwd, cost_basis=excluded.cost_basis, pricing_key=excluded.pricing_key
         "#,
         params![
             s.id,
@@ -497,6 +497,8 @@ fn exec_upsert_session(conn: &Connection, s: &Session) -> Result<(), StoreError>
             if s.starred { 1 } else { 0 },
             s.pid.map(|v| v as i64),
             s.cwd,
+            s.cost_basis.as_str(),
+            s.pricing_key,
         ],
     )?;
     Ok(())
@@ -542,6 +544,12 @@ fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
                 cache_read_usd: 0.0,
                 cache_write_usd: 0.0,
             }),
+        cost_basis: match row.get::<_, Option<String>>("cost_basis")?.as_deref() {
+            Some("provider") => crate::model::CostBasis::Provider,
+            Some("estimated") => crate::model::CostBasis::Estimated,
+            _ => crate::model::CostBasis::Unknown,
+        },
+        pricing_key: row.get("pricing_key")?,
         turn_count: row.get::<_, i64>("turn_count")? as u32,
         tool_call_count: row.get::<_, i64>("tool_call_count")? as u32,
         subagent_count: row.get::<_, i64>("subagent_count")? as u32,

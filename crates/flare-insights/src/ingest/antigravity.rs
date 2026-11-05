@@ -108,6 +108,7 @@ impl Adapter for AntigravityAdapter {
                             .map(|name| name.to_string_lossy().into_owned())
                             .unwrap_or_else(|| workspace.to_string_lossy().into_owned());
                         session.project_path = Some(workspace.to_string_lossy().into_owned());
+                        session.cwd = session.project_path.clone();
                     }
                 }
                 bundle.sessions.extend(b.sessions);
@@ -272,9 +273,10 @@ pub(crate) fn parse_antigravity_jsonl(path: &Path, pricing: &PricingTable) -> Op
         } else if typ == "PLANNER_RESPONSE" || source == "MODEL" {
             seq += 1;
             let assistant_text = v
-                .get("thinking")
-                .or_else(|| v.get("content"))
+                .get("content")
                 .and_then(|c| c.as_str())
+                .filter(|text| !text.is_empty())
+                .or_else(|| v.get("thinking").and_then(|c| c.as_str()))
                 .map(str::to_string);
 
             let t = extract_tokens(v);
@@ -367,14 +369,9 @@ pub(crate) fn parse_antigravity_jsonl(path: &Path, pricing: &PricingTable) -> Op
         }
     }
 
-    let model_str = model.unwrap_or_else(|| "gemini".to_string());
-    let cost = {
-        let c = pricing.cost_for(Some(&model_str), &tokens);
-        if c.total_usd > 0.0 {
-            Some(c)
-        } else {
-            None
-        }
+    let (cost, cost_basis, pricing_key) = match pricing.cost_for(model.as_deref(), &tokens) {
+        Some((cost, key)) => (Some(cost), crate::model::CostBasis::Estimated, Some(key)),
+        None => (None, crate::model::CostBasis::Unknown, None),
     };
 
     let duration_secs = match (started_at, updated_at) {
@@ -386,9 +383,10 @@ pub(crate) fn parse_antigravity_jsonl(path: &Path, pricing: &PricingTable) -> Op
         id: id.clone(),
         source: SessionSource::Antigravity,
         project,
+        cwd: project_path.clone(),
         project_path,
         title,
-        model: Some(model_str),
+        model,
         status: SessionStatus::Completed,
         awaiting_reason: None,
         started_at,
@@ -397,13 +395,14 @@ pub(crate) fn parse_antigravity_jsonl(path: &Path, pricing: &PricingTable) -> Op
         duration_secs,
         tokens,
         cost,
+        cost_basis,
+        pricing_key,
         turn_count: turns.len() as u32,
         tool_call_count: tool_calls.len() as u32,
         subagent_count: subagents.len() as u32,
         tags: vec![],
         starred: false,
         pid: None,
-        cwd: None,
     };
 
     Some(IngestBundle {
@@ -491,6 +490,59 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
     use tempfile::TempDir;
+
+    #[test]
+    fn antigravity_falls_back_to_thinking_when_content_empty() {
+        for content in [serde_json::Value::Null, serde_json::json!("")] {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("session.jsonl");
+            std::fs::write(&path, serde_json::json!({"type":"PLANNER_RESPONSE", "content": content, "thinking":"Reasoning"}).to_string()).unwrap();
+            let bundle = parse_antigravity_jsonl(&path, &PricingTable::default()).unwrap();
+            assert_eq!(bundle.turns[0].assistant_text.as_deref(), Some("Reasoning"));
+        }
+    }
+
+    #[test]
+    fn antigravity_keeps_content_when_thinking_present() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        std::fs::write(&path, r#"{"type":"PLANNER_RESPONSE","source":"MODEL","content":"Final answer","thinking":"Private reasoning"}"#).unwrap();
+        let bundle = parse_antigravity_jsonl(&path, &PricingTable::default()).unwrap();
+        assert_eq!(
+            bundle.turns[0].assistant_text.as_deref(),
+            Some("Final answer")
+        );
+    }
+
+    #[test]
+    fn antigravity_missing_model_is_none_and_basis_unknown() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        std::fs::write(&path, r#"{"type":"PLANNER_RESPONSE","source":"MODEL","content":"Answer","input_tokens":100,"output_tokens":20}"#).unwrap();
+        let bundle = parse_antigravity_jsonl(&path, &PricingTable::default()).unwrap();
+        let session = &bundle.sessions[0];
+        assert!(session.model.is_none());
+        assert!(session.cost.is_none());
+        assert_eq!(session.cost_basis, crate::model::CostBasis::Unknown);
+        assert!(session.pricing_key.is_none());
+    }
+
+    #[test]
+    fn antigravity_known_model_records_estimate_and_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        std::fs::write(&path, concat!(
+            "{\"type\":\"USER_INPUT\",\"content\":\"Active Workspaces: /tmp/project\"}\n",
+            "{\"type\":\"PLANNER_RESPONSE\",\"model\":\"gemini-test\",\"content\":\"Answer\",\"input_tokens\":1000000}"
+        )).unwrap();
+        let bundle = parse_antigravity_jsonl(&path, &PricingTable::default()).unwrap();
+        let session = &bundle.sessions[0];
+        assert_eq!(session.cost_basis, crate::model::CostBasis::Estimated);
+        assert_eq!(session.pricing_key.as_deref(), Some("gemini"));
+        assert_eq!(session.cost.as_ref().unwrap().total_usd, 1.25);
+        assert_eq!(session.project_path.as_deref(), Some("/tmp/project"));
+        assert_eq!(session.cwd, session.project_path);
+    }
 
     #[test]
     fn empty_dir_returns_empty() {
@@ -625,6 +677,7 @@ mod tests {
             workspace.to_str()
         );
         assert_eq!(refreshed.sessions[0].project, "my project");
+        assert_eq!(refreshed.sessions[0].cwd.as_deref(), workspace.to_str());
         assert_eq!(
             std::fs::read(&db).unwrap(),
             before,
