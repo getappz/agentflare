@@ -254,10 +254,10 @@ fn classify(docs: &[&Doc], distinct_sessions: usize) -> (Destination, String) {
     )
 }
 
-fn query_turns(
-    store: &InsightsStore,
-    ids: &[&str],
-) -> anyhow::Result<Vec<(String, u32, Option<String>, bool)>> {
+/// (session id, seq, user text, has a valid timestamp)
+type TurnRow = (String, u32, Option<String>, bool);
+
+fn query_turns(store: &InsightsStore, ids: &[&str]) -> anyhow::Result<Vec<TurnRow>> {
     let conn = &store.conn;
     let mut out = Vec::new();
     for chunk in ids.chunks(500) {
