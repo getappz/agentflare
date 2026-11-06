@@ -242,17 +242,7 @@ impl InsightsStore {
             r#"INSERT INTO tool_calls(id, session_id, turn_seq, name, input, output, status, duration_ms, created_at)
                VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
                ON CONFLICT(id) DO UPDATE SET session_id=excluded.session_id, turn_seq=excluded.turn_seq, name=excluded.name, input=excluded.input, output=excluded.output, status=excluded.status, duration_ms=excluded.duration_ms, created_at=excluded.created_at"#,
-            params![
-                tc.id,
-                tc.session_id,
-                tc.turn_seq as i64,
-                tc.name,
-                serde_json::to_string(&tc.input).unwrap(),
-                tc.output,
-                tc.status,
-                tc.duration_ms.map(|v| v as i64),
-                tc.created_at.map(|v| v.to_rfc3339()),
-            ],
+            rusqlite::params_from_iter(tool_call_params(tc)),
         )?;
         Ok(())
     }
@@ -264,17 +254,7 @@ impl InsightsStore {
                 r#"INSERT INTO tool_calls(id, session_id, turn_seq, name, input, output, status, duration_ms, created_at)
                    VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
                     ON CONFLICT(id) DO UPDATE SET session_id=excluded.session_id, turn_seq=excluded.turn_seq, name=excluded.name, input=excluded.input, output=excluded.output, status=excluded.status, duration_ms=excluded.duration_ms, created_at=excluded.created_at"#,
-                params![
-                    tc.id,
-                    tc.session_id,
-                    tc.turn_seq as i64,
-                    tc.name,
-                    serde_json::to_string(&tc.input).unwrap(),
-                    tc.output,
-                    tc.status,
-                    tc.duration_ms.map(|v| v as i64),
-                    tc.created_at.map(|v| v.to_rfc3339()),
-                ],
+                rusqlite::params_from_iter(tool_call_params(tc)),
             )?;
         }
         tx.commit()?;
@@ -406,40 +386,180 @@ impl InsightsStore {
     ) -> Result<(), StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         for (path, mtime_ms, size) in entries {
-            tx.execute(
-                "INSERT INTO ingest_file_cursors(source, path, mtime_ms, size) VALUES (?1,?2,?3,?4)
-                 ON CONFLICT(source, path) DO UPDATE SET mtime_ms=excluded.mtime_ms, size=excluded.size",
-                params![source, path.to_string_lossy(), mtime_ms, *size as i64],
-            )?;
+            exec_upsert_file_cursor(&tx, source, path, *mtime_ms, *size)?;
         }
         tx.commit()?;
         Ok(())
     }
 
-    /// DRY transactional session+turns+tools+files+subagents
-    pub fn upsert_session_bundle(
+    /// Commit one source's scan atomically: every session in the bundle has
+    /// its children replaced (delete + plain insert, so a rewritten file with
+    /// shifted `seq` numbers cannot collide), then the file cursors advance.
+    /// Any failure rolls the whole bundle back, cursors included, so the
+    /// files are re-read on the next sync instead of hidden until `--force`.
+    pub fn commit_ingest(
         &self,
-        s: &Session,
-        turns: &[Turn],
-        tools: &[ToolCall],
-        files: &[crate::model::FileEvent],
-        subs: &[crate::model::Subagent],
-    ) -> Result<(), StoreError> {
-        self.upsert_session(s)?;
-        if !turns.is_empty() {
-            self.upsert_turns_batch(turns)?;
+        source: &str,
+        bundle: &crate::ingest::IngestBundle,
+    ) -> Result<IngestStats, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut stats = IngestStats::default();
+        for s in &bundle.sessions {
+            for table in ["turns", "tool_calls", "file_events", "subagents"] {
+                tx.execute(
+                    &format!("DELETE FROM {table} WHERE session_id=?1"),
+                    params![s.id],
+                )?;
+            }
+            exec_upsert_session(&tx, s)?;
+            stats.sessions += 1;
         }
-        if !tools.is_empty() {
-            self.upsert_tool_calls_batch(tools)?;
+        for t in &bundle.turns {
+            stats.turns += tx.execute(
+                "INSERT INTO turns(id, session_id, seq, user_text, assistant_text, started_at, ended_at, input_tokens, output_tokens, cost_usd, cache_read_tokens, cache_write_tokens, reasoning_tokens)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                rusqlite::params_from_iter(turn_params(t)),
+            )?;
         }
-        if !files.is_empty() {
-            self.upsert_file_events_batch(files)?;
+        for tc in last_per_id(&bundle.tool_calls, |t| (&t.session_id, &t.id)) {
+            // A moved call keeps its subagent links, which live in the owning session.
+            if let Some((owner, new_id)) =
+                move_foreign_row_aside(&tx, "tool_calls", &tc.id, &tc.session_id)?
+            {
+                tx.execute(
+                    "UPDATE subagents SET parent_tool_call_id = ?1
+                     WHERE parent_tool_call_id = ?2 AND session_id = ?3",
+                    params![new_id, tc.id, owner],
+                )?;
+            }
+            stats.tool_calls += tx.execute(
+                "INSERT INTO tool_calls(id, session_id, turn_seq, name, input, output, status, duration_ms, created_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                rusqlite::params_from_iter(tool_call_params(tc)),
+            )?;
         }
-        if !subs.is_empty() {
-            self.upsert_subagents_batch(subs)?;
+        for e in &bundle.file_events {
+            stats.file_events += tx.execute(
+                "INSERT INTO file_events(id, session_id, path, kind, at) VALUES (?1,?2,?3,?4,?5)",
+                params![e.id, e.session_id, e.path, e.kind, e.at.to_rfc3339()],
+            )?;
         }
-        Ok(())
+        for s in last_per_id(&bundle.subagents, |s| (&s.session_id, &s.id)) {
+            move_foreign_row_aside(&tx, "subagents", &s.id, &s.session_id)?;
+            stats.subagents += tx.execute(
+                "INSERT INTO subagents(id, session_id, parent_tool_call_id, kind, status, task) VALUES (?1,?2,?3,?4,?5,?6)",
+                params![s.id, s.session_id, s.parent_tool_call_id, s.kind, s.status, s.task],
+            )?;
+        }
+        for (path, mtime_ms, size) in &bundle.file_cursors {
+            exec_upsert_file_cursor(&tx, source, path, *mtime_ms, *size)?;
+        }
+        tx.commit()?;
+        Ok(stats)
     }
+}
+
+/// Keep only the last row per `(session_id, id)`, in original order. A
+/// transcript can repeat a child id; a plain INSERT would fail and roll back
+/// the whole source, so the repeat replaces the earlier row as upserts used to.
+fn last_per_id<'a, T>(items: &'a [T], key: impl Fn(&'a T) -> (&'a str, &'a str)) -> Vec<&'a T> {
+    let last: std::collections::HashMap<_, _> =
+        items.iter().enumerate().map(|(i, t)| (key(t), i)).collect();
+    items
+        .iter()
+        .enumerate()
+        .filter(|(i, t)| last[&key(t)] == *i)
+        .map(|(_, t)| t)
+        .collect()
+}
+
+/// Child ids are global primary keys. A row another session already holds under
+/// `id` (a pre-scoping id that happens to read `session:raw`) must not roll back
+/// this source's commit, so re-key it to a free id within its own session and
+/// keep it there. Returns the owning session and the row's new id when one moved.
+fn move_foreign_row_aside(
+    conn: &Connection,
+    table: &str,
+    id: &str,
+    session_id: &str,
+) -> Result<Option<(String, String)>, StoreError> {
+    let owner: Option<String> = conn
+        .query_row(
+            &format!("SELECT session_id FROM {table} WHERE id = ?1 AND session_id <> ?2"),
+            params![id, session_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(owner) = owner else {
+        return Ok(None);
+    };
+    let mut new_id = format!("{owner}:{id}");
+    while conn
+        .query_row(
+            &format!("SELECT 1 FROM {table} WHERE id = ?1"),
+            params![new_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some()
+    {
+        new_id = format!("{owner}:{new_id}");
+    }
+    conn.execute(
+        &format!("UPDATE {table} SET id = ?1 WHERE id = ?2"),
+        params![new_id, id],
+    )?;
+    Ok(Some((owner, new_id)))
+}
+
+/// Rows written by one [`InsightsStore::commit_ingest`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct IngestStats {
+    pub sessions: usize,
+    pub turns: usize,
+    pub tool_calls: usize,
+    pub file_events: usize,
+    pub subagents: usize,
+}
+
+impl std::ops::AddAssign for IngestStats {
+    fn add_assign(&mut self, o: Self) {
+        self.sessions += o.sessions;
+        self.turns += o.turns;
+        self.tool_calls += o.tool_calls;
+        self.file_events += o.file_events;
+        self.subagents += o.subagents;
+    }
+}
+
+fn exec_upsert_file_cursor(
+    conn: &Connection,
+    source: &str,
+    path: &Path,
+    mtime_ms: i64,
+    size: u64,
+) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT INTO ingest_file_cursors(source, path, mtime_ms, size) VALUES (?1,?2,?3,?4)
+         ON CONFLICT(source, path) DO UPDATE SET mtime_ms=excluded.mtime_ms, size=excluded.size",
+        params![source, path.to_string_lossy(), mtime_ms, size as i64],
+    )?;
+    Ok(())
+}
+
+/// Positional params shared by the tool_call upserts and `commit_ingest` (`?1..?9`).
+fn tool_call_params(tc: &ToolCall) -> [Box<dyn rusqlite::ToSql + '_>; 9] {
+    [
+        Box::new(&tc.id),
+        Box::new(&tc.session_id),
+        Box::new(tc.turn_seq as i64),
+        Box::new(&tc.name),
+        Box::new(serde_json::to_string(&tc.input).unwrap()),
+        Box::new(&tc.output),
+        Box::new(&tc.status),
+        Box::new(tc.duration_ms.map(|v| v as i64)),
+        Box::new(tc.created_at.map(|v| v.to_rfc3339())),
+    ]
 }
 
 fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
@@ -652,4 +772,239 @@ fn row_to_tool_call(row: &rusqlite::Row) -> rusqlite::Result<ToolCall> {
         duration_ms: row.get::<_, Option<i64>>("duration_ms")?.map(|v| v as u64),
         created_at: created.and_then(|s| s.parse::<DateTime<Utc>>().ok()),
     })
+}
+
+#[cfg(test)]
+mod commit_tests {
+    use super::*;
+    use crate::ingest::IngestBundle;
+    use crate::migrations::tests::session;
+
+    fn turn(id: &str, session_id: &str, seq: u32) -> Turn {
+        Turn {
+            id: id.into(),
+            session_id: session_id.into(),
+            seq,
+            user_text: Some(format!("turn {id}")),
+            assistant_text: None,
+            started_at: None,
+            ended_at: None,
+            tokens: None,
+            cost_usd: None,
+        }
+    }
+
+    fn tool_call(id: &str, session_id: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            session_id: session_id.into(),
+            turn_seq: 1,
+            name: "Read".into(),
+            input: serde_json::json!({}),
+            output: None,
+            status: "ok".into(),
+            duration_ms: None,
+            created_at: None,
+        }
+    }
+
+    fn bundle(sessions: Vec<Session>, turns: Vec<Turn>) -> IngestBundle {
+        IngestBundle {
+            sessions,
+            turns,
+            file_cursors: vec![(PathBuf::from("/logs/s1.jsonl"), 10, 20)],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn failed_commit_leaves_cursor_unadvanced() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        let b = bundle(vec![session("s1")], vec![turn("t1", "not-in-bundle", 1)]);
+        assert!(store.commit_ingest("claude_code", &b).is_err());
+        assert!(store.load_file_cursors("claude_code").unwrap().is_empty());
+        assert!(store.get_session("s1").unwrap().is_none());
+    }
+
+    #[test]
+    fn second_commit_does_not_duplicate_children() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        let mut b = bundle(
+            vec![session("s1")],
+            vec![turn("a", "s1", 1), turn("b", "s1", 2)],
+        );
+        b.tool_calls = vec![tool_call("tc1", "s1")];
+        b.file_events = vec![crate::model::FileEvent {
+            id: "fe1".into(),
+            session_id: "s1".into(),
+            path: "/p".into(),
+            kind: "edit".into(),
+            at: Utc::now(),
+        }];
+        b.subagents = vec![crate::model::Subagent {
+            id: "sub1".into(),
+            session_id: "s1".into(),
+            parent_tool_call_id: None,
+            kind: "task".into(),
+            status: "done".into(),
+            task: None,
+        }];
+        let first = store.commit_ingest("claude_code", &b).unwrap();
+        let second = store.commit_ingest("claude_code", &b).unwrap();
+        assert_eq!(first, second);
+        assert_eq!((first.sessions, first.turns, first.tool_calls), (1, 2, 1));
+        assert_eq!((first.file_events, first.subagents), (1, 1));
+        assert_eq!(store.get_turns("s1").unwrap().len(), 2);
+        assert_eq!(store.get_tool_calls("s1").unwrap().len(), 1);
+        assert_eq!(store.get_file_events("s1").unwrap().len(), 1);
+        assert_eq!(store.get_subagents("s1").unwrap().len(), 1);
+        let cursors = store.load_file_cursors("claude_code").unwrap();
+        assert_eq!(cursors.get(Path::new("/logs/s1.jsonl")), Some(&(10, 20)));
+    }
+
+    #[test]
+    fn repeated_child_ids_in_one_session_do_not_roll_back() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        let mut b = bundle(vec![session("s1")], vec![turn("a", "s1", 1)]);
+        let mut dup = tool_call("tc1", "s1");
+        dup.name = "second".into();
+        b.tool_calls = vec![tool_call("tc1", "s1"), dup];
+        let sub = |task: &str| crate::model::Subagent {
+            id: "sub1".into(),
+            session_id: "s1".into(),
+            parent_tool_call_id: None,
+            kind: "task".into(),
+            status: "done".into(),
+            task: Some(task.into()),
+        };
+        b.subagents = vec![sub("old"), sub("new")];
+        let stats = store.commit_ingest("claude_code", &b).unwrap();
+        assert_eq!((stats.tool_calls, stats.subagents), (1, 1));
+        assert_eq!(store.get_tool_calls("s1").unwrap()[0].name, "second");
+        assert_eq!(
+            store.get_subagents("s1").unwrap()[0].task.as_deref(),
+            Some("new")
+        );
+    }
+
+    #[test]
+    fn legacy_row_holding_a_scoped_id_is_kept_and_does_not_block_the_commit() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        let sub = |id: &str, session: &str, parent: Option<&str>| crate::model::Subagent {
+            id: id.into(),
+            session_id: session.into(),
+            parent_tool_call_id: parent.map(str::to_string),
+            kind: "task".into(),
+            status: "done".into(),
+            task: None,
+        };
+        let mut legacy = bundle(vec![session("old")], vec![]);
+        let mut legacy_call = tool_call("s:call", "old");
+        legacy_call.name = "legacy".into();
+        legacy.tool_calls = vec![legacy_call];
+        legacy.subagents = vec![sub("s:sub", "old", Some("s:call"))];
+        store.commit_ingest("codex", &legacy).unwrap();
+
+        let mut new = bundle(vec![session("s")], vec![]);
+        new.tool_calls = vec![tool_call("s:call", "s")];
+        new.subagents = vec![sub("s:sub", "s", Some("s:call"))];
+        new.file_cursors = vec![("/s.jsonl".into(), 1, 1)];
+        let stats = store.commit_ingest("codex", &new).unwrap();
+        assert_eq!((stats.tool_calls, stats.subagents), (1, 1));
+        assert!(store
+            .load_file_cursors("codex")
+            .unwrap()
+            .contains_key(std::path::Path::new("/s.jsonl")));
+
+        assert_eq!(store.get_tool_calls("s").unwrap()[0].id, "s:call");
+        let kept = store.get_tool_calls("old").unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            (kept[0].id.as_str(), kept[0].name.as_str()),
+            ("old:s:call", "legacy")
+        );
+        let kept_sub = store.get_subagents("old").unwrap();
+        assert_eq!(kept_sub[0].id, "old:s:sub");
+        assert_eq!(
+            kept_sub[0].parent_tool_call_id.as_deref(),
+            Some("old:s:call")
+        );
+        assert_eq!(
+            store.get_subagents("s").unwrap()[0]
+                .parent_tool_call_id
+                .as_deref(),
+            Some("s:call")
+        );
+    }
+
+    #[test]
+    fn occupied_rekey_destination_does_not_block_the_commit() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        let sub = |id: &str, session: &str, parent: Option<&str>| crate::model::Subagent {
+            id: id.into(),
+            session_id: session.into(),
+            parent_tool_call_id: parent.map(str::to_string),
+            kind: "task".into(),
+            status: "done".into(),
+            task: None,
+        };
+        let mut legacy = bundle(vec![session("old")], vec![]);
+        legacy.tool_calls = vec![tool_call("s:call", "old"), tool_call("old:s:call", "old")];
+        legacy.subagents = vec![
+            sub("s:sub", "old", Some("s:call")),
+            sub("old:s:sub", "old", Some("old:s:call")),
+        ];
+        store.commit_ingest("codex", &legacy).unwrap();
+
+        let mut new = bundle(vec![session("s")], vec![]);
+        new.tool_calls = vec![tool_call("s:call", "s")];
+        new.subagents = vec![sub("s:sub", "s", Some("s:call"))];
+        new.file_cursors = vec![("/s.jsonl".into(), 1, 1)];
+        store.commit_ingest("codex", &new).unwrap();
+        assert!(store
+            .load_file_cursors("codex")
+            .unwrap()
+            .contains_key(std::path::Path::new("/s.jsonl")));
+
+        assert_eq!(store.get_tool_calls("s").unwrap()[0].id, "s:call");
+        let mut kept: Vec<_> = store
+            .get_tool_calls("old")
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        kept.sort();
+        assert_eq!(kept, ["old:old:s:call", "old:s:call"]);
+        let parents: std::collections::HashMap<_, _> = store
+            .get_subagents("old")
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.id, s.parent_tool_call_id))
+            .collect();
+        assert_eq!(parents["old:old:s:sub"].as_deref(), Some("old:old:s:call"));
+        assert_eq!(parents["old:s:sub"].as_deref(), Some("old:s:call"));
+    }
+
+    #[test]
+    fn rewrite_with_shifted_seq_succeeds() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        let b = bundle(
+            vec![session("s1")],
+            vec![turn("a", "s1", 1), turn("b", "s1", 2), turn("c", "s1", 3)],
+        );
+        store.commit_ingest("claude_code", &b).unwrap();
+        let b = bundle(
+            vec![session("s1")],
+            vec![turn("d", "s1", 1), turn("e", "s1", 2)],
+        );
+        let stats = store.commit_ingest("claude_code", &b).unwrap();
+        assert_eq!(stats.turns, 2);
+        let ids: Vec<String> = store
+            .get_turns("s1")
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(ids, ["d", "e"]);
+    }
 }

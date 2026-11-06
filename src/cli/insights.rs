@@ -165,11 +165,8 @@ fn run_sync(db: PathBuf, args: SyncArgs) {
     let store = open_store(db.clone());
     let config = flare_insights::config::InsightsConfig::default();
     let mgr = flare_insights::ingest::IngestManager::new();
-    let mut total_sessions = 0;
-    let mut total_turns = 0;
-    let mut total_tools = 0;
-    let mut total_files = 0;
-    let mut total_subs = 0;
+    let mut totals = flare_insights::store::IngestStats::default();
+    let mut failed_sources = 0usize;
     let mut printed_progress = false;
     let empty_cursors = args
         .force
@@ -193,41 +190,30 @@ fn run_sync(db: PathBuf, args: SyncArgs) {
     }
     for (source, res) in results {
         match res {
-            Ok(bundle) => {
-                println!(
-                    "{source}: {} sessions {} turns {} tools",
-                    bundle.sessions.len(),
-                    bundle.turns.len(),
-                    bundle.tool_calls.len()
-                );
-                // DRY: transactional bundle via store helpers
-                let _ = store.upsert_sessions_batch(&bundle.sessions);
-                if !bundle.turns.is_empty() {
-                    let _ = store.upsert_turns_batch(&bundle.turns);
+            // One transaction per source: cursors only advance when every row landed.
+            Ok(bundle) => match store.commit_ingest(&source, &bundle) {
+                Ok(stats) => {
+                    println!(
+                        "{source}: {} sessions {} turns {} tools",
+                        stats.sessions, stats.turns, stats.tool_calls
+                    );
+                    totals += stats;
                 }
-                if !bundle.tool_calls.is_empty() {
-                    let _ = store.upsert_tool_calls_batch(&bundle.tool_calls);
+                Err(e) => {
+                    eprintln!("{source}: error committing: {e}");
+                    failed_sources += 1;
                 }
-                if !bundle.file_events.is_empty() {
-                    let _ = store.upsert_file_events_batch(&bundle.file_events);
-                }
-                if !bundle.subagents.is_empty() {
-                    let _ = store.upsert_subagents_batch(&bundle.subagents);
-                }
-                if !bundle.file_cursors.is_empty() {
-                    let _ = store.upsert_file_cursors_batch(&source, &bundle.file_cursors);
-                }
-                total_sessions += bundle.sessions.len();
-                total_turns += bundle.turns.len();
-                total_tools += bundle.tool_calls.len();
-                total_files += bundle.file_events.len();
-                total_subs += bundle.subagents.len();
-            }
+            },
             Err(e) => eprintln!("{source}: error {e}"),
         }
     }
     println!(
-        "synced {total_sessions} sessions {total_turns} turns {total_tools} tools {total_files} files {total_subs} subs -> {}",
+        "synced {} sessions {} turns {} tools {} files {} subs -> {}",
+        totals.sessions,
+        totals.turns,
+        totals.tool_calls,
+        totals.file_events,
+        totals.subagents,
         db.display()
     );
     if args.prune_days > 0 {
@@ -236,6 +222,9 @@ fn run_sync(db: PathBuf, args: SyncArgs) {
             Ok(n) => println!("pruned {n} sessions older than {} days", args.prune_days),
             Err(e) => eprintln!("prune error: {e}"),
         }
+    }
+    if failed_sources > 0 {
+        std::process::exit(1);
     }
 }
 
