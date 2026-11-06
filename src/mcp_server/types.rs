@@ -1481,7 +1481,7 @@ pub(crate) struct SearchRequest {
     #[schemars(description = "Search query")]
     pub(crate) query: String,
     #[schemars(
-        description = "Search type: 'store' (default, FTS across store docs), 'memory' (brain.db observations), 'session' (past agent sessions under the current dir, local insights index; use the insights tool with project="*" for all), 'code' (leanctx ctx_search), 'web' (rivalsearch internet), 'social' (9 platforms), 'news' (5 sources), 'github' (repos), 'academic' (papers), 'datasets' (hubs), 'websites' (crawl), 'weather' (Open-Meteo), 'financial' (SEC), 'crypto' (CoinGecko), 'fx' (ECB rates), 'indicators' (World Bank), 'youtube' (transcripts), 'bluesky' (profiles), 'all' (fan out to store+memory+code, fused by RRF k=60 into one ranked hit list), 'all+web' (all plus the web arm)"
+        description = "Search type: 'store' (default, FTS across store docs), 'memory' (brain.db observations), 'session' (past agent sessions under the current dir, local insights index; use the insights tool with project=\"*\" for all), 'code' (leanctx ctx_search), 'web' (rivalsearch internet), 'social' (9 platforms), 'news' (5 sources), 'github' (repos), 'academic' (papers), 'datasets' (hubs), 'websites' (crawl), 'weather' (Open-Meteo), 'financial' (SEC), 'crypto' (CoinGecko), 'fx' (ECB rates), 'indicators' (World Bank), 'youtube' (transcripts), 'bluesky' (profiles), 'all' (fan out to store+memory+code, fused by RRF k=60 into one ranked hit list), 'all+web' (all plus the web arm)"
     )]
     #[serde(default)]
     pub(crate) r#type: Option<String>,
