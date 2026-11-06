@@ -9,12 +9,7 @@ impl AgentflareMcp {
             "memory" => self.search_memory(&req),
             "web" => self.search_web(&req).await,
             "store" => self.search_store(&req),
-            "session" | "sessions" => self.insights_impl(InsightsRequest {
-                action: "search".into(),
-                query: Some(req.query.clone()),
-                limit: req.limit,
-                ..Default::default()
-            }),
+            "session" | "sessions" => self.search_sessions(&req),
             "all" => self.search_all(&req, false).await,
             "all+web" => self.search_all(&req, true).await,
             "social" => self.search_social(&req).await,

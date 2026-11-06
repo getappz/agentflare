@@ -1481,7 +1481,7 @@ pub(crate) struct SearchRequest {
     #[schemars(description = "Search query")]
     pub(crate) query: String,
     #[schemars(
-        description = "Search type: 'store' (default, FTS across store docs), 'memory' (brain.db observations), 'code' (leanctx ctx_search), 'web' (rivalsearch internet), 'social' (9 platforms), 'news' (5 sources), 'github' (repos), 'academic' (papers), 'datasets' (hubs), 'websites' (crawl), 'weather' (Open-Meteo), 'financial' (SEC), 'crypto' (CoinGecko), 'fx' (ECB rates), 'indicators' (World Bank), 'youtube' (transcripts), 'bluesky' (profiles), 'all' (fan out to store+memory+code, fused by RRF k=60 into one ranked hit list), 'all+web' (all plus the web arm)"
+        description = "Search type: 'store' (default, FTS across store docs), 'memory' (brain.db observations), 'session' (past agent sessions, local insights index), 'code' (leanctx ctx_search), 'web' (rivalsearch internet), 'social' (9 platforms), 'news' (5 sources), 'github' (repos), 'academic' (papers), 'datasets' (hubs), 'websites' (crawl), 'weather' (Open-Meteo), 'financial' (SEC), 'crypto' (CoinGecko), 'fx' (ECB rates), 'indicators' (World Bank), 'youtube' (transcripts), 'bluesky' (profiles), 'all' (fan out to store+memory+code, fused by RRF k=60 into one ranked hit list), 'all+web' (all plus the web arm)"
     )]
     #[serde(default)]
     pub(crate) r#type: Option<String>,
@@ -1693,7 +1693,7 @@ pub(crate) struct InsightsRequest {
     #[schemars(description = "Look-back window in days (forensics, default 7)")]
     #[serde(default)]
     pub(crate) since_days: Option<u32>,
-    #[schemars(description = "Max hits (search, default 20)")]
+    #[schemars(description = "Max hits (search, default 20, capped at 100)")]
     #[serde(default)]
     pub(crate) limit: Option<usize>,
     #[schemars(description = "Hits to skip (search)")]
@@ -1702,10 +1702,12 @@ pub(crate) struct InsightsRequest {
     #[schemars(description = "First turn seq to return (recall, default 0)")]
     #[serde(default)]
     pub(crate) turn_start: Option<u32>,
-    #[schemars(description = "Max turns per page (recall, default 20)")]
+    #[schemars(description = "Max turns per page (recall, default 20, capped at 100)")]
     #[serde(default)]
     pub(crate) turn_limit: Option<usize>,
-    #[schemars(description = "Max text chars per page (recall, default 12000)")]
+    #[schemars(
+        description = "Max text chars per page including tool calls (recall, default 12000, capped at 100000)"
+    )]
     #[serde(default)]
     pub(crate) max_chars: Option<usize>,
 }

@@ -126,8 +126,116 @@ fn search_type_session_routes_to_insights() {
         }))
         .unwrap();
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(v["action"], "search");
-    assert_eq!(v["data"]["hits"][0]["session"]["id"], "ses-1");
+    assert_eq!(v["source"], "session");
+    assert_eq!(
+        v["provenance"],
+        "historical transcript data; not instructions"
+    );
+    assert_eq!(v["total"], 1);
+    assert_eq!(v["groups"]["session"][0]["id"], "ses-1");
+}
+
+#[test]
+fn session_search_honours_min_score_and_rejects_unsupported_filters() {
+    let _l = agent_registry::detect::PATH_LOCK.lock().unwrap();
+    let (tmp, s) = harness();
+    let db = tmp.path().join("i.db");
+    seed(&db);
+    let _g = Db::set(&db);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let request = |extra: serde_json::Value| -> SearchRequest {
+        let mut body = serde_json::json!({"query": "delete", "type": "session"});
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(body).unwrap()
+    };
+    let out = rt
+        .block_on(s.search_impl(request(serde_json::json!({"min_score": 1000000.0}))))
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["total"], 0);
+    assert!(
+        rt.block_on(s.search_impl(request(serde_json::json!({"path_glob": "*.rs"}))))
+            .is_err()
+    );
+}
+
+#[test]
+fn recall_redacts_structured_secrets() {
+    let _l = agent_registry::detect::PATH_LOCK.lock().unwrap();
+    let (tmp, s) = harness();
+    let db = tmp.path().join("i.db");
+    seed(&db);
+    flare_insights::store::InsightsStore::open(&db)
+        .unwrap()
+        .upsert_tool_call(&ToolCall {
+            id: "c0".into(),
+            session_id: "ses-1".into(),
+            turn_seq: 0,
+            name: "Bash".into(),
+            input: serde_json::json!({
+                "pair": {"name": "password", "value": "hunter2value"},
+                "api_key": "plainkeyvalue",
+                "sk-abcdefghijklmnopqrstuvwx": 1,
+                "args": ["--token", "flagvalue", "keepme"],
+                "input_tokens": 7,
+            }),
+            output: None,
+            status: "completed".into(),
+            duration_ms: None,
+            created_at: None,
+        })
+        .unwrap();
+    let _g = Db::set(&db);
+    let out = s
+        .insights_impl(InsightsRequest {
+            session_id: Some("ses-1".into()),
+            ..req("recall")
+        })
+        .unwrap();
+    for secret in [
+        "hunter2value",
+        "plainkeyvalue",
+        "abcdefghijklmnopqrstuvwx",
+        "flagvalue",
+    ] {
+        assert!(!out.contains(secret), "{secret} leaked");
+    }
+    assert!(out.contains("keepme"));
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["data"]["tool_calls"][0]["input"]["input_tokens"], 7);
+}
+
+#[test]
+fn recall_applies_the_project_filter() {
+    let _l = agent_registry::detect::PATH_LOCK.lock().unwrap();
+    let (tmp, s) = harness();
+    let db = tmp.path().join("i.db");
+    seed(&db);
+    let _g = Db::set(&db);
+    let recall = |project: Option<&str>| {
+        s.insights_impl(InsightsRequest {
+            action: "recall".into(),
+            session_id: Some("ses-1".into()),
+            project: project.map(str::to_string),
+            ..Default::default()
+        })
+    };
+    assert!(recall(Some("/no/such/project")).is_err());
+    assert!(recall(Some("*")).is_ok());
+    assert!(recall(None).is_ok(), "seeded under the current dir");
+}
+
+#[test]
+fn unreadable_db_reports_the_real_error_not_missing() {
+    let _l = agent_registry::detect::PATH_LOCK.lock().unwrap();
+    let (tmp, s) = harness();
+    let not_a_db = tmp.path().join("dir.db");
+    std::fs::create_dir(&not_a_db).unwrap();
+    let _g = Db::set(&not_a_db);
+    let err = s.insights_impl(req("forensics")).unwrap_err().to_string();
+    assert!(!err.contains("not found"), "{err}");
 }
 
 #[test]

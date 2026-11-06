@@ -1,6 +1,7 @@
 //! Paged read of one session's turns and tool calls (the `recall` MCP action).
 
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::model::{Session, ToolCall, Turn};
 use crate::store::InsightsStore;
@@ -15,7 +16,8 @@ pub struct RecallPage {
     pub tool_calls: Vec<ToolCall>,
     /// Seq to pass as `turn_start` for the next page; `None` at the end.
     pub next_turn_start: Option<u32>,
-    /// True when the page was cut short by `max_chars` (not by `turn_limit`).
+    /// True when `max_chars` deferred later turns or omitted text on this page
+    /// (not when `turn_limit` alone ended it).
     pub truncated: bool,
 }
 
@@ -29,27 +31,45 @@ pub fn recall_page(
     turn_limit: usize,
     max_chars: usize,
 ) -> anyhow::Result<Option<RecallPage>> {
+    recall_page_scrubbed(
+        store,
+        source,
+        session_id,
+        turn_start,
+        turn_limit,
+        max_chars,
+        &|_| {},
+    )
+}
+
+/// [`recall_page`] with `scrub` applied before text is cut to `max_chars`, so a
+/// redactor sees whole values and cannot be defeated by a secret cut in half.
+pub fn recall_page_scrubbed(
+    store: &InsightsStore,
+    source: Option<&str>,
+    session_id: &str,
+    turn_start: u32,
+    turn_limit: usize,
+    max_chars: usize,
+    scrub: &dyn Fn(&mut Value),
+) -> anyhow::Result<Option<RecallPage>> {
     let Some(session) = store.get_session_by_provider_id(session_id)? else {
         return Ok(None);
     };
     if source.is_some_and(|s| s != session.source.as_str()) {
         return Ok(None);
     }
-    let mut rest: Vec<Turn> = store
-        .get_turns(&session.id)?
-        .into_iter()
-        .filter(|t| t.seq >= turn_start)
-        .collect();
-    rest.sort_by_key(|t| t.seq);
+    let limit = turn_limit.max(1);
+    // One extra turn tells us whether a next page exists.
+    let rest = store.get_turns_page(&session.id, turn_start, limit.saturating_add(1))?;
 
     let (mut turns, mut chars, mut truncated) = (Vec::new(), 0usize, false);
-    let mut iter = rest.into_iter();
     let mut next_turn_start = None;
-    for t in iter.by_ref() {
+    for t in rest {
         let len = t.user_text.as_deref().map_or(0, |s| s.chars().count())
             + t.assistant_text.as_deref().map_or(0, |s| s.chars().count());
         let over_chars = !turns.is_empty() && chars + len > max_chars;
-        if turns.len() >= turn_limit.max(1) || over_chars {
+        if turns.len() >= limit || over_chars {
             truncated = over_chars;
             next_turn_start = Some(t.seq);
             break;
@@ -57,12 +77,13 @@ pub fn recall_page(
         chars += len;
         turns.push(t);
     }
-    let seqs: std::collections::HashSet<u32> = turns.iter().map(|t| t.seq).collect();
-    let tool_calls = store
-        .get_tool_calls(&session.id)?
-        .into_iter()
-        .filter(|c| seqs.contains(&c.turn_seq))
-        .collect();
+    let mut tool_calls = match (turns.first(), turns.last()) {
+        (Some(first), Some(last)) => {
+            store.get_tool_calls_in_turns(&session.id, first.seq, last.seq)?
+        }
+        _ => Vec::new(),
+    };
+    truncated |= bound_text(&mut turns, &mut tool_calls, max_chars, scrub);
     Ok(Some(RecallPage {
         session,
         turns,
@@ -70,6 +91,64 @@ pub fn recall_page(
         next_turn_start,
         truncated,
     }))
+}
+
+/// Scrub all page text, then spend one `max_chars` budget across it, marking what
+/// is omitted. Returns whether anything was cut.
+fn bound_text(
+    turns: &mut [Turn],
+    tool_calls: &mut [ToolCall],
+    max_chars: usize,
+    scrub: &dyn Fn(&mut Value),
+) -> bool {
+    let mut left = max_chars;
+    let mut cut = false;
+    for t in turns.iter_mut() {
+        for text in [&mut t.user_text, &mut t.assistant_text]
+            .into_iter()
+            .flatten()
+        {
+            cut |= scrub_and_clip(text, &mut left, scrub);
+        }
+    }
+    for c in tool_calls.iter_mut() {
+        scrub(&mut c.input);
+        let n = if c.input.is_null() {
+            0
+        } else {
+            c.input.to_string().chars().count()
+        };
+        if n > left {
+            c.input = Value::String(format!("[{n} chars omitted]"));
+            cut = true;
+            left = 0;
+        } else {
+            left -= n;
+        }
+        if let Some(output) = c.output.as_mut() {
+            cut |= scrub_and_clip(output, &mut left, scrub);
+        }
+    }
+    cut
+}
+
+fn scrub_and_clip(text: &mut String, left: &mut usize, scrub: &dyn Fn(&mut Value)) -> bool {
+    let mut value = Value::String(std::mem::take(text));
+    scrub(&mut value);
+    *text = match value {
+        Value::String(s) => s,
+        other => other.to_string(),
+    };
+    let n = text.chars().count();
+    if n <= *left {
+        *left -= n;
+        return false;
+    }
+    let mut kept: String = text.chars().take(*left).collect();
+    kept.push_str(&format!("…[{} chars omitted]", n - *left));
+    *text = kept;
+    *left = 0;
+    true
 }
 
 #[cfg(test)]
@@ -168,5 +247,61 @@ mod tests {
         assert!(recall_page(&store, None, "nope", 0, 20, 12_000)
             .unwrap()
             .is_none());
+    }
+
+    fn big_call(sid: &str, seq: u32, input: Value, output: &str) -> ToolCall {
+        ToolCall {
+            id: format!("{sid}-c{seq}"),
+            session_id: sid.into(),
+            turn_seq: seq,
+            name: "Bash".into(),
+            input,
+            output: Some(output.into()),
+            status: "completed".into(),
+            duration_ms: None,
+            created_at: None,
+        }
+    }
+
+    #[test]
+    fn tool_text_is_bounded_by_max_chars_and_paging_still_progresses() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        store.upsert_session(&session("s1", 2)).unwrap();
+        store
+            .upsert_turns_batch(&[turn("s1", 0), turn("s1", 1)])
+            .unwrap();
+        let huge = "x".repeat(50_000);
+        store
+            .upsert_tool_call(&big_call("s1", 0, serde_json::json!({"cmd": huge}), &huge))
+            .unwrap();
+        let p = recall_page(&store, None, "s1", 0, 1, 1_000)
+            .unwrap()
+            .unwrap();
+        let call = &p.tool_calls[0];
+        assert!(p.truncated);
+        assert_eq!(call.input, "[50010 chars omitted]");
+        assert!(call.output.as_deref().unwrap().len() < 1_100);
+        assert!(call.output.as_deref().unwrap().contains("chars omitted]"));
+        assert_eq!(p.next_turn_start, Some(1));
+    }
+
+    #[test]
+    fn scrub_runs_before_text_is_cut() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        store.upsert_session(&session("s1", 1)).unwrap();
+        let mut t = turn("s1", 0);
+        t.user_text = Some("SECRETVALUE".into());
+        t.assistant_text = None;
+        store.upsert_turns_batch(&[t]).unwrap();
+        let scrub = |v: &mut Value| {
+            if let Value::String(s) = v {
+                *s = s.replace("SECRETVALUE", "R");
+            }
+        };
+        let p = recall_page_scrubbed(&store, None, "s1", 0, 1, 4, &scrub)
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.turns[0].user_text.as_deref(), Some("R"));
+        assert!(!p.truncated);
     }
 }
