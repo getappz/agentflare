@@ -192,11 +192,10 @@ fn route_request(
                 .map(|(t, _)| t.elapsed() < STATS_CACHE_TTL)
                 .unwrap_or(false);
             if !fresh {
-                let sessions = store.list_sessions(10000, 0).unwrap_or_default();
-                let tools = store.list_tool_calls(100000).unwrap_or_default();
-                let files = store.list_file_events(100000).unwrap_or_default();
-                let analytics =
-                    crate::analytics::compute_analytics_with_tools(&sessions, &tools, &files);
+                let analytics = match store.stats_window(&Default::default()) {
+                    Ok(a) => a,
+                    Err(e) => return (500, serde_json::json!({"error": e.to_string()})),
+                };
                 *cache = Some((Instant::now(), serde_json::to_value(&analytics).unwrap()));
             }
             (200, cache.as_ref().unwrap().1.clone())
@@ -320,7 +319,7 @@ async function load(){
     <div class="stat"><div class="label">Sessions</div><div class="value">${stats.total_sessions ?? 0}</div></div>
     <div class="stat"><div class="label">Tokens</div><div class="value">${fmtTokens(stats.total_tokens)}</div></div>
     <div class="stat"><div class="label">Cost</div><div class="value">${fmtCost(stats.total_cost_usd)}</div></div>
-    <div class="stat"><div class="label">Cache hit</div><div class="value">${((stats.cache_hit_rate ?? 0) * 100).toFixed(0)}%</div></div>
+    <div class="stat"><div class="label">Cache read share</div><div class="value">${stats.cache_read_share == null ? '-' : (stats.cache_read_share * 100).toFixed(0) + '%'}</div></div>
   `;
   document.querySelector('#sessions tbody').innerHTML = sessions.map(s => `
     <tr>
