@@ -288,3 +288,20 @@ fn inaccessible_db_path_reports_the_real_error_not_missing() {
         assert!(!err.contains("not found"), "{err}");
     }
 }
+
+#[test]
+fn discover_rejects_a_source_filter() {
+    let _l = agent_registry::detect::PATH_LOCK.lock().unwrap();
+    let (tmp, s) = harness();
+    let db = tmp.path().join("i.db");
+    seed(&db);
+    let _g = Db::set(&db);
+    assert!(s.insights_impl(req("discover")).is_ok());
+    assert!(
+        s.insights_impl(InsightsRequest {
+            source: Some("codex".into()),
+            ..req("discover")
+        })
+        .is_err()
+    );
+}

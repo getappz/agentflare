@@ -44,6 +44,7 @@ pub async fn serve(db_path: PathBuf, port: u16) -> anyhow::Result<()> {
     println!("  GET /api/search?q=hello&limit=20");
     println!("  GET /api/stats");
     println!("  GET /api/forensics?days=7&project=/path");
+    println!("  GET /api/discover?days=30&project=/path");
 
     let state = Arc::new(AppState {
         read_store: Mutex::new(InsightsStore::open(&db_path)?),
@@ -109,13 +110,20 @@ async fn handle_conn(
         return write_html_response(socket, &html).await;
     }
 
-    // Forensics scans whole tables, so it gets its own connection on a blocking
-    // thread rather than holding the shared read lock against every other route.
-    let (status, body) = if route == "/api/forensics" {
+    // Forensics/discover scan whole tables, so they get their own connection on a
+    // blocking thread rather than holding the shared read lock against every other route.
+    let (status, body) = if route == "/api/forensics" || route == "/api/discover" {
         let db_path = state.db_path.clone();
         let query = query.map(str::to_string);
+        let route = route.to_string();
         tokio::task::spawn_blocking(move || match InsightsStore::open_read_only(&db_path) {
-            Ok(store) => forensics_response(&store, query.as_deref()),
+            Ok(store) => {
+                if route == "/api/discover" {
+                    discover_response(&store, query.as_deref())
+                } else {
+                    forensics_response(&store, query.as_deref())
+                }
+            }
             Err(e) => (500, serde_json::json!({"error": e.to_string()})),
         })
         .await?
@@ -141,6 +149,30 @@ fn forensics_response(store: &InsightsStore, query: Option<&str>) -> (u16, serde
         session_id: params.get("session").cloned(),
     };
     match crate::forensics::compute(store, &opts, chrono::Utc::now()) {
+        Ok(r) => (200, serde_json::to_value(&r).unwrap()),
+        Err(e) => (500, serde_json::json!({"error": e.to_string()})),
+    }
+}
+
+fn discover_response(store: &InsightsStore, query: Option<&str>) -> (u16, serde_json::Value) {
+    let params = parse_query(query);
+    let opts = crate::discover::DiscoverOptions {
+        days: params
+            .get("days")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30),
+        project_prefix: params.get("project").cloned(),
+        min_sessions: params
+            .get("min_sessions")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2),
+        min_count: params
+            .get("min_count")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3),
+        jaccard_threshold: crate::discover::DEFAULT_JACCARD_THRESHOLD,
+    };
+    match crate::discover::mine(store, &opts, chrono::Utc::now()) {
         Ok(r) => (200, serde_json::to_value(&r).unwrap()),
         Err(e) => (500, serde_json::json!({"error": e.to_string()})),
     }
@@ -430,5 +462,16 @@ mod forensics_route_tests {
         assert_eq!(body["filters"]["days"], 3);
         assert_eq!(body["filters"]["project"], "/x");
         assert_eq!(body["schema_version"], 1);
+    }
+
+    #[test]
+    fn discover_route_returns_report() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        let (status, body) = discover_response(&store, Some("days=14&project=/x"));
+        assert_eq!(status, 200);
+        assert_eq!(body["filters"]["days"], 14);
+        assert_eq!(body["filters"]["project"], "/x");
+        assert_eq!(body["schema_version"], 1);
+        assert!(body["body"].as_array().unwrap().is_empty());
     }
 }

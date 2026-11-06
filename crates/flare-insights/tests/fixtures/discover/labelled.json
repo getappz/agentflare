@@ -1,0 +1,55 @@
+[
+  {"text": "always run cargo fmt before committing code changes", "session_id": "r1a", "expected_group": "rule_fmt", "expected_kind": "rule"},
+  {"text": "always run cargo fmt before committing these changes", "session_id": "r1b", "expected_group": "rule_fmt", "expected_kind": "rule"},
+  {"text": "always run cargo fmt before committing your changes", "session_id": "r1c", "expected_group": "rule_fmt", "expected_kind": "rule"},
+  {"text": "always run cargo fmt before committing my changes", "session_id": "r1d", "expected_group": "rule_fmt", "expected_kind": "rule"},
+
+  {"text": "never force push directly onto the main branch", "session_id": "r2a", "expected_group": "rule_never_push", "expected_kind": "rule"},
+  {"text": "never force push directly onto the master branch", "session_id": "r2b", "expected_group": "rule_never_push", "expected_kind": "rule"},
+  {"text": "never force push directly onto the main branch please", "session_id": "r2c", "expected_group": "rule_never_push", "expected_kind": "rule"},
+
+  {"text": "do not commit secrets into the repository ever", "session_id": "r3a", "expected_group": "rule_no_secrets", "expected_kind": "rule"},
+  {"text": "do not commit secrets into the repository please", "session_id": "r3b", "expected_group": "rule_no_secrets", "expected_kind": "rule"},
+  {"text": "do not commit secrets into the repository again", "session_id": "r3c", "expected_group": "rule_no_secrets", "expected_kind": "rule"},
+
+  {"text": "must include regression tests with every bugfix", "session_id": "r4a", "expected_group": "rule_must_tests", "expected_kind": "rule"},
+  {"text": "must include regression tests with every bug fix", "session_id": "r4b", "expected_group": "rule_must_tests", "expected_kind": "rule"},
+  {"text": "must include regression tests with every hot fix", "session_id": "r4c", "expected_group": "rule_must_tests", "expected_kind": "rule"},
+
+  {"text": "deploy service to staging-1", "session_id": "c1a", "expected_group": "cmd_deploy", "expected_kind": "command"},
+  {"text": "deploy service to staging-2", "session_id": "c1b", "expected_group": "cmd_deploy", "expected_kind": "command"},
+  {"text": "deploy service to staging-3", "session_id": "c1c", "expected_group": "cmd_deploy", "expected_kind": "command"},
+  {"text": "deploy service to /prod/app", "session_id": "c1d", "expected_group": "cmd_deploy", "expected_kind": "command"},
+
+  {"text": "restart worker process id 41", "session_id": "c2a", "expected_group": "cmd_restart", "expected_kind": "command"},
+  {"text": "restart worker process id 42", "session_id": "c2b", "expected_group": "cmd_restart", "expected_kind": "command"},
+  {"text": "restart worker process id 43", "session_id": "c2c", "expected_group": "cmd_restart", "expected_kind": "command"},
+
+  {"text": "please walk through writing a skill that reviews pull requests for missing tests and summarizes findings", "session_id": "s1a", "expected_group": "skill_pr_review", "expected_kind": "skill"},
+  {"text": "please walk through writing a skill that reviews pull requests for missing docs and summarizes findings", "session_id": "s1b", "expected_group": "skill_pr_review", "expected_kind": "skill"},
+  {"text": "please walk through writing a skill that reviews pull requests for missing coverage and summarizes findings", "session_id": "s1c", "expected_group": "skill_pr_review", "expected_kind": "skill"},
+  {"text": "please walk through writing a skill that reviews pull requests for missing checks and summarizes findings", "session_id": "s1d", "expected_group": "skill_pr_review", "expected_kind": "skill"},
+
+  {"text": "help me build a reusable skill for triaging flaky ci failures across crates and proposing focused fixes", "session_id": "s2a", "expected_group": "skill_flaky_ci", "expected_kind": "skill"},
+  {"text": "help me build a reusable skill for triaging flaky ci failures across crates and proposing safe fixes", "session_id": "s2b", "expected_group": "skill_flaky_ci", "expected_kind": "skill"},
+  {"text": "help me build a reusable skill for triaging flaky ci failures across crates and proposing small fixes", "session_id": "s2c", "expected_group": "skill_flaky_ci", "expected_kind": "skill"},
+
+  {"text": "create a skill that documents how to onboard a new agentflare adapter with ingest tests and fixtures", "session_id": "s3a", "expected_group": "skill_adapter", "expected_kind": "skill"},
+  {"text": "create a skill that documents how to onboard a new agentflare adapter with ingest checks and fixtures", "session_id": "s3b", "expected_group": "skill_adapter", "expected_kind": "skill"},
+  {"text": "create a skill that documents how to onboard a new agentflare adapter with ingest suites and fixtures", "session_id": "s3c", "expected_group": "skill_adapter", "expected_kind": "skill"},
+
+  {"text": "fix the thing please thanks now", "session_id": "n1a", "expected_group": "ambiguous_fix", "expected_kind": "none"},
+  {"text": "fix the thing please thanks soon", "session_id": "n1b", "expected_group": "ambiguous_fix", "expected_kind": "none"},
+  {"text": "fix the thing please thanks later", "session_id": "n1c", "expected_group": "ambiguous_fix", "expected_kind": "none"},
+
+  {"text": "look into this weird issue today", "session_id": "n2a", "expected_group": "ambiguous_look", "expected_kind": "none"},
+  {"text": "look into this weird issue again", "session_id": "n2b", "expected_group": "ambiguous_look", "expected_kind": "none"},
+  {"text": "look into this weird issue please", "session_id": "n2c", "expected_group": "ambiguous_look", "expected_kind": "none"},
+
+  {"text": "unrelated request about painting watercolors outdoors", "session_id": "x1", "expected_group": "noise_paint", "expected_kind": "none"},
+  {"text": "completely different chat about baking sourdough bread", "session_id": "x2", "expected_group": "noise_bread", "expected_kind": "none"},
+  {"text": "random note about commuting by bicycle downtown", "session_id": "x3", "expected_group": "noise_bike", "expected_kind": "none"},
+  {"text": "one-off ask for the weather forecast tomorrow", "session_id": "x4", "expected_group": "noise_weather", "expected_kind": "none"},
+  {"text": "isolated question about piano practice schedules", "session_id": "x5", "expected_group": "noise_piano", "expected_kind": "none"},
+  {"text": "singleton prompt about gardening tomato seedlings", "session_id": "x6", "expected_group": "noise_garden", "expected_kind": "none"}
+]
