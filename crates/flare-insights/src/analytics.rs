@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use chrono::{Datelike, Timelike};
 
+use crate::evidence::CoverageMeta;
 use crate::model::{FileEvent, Session, TokenUsage, ToolCall};
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -22,14 +23,7 @@ pub struct Analytics {
     pub cache_read_share: Option<f64>,
     /// read / (input + read + write); `None` on a zero denominator.
     pub cache_prompt_efficiency: Option<f64>,
-    pub coverage: StatsCoverage,
-}
-
-#[derive(Debug, Clone, Default, serde::Serialize)]
-pub struct StatsCoverage {
-    pub sessions_considered: usize,
-    pub unpriced_sessions: usize,
-    pub sessions_missing_timestamps: usize,
+    pub coverage: CoverageMeta,
 }
 
 fn ratio(num: u64, den: u64) -> Option<f64> {
@@ -67,8 +61,16 @@ pub fn compute_analytics_with_tools(
     let mut by_project: HashMap<String, usize> = HashMap::new();
     let mut by_day: HashMap<String, DailyBucket> = HashMap::new();
     let (mut t_in, mut t_read, mut t_write) = (0u64, 0u64, 0u64);
-    let mut coverage = StatsCoverage {
-        sessions_considered: sessions.len(),
+    // An empty list reports the same bounds as `stats_window`: now, not the epoch.
+    let now = chrono::Utc::now();
+    let mut coverage = CoverageMeta {
+        window_start: sessions.iter().map(|s| s.updated_at).min().unwrap_or(now),
+        window_end: sessions.iter().map(|s| s.updated_at).max().unwrap_or(now),
+        sessions_in_window: sessions.len(),
+        eligible_sessions: sessions.len(),
+        eligible_turns: sessions.iter().map(|s| s.turn_count as usize).sum(),
+        // This API receives session summaries, not turn timestamps.
+        sessions_missing_turn_timestamps: sessions.len(),
         ..Default::default()
     };
 
@@ -110,7 +112,6 @@ pub fn compute_analytics_with_tools(
         t_read += s.tokens.cache_read;
         t_write += s.tokens.cache_write;
         coverage.unpriced_sessions += s.cost.is_none() as usize;
-        coverage.sessions_missing_timestamps += s.started_at.is_none() as usize;
     }
 
     let mut by_day_vec: Vec<DailyBucket> = by_day.into_values().collect();
