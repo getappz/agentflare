@@ -13,6 +13,13 @@ use crate::config::InsightsConfig;
 use crate::model::{FileEvent, Session, Subagent, ToolCall, Turn};
 use crate::store::InsightsStore;
 
+/// Provider-issued child ids can recur across sessions (a forked or resumed
+/// session copies its parent's calls verbatim). Row ids are global primary keys
+/// and one collision rolls back the whole source commit, so scope them by session.
+pub(crate) fn scoped_id(session_id: &str, raw: &str) -> String {
+    format!("{session_id}:{raw}")
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum IngestError {
     #[error("io: {0}")]

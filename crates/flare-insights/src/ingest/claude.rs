@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use walkdir::WalkDir;
 
+use super::scoped_id;
 use crate::config::InsightsConfig;
 use crate::config::PricingTable;
 use crate::ingest::{
@@ -63,13 +64,6 @@ impl Adapter for ClaudeAdapter {
         }
         Ok(bundle)
     }
-}
-
-/// A forked/resumed Claude session copies its parent's messages verbatim, so
-/// `toolu_…` and message uuids recur across session files. Row ids are primary
-/// keys, so scope them by session to keep both copies.
-fn scoped_id(session_id: &str, raw: &str) -> String {
-    format!("{session_id}:{raw}")
 }
 
 fn parse_claude_jsonl(path: &Path) -> Option<IngestBundle> {
