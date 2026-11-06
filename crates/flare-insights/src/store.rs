@@ -18,7 +18,7 @@ pub enum StoreError {
 }
 
 pub struct InsightsStore {
-    conn: Connection,
+    pub(crate) conn: Connection,
 }
 
 impl InsightsStore {
@@ -490,7 +490,7 @@ fn exec_upsert_session(conn: &Connection, s: &Session) -> Result<(), StoreError>
     Ok(())
 }
 
-fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
+pub(crate) fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
     let source_str: String = row.get("source")?;
     let status_str: String = row.get("status")?;
     let awaiting_str: Option<String> = row.get("awaiting_reason")?;

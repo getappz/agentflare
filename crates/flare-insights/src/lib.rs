@@ -25,6 +25,7 @@ pub mod model;
 pub mod replay;
 pub mod search;
 pub mod store;
+pub mod store_query;
 
 pub mod api;
 
