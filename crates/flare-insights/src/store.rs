@@ -421,7 +421,7 @@ impl InsightsStore {
                 rusqlite::params_from_iter(turn_params(t)),
             )?;
         }
-        for tc in &bundle.tool_calls {
+        for tc in last_per_id(&bundle.tool_calls, |t| (&t.session_id, &t.id)) {
             stats.tool_calls += tx.execute(
                 "INSERT INTO tool_calls(id, session_id, turn_seq, name, input, output, status, duration_ms, created_at)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
@@ -434,7 +434,7 @@ impl InsightsStore {
                 params![e.id, e.session_id, e.path, e.kind, e.at.to_rfc3339()],
             )?;
         }
-        for s in &bundle.subagents {
+        for s in last_per_id(&bundle.subagents, |s| (&s.session_id, &s.id)) {
             stats.subagents += tx.execute(
                 "INSERT INTO subagents(id, session_id, parent_tool_call_id, kind, status, task) VALUES (?1,?2,?3,?4,?5,?6)",
                 params![s.id, s.session_id, s.parent_tool_call_id, s.kind, s.status, s.task],
@@ -446,6 +446,21 @@ impl InsightsStore {
         tx.commit()?;
         Ok(stats)
     }
+}
+
+/// Keep only the last row per `(session_id, id)`, in original order. A
+/// transcript can repeat a child id; a plain INSERT would fail and roll back
+/// the whole source, so the repeat replaces the earlier row as upserts used to.
+/// Cross-session id collisions are left alone so they still fail loudly.
+fn last_per_id<'a, T>(items: &'a [T], key: impl Fn(&'a T) -> (&'a str, &'a str)) -> Vec<&'a T> {
+    let last: std::collections::HashMap<_, _> =
+        items.iter().enumerate().map(|(i, t)| (key(t), i)).collect();
+    items
+        .iter()
+        .enumerate()
+        .filter(|(i, t)| last[&key(t)] == *i)
+        .map(|(_, t)| t)
+        .collect()
 }
 
 /// Rows written by one [`InsightsStore::commit_ingest`].
@@ -796,6 +811,31 @@ mod commit_tests {
         assert_eq!(store.get_subagents("s1").unwrap().len(), 1);
         let cursors = store.load_file_cursors("claude_code").unwrap();
         assert_eq!(cursors.get(Path::new("/logs/s1.jsonl")), Some(&(10, 20)));
+    }
+
+    #[test]
+    fn repeated_child_ids_in_one_session_do_not_roll_back() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        let mut b = bundle(vec![session("s1")], vec![turn("a", "s1", 1)]);
+        let mut dup = tool_call("tc1", "s1");
+        dup.name = "second".into();
+        b.tool_calls = vec![tool_call("tc1", "s1"), dup];
+        let sub = |task: &str| crate::model::Subagent {
+            id: "sub1".into(),
+            session_id: "s1".into(),
+            parent_tool_call_id: None,
+            kind: "task".into(),
+            status: "done".into(),
+            task: Some(task.into()),
+        };
+        b.subagents = vec![sub("old"), sub("new")];
+        let stats = store.commit_ingest("claude_code", &b).unwrap();
+        assert_eq!((stats.tool_calls, stats.subagents), (1, 1));
+        assert_eq!(store.get_tool_calls("s1").unwrap()[0].name, "second");
+        assert_eq!(
+            store.get_subagents("s1").unwrap()[0].task.as_deref(),
+            Some("new")
+        );
     }
 
     #[test]
