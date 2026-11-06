@@ -1690,7 +1690,9 @@ pub(crate) struct InsightsRequest {
     #[schemars(description = "Project path prefix; defaults to the current dir, \"*\" = all")]
     #[serde(default)]
     pub(crate) project: Option<String>,
-    #[schemars(description = "Look-back window in days (forensics, default 7)")]
+    #[schemars(
+        description = "Look-back window in days (forensics default 7, discover default 30)"
+    )]
     #[serde(default)]
     pub(crate) since_days: Option<u32>,
     #[schemars(description = "Max hits (search, default 20, capped at 100)")]

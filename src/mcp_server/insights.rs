@@ -1,4 +1,4 @@
-//! `insights` tool: read-only search/recall/forensics over the local
+//! `insights` tool: read-only search/recall/forensics/discover over the local
 //! insights index. Never rescans, never writes, never publishes a handoff.
 
 use super::resume::resume_insights_db;
@@ -87,10 +87,10 @@ fn envelope(action: &str, mut data: Value) -> Result<String, ErrorData> {
 impl super::AgentflareMcp {
     pub fn insights_impl(&self, req: InsightsRequest) -> Result<String, ErrorData> {
         let action = req.action.trim().to_string();
-        if action == "discover" {
-            return Err(invalid("insights action 'discover' is not available yet"));
-        }
-        if !matches!(action.as_str(), "search" | "recall" | "forensics") {
+        if !matches!(
+            action.as_str(),
+            "search" | "recall" | "forensics" | "discover"
+        ) {
             return Err(invalid(format!(
                 "unknown insights action '{action}' — use search|recall|forensics|discover"
             )));
@@ -176,7 +176,7 @@ impl super::AgentflareMcp {
                 }
                 serde_json::to_value(page).map_err(internal)?
             }
-            _ => {
+            "forensics" => {
                 let report = flare_insights::forensics::compute(
                     &store,
                     &flare_insights::forensics::ForensicsOptions {
@@ -190,6 +190,23 @@ impl super::AgentflareMcp {
                 .map_err(internal)?;
                 serde_json::to_value(report).map_err(internal)?
             }
+            "discover" => {
+                let _ = source; // DiscoverOptions has no source filter (plan T11).
+                let report = flare_insights::discover::mine(
+                    &store,
+                    &flare_insights::discover::DiscoverOptions {
+                        days: req.since_days.unwrap_or(30),
+                        project_prefix: project,
+                        min_sessions: 2,
+                        min_count: 3,
+                        jaccard_threshold: flare_insights::discover::DEFAULT_JACCARD_THRESHOLD,
+                    },
+                    chrono::Utc::now(),
+                )
+                .map_err(internal)?;
+                serde_json::to_value(report).map_err(internal)?
+            }
+            _ => unreachable!("action validated above"),
         };
         envelope(&action, data)
     }

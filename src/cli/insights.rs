@@ -34,6 +34,8 @@ pub enum InsightsCommands {
     Doctor(DoctorArgs),
     /// Forensic detectors: repeats, failed-tool streaks, big outputs, cost, cache
     Forensics(ForensicsArgs),
+    /// Discover recurring user requests as printed proposals (never writes files)
+    Discover(DiscoverArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -47,6 +49,21 @@ pub struct ForensicsArgs {
     pub source: Option<String>,
     #[arg(long)]
     pub session: Option<String>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Parser, Debug)]
+pub struct DiscoverArgs {
+    #[arg(long, default_value = "30")]
+    pub days: u32,
+    /// Only sessions whose cwd/project path is under this path
+    #[arg(long)]
+    pub project: Option<String>,
+    #[arg(long, default_value = "2")]
+    pub min_sessions: usize,
+    #[arg(long, default_value = "3")]
+    pub min_count: usize,
     #[arg(long)]
     pub json: bool,
 }
@@ -166,6 +183,7 @@ impl InsightsArgs {
             InsightsCommands::Watch(args) => run_watch(db_path, args),
             InsightsCommands::Doctor(args) => run_doctor(db_path, args),
             InsightsCommands::Forensics(args) => run_forensics(db_path, args),
+            InsightsCommands::Discover(args) => run_discover(db_path, args),
         }
     }
 }
@@ -598,6 +616,40 @@ fn run_forensics(db: PathBuf, args: ForensicsArgs) {
     }
 }
 
+fn run_discover(db: PathBuf, args: DiscoverArgs) {
+    let store = open_store(db);
+    let opts = flare_insights::discover::DiscoverOptions {
+        days: args.days,
+        project_prefix: args.project,
+        min_sessions: args.min_sessions,
+        min_count: args.min_count,
+        jaccard_threshold: flare_insights::discover::DEFAULT_JACCARD_THRESHOLD,
+    };
+    let report = flare_insights::discover::mine(&store, &opts, chrono::Utc::now()).unwrap_or_else(
+        |e| {
+            eprintln!("discover failed: {e}");
+            std::process::exit(1);
+        },
+    );
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        return;
+    }
+    println!(
+        "discover: last {} days, {} proposals ({} eligible sessions)",
+        args.days,
+        report.body.len(),
+        report.coverage.eligible_sessions
+    );
+    for p in &report.body {
+        println!(
+            "[{:?}] sessions={} occurrences={} — {}",
+            p.destination, p.distinct_sessions, p.occurrences, p.draft
+        );
+        println!("  rationale: {}", p.rationale);
+    }
+}
+
 #[cfg(test)]
 mod forensics_args_tests {
     use super::*;
@@ -631,5 +683,44 @@ mod forensics_args_tests {
         assert_eq!(f.source.as_deref(), Some("codex"));
         assert_eq!(f.session.as_deref(), Some("s1"));
         assert!(f.json);
+    }
+}
+
+#[cfg(test)]
+mod discover_args_tests {
+    use super::*;
+
+    #[test]
+    fn discover_flags_parse_with_defaults() {
+        let a = InsightsArgs::try_parse_from(["insights", "discover"]).unwrap();
+        let Some(InsightsCommands::Discover(d)) = a.command else {
+            panic!("expected discover")
+        };
+        assert_eq!(
+            (d.days, d.min_sessions, d.min_count, d.json, d.project.is_none()),
+            (30, 2, 3, false, true)
+        );
+        let a = InsightsArgs::try_parse_from([
+            "insights",
+            "discover",
+            "--days",
+            "14",
+            "--project",
+            "/p",
+            "--min-sessions",
+            "4",
+            "--min-count",
+            "5",
+            "--json",
+        ])
+        .unwrap();
+        let Some(InsightsCommands::Discover(d)) = a.command else {
+            panic!("expected discover")
+        };
+        assert_eq!(d.days, 14);
+        assert_eq!(d.project.as_deref(), Some("/p"));
+        assert_eq!(d.min_sessions, 4);
+        assert_eq!(d.min_count, 5);
+        assert!(d.json);
     }
 }
