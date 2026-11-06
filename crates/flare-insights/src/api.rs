@@ -42,6 +42,7 @@ pub async fn serve(db_path: PathBuf, port: u16) -> anyhow::Result<()> {
     println!("  GET /api/sessions/:id");
     println!("  GET /api/search?q=hello&limit=20");
     println!("  GET /api/stats");
+    println!("  GET /api/forensics?days=7&project=/path");
 
     let state = Arc::new(AppState {
         read_store: Mutex::new(InsightsStore::open(&db_path)?),
@@ -188,6 +189,19 @@ fn route_request(
             };
             let res = crate::search::search(&store, &opts).unwrap_or_default();
             (200, serde_json::to_value(&res).unwrap())
+        }
+        "/api/forensics" => {
+            let params = parse_query(query);
+            let opts = crate::forensics::ForensicsOptions {
+                days: params.get("days").and_then(|v| v.parse().ok()).unwrap_or(7),
+                project_prefix: params.get("project").cloned(),
+                source: params.get("source").cloned(),
+                session_id: params.get("session").cloned(),
+            };
+            match crate::forensics::compute(&store, &opts, chrono::Utc::now()) {
+                Ok(r) => (200, serde_json::to_value(&r).unwrap()),
+                Err(e) => (500, serde_json::json!({"error": e.to_string()})),
+            }
         }
         "/api/stats" => {
             let mut cache = state.stats_cache.lock().unwrap();
@@ -386,5 +400,24 @@ mod urlencoding {
         Ok(std::borrow::Cow::Owned(
             String::from_utf8_lossy(&out).into_owned(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod forensics_route_tests {
+    use super::*;
+
+    #[test]
+    fn forensics_route_returns_report() {
+        let state = Arc::new(AppState {
+            read_store: Mutex::new(InsightsStore::open_in_memory().unwrap()),
+            write_store: Mutex::new(InsightsStore::open_in_memory().unwrap()),
+            stats_cache: Mutex::new(None),
+        });
+        let (status, body) = route_request(&state, "/api/forensics", Some("days=3&project=/x"));
+        assert_eq!(status, 200);
+        assert_eq!(body["filters"]["days"], 3);
+        assert_eq!(body["filters"]["project"], "/x");
+        assert_eq!(body["schema_version"], 1);
     }
 }

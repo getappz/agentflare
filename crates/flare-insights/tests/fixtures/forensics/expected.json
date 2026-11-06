@@ -1,0 +1,309 @@
+{
+  "schema_version": 1,
+  "detector_version": 1,
+  "generated_at": "2026-01-08T00:00:00Z",
+  "filters": {
+    "days": 7,
+    "project": null,
+    "source": null,
+    "session": null
+  },
+  "coverage": {
+    "window_start": "2026-01-01T00:00:00Z",
+    "window_end": "2026-01-08T00:00:00Z",
+    "sessions_in_window": 5,
+    "eligible_sessions": 3,
+    "eligible_turns": 5,
+    "unpriced_sessions": 2,
+    "cost_basis_mix": {
+      "estimated": 3
+    },
+    "sessions_missing_turn_timestamps": 5,
+    "failed_sources": []
+  },
+  "capabilities": [
+    {
+      "source": "claude_code",
+      "cache_tokens": "recorded",
+      "turn_timestamps": "partial",
+      "tool_failure_status": "recorded",
+      "cost_basis": "recorded",
+      "project_path": "partial",
+      "subagents": "partial"
+    },
+    {
+      "source": "codex",
+      "cache_tokens": "recorded",
+      "turn_timestamps": "recorded",
+      "tool_failure_status": "not_recorded",
+      "cost_basis": "not_recorded",
+      "project_path": "recorded",
+      "subagents": "not_recorded"
+    },
+    {
+      "source": "opencode",
+      "cache_tokens": "recorded",
+      "turn_timestamps": "not_recorded",
+      "tool_failure_status": "recorded",
+      "cost_basis": "recorded",
+      "project_path": "partial",
+      "subagents": "partial"
+    },
+    {
+      "source": "cursor",
+      "cache_tokens": "not_recorded",
+      "turn_timestamps": "recorded",
+      "tool_failure_status": "recorded",
+      "cost_basis": "recorded",
+      "project_path": "recorded",
+      "subagents": "recorded"
+    },
+    {
+      "source": "antigravity",
+      "cache_tokens": "recorded",
+      "turn_timestamps": "recorded",
+      "tool_failure_status": "partial",
+      "cost_basis": "recorded",
+      "project_path": "partial",
+      "subagents": "partial"
+    }
+  ],
+  "body": [
+    {
+      "id": "repeated_user_text.within_session",
+      "detector": "repeated_user_text",
+      "value": [
+        {
+          "hash": "7621a0714284b3b1087679dbd397bf37d7fdfabb7c49af97f46d80925803a61e",
+          "count": 3,
+          "sessions": 2
+        }
+      ],
+      "unit": "groups",
+      "basis": "measured",
+      "unavailable_reason": null,
+      "evidence": [
+        {
+          "source": "claude_code",
+          "session_id": "c1",
+          "turn_seq": 1,
+          "tool_call_id": null,
+          "at": null,
+          "excerpt": "please run the full test suite now"
+        },
+        {
+          "source": "claude_code",
+          "session_id": "c2",
+          "turn_seq": 1,
+          "tool_call_id": null,
+          "at": null,
+          "excerpt": "please run the full test suite now"
+        }
+      ],
+      "note": "normalised user text repeated; hash groups with counts"
+    },
+    {
+      "id": "repeated_user_text.cross_session",
+      "detector": "repeated_user_text",
+      "value": [
+        {
+          "hash": "7621a0714284b3b1087679dbd397bf37d7fdfabb7c49af97f46d80925803a61e",
+          "count": 3,
+          "sessions": 2
+        }
+      ],
+      "unit": "groups",
+      "basis": "measured",
+      "unavailable_reason": null,
+      "evidence": [
+        {
+          "source": "claude_code",
+          "session_id": "c1",
+          "turn_seq": 1,
+          "tool_call_id": null,
+          "at": null,
+          "excerpt": "please run the full test suite now"
+        },
+        {
+          "source": "claude_code",
+          "session_id": "c2",
+          "turn_seq": 1,
+          "tool_call_id": null,
+          "at": null,
+          "excerpt": "please run the full test suite now"
+        }
+      ],
+      "note": "normalised user text repeated; hash groups with counts"
+    },
+    {
+      "id": "failed_tool_streaks",
+      "detector": "failed_tool_streaks",
+      "value": [
+        {
+          "session_id": "c1",
+          "tool": "Bash",
+          "length": 2,
+          "turn_seq": 1
+        }
+      ],
+      "unit": "streaks",
+      "basis": "measured",
+      "unavailable_reason": null,
+      "evidence": [
+        {
+          "source": "claude_code",
+          "session_id": "c1",
+          "turn_seq": 1,
+          "tool_call_id": "t1",
+          "at": null,
+          "excerpt": null
+        }
+      ],
+      "note": "1 session(s) from adapters without tool failure status excluded"
+    },
+    {
+      "id": "large_retained_tool_output",
+      "detector": "large_retained_tool_output",
+      "value": [
+        {
+          "tool_call_id": "t3",
+          "session_id": "c1",
+          "tool": "Read",
+          "bytes": 40000
+        }
+      ],
+      "unit": "bytes",
+      "basis": "measured",
+      "unavailable_reason": null,
+      "evidence": [
+        {
+          "source": "claude_code",
+          "session_id": "c1",
+          "turn_seq": 2,
+          "tool_call_id": "t3",
+          "at": null,
+          "excerpt": null
+        }
+      ],
+      "note": "tool outputs of at least 40000 bytes"
+    },
+    {
+      "id": "large_retained_tool_output.estimated_tokens",
+      "detector": "large_retained_tool_output",
+      "value": [
+        {
+          "tool_call_id": "t3",
+          "session_id": "c1",
+          "tool": "Read",
+          "estimated_tokens": 10000
+        }
+      ],
+      "unit": "tokens",
+      "basis": {
+        "estimated": {
+          "assumption": "4 bytes per token"
+        }
+      },
+      "unavailable_reason": null,
+      "evidence": [
+        {
+          "source": "claude_code",
+          "session_id": "c1",
+          "turn_seq": 2,
+          "tool_call_id": "t3",
+          "at": null,
+          "excerpt": null
+        }
+      ],
+      "note": "bytes / 4"
+    },
+    {
+      "id": "cost_concentration",
+      "detector": "cost_concentration",
+      "value": {
+        "top5_share": 1.0,
+        "top5_usd": 13.0,
+        "total_usd": 13.0,
+        "priced_sessions": 3,
+        "unpriced_sessions": 2,
+        "cost_basis_mix": {
+          "estimated": 3
+        },
+        "top": [
+          {
+            "session_id": "c1",
+            "cost_usd": 10.0
+          },
+          {
+            "session_id": "c2",
+            "cost_usd": 2.0
+          },
+          {
+            "session_id": "u1",
+            "cost_usd": 1.0
+          }
+        ]
+      },
+      "unit": "share",
+      "basis": "measured",
+      "unavailable_reason": null,
+      "evidence": [
+        {
+          "source": "claude_code",
+          "session_id": "c1",
+          "turn_seq": null,
+          "tool_call_id": null,
+          "at": null,
+          "excerpt": null
+        },
+        {
+          "source": "claude_code",
+          "session_id": "c2",
+          "turn_seq": null,
+          "tool_call_id": null,
+          "at": null,
+          "excerpt": null
+        },
+        {
+          "source": "cursor",
+          "session_id": "u1",
+          "turn_seq": null,
+          "tool_call_id": null,
+          "at": null,
+          "excerpt": null
+        }
+      ],
+      "note": "computed over priced sessions only; 2 unpriced session(s) excluded"
+    },
+    {
+      "id": "cache_reuse.claude_code",
+      "detector": "cache_reuse",
+      "value": 0.665929203539823,
+      "unit": "share",
+      "basis": "measured",
+      "unavailable_reason": null,
+      "evidence": [],
+      "note": "cache_read_share = read / (input + read)"
+    },
+    {
+      "id": "cache_reuse.codex",
+      "detector": "cache_reuse",
+      "value": 0.8,
+      "unit": "share",
+      "basis": "measured",
+      "unavailable_reason": null,
+      "evidence": [],
+      "note": "cache_read_share = read / (input + read)"
+    },
+    {
+      "id": "cache_reuse.cursor",
+      "detector": "cache_reuse",
+      "value": null,
+      "unit": "share",
+      "basis": "measured",
+      "unavailable_reason": "cache_not_recorded",
+      "evidence": [],
+      "note": "cache_read_share = read / (input + read)"
+    }
+  ]
+}

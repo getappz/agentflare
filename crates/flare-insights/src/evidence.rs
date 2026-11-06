@@ -45,6 +45,9 @@ pub struct CoverageMeta {
     pub eligible_sessions: usize,
     pub eligible_turns: usize,
     pub unpriced_sessions: usize,
+    /// Count of priced sessions per `cost_basis` (`provider`/`estimated`/`unknown`).
+    #[serde(default)]
+    pub cost_basis_mix: std::collections::BTreeMap<String, usize>,
     pub sessions_missing_turn_timestamps: usize,
     pub failed_sources: Vec<String>,
 }
@@ -91,7 +94,7 @@ mod tests {
                 "window_start": "2026-01-01T00:00:00Z",
                 "window_end": "2026-01-02T00:00:00Z",
                 "sessions_in_window": 0, "eligible_sessions": 0,
-                "eligible_turns": 0, "unpriced_sessions": 0,
+                "eligible_turns": 0, "unpriced_sessions": 0, "cost_basis_mix": {},
                 "sessions_missing_turn_timestamps": 0, "failed_sources": []
             },
             "capabilities": crate::capability::capabilities(),
