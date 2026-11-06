@@ -151,7 +151,7 @@
           "excerpt": null
         }
       ],
-      "note": "1 session(s) from adapters without tool failure status excluded"
+      "note": "length counts consecutive same-tool calls from a failure on, so later calls in a streak may have succeeded; 1 session(s) from adapters without tool failure status excluded"
     },
     {
       "id": "large_retained_tool_output",

@@ -269,6 +269,33 @@ impl InsightsStore {
         Ok(out)
     }
 
+    /// Every session updated since `since`, with the filters applied in SQL.
+    pub fn sessions_in_window(
+        &self,
+        since: DateTime<Utc>,
+        source: Option<&str>,
+        project_prefix: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<Vec<Session>, StoreError> {
+        let (mut sql, mut binds) = sessions_select(
+            "SELECT s.* FROM sessions s",
+            Some(since),
+            source,
+            project_prefix,
+        );
+        if let Some(id) = session_id {
+            sql.push_str(" AND s.id = ?");
+            binds.push(Value::Text(id.to_string()));
+        }
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(binds), row_to_session)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     /// Aggregate stats over a window with SQL GROUP BY (no row-count cap).
     pub fn stats_window(&self, w: &StatsWindow) -> Result<Analytics, StoreError> {
         let (filter, binds) = sessions_select(
@@ -398,6 +425,17 @@ impl InsightsStore {
             |r| r.get::<_, i64>(0),
         )? as usize;
         (a.cache_read_share, a.cache_prompt_efficiency) = cache_metrics(t_in, t_read, t_write);
+
+        let mut stmt = conn.prepare(&format!(
+            "SELECT COALESCE(cost_basis, 'unknown'), COUNT(*) FROM sessions
+             WHERE id IN ({filter}) AND cost_usd IS NOT NULL GROUP BY 1"
+        ))?;
+        for r in stmt.query_map(params_from_iter(binds.clone()), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+        })? {
+            let (basis, n) = r?;
+            a.coverage.cost_basis_mix.insert(basis, n);
+        }
 
         let mut stmt = conn.prepare(&format!(
             "SELECT name, COUNT(*), SUM(status IN ('failed','error'))
@@ -698,5 +736,32 @@ mod tests {
         let c = crate::analytics::compute_analytics(&[]).coverage;
         assert!(c.window_start >= before);
         assert_eq!(c.window_start, c.window_end);
+    }
+
+    #[test]
+    fn stats_window_reports_cost_basis_mix_for_priced_sessions() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        let mut priced = sample_session("p", SessionSource::Codex, None);
+        priced.cost_basis = CostBasis::Estimated;
+        priced.cost = Some(Cost {
+            total_usd: 1.0,
+            input_usd: 0.0,
+            output_usd: 0.0,
+            cache_read_usd: 0.0,
+            cache_write_usd: 0.0,
+        });
+        store.upsert_session(&priced).unwrap();
+        store
+            .upsert_session(&sample_session("u", SessionSource::Codex, None))
+            .unwrap();
+        let mix = store
+            .stats_window(&StatsWindow::default())
+            .unwrap()
+            .coverage
+            .cost_basis_mix;
+        assert_eq!(mix.len(), 1);
+        assert_eq!(mix["estimated"], 1);
+        let from_list = crate::analytics::compute_analytics(&[priced]).coverage;
+        assert_eq!(from_list.cost_basis_mix["estimated"], 1);
     }
 }

@@ -29,6 +29,7 @@ struct AppState {
     // background resync, which is worse than the per-request reopen this
     // replaced.
     read_store: Mutex<InsightsStore>,
+    db_path: PathBuf,
     write_store: Mutex<InsightsStore>,
     stats_cache: Mutex<Option<(Instant, serde_json::Value)>>,
 }
@@ -47,6 +48,7 @@ pub async fn serve(db_path: PathBuf, port: u16) -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         read_store: Mutex::new(InsightsStore::open(&db_path)?),
         write_store: Mutex::new(InsightsStore::open(&db_path)?),
+        db_path,
         stats_cache: Mutex::new(None),
     });
 
@@ -107,7 +109,19 @@ async fn handle_conn(
         return write_html_response(socket, &html).await;
     }
 
-    let (status, body) = route_request(state, route, query);
+    // Forensics scans whole tables, so it gets its own connection on a blocking
+    // thread rather than holding the shared read lock against every other route.
+    let (status, body) = if route == "/api/forensics" {
+        let db_path = state.db_path.clone();
+        let query = query.map(str::to_string);
+        tokio::task::spawn_blocking(move || match InsightsStore::open_read_only(&db_path) {
+            Ok(store) => forensics_response(&store, query.as_deref()),
+            Err(e) => (500, serde_json::json!({"error": e.to_string()})),
+        })
+        .await?
+    } else {
+        route_request(state, route, query)
+    };
 
     let status_text = match status {
         200 => "OK",
@@ -116,6 +130,20 @@ async fn handle_conn(
         _ => "OK",
     };
     write_response(socket, status, status_text, &body).await
+}
+
+fn forensics_response(store: &InsightsStore, query: Option<&str>) -> (u16, serde_json::Value) {
+    let params = parse_query(query);
+    let opts = crate::forensics::ForensicsOptions {
+        days: params.get("days").and_then(|v| v.parse().ok()).unwrap_or(7),
+        project_prefix: params.get("project").cloned(),
+        source: params.get("source").cloned(),
+        session_id: params.get("session").cloned(),
+    };
+    match crate::forensics::compute(store, &opts, chrono::Utc::now()) {
+        Ok(r) => (200, serde_json::to_value(&r).unwrap()),
+        Err(e) => (500, serde_json::json!({"error": e.to_string()})),
+    }
 }
 
 /// Synchronous request handling -- the store lock never has to survive
@@ -189,19 +217,6 @@ fn route_request(
             };
             let res = crate::search::search(&store, &opts).unwrap_or_default();
             (200, serde_json::to_value(&res).unwrap())
-        }
-        "/api/forensics" => {
-            let params = parse_query(query);
-            let opts = crate::forensics::ForensicsOptions {
-                days: params.get("days").and_then(|v| v.parse().ok()).unwrap_or(7),
-                project_prefix: params.get("project").cloned(),
-                source: params.get("source").cloned(),
-                session_id: params.get("session").cloned(),
-            };
-            match crate::forensics::compute(&store, &opts, chrono::Utc::now()) {
-                Ok(r) => (200, serde_json::to_value(&r).unwrap()),
-                Err(e) => (500, serde_json::json!({"error": e.to_string()})),
-            }
         }
         "/api/stats" => {
             let mut cache = state.stats_cache.lock().unwrap();
@@ -409,12 +424,8 @@ mod forensics_route_tests {
 
     #[test]
     fn forensics_route_returns_report() {
-        let state = Arc::new(AppState {
-            read_store: Mutex::new(InsightsStore::open_in_memory().unwrap()),
-            write_store: Mutex::new(InsightsStore::open_in_memory().unwrap()),
-            stats_cache: Mutex::new(None),
-        });
-        let (status, body) = route_request(&state, "/api/forensics", Some("days=3&project=/x"));
+        let store = InsightsStore::open_in_memory().unwrap();
+        let (status, body) = forensics_response(&store, Some("days=3&project=/x"));
         assert_eq!(status, 200);
         assert_eq!(body["filters"]["days"], 3);
         assert_eq!(body["filters"]["project"], "/x");

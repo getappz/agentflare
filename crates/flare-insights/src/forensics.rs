@@ -124,17 +124,12 @@ pub fn compute(
     let since = now
         .checked_sub_signed(Duration::days(opts.days as i64))
         .unwrap_or(DateTime::<Utc>::MIN_UTC);
-    let sessions: Vec<Session> = store
-        .list_sessions_filtered(
-            opts.source.as_deref(),
-            opts.project_prefix.as_deref(),
-            usize::MAX >> 1,
-            0,
-        )?
-        .into_iter()
-        .filter(|s| s.updated_at >= since)
-        .filter(|s| opts.session_id.as_deref().is_none_or(|id| id == s.id))
-        .collect();
+    let sessions = store.sessions_in_window(
+        since,
+        opts.source.as_deref(),
+        opts.project_prefix.as_deref(),
+        opts.session_id.as_deref(),
+    )?;
     let by_id: HashMap<&str, &Session> = sessions.iter().map(|s| (s.id.as_str(), s)).collect();
     let mut ids: Vec<&str> = by_id.keys().copied().collect();
     ids.sort_unstable();
@@ -346,7 +341,9 @@ fn failed_tool_streaks(
         MetricBasis::Measured,
         None,
         evidence,
-        &format!("{excluded} session(s) from adapters without tool failure status excluded"),
+        &format!(
+            "length counts consecutive same-tool calls from a failure on, so later calls in a streak may have succeeded; {excluded} session(s) from adapters without tool failure status excluded"
+        ),
     ))
 }
 
@@ -433,7 +430,12 @@ fn cost_concentration(sessions: &[Session]) -> Finding {
             None,
         )
     } else {
-        (None, Some("no_priced_sessions"))
+        let reason = if priced.is_empty() {
+            "no_priced_sessions"
+        } else {
+            "zero_total_cost"
+        };
+        (None, Some(reason))
     };
     finding(
         "cost_concentration",
@@ -477,4 +479,33 @@ fn cache_reuse(sessions: &[Session]) -> Vec<Finding> {
             )
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::migrations::tests::session;
+    use crate::model::Cost;
+
+    #[test]
+    fn zero_cost_sessions_have_a_distinct_reason() {
+        assert_eq!(
+            cost_concentration(&[session("none")])
+                .unavailable_reason
+                .as_deref(),
+            Some("no_priced_sessions")
+        );
+        let mut free = session("free");
+        free.cost = Some(Cost {
+            total_usd: 0.0,
+            input_usd: 0.0,
+            output_usd: 0.0,
+            cache_read_usd: 0.0,
+            cache_write_usd: 0.0,
+        });
+        assert_eq!(
+            cost_concentration(&[free]).unavailable_reason.as_deref(),
+            Some("zero_total_cost")
+        );
+    }
 }
