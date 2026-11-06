@@ -8,7 +8,8 @@ use rusqlite::params_from_iter;
 use rusqlite::types::Value;
 use serde::Serialize;
 
-use crate::analytics::{cache_metrics, Analytics, DailyBucket, StatsCoverage};
+use crate::analytics::{cache_metrics, Analytics, DailyBucket};
+use crate::evidence::CoverageMeta;
 
 use crate::model::{Session, SessionSource, TokenUsage};
 use crate::store::{row_to_session, InsightsStore, StoreError};
@@ -136,7 +137,7 @@ impl InsightsStore {
             tool_failure_rate: None,
             cache_read_share: None,
             cache_prompt_efficiency: None,
-            coverage: StatsCoverage::default(),
+            coverage: CoverageMeta::default(),
         };
 
         let mut stmt = conn.prepare(&format!(
@@ -167,7 +168,7 @@ impl InsightsStore {
         let mut stmt = conn.prepare(&format!(
             "SELECT substr(updated_at,1,10), COUNT(*), SUM(input_tokens), SUM(output_tokens),
                     SUM(cache_read_tokens), SUM(cache_write_tokens), SUM(reasoning_tokens),
-                    COALESCE(SUM(cost_usd),0), SUM(cost_usd IS NULL), SUM(started_at IS NULL)
+                    COALESCE(SUM(cost_usd),0), SUM(cost_usd IS NULL)
              FROM sessions WHERE id IN ({filter}) GROUP BY 1 ORDER BY 1"
         ))?;
         let rows = stmt.query_map(params_from_iter(binds.clone()), |r| {
@@ -186,12 +187,11 @@ impl InsightsStore {
                     cost_usd: r.get(7)?,
                 },
                 n(8)? as usize,
-                n(9)? as usize,
             ))
         })?;
         let (mut t_in, mut t_read, mut t_write) = (0, 0, 0);
         for r in rows {
-            let (b, unpriced, no_ts) = r?;
+            let (b, unpriced) = r?;
             a.total_sessions += b.sessions;
             a.total_tokens += b.tokens.total();
             a.total_cost_usd += b.cost_usd;
@@ -199,10 +199,42 @@ impl InsightsStore {
             t_read += b.tokens.cache_read;
             t_write += b.tokens.cache_write;
             a.coverage.unpriced_sessions += unpriced;
-            a.coverage.sessions_missing_timestamps += no_ts;
             a.by_day_updated.push(b);
         }
-        a.coverage.sessions_considered = a.total_sessions;
+        a.coverage.sessions_in_window = a.total_sessions;
+        a.coverage.eligible_sessions = a.total_sessions;
+        let (first, last): (Option<String>, Option<String>) = conn.query_row(
+            &format!(
+                "SELECT MIN(updated_at), MAX(updated_at) FROM sessions WHERE id IN ({filter})"
+            ),
+            params_from_iter(binds.clone()),
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let parse = |text: String| {
+            DateTime::parse_from_rfc3339(&text)
+                .map(|t| t.with_timezone(&Utc))
+                .map_err(|e| StoreError::Parse(e.to_string()))
+        };
+        a.coverage.window_end = last.map(parse).transpose()?.unwrap_or_else(Utc::now);
+        a.coverage.window_start = w
+            .since
+            .or(first.map(parse).transpose()?)
+            .unwrap_or(a.coverage.window_end);
+        a.coverage.eligible_turns = conn.query_row(
+            &format!("SELECT COUNT(*) FROM turns WHERE {ids}"),
+            params_from_iter(binds.clone()),
+            |r| r.get::<_, i64>(0),
+        )? as usize;
+        a.coverage.sessions_missing_turn_timestamps = conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM sessions s WHERE id IN ({filter}) AND (
+                    NOT EXISTS (SELECT 1 FROM turns t WHERE t.session_id = s.id)
+                    OR EXISTS (SELECT 1 FROM turns t WHERE t.session_id = s.id
+                               AND julianday(t.started_at) IS NULL))"
+            ),
+            params_from_iter(binds.clone()),
+            |r| r.get::<_, i64>(0),
+        )? as usize;
         (a.cache_read_share, a.cache_prompt_efficiency) = cache_metrics(t_in, t_read, t_write);
 
         let mut stmt = conn.prepare(&format!(
@@ -391,7 +423,7 @@ mod tests {
         let a = store.stats_window(&StatsWindow::default()).unwrap();
         assert_eq!(a.cache_read_share, None);
         assert_eq!(a.cache_prompt_efficiency, None);
-        assert_eq!(a.coverage.sessions_considered, 1);
+        assert_eq!(a.coverage.sessions_in_window, 1);
         assert_eq!(a.coverage.unpriced_sessions, 1);
     }
 
@@ -416,6 +448,52 @@ mod tests {
         assert_eq!(only.cache_read_share, Some(0.75));
         assert_eq!(only.by_source.get("claude_code"), Some(&1));
         assert_eq!(only.total_sessions, 1);
+    }
+
+    #[test]
+    fn coverage_uses_filtered_turn_rows_and_absolute_bounds() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        let start: DateTime<Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
+        let end: DateTime<Utc> = "2026-01-02T00:00:00Z".parse().unwrap();
+        for (id, source) in [
+            ("timed", SessionSource::Codex),
+            ("missing", SessionSource::Codex),
+            ("empty", SessionSource::Codex),
+            ("other", SessionSource::Cursor),
+        ] {
+            let mut session = sample_session(id, source, None);
+            session.updated_at = end;
+            // Session timestamps must not substitute for turn timestamps.
+            session.started_at = Some(start);
+            session.turn_count = 999;
+            store.upsert_session(&session).unwrap();
+        }
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO turns(id, session_id, seq, started_at) VALUES
+                ('t1', 'timed', 1, '2026-01-01T12:00:00Z'),
+                ('t2', 'missing', 1, NULL),
+                ('t3', 'missing', 2, 'invalid'),
+                ('t4', 'other', 1, NULL);",
+            )
+            .unwrap();
+        let coverage = store
+            .stats_window(&StatsWindow {
+                since: Some(start),
+                source: Some("codex".into()),
+                project_prefix: None,
+            })
+            .unwrap()
+            .coverage;
+        assert_eq!(coverage.window_start, start);
+        assert_eq!(coverage.window_end, end);
+        assert_eq!(coverage.sessions_in_window, 3);
+        assert_eq!(coverage.eligible_sessions, 3);
+        assert_eq!(coverage.eligible_turns, 3);
+        assert_eq!(coverage.unpriced_sessions, 3);
+        assert_eq!(coverage.sessions_missing_turn_timestamps, 2);
+        assert!(coverage.failed_sources.is_empty());
     }
 
     #[test]

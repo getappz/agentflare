@@ -1,7 +1,9 @@
-use serde::Serialize;
+use std::borrow::Cow;
+
+use serde::{Deserialize, Serialize};
 
 /// Adapter-level support, not a guarantee that every source event has a value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Support {
     Recorded,
@@ -9,9 +11,9 @@ pub enum Support {
     NotRecorded,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdapterCapabilities {
-    pub source: &'static str,
+    pub source: Cow<'static, str>,
     pub cache_tokens: Support,
     pub turn_timestamps: Support,
     pub tool_failure_status: Support,
@@ -27,7 +29,7 @@ pub fn capabilities() -> &'static [AdapterCapabilities] {
 
     static CAPABILITIES: &[AdapterCapabilities] = &[
         AdapterCapabilities {
-            source: "claude_code",
+            source: Cow::Borrowed("claude_code"),
             cache_tokens: Recorded,
             turn_timestamps: Partial,
             tool_failure_status: Recorded,
@@ -38,7 +40,7 @@ pub fn capabilities() -> &'static [AdapterCapabilities] {
             subagents: Partial,
         },
         AdapterCapabilities {
-            source: "codex",
+            source: Cow::Borrowed("codex"),
             cache_tokens: Recorded,
             turn_timestamps: Recorded,
             tool_failure_status: NotRecorded,
@@ -47,7 +49,7 @@ pub fn capabilities() -> &'static [AdapterCapabilities] {
             subagents: NotRecorded,
         },
         AdapterCapabilities {
-            source: "opencode",
+            source: Cow::Borrowed("opencode"),
             cache_tokens: Recorded,
             turn_timestamps: NotRecorded,
             tool_failure_status: Recorded,
@@ -58,7 +60,7 @@ pub fn capabilities() -> &'static [AdapterCapabilities] {
             subagents: Partial,
         },
         AdapterCapabilities {
-            source: "cursor",
+            source: Cow::Borrowed("cursor"),
             cache_tokens: NotRecorded,
             turn_timestamps: Recorded,
             tool_failure_status: Recorded,
@@ -67,7 +69,7 @@ pub fn capabilities() -> &'static [AdapterCapabilities] {
             subagents: Recorded,
         },
         AdapterCapabilities {
-            source: "antigravity",
+            source: Cow::Borrowed("antigravity"),
             cache_tokens: Recorded,
             turn_timestamps: Recorded,
             // Failure is inferred from command-exit text in tool output.
@@ -107,7 +109,7 @@ mod tests {
         }
         for row in capabilities() {
             assert!(
-                sources.contains(&row.source),
+                sources.contains(&row.source.as_ref()),
                 "unregistered source {}",
                 row.source
             );
