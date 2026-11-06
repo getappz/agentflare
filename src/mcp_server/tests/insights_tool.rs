@@ -264,3 +264,27 @@ fn recall_never_opens_store_read_write() {
     assert!(!missing.exists());
     assert!(s.insights_impl(req("discover")).is_err());
 }
+
+#[cfg(unix)]
+#[test]
+fn inaccessible_db_path_reports_the_real_error_not_missing() {
+    use std::os::unix::fs::PermissionsExt;
+    let _l = agent_registry::detect::PATH_LOCK.lock().unwrap();
+    let (tmp, s) = harness();
+    let locked = tmp.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let db = locked.join("i.db");
+    // Permission bits do not bind root; nothing to assert there.
+    let enforced = db.try_exists().is_err();
+    let result = {
+        let _g = Db::set(&db);
+        s.insights_impl(req("forensics"))
+    };
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+    if enforced {
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("cannot access"), "{err}");
+        assert!(!err.contains("not found"), "{err}");
+    }
+}

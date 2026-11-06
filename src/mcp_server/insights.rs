@@ -96,11 +96,21 @@ impl super::AgentflareMcp {
             )));
         }
         let db = resume_insights_db();
-        if !db.exists() {
-            return Err(invalid(format!(
-                "insights DB not found at {} — run `agentflare insights sync` first",
-                db.display()
-            )));
+        // `exists()` would report a permission error as a missing file.
+        match db.try_exists() {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(invalid(format!(
+                    "insights DB not found at {} — run `agentflare insights sync` first",
+                    db.display()
+                )));
+            }
+            Err(e) => {
+                return Err(internal(format!(
+                    "cannot access insights DB at {}: {e}",
+                    db.display()
+                )));
+            }
         }
         let store = InsightsStore::open_read_only(&db)
             .map_err(|e| internal(format!("cannot open insights DB at {}: {e}", db.display())))?;
