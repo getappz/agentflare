@@ -422,6 +422,15 @@ impl InsightsStore {
             )?;
         }
         for tc in last_per_id(&bundle.tool_calls, |t| (&t.session_id, &t.id)) {
+            // A moved call keeps its subagent links, which live in the owning session.
+            let moved = move_foreign_row_aside(&tx, "tool_calls", &tc.id, &tc.session_id)?;
+            if moved > 0 {
+                tx.execute(
+                    "UPDATE subagents SET parent_tool_call_id = session_id || ':' || parent_tool_call_id
+                     WHERE parent_tool_call_id = ?1 AND session_id <> ?2",
+                    params![tc.id, tc.session_id],
+                )?;
+            }
             stats.tool_calls += tx.execute(
                 "INSERT INTO tool_calls(id, session_id, turn_seq, name, input, output, status, duration_ms, created_at)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
@@ -435,6 +444,7 @@ impl InsightsStore {
             )?;
         }
         for s in last_per_id(&bundle.subagents, |s| (&s.session_id, &s.id)) {
+            move_foreign_row_aside(&tx, "subagents", &s.id, &s.session_id)?;
             stats.subagents += tx.execute(
                 "INSERT INTO subagents(id, session_id, parent_tool_call_id, kind, status, task) VALUES (?1,?2,?3,?4,?5,?6)",
                 params![s.id, s.session_id, s.parent_tool_call_id, s.kind, s.status, s.task],
@@ -451,7 +461,6 @@ impl InsightsStore {
 /// Keep only the last row per `(session_id, id)`, in original order. A
 /// transcript can repeat a child id; a plain INSERT would fail and roll back
 /// the whole source, so the repeat replaces the earlier row as upserts used to.
-/// Cross-session id collisions are left alone so they still fail loudly.
 fn last_per_id<'a, T>(items: &'a [T], key: impl Fn(&'a T) -> (&'a str, &'a str)) -> Vec<&'a T> {
     let last: std::collections::HashMap<_, _> =
         items.iter().enumerate().map(|(i, t)| (key(t), i)).collect();
@@ -461,6 +470,23 @@ fn last_per_id<'a, T>(items: &'a [T], key: impl Fn(&'a T) -> (&'a str, &'a str))
         .filter(|(i, t)| last[&key(t)] == *i)
         .map(|(_, t)| t)
         .collect()
+}
+
+/// Child ids are global primary keys. A row another session already holds under
+/// `id` (a pre-scoping id that happens to read `session:raw`) must not roll back
+/// this source's commit, so re-key it within its own session and keep it there.
+fn move_foreign_row_aside(
+    conn: &Connection,
+    table: &str,
+    id: &str,
+    session_id: &str,
+) -> Result<usize, StoreError> {
+    Ok(conn.execute(
+        &format!(
+            "UPDATE {table} SET id = session_id || ':' || id WHERE id = ?1 AND session_id <> ?2"
+        ),
+        params![id, session_id],
+    )?)
 }
 
 /// Rows written by one [`InsightsStore::commit_ingest`].
@@ -835,6 +861,56 @@ mod commit_tests {
         assert_eq!(
             store.get_subagents("s1").unwrap()[0].task.as_deref(),
             Some("new")
+        );
+    }
+
+    #[test]
+    fn legacy_row_holding_a_scoped_id_is_kept_and_does_not_block_the_commit() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        let sub = |id: &str, session: &str, parent: Option<&str>| crate::model::Subagent {
+            id: id.into(),
+            session_id: session.into(),
+            parent_tool_call_id: parent.map(str::to_string),
+            kind: "task".into(),
+            status: "done".into(),
+            task: None,
+        };
+        let mut legacy = bundle(vec![session("old")], vec![]);
+        let mut legacy_call = tool_call("s:call", "old");
+        legacy_call.name = "legacy".into();
+        legacy.tool_calls = vec![legacy_call];
+        legacy.subagents = vec![sub("s:sub", "old", Some("s:call"))];
+        store.commit_ingest("codex", &legacy).unwrap();
+
+        let mut new = bundle(vec![session("s")], vec![]);
+        new.tool_calls = vec![tool_call("s:call", "s")];
+        new.subagents = vec![sub("s:sub", "s", Some("s:call"))];
+        new.file_cursors = vec![("/s.jsonl".into(), 1, 1)];
+        let stats = store.commit_ingest("codex", &new).unwrap();
+        assert_eq!((stats.tool_calls, stats.subagents), (1, 1));
+        assert!(store
+            .load_file_cursors("codex")
+            .unwrap()
+            .contains_key(std::path::Path::new("/s.jsonl")));
+
+        assert_eq!(store.get_tool_calls("s").unwrap()[0].id, "s:call");
+        let kept = store.get_tool_calls("old").unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            (kept[0].id.as_str(), kept[0].name.as_str()),
+            ("old:s:call", "legacy")
+        );
+        let kept_sub = store.get_subagents("old").unwrap();
+        assert_eq!(kept_sub[0].id, "old:s:sub");
+        assert_eq!(
+            kept_sub[0].parent_tool_call_id.as_deref(),
+            Some("old:s:call")
+        );
+        assert_eq!(
+            store.get_subagents("s").unwrap()[0]
+                .parent_tool_call_id
+                .as_deref(),
+            Some("s:call")
         );
     }
 
