@@ -132,14 +132,14 @@ pub fn migrations() -> Migrations<'static> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::model::*;
     use crate::store::InsightsStore;
     use chrono::{TimeZone, Utc};
     use rusqlite::Connection;
 
-    fn session(id: &str) -> Session {
+    pub(crate) fn session(id: &str) -> Session {
         Session {
             id: id.into(),
             source: SessionSource::ClaudeCode,

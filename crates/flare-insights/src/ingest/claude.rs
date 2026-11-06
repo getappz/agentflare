@@ -65,6 +65,13 @@ impl Adapter for ClaudeAdapter {
     }
 }
 
+/// A forked/resumed Claude session copies its parent's messages verbatim, so
+/// `toolu_…` and message uuids recur across session files. Row ids are primary
+/// keys, so scope them by session to keep both copies.
+fn scoped_id(session_id: &str, raw: &str) -> String {
+    format!("{session_id}:{raw}")
+}
+
 fn parse_claude_jsonl(path: &Path) -> Option<IngestBundle> {
     let vals = crate::ingest::read_jsonl_sessions(path);
     if vals.is_empty() {
@@ -146,8 +153,8 @@ fn parse_claude_jsonl(path: &Path) -> Option<IngestBundle> {
                 .get("id")
                 .or_else(|| v.get("uuid"))
                 .and_then(|id| id.as_str())
-                .unwrap_or(&format!("{}-sub-{}", id, subagents.len()))
-                .to_string();
+                .map(|raw| format!("{id}:{raw}"))
+                .unwrap_or_else(|| format!("{}-sub-{}", id, subagents.len()));
             let task = v
                 .get("task")
                 .or_else(|| v.get("content"))
@@ -198,7 +205,7 @@ fn parse_claude_jsonl(path: &Path) -> Option<IngestBundle> {
                         if let Some(index) = c
                             .get("tool_use_id")
                             .and_then(|id| id.as_str())
-                            .and_then(|id| tool_indices.get(id))
+                            .and_then(|raw| tool_indices.get(&scoped_id(&id, raw)))
                             .copied()
                         {
                             let tool: &mut ToolCall = &mut tool_calls[index];
@@ -221,8 +228,8 @@ fn parse_claude_jsonl(path: &Path) -> Option<IngestBundle> {
                         let call_id = c
                             .get("id")
                             .and_then(|v| v.as_str())
-                            .unwrap_or(&format!("{}-{}-tool-{}", id, seq, tool_calls.len()))
-                            .to_string();
+                            .map(|raw| scoped_id(&id, raw))
+                            .unwrap_or_else(|| format!("{}-{}-tool-{}", id, seq, tool_calls.len()));
                         let name = c
                             .get("name")
                             .and_then(|v| v.as_str())
@@ -408,6 +415,32 @@ mod tests {
         );
         assert_eq!(bundle.tool_calls[1].status, "completed");
         assert_eq!(bundle.tool_calls[2].status, "pending");
+    }
+
+    #[test]
+    fn forked_sessions_sharing_tool_use_ids_both_commit() {
+        let dir = TempDir::new().unwrap();
+        let record = serde_json::json!({"type":"assistant","uuid":"m1","message":{"content":[
+            {"type":"tool_use","id":"toolu_shared","name":"Task","input":{"description":"x"}}
+        ]}})
+        .to_string();
+        let mut bundle = IngestBundle::default();
+        for name in ["parent.jsonl", "fork.jsonl"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, &record).unwrap();
+            let b = parse_claude_jsonl(&path).unwrap();
+            bundle.sessions.extend(b.sessions);
+            bundle.tool_calls.extend(b.tool_calls);
+            bundle.subagents.extend(b.subagents);
+        }
+        let store = crate::store::InsightsStore::open_in_memory().unwrap();
+        let stats = store.commit_ingest("claude_code", &bundle).unwrap();
+        assert_eq!(
+            (stats.sessions, stats.tool_calls, stats.subagents),
+            (2, 2, 2)
+        );
+        assert_eq!(store.get_tool_calls("parent").unwrap().len(), 1);
+        assert_eq!(store.get_tool_calls("fork").unwrap().len(), 1);
     }
     #[test]
     fn empty_dir_returns_empty() {
