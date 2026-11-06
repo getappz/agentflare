@@ -9,6 +9,12 @@ impl AgentflareMcp {
             "memory" => self.search_memory(&req),
             "web" => self.search_web(&req).await,
             "store" => self.search_store(&req),
+            "session" | "sessions" => self.insights_impl(InsightsRequest {
+                action: "search".into(),
+                query: Some(req.query.clone()),
+                limit: req.limit,
+                ..Default::default()
+            }),
             "all" => self.search_all(&req, false).await,
             "all+web" => self.search_all(&req, true).await,
             "social" => self.search_social(&req).await,
@@ -26,7 +32,7 @@ impl AgentflareMcp {
             "bluesky" => self.search_bluesky(&req).await,
             other => Err(ErrorData::invalid_params(
                 format!(
-                    "unknown type '{other}' — use store|memory|code|web|all|all+web|social|news|github|academic|datasets|websites|weather|financial|crypto|fx|indicators|youtube|bluesky"
+                    "unknown type '{other}' — use store|memory|session|code|web|all|all+web|social|news|github|academic|datasets|websites|weather|financial|crypto|fx|indicators|youtube|bluesky"
                 ),
                 None,
             )),

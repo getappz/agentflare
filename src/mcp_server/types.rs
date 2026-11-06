@@ -1672,3 +1672,40 @@ pub(crate) struct AutopilotRequest {
     #[serde(default)]
     pub(crate) rate_limit_pct: Option<f64>,
 }
+
+/// Read-only access to the local insights index (past agent sessions).
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub(crate) struct InsightsRequest {
+    #[schemars(description = "search | recall | forensics | discover")]
+    pub(crate) action: String,
+    #[schemars(description = "Search text (search)")]
+    #[serde(default)]
+    pub(crate) query: Option<String>,
+    #[schemars(description = "Session id (recall; optional filter for forensics)")]
+    #[serde(default)]
+    pub(crate) session_id: Option<String>,
+    #[schemars(description = "Agent source filter, e.g. claude-code|codex|opencode|cursor")]
+    #[serde(default)]
+    pub(crate) source: Option<String>,
+    #[schemars(description = "Project path prefix; defaults to the current dir, \"*\" = all")]
+    #[serde(default)]
+    pub(crate) project: Option<String>,
+    #[schemars(description = "Look-back window in days (forensics, default 7)")]
+    #[serde(default)]
+    pub(crate) since_days: Option<u32>,
+    #[schemars(description = "Max hits (search, default 20)")]
+    #[serde(default)]
+    pub(crate) limit: Option<usize>,
+    #[schemars(description = "Hits to skip (search)")]
+    #[serde(default)]
+    pub(crate) offset: Option<usize>,
+    #[schemars(description = "First turn seq to return (recall, default 0)")]
+    #[serde(default)]
+    pub(crate) turn_start: Option<u32>,
+    #[schemars(description = "Max turns per page (recall, default 20)")]
+    #[serde(default)]
+    pub(crate) turn_limit: Option<usize>,
+    #[schemars(description = "Max text chars per page (recall, default 12000)")]
+    #[serde(default)]
+    pub(crate) max_chars: Option<usize>,
+}
