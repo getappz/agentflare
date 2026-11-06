@@ -231,3 +231,48 @@ fn repeated_text_evidence_lists_every_session() {
         .len();
     assert_eq!(ev, 2);
 }
+
+#[test]
+fn streak_can_start_after_a_success_in_the_same_tool_run() {
+    // c3 already has Bash ok, Bash failed; a following Bash ok makes failed, ok a streak.
+    let store = load(&|id| id == "c3");
+    store
+        .upsert_tool_call(&ToolCall {
+            id: "t12".into(),
+            session_id: "c3".into(),
+            turn_seq: 1,
+            name: "Bash".into(),
+            input: Value::Null,
+            output: None,
+            status: "ok".into(),
+            duration_ms: None,
+            created_at: None,
+        })
+        .unwrap();
+    let r = run(&store, Default::default());
+    let value = &finding(&r, "failed_tool_streaks")["value"][0];
+    assert_eq!(value["length"], 2);
+    assert_eq!(value["tool"], "Bash");
+}
+
+#[test]
+fn huge_days_does_not_panic() {
+    let store = load(&|_| true);
+    let opts = ForensicsOptions {
+        days: u32::MAX,
+        ..Default::default()
+    };
+    assert_eq!(run(&store, opts)["coverage"]["sessions_in_window"], 6);
+}
+
+#[test]
+fn within_session_repeat_counts_only_sessions_that_repeated() {
+    // c1 says it twice, c2 once: within-session is c1 alone, cross-session is both.
+    let store = load(&|_| true);
+    let r = run(&store, Default::default());
+    let within = finding(&r, "repeated_user_text.within_session");
+    assert_eq!(within["value"][0]["count"], 2);
+    assert_eq!(within["value"][0]["sessions"], 1);
+    let cross = finding(&r, "repeated_user_text.cross_session");
+    assert_eq!(cross["value"][0]["count"], 3);
+}

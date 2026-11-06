@@ -75,8 +75,8 @@
       "value": [
         {
           "hash": "7621a0714284b3b1087679dbd397bf37d7fdfabb7c49af97f46d80925803a61e",
-          "count": 3,
-          "sessions": 2
+          "count": 2,
+          "sessions": 1
         }
       ],
       "unit": "groups",
@@ -86,14 +86,6 @@
         {
           "source": "claude_code",
           "session_id": "c1",
-          "turn_seq": 1,
-          "tool_call_id": null,
-          "at": null,
-          "excerpt": "please run the full test suite now"
-        },
-        {
-          "source": "claude_code",
-          "session_id": "c2",
           "turn_seq": 1,
           "tool_call_id": null,
           "at": null,

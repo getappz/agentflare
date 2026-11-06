@@ -120,7 +120,10 @@ pub fn compute(
     opts: &ForensicsOptions,
     now: DateTime<Utc>,
 ) -> anyhow::Result<Report<Vec<Finding>>> {
-    let since = now - Duration::days(opts.days as i64);
+    // A huge `days` (reachable from the API query string) must not panic on overflow.
+    let since = now
+        .checked_sub_signed(Duration::days(opts.days as i64))
+        .unwrap_or(DateTime::<Utc>::MIN_UTC);
     let sessions: Vec<Session> = store
         .list_sessions_filtered(
             opts.source.as_deref(),
@@ -147,7 +150,11 @@ pub fn compute(
     )?;
 
     let with_turns: HashSet<&str> = turns.iter().map(|t| t.0.as_str()).collect();
-    let timestamped: HashSet<&str> = turns.iter().filter(|t| t.3).map(|t| t.0.as_str()).collect();
+    let untimed: HashSet<&str> = turns
+        .iter()
+        .filter(|t| !t.3)
+        .map(|t| t.0.as_str())
+        .collect();
     let mut cost_basis_mix: BTreeMap<String, usize> = BTreeMap::new();
     for s in sessions.iter().filter(|s| s.cost.is_some()) {
         *cost_basis_mix
@@ -163,8 +170,11 @@ pub fn compute(
         eligible_turns: turns.len(),
         unpriced_sessions: sessions.iter().filter(|s| s.cost.is_none()).count(),
         cost_basis_mix,
-        // Sessions in the window with no timestamped turn (including no turns).
-        sessions_missing_turn_timestamps: sessions.len() - timestamped.len(),
+        // Same meaning as `stats_window`: no turns, or any turn without a timestamp.
+        sessions_missing_turn_timestamps: sessions
+            .iter()
+            .filter(|s| !with_turns.contains(s.id.as_str()) || untimed.contains(s.id.as_str()))
+            .count(),
         failed_sources: Vec::new(),
     };
 
@@ -214,16 +224,16 @@ fn repeated_user_text(
     let build = |within: bool| {
         let mut rows: Vec<Group> = Vec::new();
         for (h, per) in &groups {
-            let total: usize = per.values().map(Vec::len).sum();
-            let hit = if within {
-                per.values().any(|v| v.len() >= 2)
-            } else {
-                per.len() >= 2
-            };
-            if !hit {
+            // Within-session counts only sessions that actually repeated the text.
+            let scoped: Vec<_> = per
+                .iter()
+                .filter(|(_, v)| !within || v.len() >= 2)
+                .collect();
+            if scoped.is_empty() || (!within && scoped.len() < 2) {
                 continue;
             }
-            let refs = per.iter().map(|(s, v)| (*s, v[0])).collect();
+            let total = scoped.iter().map(|(_, v)| v.len()).sum();
+            let refs = scoped.iter().map(|(s, v)| (**s, v[0])).collect();
             rows.push((h.clone(), total, refs));
         }
         rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
@@ -265,7 +275,7 @@ fn failed_tool_streaks(
 ) -> anyhow::Result<Finding> {
     let recorded = |s: &Session| {
         capability::for_source(s.source.as_str())
-            .is_some_and(|c| c.tool_failure_status != Support::NotRecorded)
+            .is_some_and(|c| c.tool_failure_status == Support::Recorded)
     };
     let eligible: HashSet<&str> = sessions
         .iter()
@@ -306,11 +316,16 @@ fn failed_tool_streaks(
     let (mut value, mut evidence) = (Vec::new(), Vec::new());
     let mut i = 0;
     while i < rows.len() {
+        // A streak starts at a failure, wherever that falls in a same-tool run.
+        if rows[i].4 != "failed" {
+            i += 1;
+            continue;
+        }
         let mut j = i + 1;
         while j < rows.len() && rows[j].1 == rows[i].1 && rows[j].3 == rows[i].3 {
             j += 1;
         }
-        if j - i >= 2 && rows[i].4 == "failed" {
+        if j - i >= 2 {
             value.push(json!({
                 "session_id": rows[i].1, "tool": rows[i].3,
                 "length": j - i, "turn_seq": rows[i].2,
