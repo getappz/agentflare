@@ -423,12 +423,13 @@ impl InsightsStore {
         }
         for tc in last_per_id(&bundle.tool_calls, |t| (&t.session_id, &t.id)) {
             // A moved call keeps its subagent links, which live in the owning session.
-            let moved = move_foreign_row_aside(&tx, "tool_calls", &tc.id, &tc.session_id)?;
-            if moved > 0 {
+            if let Some((owner, new_id)) =
+                move_foreign_row_aside(&tx, "tool_calls", &tc.id, &tc.session_id)?
+            {
                 tx.execute(
-                    "UPDATE subagents SET parent_tool_call_id = session_id || ':' || parent_tool_call_id
-                     WHERE parent_tool_call_id = ?1 AND session_id <> ?2",
-                    params![tc.id, tc.session_id],
+                    "UPDATE subagents SET parent_tool_call_id = ?1
+                     WHERE parent_tool_call_id = ?2 AND session_id = ?3",
+                    params![new_id, tc.id, owner],
                 )?;
             }
             stats.tool_calls += tx.execute(
@@ -474,19 +475,41 @@ fn last_per_id<'a, T>(items: &'a [T], key: impl Fn(&'a T) -> (&'a str, &'a str))
 
 /// Child ids are global primary keys. A row another session already holds under
 /// `id` (a pre-scoping id that happens to read `session:raw`) must not roll back
-/// this source's commit, so re-key it within its own session and keep it there.
+/// this source's commit, so re-key it to a free id within its own session and
+/// keep it there. Returns the owning session and the row's new id when one moved.
 fn move_foreign_row_aside(
     conn: &Connection,
     table: &str,
     id: &str,
     session_id: &str,
-) -> Result<usize, StoreError> {
-    Ok(conn.execute(
-        &format!(
-            "UPDATE {table} SET id = session_id || ':' || id WHERE id = ?1 AND session_id <> ?2"
-        ),
-        params![id, session_id],
-    )?)
+) -> Result<Option<(String, String)>, StoreError> {
+    let owner: Option<String> = conn
+        .query_row(
+            &format!("SELECT session_id FROM {table} WHERE id = ?1 AND session_id <> ?2"),
+            params![id, session_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(owner) = owner else {
+        return Ok(None);
+    };
+    let mut new_id = format!("{owner}:{id}");
+    while conn
+        .query_row(
+            &format!("SELECT 1 FROM {table} WHERE id = ?1"),
+            params![new_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some()
+    {
+        new_id = format!("{owner}:{new_id}");
+    }
+    conn.execute(
+        &format!("UPDATE {table} SET id = ?1 WHERE id = ?2"),
+        params![new_id, id],
+    )?;
+    Ok(Some((owner, new_id)))
 }
 
 /// Rows written by one [`InsightsStore::commit_ingest`].
@@ -912,6 +935,54 @@ mod commit_tests {
                 .as_deref(),
             Some("s:call")
         );
+    }
+
+    #[test]
+    fn occupied_rekey_destination_does_not_block_the_commit() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        let sub = |id: &str, session: &str, parent: Option<&str>| crate::model::Subagent {
+            id: id.into(),
+            session_id: session.into(),
+            parent_tool_call_id: parent.map(str::to_string),
+            kind: "task".into(),
+            status: "done".into(),
+            task: None,
+        };
+        let mut legacy = bundle(vec![session("old")], vec![]);
+        legacy.tool_calls = vec![tool_call("s:call", "old"), tool_call("old:s:call", "old")];
+        legacy.subagents = vec![
+            sub("s:sub", "old", Some("s:call")),
+            sub("old:s:sub", "old", Some("old:s:call")),
+        ];
+        store.commit_ingest("codex", &legacy).unwrap();
+
+        let mut new = bundle(vec![session("s")], vec![]);
+        new.tool_calls = vec![tool_call("s:call", "s")];
+        new.subagents = vec![sub("s:sub", "s", Some("s:call"))];
+        new.file_cursors = vec![("/s.jsonl".into(), 1, 1)];
+        store.commit_ingest("codex", &new).unwrap();
+        assert!(store
+            .load_file_cursors("codex")
+            .unwrap()
+            .contains_key(std::path::Path::new("/s.jsonl")));
+
+        assert_eq!(store.get_tool_calls("s").unwrap()[0].id, "s:call");
+        let mut kept: Vec<_> = store
+            .get_tool_calls("old")
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        kept.sort();
+        assert_eq!(kept, ["old:old:s:call", "old:s:call"]);
+        let parents: std::collections::HashMap<_, _> = store
+            .get_subagents("old")
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.id, s.parent_tool_call_id))
+            .collect();
+        assert_eq!(parents["old:old:s:sub"].as_deref(), Some("old:old:s:call"));
+        assert_eq!(parents["old:s:sub"].as_deref(), Some("old:s:call"));
     }
 
     #[test]
