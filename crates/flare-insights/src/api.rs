@@ -173,12 +173,16 @@ fn route_request(
                 .get("limit")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(20);
+            let offset = params
+                .get("offset")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
             let opts = crate::search::SearchOptions {
                 query: q,
                 source: params.get("source").cloned(),
                 project: params.get("project").cloned(),
                 limit,
-                offset: 0,
+                offset,
                 include_files: true,
                 include_tools: true,
             };

@@ -3,12 +3,32 @@
 //! `sessions.source` / `sessions.status` are stored via `serde_json::to_string`,
 //! so filters must compare against the JSON-quoted form (e.g. `"codex"`).
 
+use chrono::{DateTime, Utc};
 use rusqlite::params_from_iter;
 use rusqlite::types::Value;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::model::Session;
 use crate::store::{row_to_session, InsightsStore, StoreError};
+
+/// One search result: session plus the best-matching turn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchHit {
+    pub session: Session,
+    pub turn_seq: u32,
+    pub rank: f64,
+    pub snippet: String,
+}
+
+/// Filters applied in SQL before grouping / limiting search hits.
+#[derive(Debug, Clone, Default)]
+pub struct SearchFilters {
+    pub source: Option<String>,
+    pub project_prefix: Option<String>,
+    pub since: Option<DateTime<Utc>>,
+    pub limit: usize,
+    pub offset: usize,
+}
 
 /// Exact string form used when upserting a JSON column (`serde_json::to_string`).
 pub fn column_json<T: Serialize>(v: &T) -> String {
@@ -29,6 +49,56 @@ pub fn source_columns(logical: &str) -> Vec<String> {
         .collect()
 }
 
+fn bound_snippet(s: String) -> String {
+    if s.chars().count() <= 240 {
+        s
+    } else {
+        s.chars().take(240).collect()
+    }
+}
+
+/// Append source / project-prefix / since predicates for a `sessions` alias `s`.
+fn push_session_filters(
+    sql: &mut String,
+    binds: &mut Vec<Value>,
+    source: Option<&str>,
+    project_prefix: Option<&str>,
+    since: Option<DateTime<Utc>>,
+) {
+    if let Some(src) = source {
+        let cols = source_columns(src);
+        let marks = vec!["?"; cols.len()].join(",");
+        sql.push_str(&format!(" AND s.source IN ({marks})"));
+        binds.extend(cols.into_iter().map(Value::Text));
+    }
+
+    if let Some(prefix) = project_prefix {
+        // Literal, case-sensitive comparison (LIKE would treat `_`/`%` as wildcards
+        // and fold ASCII case). Trailing separators are ignored; children may use
+        // `/` or `\\`.
+        let base = prefix.trim_end_matches(['/', '\\']);
+        let n = base.chars().count() as i64 + 1;
+        let mut clause = String::from(" AND (");
+        for (i, col) in ["s.cwd", "s.project_path"].iter().enumerate() {
+            if i > 0 {
+                clause.push_str(" OR ");
+            }
+            clause.push_str(&format!("{col} = ? OR (substr({col}, 1, ?) IN (?, ?))"));
+            binds.push(Value::Text(base.to_string()));
+            binds.push(Value::Integer(n));
+            binds.push(Value::Text(format!("{base}/")));
+            binds.push(Value::Text(format!("{base}\\")));
+        }
+        clause.push(')');
+        sql.push_str(&clause);
+    }
+
+    if let Some(since) = since {
+        sql.push_str(" AND s.updated_at >= ?");
+        binds.push(Value::Text(since.to_rfc3339()));
+    }
+}
+
 impl InsightsStore {
     /// List sessions with optional source and project-prefix filters applied in SQL.
     ///
@@ -41,43 +111,135 @@ impl InsightsStore {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<Session>, StoreError> {
-        let mut sql = String::from("SELECT * FROM sessions WHERE 1=1");
+        let mut sql = String::from("SELECT s.* FROM sessions s WHERE 1=1");
         let mut binds: Vec<Value> = Vec::new();
+        push_session_filters(&mut sql, &mut binds, source, project_prefix, None);
 
-        if let Some(src) = source {
-            let cols = source_columns(src);
-            let marks = vec!["?"; cols.len()].join(",");
-            sql.push_str(&format!(" AND source IN ({marks})"));
-            binds.extend(cols.into_iter().map(Value::Text));
-        }
-
-        if let Some(prefix) = project_prefix {
-            // Literal, case-sensitive comparison (LIKE would treat `_`/`%` as wildcards
-            // and fold ASCII case). Trailing separators are ignored; children may use
-            // `/` or `\\`.
-            let base = prefix.trim_end_matches(['/', '\\']);
-            let n = base.chars().count() as i64 + 1;
-            let mut clause = String::from(" AND (");
-            for (i, col) in ["cwd", "project_path"].iter().enumerate() {
-                if i > 0 {
-                    clause.push_str(" OR ");
-                }
-                clause.push_str(&format!("{col} = ? OR (substr({col}, 1, ?) IN (?, ?))"));
-                binds.push(Value::Text(base.to_string()));
-                binds.push(Value::Integer(n));
-                binds.push(Value::Text(format!("{base}/")));
-                binds.push(Value::Text(format!("{base}\\")));
-            }
-            clause.push(')');
-            sql.push_str(&clause);
-        }
-
-        sql.push_str(" ORDER BY updated_at DESC LIMIT ? OFFSET ?");
+        sql.push_str(" ORDER BY s.updated_at DESC LIMIT ? OFFSET ?");
         binds.push(Value::Integer(limit as i64));
         binds.push(Value::Integer(offset as i64));
 
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(binds), row_to_session)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Full-text (or short-query LIKE) search with filters applied before limit.
+    ///
+    /// One hit per session (best `rank`); queries shorter than 3 chars use LIKE.
+    pub fn search_hits(
+        &self,
+        query: &str,
+        f: &SearchFilters,
+    ) -> Result<Vec<SearchHit>, StoreError> {
+        let q = query.trim();
+        if q.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let use_like = q.chars().count() < 3;
+        let mut binds: Vec<Value> = Vec::new();
+        let mut sql = if use_like {
+            let pattern = format!("%{q}%");
+            binds.push(Value::Text(pattern.clone()));
+            binds.push(Value::Text(pattern.clone()));
+            binds.push(Value::Text(pattern));
+            String::from(
+                r#"WITH matched AS (
+                    SELECT
+                        t.session_id AS sid,
+                        t.seq AS turn_seq,
+                        0.0 AS hit_rank,
+                        CASE
+                            WHEN t.assistant_text LIKE ? THEN substr(COALESCE(t.assistant_text, ''), 1, 240)
+                            ELSE substr(COALESCE(t.user_text, ''), 1, 240)
+                        END AS snip,
+                        ROW_NUMBER() OVER (PARTITION BY t.session_id ORDER BY t.seq) AS rn
+                    FROM turns t
+                    JOIN sessions s ON s.id = t.session_id
+                    WHERE (t.user_text LIKE ? OR t.assistant_text LIKE ?)"#,
+            )
+        } else {
+            // snippet() requires MATCH in the same SELECT; pick best rowids in a CTE
+            // first, then join back for snippet.
+            let fts_q = flare_search_kit::fts_phrase_query(q);
+            binds.push(Value::Text(fts_q.clone()));
+            String::from(
+                r#"WITH candidates AS (
+                    SELECT
+                        t.rowid AS turn_rowid,
+                        t.session_id AS sid,
+                        t.seq AS turn_seq,
+                        rank AS hit_rank,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY t.session_id ORDER BY rank, t.rowid
+                        ) AS rn
+                    FROM turns_fts
+                    JOIN turns t ON t.rowid = turns_fts.rowid
+                    JOIN sessions s ON s.id = t.session_id
+                    WHERE turns_fts MATCH ?"#,
+            )
+        };
+
+        push_session_filters(
+            &mut sql,
+            &mut binds,
+            f.source.as_deref(),
+            f.project_prefix.as_deref(),
+            f.since,
+        );
+
+        if use_like {
+            sql.push_str(
+                r#"
+                )
+                SELECT s.*, m.turn_seq, m.hit_rank AS rank, m.snip AS snippet
+                FROM matched m
+                JOIN sessions s ON s.id = m.sid
+                WHERE m.rn = 1
+                ORDER BY m.hit_rank
+                LIMIT ?, ?"#,
+            );
+        } else {
+            let fts_q = flare_search_kit::fts_phrase_query(q);
+            binds.push(Value::Text(fts_q));
+            sql.push_str(
+                r#"
+                ),
+                best AS (
+                    SELECT turn_rowid, sid, turn_seq, hit_rank
+                    FROM candidates WHERE rn = 1
+                )
+                SELECT s.*, b.turn_seq, b.hit_rank AS rank,
+                       snippet(turns_fts, 2, '[', ']', '…', 24) AS snippet
+                FROM best b
+                JOIN turns_fts ON turns_fts.rowid = b.turn_rowid
+                JOIN sessions s ON s.id = b.sid
+                WHERE turns_fts MATCH ?
+                ORDER BY b.hit_rank
+                LIMIT ?, ?"#,
+            );
+        }
+        binds.push(Value::Integer(f.offset as i64));
+        binds.push(Value::Integer(f.limit as i64));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(binds), |row| {
+            let session = row_to_session(row)?;
+            let turn_seq: i64 = row.get("turn_seq")?;
+            let rank: f64 = row.get("rank")?;
+            let snippet: String = row.get("snippet")?;
+            Ok(SearchHit {
+                session,
+                turn_seq: turn_seq as u32,
+                rank,
+                snippet: bound_snippet(snippet),
+            })
+        })?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);

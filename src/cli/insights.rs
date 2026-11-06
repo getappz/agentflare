@@ -370,13 +370,16 @@ fn run_search(db: PathBuf, args: SearchArgs) {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&res).unwrap());
     } else {
-        for s in res {
+        for hit in res {
+            let s = &hit.session;
             println!(
-                "{:<36} {:<12} {} {}",
+                "{:<36} {:<12} seq={:<4} {} {} | {}",
                 s.id,
                 s.source.as_str(),
+                hit.turn_seq,
                 s.project,
-                s.title.as_deref().unwrap_or("")
+                s.title.as_deref().unwrap_or(""),
+                hit.snippet
             )
         }
     }
