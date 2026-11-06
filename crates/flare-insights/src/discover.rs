@@ -343,14 +343,15 @@ pub fn mine(
     }
 
     // Connected components never depend on pair order, so nothing here stores pairs.
-    // Identical prompts match by definition: collapse them to one representative so a
-    // prompt repeated thousands of times costs one comparison, not a quadratic number.
+    // Prompts with the same token sequence share every n-gram, so they are connected
+    // whenever any is: collapse them to one representative so a prompt repeated
+    // thousands of times costs one comparison. A same-set reordering has different
+    // n-grams and must stay separate.
     let mut uf = UnionFind::new(docs.len());
     let mut representative: HashMap<Vec<&str>, usize> = HashMap::new();
     let mut is_representative = vec![false; docs.len()];
     for (i, doc) in docs.iter().enumerate() {
-        let mut key: Vec<&str> = doc.token_set.iter().map(String::as_str).collect();
-        key.sort_unstable();
+        let key: Vec<&str> = doc.tokens.iter().map(String::as_str).collect();
         match representative.entry(key) {
             Entry::Occupied(first) => {
                 if opts.jaccard_threshold <= 1.0 {

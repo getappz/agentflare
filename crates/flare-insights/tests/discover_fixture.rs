@@ -283,3 +283,25 @@ fn coverage_counts_sessions_with_untimed_turns() {
         "fixture turns carry no timestamps"
     );
 }
+
+#[test]
+fn reordered_prompts_are_not_treated_as_identical() {
+    let mut rows = Vec::new();
+    for (prefix, text) in [
+        ("a", "alpha bravo charlie delta echo foxtrot"),
+        ("b", "alpha charlie echo bravo delta foxtrot"),
+    ] {
+        for i in 1..=3 {
+            rows.push(row(text.into(), format!("{prefix}{i}")));
+        }
+    }
+    rows.push(row(
+        "alpha charlie echo bravo delta golf".into(),
+        "c1".into(),
+    ));
+    let store = load_store(&rows);
+    let report = mine(&store, &opts(DEFAULT_JACCARD_THRESHOLD), now()).unwrap();
+    let mut sizes: Vec<_> = report.body.iter().map(|p| p.occurrences).collect();
+    sizes.sort_unstable();
+    assert_eq!(sizes, [3, 4]);
+}
