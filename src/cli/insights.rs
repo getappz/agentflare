@@ -32,6 +32,23 @@ pub enum InsightsCommands {
     Watch(WatchArgs),
     /// Check health of insights DB and sources (claude/codex/opencode/cursor)
     Doctor(DoctorArgs),
+    /// Forensic detectors: repeats, failed-tool streaks, big outputs, cost, cache
+    Forensics(ForensicsArgs),
+}
+
+#[derive(Parser, Debug)]
+pub struct ForensicsArgs {
+    #[arg(long, default_value = "7")]
+    pub days: u32,
+    /// Only sessions whose cwd/project path is under this path
+    #[arg(long)]
+    pub project: Option<String>,
+    #[arg(long)]
+    pub source: Option<String>,
+    #[arg(long)]
+    pub session: Option<String>,
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -148,6 +165,7 @@ impl InsightsArgs {
             InsightsCommands::Serve(args) => run_serve(db_path, args),
             InsightsCommands::Watch(args) => run_watch(db_path, args),
             InsightsCommands::Doctor(args) => run_doctor(db_path, args),
+            InsightsCommands::Forensics(args) => run_forensics(db_path, args),
         }
     }
 }
@@ -547,5 +565,71 @@ fn run_doctor(db: PathBuf, args: DoctorArgs) {
                 if *present { "found" } else { "missing" }
             );
         }
+    }
+}
+
+fn run_forensics(db: PathBuf, args: ForensicsArgs) {
+    let store = open_store(db);
+    let opts = flare_insights::forensics::ForensicsOptions {
+        days: args.days,
+        project_prefix: args.project,
+        source: args.source,
+        session_id: args.session,
+    };
+    let report = flare_insights::forensics::compute(&store, &opts, chrono::Utc::now())
+        .unwrap_or_else(|e| {
+            eprintln!("forensics failed: {e}");
+            std::process::exit(1);
+        });
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        return;
+    }
+    println!(
+        "forensics: last {} days, {} sessions ({} unpriced)",
+        args.days, report.coverage.sessions_in_window, report.coverage.unpriced_sessions
+    );
+    for f in &report.body {
+        match (&f.value, &f.unavailable_reason) {
+            (_, Some(why)) => println!("{}: unavailable ({why})", f.id),
+            (Some(v), None) => println!("{}: {}", f.id, v),
+            (None, None) => println!("{}: -", f.id),
+        }
+    }
+}
+
+#[cfg(test)]
+mod forensics_args_tests {
+    use super::*;
+
+    #[test]
+    fn forensics_flags_parse_with_defaults() {
+        let a = InsightsArgs::try_parse_from(["insights", "forensics"]).unwrap();
+        let Some(InsightsCommands::Forensics(f)) = a.command else {
+            panic!("expected forensics")
+        };
+        assert_eq!((f.days, f.json, f.project.is_none()), (7, false, true));
+        let a = InsightsArgs::try_parse_from([
+            "insights",
+            "forensics",
+            "--days",
+            "3",
+            "--project",
+            "/p",
+            "--source",
+            "codex",
+            "--session",
+            "s1",
+            "--json",
+        ])
+        .unwrap();
+        let Some(InsightsCommands::Forensics(f)) = a.command else {
+            panic!("expected forensics")
+        };
+        assert_eq!(f.days, 3);
+        assert_eq!(f.project.as_deref(), Some("/p"));
+        assert_eq!(f.source.as_deref(), Some("codex"));
+        assert_eq!(f.session.as_deref(), Some("s1"));
+        assert!(f.json);
     }
 }

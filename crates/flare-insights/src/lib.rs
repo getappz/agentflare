@@ -19,6 +19,7 @@ pub mod capability;
 pub mod config;
 pub mod evidence;
 pub mod export;
+pub mod forensics;
 pub mod handoff;
 pub mod ingest;
 pub mod migrations;

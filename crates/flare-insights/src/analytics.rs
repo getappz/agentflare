@@ -78,6 +78,10 @@ pub fn compute_analytics_with_tools(
         total_tokens += s.tokens.total();
         if let Some(c) = &s.cost {
             total_cost += c.total_usd;
+            *coverage
+                .cost_basis_mix
+                .entry(s.cost_basis.as_str().to_string())
+                .or_default() += 1;
         }
         *by_source.entry(s.source.as_str().to_string()).or_default() += 1;
         if let Some(m) = &s.model {
