@@ -24,6 +24,7 @@ pub mod handoff;
 pub mod ingest;
 pub mod migrations;
 pub mod model;
+pub mod recall;
 pub mod replay;
 pub mod search;
 pub mod store;

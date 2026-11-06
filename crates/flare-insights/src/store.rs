@@ -235,6 +235,25 @@ impl InsightsStore {
         Ok(out)
     }
 
+    /// Up to `limit` turns from `seq >= start`, in order.
+    pub fn get_turns_page(
+        &self,
+        session_id: &str,
+        start: u32,
+        limit: usize,
+    ) -> Result<Vec<Turn>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM turns WHERE session_id=?1 AND seq>=?2 ORDER BY seq ASC LIMIT ?3",
+        )?;
+        let limit = limit.min(i64::MAX as usize) as i64;
+        let rows = stmt.query_map(params![session_id, start, limit], row_to_turn)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     // ---- tool_calls ----
 
     pub fn upsert_tool_call(&self, tc: &ToolCall) -> Result<(), StoreError> {
@@ -266,6 +285,25 @@ impl InsightsStore {
             .conn
             .prepare("SELECT * FROM tool_calls WHERE session_id=?1 ORDER BY turn_seq ASC")?;
         let rows = stmt.query_map(params![session_id], row_to_tool_call)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Tool calls for turns `first..=last`, in call order.
+    pub fn get_tool_calls_in_turns(
+        &self,
+        session_id: &str,
+        first: u32,
+        last: u32,
+    ) -> Result<Vec<ToolCall>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM tool_calls WHERE session_id=?1 AND turn_seq BETWEEN ?2 AND ?3
+             ORDER BY turn_seq ASC, rowid ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id, first, last], row_to_tool_call)?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
