@@ -379,7 +379,7 @@ fn run_search(db: PathBuf, args: SearchArgs) {
                 hit.turn_seq,
                 s.project,
                 s.title.as_deref().unwrap_or(""),
-                hit.snippet
+                hit.snippet.split_whitespace().collect::<Vec<_>>().join(" ")
             )
         }
     }
@@ -387,30 +387,38 @@ fn run_search(db: PathBuf, args: SearchArgs) {
 
 fn run_stats(db: PathBuf, args: StatsArgs) {
     let store = open_store(db);
-    let sessions = store.list_sessions(10000, 0).unwrap_or_default();
-    let tools = store.list_tool_calls(100000).unwrap_or_default();
-    let files = store.list_file_events(100000).unwrap_or_default();
-    let analytics =
-        flare_insights::analytics::compute_analytics_with_tools(&sessions, &tools, &files);
+    let analytics = match store.stats_window(&Default::default()) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("stats failed: {e}");
+            std::process::exit(1);
+        }
+    };
     if args.json {
         println!("{}", serde_json::to_string_pretty(&analytics).unwrap());
     } else {
+        let pct = |v: Option<f64>| v.map_or("n/a".to_string(), |v| format!("{:.1}%", v * 100.0));
         println!(
-            "sessions: {} tokens: {} cost: ${:.2} cache_hit: {:.1}% tools:{} files:{}",
+            "sessions: {} tokens: {} cost: ${:.2} cache_read_share: {} cache_prompt_efficiency: {} (unpriced: {}, no timestamps: {})",
             analytics.total_sessions,
             analytics.total_tokens,
             analytics.total_cost_usd,
-            analytics.cache_hit_rate * 100.0,
-            tools.len(),
-            files.len()
+            pct(analytics.cache_read_share),
+            pct(analytics.cache_prompt_efficiency),
+            analytics.coverage.unpriced_sessions,
+            analytics.coverage.sessions_missing_timestamps,
         );
         println!("by_source: {:?}", analytics.by_source);
         println!("by_project: {:?}", analytics.by_project);
-        let top_tools = flare_insights::analytics::top_tools(&tools, 5);
-        let top_files = flare_insights::analytics::top_files(&files, 5);
-        println!("top_tools: {:?}", top_tools);
-        println!("top_files: {:?}", top_files);
-        for b in &analytics.by_day {
+        fn top<V: Copy + Ord>(m: &std::collections::HashMap<String, V>) -> Vec<(&String, V)> {
+            let mut v: Vec<_> = m.iter().map(|(k, v)| (k, *v)).collect();
+            v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+            v.truncate(5);
+            v
+        }
+        println!("top_tools: {:?}", top(&analytics.tool_freq));
+        println!("top_files: {:?}", top(&analytics.file_freq));
+        for b in &analytics.by_day_updated {
             println!("{}: {} sessions ${:.2}", b.date, b.sessions, b.cost_usd);
         }
     }

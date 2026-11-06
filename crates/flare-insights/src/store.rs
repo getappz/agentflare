@@ -8,13 +8,45 @@ use crate::model::{Session, SessionSource, SessionStatus, TokenUsage, ToolCall, 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("sqlite: {0}")]
-    Sqlite(#[from] rusqlite::Error),
+    Sqlite(rusqlite::Error),
+    #[error("parse: {0}")]
+    Parse(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
     #[error("migration: {0}")]
     Migration(#[from] rusqlite_migration::Error),
+}
+
+/// Carried inside `rusqlite::Error::FromSqlConversionFailure` so row mappers can
+/// report an unparseable column; `From<rusqlite::Error>` lifts it to `StoreError::Parse`.
+#[derive(Debug)]
+struct BadColumn(String);
+impl std::fmt::Display for BadColumn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for BadColumn {}
+
+impl From<rusqlite::Error> for StoreError {
+    fn from(e: rusqlite::Error) -> Self {
+        if let rusqlite::Error::FromSqlConversionFailure(_, _, inner) = &e {
+            if let Some(b) = inner.downcast_ref::<BadColumn>() {
+                return Self::Parse(b.0.clone());
+            }
+        }
+        Self::Sqlite(e)
+    }
+}
+
+fn bad_column(col: &str, value: &str) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        0,
+        rusqlite::types::Type::Text,
+        Box::new(BadColumn(format!("unparseable {col} {value:?}"))),
+    )
 }
 
 pub struct InsightsStore {
@@ -498,7 +530,10 @@ pub(crate) fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
     let updated: String = row.get("updated_at")?;
     let ended: Option<String> = row.get("ended_at")?;
     let tags_str: String = row.get("tags")?;
-    let parse_dt = |s: String| s.parse::<DateTime<Utc>>().unwrap_or_else(|_| Utc::now());
+    let parse_opt = |s: String| s.parse::<DateTime<Utc>>().ok();
+    let updated_at = updated
+        .parse::<DateTime<Utc>>()
+        .map_err(|_| bad_column("updated_at", &updated))?;
     Ok(Session {
         id: row.get("id")?,
         source: serde_json::from_str(&source_str).unwrap_or(SessionSource::Unknown(source_str)),
@@ -508,9 +543,9 @@ pub(crate) fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
         model: row.get("model")?,
         status: serde_json::from_str(&status_str).unwrap_or(SessionStatus::Idle),
         awaiting_reason: awaiting_str.and_then(|s| serde_json::from_str(&s).ok()),
-        started_at: started.map(parse_dt),
-        updated_at: parse_dt(updated),
-        ended_at: ended.map(parse_dt),
+        started_at: started.and_then(parse_opt),
+        updated_at,
+        ended_at: ended.and_then(parse_opt),
         duration_secs: row
             .get::<_, Option<i64>>("duration_secs")?
             .map(|v| v as u64),
@@ -581,7 +616,7 @@ fn row_to_file_event(row: &rusqlite::Row) -> rusqlite::Result<crate::model::File
     let at_str: String = row.get("at")?;
     let at = at_str
         .parse::<DateTime<Utc>>()
-        .unwrap_or_else(|_| Utc::now());
+        .map_err(|_| bad_column("at", &at_str))?;
     Ok(crate::model::FileEvent {
         id: row.get("id")?,
         session_id: row.get("session_id")?,

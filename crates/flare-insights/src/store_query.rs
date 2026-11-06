@@ -8,7 +8,9 @@ use rusqlite::params_from_iter;
 use rusqlite::types::Value;
 use serde::{Deserialize, Serialize};
 
-use crate::model::Session;
+use crate::analytics::{cache_metrics, Analytics, DailyBucket, StatsCoverage};
+
+use crate::model::{Session, SessionSource, TokenUsage};
 use crate::store::{row_to_session, InsightsStore, StoreError};
 
 /// One search result: session plus the best-matching turn.
@@ -99,6 +101,27 @@ fn push_session_filters(
     }
 }
 
+/// `<select> WHERE 1=1 [AND ...]` for a query aliasing `sessions` as `s`.
+fn sessions_select(
+    select: &str,
+    since: Option<DateTime<Utc>>,
+    source: Option<&str>,
+    project_prefix: Option<&str>,
+) -> (String, Vec<Value>) {
+    let mut sql = format!("{select} WHERE 1=1");
+    let mut binds: Vec<Value> = Vec::new();
+    push_session_filters(&mut sql, &mut binds, source, project_prefix, since);
+    (sql, binds)
+}
+
+/// Window for [`InsightsStore::stats_window`].
+#[derive(Debug, Clone, Default)]
+pub struct StatsWindow {
+    pub since: Option<DateTime<Utc>>,
+    pub source: Option<String>,
+    pub project_prefix: Option<String>,
+}
+
 impl InsightsStore {
     /// List sessions with optional source and project-prefix filters applied in SQL.
     ///
@@ -111,10 +134,8 @@ impl InsightsStore {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<Session>, StoreError> {
-        let mut sql = String::from("SELECT s.* FROM sessions s WHERE 1=1");
-        let mut binds: Vec<Value> = Vec::new();
-        push_session_filters(&mut sql, &mut binds, source, project_prefix, None);
-
+        let (mut sql, mut binds) =
+            sessions_select("SELECT s.* FROM sessions s", None, source, project_prefix);
         sql.push_str(" ORDER BY s.updated_at DESC LIMIT ? OFFSET ?");
         binds.push(Value::Integer(limit as i64));
         binds.push(Value::Integer(offset as i64));
@@ -201,7 +222,7 @@ impl InsightsStore {
                 FROM matched m
                 JOIN sessions s ON s.id = m.sid
                 WHERE m.rn = 1
-                ORDER BY m.hit_rank
+                ORDER BY m.hit_rank, s.updated_at DESC, s.id
                 LIMIT ?, ?"#,
             );
         } else {
@@ -215,12 +236,12 @@ impl InsightsStore {
                     FROM candidates WHERE rn = 1
                 )
                 SELECT s.*, b.turn_seq, b.hit_rank AS rank,
-                       snippet(turns_fts, 2, '[', ']', '…', 24) AS snippet
+                       snippet(turns_fts, -1, '[', ']', '…', 24) AS snippet
                 FROM best b
                 JOIN turns_fts ON turns_fts.rowid = b.turn_rowid
                 JOIN sessions s ON s.id = b.sid
                 WHERE turns_fts MATCH ?
-                ORDER BY b.hit_rank
+                ORDER BY b.hit_rank, s.updated_at DESC, s.id
                 LIMIT ?, ?"#,
             );
         }
@@ -245,6 +266,130 @@ impl InsightsStore {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    /// Aggregate stats over a window with SQL GROUP BY (no row-count cap).
+    pub fn stats_window(&self, w: &StatsWindow) -> Result<Analytics, StoreError> {
+        let (filter, binds) = sessions_select(
+            "SELECT s.id FROM sessions s",
+            w.since,
+            w.source.as_deref(),
+            w.project_prefix.as_deref(),
+        );
+        let ids = format!("session_id IN ({filter})");
+        let conn = &self.conn;
+
+        let mut a = Analytics {
+            total_sessions: 0,
+            total_tokens: 0,
+            total_cost_usd: 0.0,
+            by_source: Default::default(),
+            by_model: Default::default(),
+            by_project: Default::default(),
+            by_day_updated: vec![],
+            tool_freq: Default::default(),
+            file_freq: Default::default(),
+            tool_failure_rate: None,
+            cache_read_share: None,
+            cache_prompt_efficiency: None,
+            coverage: StatsCoverage::default(),
+        };
+
+        let mut stmt = conn.prepare(&format!(
+            "SELECT source, COUNT(*) FROM sessions WHERE id IN ({filter}) GROUP BY source"
+        ))?;
+        for r in stmt.query_map(params_from_iter(binds.clone()), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+        })? {
+            let (raw, n) = r?;
+            let name = serde_json::from_str::<SessionSource>(&raw)
+                .map(|s| s.as_str().to_string())
+                .unwrap_or(raw);
+            *a.by_source.entry(name).or_default() += n;
+        }
+
+        for (col, dest) in [("model", &mut a.by_model), ("project", &mut a.by_project)] {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {col}, COUNT(*) FROM sessions WHERE id IN ({filter}) AND {col} IS NOT NULL GROUP BY {col}"
+            ))?;
+            for r in stmt.query_map(params_from_iter(binds.clone()), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+            })? {
+                let (k, n) = r?;
+                dest.insert(k, n);
+            }
+        }
+
+        let mut stmt = conn.prepare(&format!(
+            "SELECT substr(updated_at,1,10), COUNT(*), SUM(input_tokens), SUM(output_tokens),
+                    SUM(cache_read_tokens), SUM(cache_write_tokens), SUM(reasoning_tokens),
+                    COALESCE(SUM(cost_usd),0), SUM(cost_usd IS NULL), SUM(started_at IS NULL)
+             FROM sessions WHERE id IN ({filter}) GROUP BY 1 ORDER BY 1"
+        ))?;
+        let rows = stmt.query_map(params_from_iter(binds.clone()), |r| {
+            let n = |i| r.get::<_, i64>(i).map(|v| v as u64);
+            Ok((
+                DailyBucket {
+                    date: r.get(0)?,
+                    sessions: n(1)? as usize,
+                    tokens: TokenUsage {
+                        input: n(2)?,
+                        output: n(3)?,
+                        cache_read: n(4)?,
+                        cache_write: n(5)?,
+                        reasoning: n(6)?,
+                    },
+                    cost_usd: r.get(7)?,
+                },
+                n(8)? as usize,
+                n(9)? as usize,
+            ))
+        })?;
+        let (mut t_in, mut t_read, mut t_write) = (0, 0, 0);
+        for r in rows {
+            let (b, unpriced, no_ts) = r?;
+            a.total_sessions += b.sessions;
+            a.total_tokens += b.tokens.total();
+            a.total_cost_usd += b.cost_usd;
+            t_in += b.tokens.input;
+            t_read += b.tokens.cache_read;
+            t_write += b.tokens.cache_write;
+            a.coverage.unpriced_sessions += unpriced;
+            a.coverage.sessions_missing_timestamps += no_ts;
+            a.by_day_updated.push(b);
+        }
+        a.coverage.sessions_considered = a.total_sessions;
+        (a.cache_read_share, a.cache_prompt_efficiency) = cache_metrics(t_in, t_read, t_write);
+
+        let mut stmt = conn.prepare(&format!(
+            "SELECT name, COUNT(*), SUM(status IN ('failed','error'))
+             FROM tool_calls WHERE {ids} GROUP BY name"
+        ))?;
+        let (mut calls, mut failed) = (0u64, 0u64);
+        for r in stmt.query_map(params_from_iter(binds.clone()), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)? as u64,
+                r.get::<_, i64>(2)? as u64,
+            ))
+        })? {
+            let (name, n, f) = r?;
+            calls += n;
+            failed += f;
+            a.tool_freq.insert(name, n);
+        }
+        a.tool_failure_rate = (calls > 0).then(|| failed as f64 / calls as f64);
+
+        let mut stmt = conn.prepare(&format!(
+            "SELECT path, COUNT(*) FROM file_events WHERE {ids} GROUP BY path"
+        ))?;
+        for r in stmt.query_map(params_from_iter(binds), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+        })? {
+            let (p, n) = r?;
+            a.file_freq.insert(p, n);
+        }
+        Ok(a)
     }
 }
 
@@ -385,5 +530,66 @@ mod tests {
             let ids: Vec<_> = rows.iter().map(|s| s.id.as_str()).collect();
             assert_eq!(ids, vec!["hit"], "prefix {prefix}");
         }
+    }
+
+    fn with_tokens(mut s: Session, input: u64, read: u64) -> Session {
+        s.tokens.input = input;
+        s.tokens.cache_read = read;
+        s
+    }
+
+    #[test]
+    fn cache_metrics_none_when_no_input_tokens() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        store
+            .upsert_session(&sample_session("z", SessionSource::Cursor, None))
+            .unwrap();
+        let a = store.stats_window(&StatsWindow::default()).unwrap();
+        assert_eq!(a.cache_read_share, None);
+        assert_eq!(a.cache_prompt_efficiency, None);
+        assert_eq!(a.coverage.sessions_considered, 1);
+        assert_eq!(a.coverage.unpriced_sessions, 1);
+    }
+
+    #[test]
+    fn cursor_structural_zero_does_not_lower_share_when_excluded_by_source() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        let claude = with_tokens(
+            sample_session("c", SessionSource::ClaudeCode, None),
+            100,
+            300,
+        );
+        let cursor = with_tokens(sample_session("u", SessionSource::Cursor, None), 400, 0);
+        store.upsert_sessions_batch(&[claude, cursor]).unwrap();
+        let all = store.stats_window(&StatsWindow::default()).unwrap();
+        assert_eq!(all.cache_read_share, Some(0.375));
+        let only = store
+            .stats_window(&StatsWindow {
+                source: Some("claude_code".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(only.cache_read_share, Some(0.75));
+        assert_eq!(only.by_source.get("claude_code"), Some(&1));
+        assert_eq!(only.total_sessions, 1);
+    }
+
+    #[test]
+    fn bad_updated_at_is_error_not_now() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        store
+            .upsert_session(&sample_session("bad", SessionSource::Codex, None))
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET updated_at='garbage' WHERE id='bad'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.get_session("bad"),
+            Err(StoreError::Parse(_))
+        ));
     }
 }

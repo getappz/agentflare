@@ -254,4 +254,61 @@ mod tests {
         assert_eq!(res[0].session.id, "sxy");
         let _hit: &SearchHit = &res[0];
     }
+
+    #[test]
+    fn snippet_comes_from_the_column_that_matched() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        store
+            .upsert_session(&sample_session("u", SessionSource::Codex, None))
+            .unwrap();
+        let mut turn = sample_turn("t1", "u", 1, "needleword in the question");
+        turn.assistant_text = Some("an unrelated reply".into());
+        store.upsert_turn(&turn).unwrap();
+        let opts = SearchOptions {
+            query: "needleword".into(),
+            limit: 10,
+            ..Default::default()
+        };
+        let res = search(&store, &opts).unwrap();
+        assert_eq!(res.len(), 1);
+        assert!(
+            res[0].snippet.contains("[needleword]"),
+            "{}",
+            res[0].snippet
+        );
+    }
+
+    #[test]
+    fn tied_hits_page_in_a_stable_order() {
+        for (query, text) in [("zq", "zq short"), ("tiedphrase", "tiedphrase text")] {
+            let store = InsightsStore::open_in_memory().unwrap();
+            for id in ["c", "a", "b"] {
+                store
+                    .upsert_session(&sample_session(id, SessionSource::Codex, None))
+                    .unwrap();
+                store
+                    .upsert_turn(&sample_turn(&format!("t{id}"), id, 1, text))
+                    .unwrap();
+            }
+            store
+                .conn
+                .execute(
+                    "UPDATE sessions SET updated_at = '2026-01-01T00:00:00+00:00'",
+                    [],
+                )
+                .unwrap();
+            let paged: Vec<String> = (0..3)
+                .map(|offset| {
+                    let opts = SearchOptions {
+                        query: query.into(),
+                        limit: 1,
+                        offset,
+                        ..Default::default()
+                    };
+                    search(&store, &opts).unwrap()[0].session.id.clone()
+                })
+                .collect();
+            assert_eq!(paged, ["a", "b", "c"], "query {query}");
+        }
+    }
 }
