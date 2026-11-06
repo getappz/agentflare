@@ -61,17 +61,11 @@ pub fn compute_analytics_with_tools(
     let mut by_project: HashMap<String, usize> = HashMap::new();
     let mut by_day: HashMap<String, DailyBucket> = HashMap::new();
     let (mut t_in, mut t_read, mut t_write) = (0u64, 0u64, 0u64);
+    // An empty list reports the same bounds as `stats_window`: now, not the epoch.
+    let now = chrono::Utc::now();
     let mut coverage = CoverageMeta {
-        window_start: sessions
-            .iter()
-            .map(|s| s.updated_at)
-            .min()
-            .unwrap_or_default(),
-        window_end: sessions
-            .iter()
-            .map(|s| s.updated_at)
-            .max()
-            .unwrap_or_default(),
+        window_start: sessions.iter().map(|s| s.updated_at).min().unwrap_or(now),
+        window_end: sessions.iter().map(|s| s.updated_at).max().unwrap_or(now),
         sessions_in_window: sessions.len(),
         eligible_sessions: sessions.len(),
         eligible_turns: sessions.iter().map(|s| s.turn_count as usize).sum(),

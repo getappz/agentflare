@@ -279,6 +279,8 @@ impl InsightsStore {
         );
         let ids = format!("session_id IN ({filter})");
         let conn = &self.conn;
+        // Every read below sees one snapshot; dropping it just ends the read.
+        let _snapshot = conn.unchecked_transaction()?;
 
         let mut a = Analytics {
             total_sessions: 0,
@@ -371,7 +373,11 @@ impl InsightsStore {
                 .map(|t| t.with_timezone(&Utc))
                 .map_err(|e| StoreError::Parse(e.to_string()))
         };
-        a.coverage.window_end = last.map(parse).transpose()?.unwrap_or_else(Utc::now);
+        // An empty window with a future `since` must not end before it starts.
+        a.coverage.window_end = last
+            .map(parse)
+            .transpose()?
+            .unwrap_or_else(|| w.since.map_or_else(Utc::now, |s| s.max(Utc::now())));
         a.coverage.window_start = w
             .since
             .or(first.map(parse).transpose()?)
@@ -669,5 +675,28 @@ mod tests {
             store.get_session("bad"),
             Err(StoreError::Parse(_))
         ));
+    }
+
+    #[test]
+    fn empty_future_window_bounds_stay_in_order() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        let since = Utc::now() + chrono::Duration::days(1);
+        let c = store
+            .stats_window(&StatsWindow {
+                since: Some(since),
+                ..Default::default()
+            })
+            .unwrap()
+            .coverage;
+        assert_eq!(c.window_start, since);
+        assert!(c.window_end >= c.window_start);
+    }
+
+    #[test]
+    fn empty_session_list_does_not_report_epoch_bounds() {
+        let before = Utc::now();
+        let c = crate::analytics::compute_analytics(&[]).coverage;
+        assert!(c.window_start >= before);
+        assert_eq!(c.window_start, c.window_end);
     }
 }

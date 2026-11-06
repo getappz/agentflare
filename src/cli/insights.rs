@@ -399,14 +399,14 @@ fn run_stats(db: PathBuf, args: StatsArgs) {
     } else {
         let pct = |v: Option<f64>| v.map_or("n/a".to_string(), |v| format!("{:.1}%", v * 100.0));
         println!(
-            "sessions: {} tokens: {} cost: ${:.2} cache_read_share: {} cache_prompt_efficiency: {} (unpriced: {}, no timestamps: {})",
+            "sessions: {} tokens: {} cost: ${:.2} cache_read_share: {} cache_prompt_efficiency: {} (unpriced: {}, sessions missing turn timestamps: {})",
             analytics.total_sessions,
             analytics.total_tokens,
             analytics.total_cost_usd,
             pct(analytics.cache_read_share),
             pct(analytics.cache_prompt_efficiency),
             analytics.coverage.unpriced_sessions,
-            analytics.coverage.sessions_missing_timestamps,
+            analytics.coverage.sessions_missing_turn_timestamps,
         );
         println!("by_source: {:?}", analytics.by_source);
         println!("by_project: {:?}", analytics.by_project);
