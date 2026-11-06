@@ -16,8 +16,9 @@ use crate::store::InsightsStore;
 /// Provider-issued child ids can recur across sessions (a forked or resumed
 /// session copies its parent's calls verbatim). Row ids are global primary keys
 /// and one collision rolls back the whole source commit, so scope them by session.
+/// The length prefix keeps the result unambiguous when either part holds a colon.
 pub(crate) fn scoped_id(session_id: &str, raw: &str) -> String {
-    format!("{session_id}:{raw}")
+    format!("{}:{session_id}:{raw}", session_id.len())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -119,4 +120,14 @@ pub(crate) fn read_jsonl_sessions(path: &Path) -> Vec<serde_json::Value> {
         .lines()
         .filter_map(|l| serde_json::from_str(l.trim()).ok())
         .collect()
+}
+
+#[cfg(test)]
+mod scoped_id_tests {
+    use super::scoped_id;
+
+    #[test]
+    fn colons_cannot_make_two_sessions_share_an_id() {
+        assert_ne!(scoped_id("s", "call:x"), scoped_id("s:call", "x"));
+    }
 }
