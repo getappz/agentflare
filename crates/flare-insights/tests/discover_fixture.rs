@@ -163,7 +163,10 @@ fn discover_precision_recall_on_fixture() {
     while t <= 0.90 + 1e-9 {
         let report = mine(&store, &opts(t), now()).unwrap();
         let (p, r, f1) = precision_recall(&rows, &report);
-        println!("  jaccard={t:.2}: P={p:.3} R={r:.3} F1={f1:.3} clusters={}", report.body.len());
+        println!(
+            "  jaccard={t:.2}: P={p:.3} R={r:.3} F1={f1:.3} clusters={}",
+            report.body.len()
+        );
         // On an F1 tie, prefer the highest threshold (stricter merges, still optimal).
         if f1 > best_f1 + 1e-12 || ((f1 - best_f1).abs() < 1e-12 && t > best_t) {
             best_f1 = f1;

@@ -224,7 +224,10 @@ fn classify_destination(texts: &[&str]) -> (Destination, String) {
         }
     }
 
-    (Destination::None, "no rule/command/skill pattern matched".into())
+    (
+        Destination::None,
+        "no rule/command/skill pattern matched".into(),
+    )
 }
 
 fn classify(docs: &[&Doc], distinct_sessions: usize) -> (Destination, String) {
@@ -277,12 +280,7 @@ pub fn mine(
     now: DateTime<Utc>,
 ) -> anyhow::Result<Report<Vec<Proposal>>> {
     let since = now.checked_sub_signed(Duration::days(opts.days as i64));
-    let sessions = store.sessions_in_window(
-        since,
-        None,
-        opts.project_prefix.as_deref(),
-        None,
-    )?;
+    let sessions = store.sessions_in_window(since, None, opts.project_prefix.as_deref(), None)?;
     let by_id: HashMap<&str, &Session> = sessions.iter().map(|s| (s.id.as_str(), s)).collect();
     let mut ids: Vec<&str> = by_id.keys().copied().collect();
     ids.sort_unstable();
@@ -413,9 +411,7 @@ pub fn mine(
             })
             .collect();
         // Stable order: session_id, turn_seq
-        examples.sort_by(|a, b| {
-            (&a.session_id, a.turn_seq).cmp(&(&b.session_id, b.turn_seq))
-        });
+        examples.sort_by(|a, b| (&a.session_id, a.turn_seq).cmp(&(&b.session_id, b.turn_seq)));
 
         proposals.push(Proposal {
             cluster_id,
@@ -475,7 +471,10 @@ mod tests {
 
     #[test]
     fn large_fence_is_dropped_before_normalise() {
-        let big = format!("please review this ```\n{}\n``` carefully now thanks", "x".repeat(600));
+        let big = format!(
+            "please review this ```\n{}\n``` carefully now thanks",
+            "x".repeat(600)
+        );
         let n = normalise_discover_text(&big).unwrap();
         assert!(!n.contains('x'));
         assert!(n.contains("please review this"));

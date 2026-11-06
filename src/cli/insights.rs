@@ -625,12 +625,11 @@ fn run_discover(db: PathBuf, args: DiscoverArgs) {
         min_count: args.min_count,
         jaccard_threshold: flare_insights::discover::DEFAULT_JACCARD_THRESHOLD,
     };
-    let report = flare_insights::discover::mine(&store, &opts, chrono::Utc::now()).unwrap_or_else(
-        |e| {
+    let report =
+        flare_insights::discover::mine(&store, &opts, chrono::Utc::now()).unwrap_or_else(|e| {
             eprintln!("discover failed: {e}");
             std::process::exit(1);
-        },
-    );
+        });
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
         return;
@@ -697,7 +696,13 @@ mod discover_args_tests {
             panic!("expected discover")
         };
         assert_eq!(
-            (d.days, d.min_sessions, d.min_count, d.json, d.project.is_none()),
+            (
+                d.days,
+                d.min_sessions,
+                d.min_count,
+                d.json,
+                d.project.is_none()
+            ),
             (30, 2, 3, false, true)
         );
         let a = InsightsArgs::try_parse_from([
