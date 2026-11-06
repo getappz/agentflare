@@ -384,7 +384,11 @@ pub fn mine(
             let size_i = docs[i].token_set.len();
             for &j in &idxs[n + 1..] {
                 let size_j = docs[j].token_set.len();
-                if (size_i.min(size_j) as f64) < opts.jaccard_threshold * size_i.max(size_j) as f64
+                // Compare the size ratio to the threshold (not `min < threshold * max`):
+                // `0.07 * 100` is 7.000000000000001 in f64 and would reject Jaccard == 0.07.
+                let (lo, hi) = (size_i.min(size_j), size_i.max(size_j));
+                if hi == 0
+                    || (lo as f64) / (hi as f64) < opts.jaccard_threshold
                     || uf.find(i) == uf.find(j)
                 {
                     continue;

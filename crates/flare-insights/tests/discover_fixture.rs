@@ -305,3 +305,31 @@ fn reordered_prompts_are_not_treated_as_identical() {
     sizes.sort_unstable();
     assert_eq!(sizes, [3, 4]);
 }
+
+#[test]
+fn size_bound_does_not_reject_exact_threshold_jaccard() {
+    // 7-token prompt ⊂ 100-token prompt → Jaccard = 7/100 = 0.07.
+    // Comparing `min < threshold * max` falsely rejects because 0.07 * 100
+    // is 7.000000000000001 in f64; comparing the size ratio does not.
+    let small: String = (0..7)
+        .map(|i| format!("t{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let large: String = (0..100)
+        .map(|i| format!("t{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let rows = vec![
+        row(small, "s0".into()),
+        row(large.clone(), "s1".into()),
+        row(large, "s2".into()),
+    ];
+    let store = load_store(&rows);
+    let report = mine(&store, &opts(0.07), now()).unwrap();
+    assert_eq!(
+        report.body.len(),
+        1,
+        "pair at the threshold must still cluster"
+    );
+    assert_eq!(report.body[0].occurrences, 3);
+}
