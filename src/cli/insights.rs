@@ -36,6 +36,8 @@ pub enum InsightsCommands {
     Forensics(ForensicsArgs),
     /// Discover recurring user requests as printed proposals (never writes files)
     Discover(DiscoverArgs),
+    /// Review proposals: scan, accept, reject, snooze
+    Reflect(super::insights_reflect::ReflectArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -184,6 +186,7 @@ impl InsightsArgs {
             InsightsCommands::Doctor(args) => run_doctor(db_path, args),
             InsightsCommands::Forensics(args) => run_forensics(db_path, args),
             InsightsCommands::Discover(args) => run_discover(db_path, args),
+            InsightsCommands::Reflect(args) => args.run(db_path),
         }
     }
 }
