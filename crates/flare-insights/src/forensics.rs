@@ -120,10 +120,9 @@ pub fn compute(
     opts: &ForensicsOptions,
     now: DateTime<Utc>,
 ) -> anyhow::Result<Report<Vec<Finding>>> {
-    // A huge `days` (reachable from the API query string) must not panic on overflow.
-    let since = now
-        .checked_sub_signed(Duration::days(opts.days as i64))
-        .unwrap_or(DateTime::<Utc>::MIN_UTC);
+    // A huge `days` (reachable from the API query string) must not panic on overflow:
+    // past the calendar's range it means "no lower bound".
+    let since = now.checked_sub_signed(Duration::days(opts.days as i64));
     let sessions = store.sessions_in_window(
         since,
         opts.source.as_deref(),
@@ -157,7 +156,7 @@ pub fn compute(
             .or_default() += 1;
     }
     let coverage = CoverageMeta {
-        window_start: since,
+        window_start: since.unwrap_or(DateTime::<Utc>::MIN_UTC),
         window_end: now,
         sessions_in_window: sessions.len(),
         // Sessions with at least one stored turn: the transcript detectors' input.

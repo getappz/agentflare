@@ -269,20 +269,16 @@ impl InsightsStore {
         Ok(out)
     }
 
-    /// Every session updated since `since`, with the filters applied in SQL.
+    /// Every session updated since `since` (all when `None`), filtered in SQL.
     pub fn sessions_in_window(
         &self,
-        since: DateTime<Utc>,
+        since: Option<DateTime<Utc>>,
         source: Option<&str>,
         project_prefix: Option<&str>,
         session_id: Option<&str>,
     ) -> Result<Vec<Session>, StoreError> {
-        let (mut sql, mut binds) = sessions_select(
-            "SELECT s.* FROM sessions s",
-            Some(since),
-            source,
-            project_prefix,
-        );
+        let (mut sql, mut binds) =
+            sessions_select("SELECT s.* FROM sessions s", since, source, project_prefix);
         if let Some(id) = session_id {
             sql.push_str(" AND s.id = ?");
             binds.push(Value::Text(id.to_string()));
@@ -763,5 +759,16 @@ mod tests {
         assert_eq!(mix["estimated"], 1);
         let from_list = crate::analytics::compute_analytics(&[priced]).coverage;
         assert_eq!(from_list.cost_basis_mix["estimated"], 1);
+    }
+
+    #[test]
+    fn no_lower_bound_keeps_expanded_year_timestamps() {
+        use chrono::TimeZone;
+        let store = InsightsStore::open_in_memory().unwrap();
+        let mut far = sample_session("far", SessionSource::Codex, None);
+        far.updated_at = Utc.with_ymd_and_hms(10000, 1, 1, 0, 0, 0).unwrap();
+        store.upsert_session(&far).unwrap();
+        let rows = store.sessions_in_window(None, None, None, None).unwrap();
+        assert_eq!(rows.len(), 1);
     }
 }
