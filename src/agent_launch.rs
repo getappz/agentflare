@@ -694,6 +694,27 @@ fn reply_from_result_event(value: &serde_json::Value, raw: &str) -> HeadlessRepl
     }
 }
 
+fn public_trajectory(stdout: &str) -> String {
+    use serde_json::Value;
+    // Capture the stream directly; the asynchronously ingested insights DB can lag this call.
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let event: Value = serde_json::from_str(line).ok()?;
+            let body = match event.get("type")?.as_str()? {
+                "assistant" | "user" => event.pointer("/message/content")?,
+                "item.started" | "item.completed" => event.get("item")?,
+                _ => return None,
+            };
+            Some(format!(
+                "{}\n{}\n",
+                event["type"].as_str()?,
+                serde_json::to_string_pretty(body).ok()?
+            ))
+        })
+        .collect()
+}
+
 /// Turns a parsed structured reply into an outcome. A cap hit
 /// (`error_max_turns`, `error_max_budget_usd`) is still a usable reply — the
 /// session id lets the next round `--resume` where the run stopped — so it
@@ -792,6 +813,7 @@ pub fn run_headless_with_owner(
         idle_timeout,
         extra_args,
         request_json,
+        None,
     )
 }
 
@@ -850,6 +872,35 @@ pub fn run_headless_in_with_owner(
         idle_timeout,
         extra_args,
         request_json,
+        None,
+    )
+}
+
+/// Refinement needs observations even when the process fails; ordinary callers need only its outcome.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_headless_in_with_evidence(
+    owner: Option<&str>,
+    cwd: &Path,
+    registry: &[AgentSpec],
+    agent: &str,
+    prompt: &str,
+    hard_cap: Duration,
+    idle_timeout: Duration,
+    extra_args: &[String],
+    request_json: bool,
+    trajectory: Option<&mut String>,
+) -> HeadlessOutcome {
+    run_headless_impl(
+        owner,
+        Some(cwd),
+        registry,
+        agent,
+        prompt,
+        hard_cap,
+        idle_timeout,
+        extra_args,
+        request_json,
+        trajectory,
     )
 }
 
@@ -864,6 +915,7 @@ fn run_headless_impl(
     idle_timeout: Duration,
     extra_args: &[String],
     request_json: bool,
+    trajectory: Option<&mut String>,
 ) -> HeadlessOutcome {
     let Some(spec) = registry.iter().find(|s| s.id.as_str() == agent) else {
         return HeadlessOutcome::UnknownAgent(format!("unknown agent: {agent}"));
@@ -1032,6 +1084,9 @@ fn run_headless_impl(
     // ends up used below -- otherwise `~/.agentflare/sandbox-diagnostics`
     // accumulates one file per headless dispatch forever.
     let sandbox_log = take_diagnostic_log(diagnostic_path.as_deref());
+    if let (Some(trajectory), Ok(captured)) = (trajectory, &result) {
+        *trajectory = public_trajectory(&captured.stdout);
+    }
     match result {
         Ok(c) if c.success => {
             if request_json && json_output_args(spec.id).is_some() {

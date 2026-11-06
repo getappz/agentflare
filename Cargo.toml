@@ -44,6 +44,7 @@ name = "agentflare"
 path = "src/lib.rs"
 
 [dependencies]
+async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 toml = { version = "0.8" }
