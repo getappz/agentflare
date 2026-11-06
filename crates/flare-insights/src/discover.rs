@@ -1,6 +1,7 @@
 //! Recurring-request discovery: cluster similar user prompts into printed proposals.
 //! Never writes files (Release 2, T11).
 
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::OnceLock;
 
@@ -256,16 +257,21 @@ fn classify(docs: &[&Doc], distinct_sessions: usize) -> (Destination, String) {
 fn query_turns(
     store: &InsightsStore,
     ids: &[&str],
-) -> anyhow::Result<Vec<(String, u32, Option<String>)>> {
+) -> anyhow::Result<Vec<(String, u32, Option<String>, bool)>> {
     let conn = &store.conn;
     let mut out = Vec::new();
     for chunk in ids.chunks(500) {
         let marks = vec!["?"; chunk.len()].join(",");
         let mut st = conn.prepare(&format!(
-            "SELECT session_id, seq, user_text FROM turns WHERE session_id IN ({marks}) ORDER BY session_id, seq"
+            "SELECT session_id, seq, user_text, julianday(started_at) IS NOT NULL FROM turns WHERE session_id IN ({marks}) ORDER BY session_id, seq"
         ))?;
         for r in st.query_map(rusqlite::params_from_iter(chunk), |row| {
-            Ok((row.get(0)?, row.get::<_, i64>(1)? as u32, row.get(2)?))
+            Ok((
+                row.get(0)?,
+                row.get::<_, i64>(1)? as u32,
+                row.get(2)?,
+                row.get(3)?,
+            ))
         })? {
             out.push(r?);
         }
@@ -287,10 +293,14 @@ pub fn mine(
 
     let turns = query_turns(store, &ids)?;
     let with_turns: HashSet<&str> = turns.iter().map(|t| t.0.as_str()).collect();
-    let untimed = 0usize; // discover does not require turn timestamps
+    let untimed: HashSet<&str> = turns
+        .iter()
+        .filter(|t| !t.3)
+        .map(|t| t.0.as_str())
+        .collect();
 
     let mut docs: Vec<Doc> = Vec::new();
-    for (sid, seq, user_text) in &turns {
+    for (sid, seq, user_text, _) in &turns {
         let Some(raw) = user_text.as_deref() else {
             continue;
         };
@@ -332,27 +342,56 @@ pub fn mine(
         }
     }
 
-    // Candidate pairs: share an n-gram present in ≥ min_sessions sessions.
-    let mut candidate_pairs: BTreeSet<(usize, usize)> = BTreeSet::new();
-    for (ng, sessions_hit) in &ngram_sessions {
-        if sessions_hit.len() < opts.min_sessions {
-            continue;
-        }
-        let idxs = ngram_docs.get(ng).map(Vec::as_slice).unwrap_or(&[]);
-        for a in 0..idxs.len() {
-            for b in (a + 1)..idxs.len() {
-                let (i, j) = (idxs[a].min(idxs[b]), idxs[a].max(idxs[b]));
-                if i != j {
-                    candidate_pairs.insert((i, j));
+    // Connected components never depend on pair order, so nothing here stores pairs.
+    // Identical prompts match by definition: collapse them to one representative so a
+    // prompt repeated thousands of times costs one comparison, not a quadratic number.
+    let mut uf = UnionFind::new(docs.len());
+    let mut representative: HashMap<Vec<&str>, usize> = HashMap::new();
+    let mut is_representative = vec![false; docs.len()];
+    for (i, doc) in docs.iter().enumerate() {
+        let mut key: Vec<&str> = doc.token_set.iter().map(String::as_str).collect();
+        key.sort_unstable();
+        match representative.entry(key) {
+            Entry::Occupied(first) => {
+                if opts.jaccard_threshold <= 1.0 {
+                    uf.union(i, *first.get());
+                } else {
+                    is_representative[i] = true;
                 }
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(i);
+                is_representative[i] = true;
             }
         }
     }
 
-    let mut uf = UnionFind::new(docs.len());
-    for (i, j) in candidate_pairs {
-        if jaccard(&docs[i].token_set, &docs[j].token_set) >= opts.jaccard_threshold {
-            uf.union(i, j);
+    // Candidates share an n-gram present in >= min_sessions sessions. Skip pairs already
+    // connected, and pairs whose sizes alone rule out the threshold (J <= min/max).
+    for (ng, sessions_hit) in &ngram_sessions {
+        if sessions_hit.len() < opts.min_sessions {
+            continue;
+        }
+        let idxs: Vec<usize> = ngram_docs
+            .get(ng)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|&i| is_representative[i])
+            .collect();
+        for (n, &i) in idxs.iter().enumerate() {
+            let size_i = docs[i].token_set.len();
+            for &j in &idxs[n + 1..] {
+                let size_j = docs[j].token_set.len();
+                if (size_i.min(size_j) as f64) < opts.jaccard_threshold * size_i.max(size_j) as f64
+                    || uf.find(i) == uf.find(j)
+                {
+                    continue;
+                }
+                if jaccard(&docs[i].token_set, &docs[j].token_set) >= opts.jaccard_threshold {
+                    uf.union(i, j);
+                }
+            }
         }
     }
 
@@ -440,11 +479,11 @@ pub fn mine(
         eligible_turns: docs.len(),
         unpriced_sessions: sessions.iter().filter(|s| s.cost.is_none()).count(),
         cost_basis_mix: BTreeMap::new(),
+        // Same meaning as `stats_window`: no turns, or any turn without a valid timestamp.
         sessions_missing_turn_timestamps: sessions
             .iter()
-            .filter(|s| !with_turns.contains(s.id.as_str()))
-            .count()
-            + untimed,
+            .filter(|s| !with_turns.contains(s.id.as_str()) || untimed.contains(s.id.as_str()))
+            .count(),
         failed_sources: Vec::new(),
     };
 

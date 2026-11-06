@@ -191,7 +191,11 @@ impl super::AgentflareMcp {
                 serde_json::to_value(report).map_err(internal)?
             }
             "discover" => {
-                let _ = source; // DiscoverOptions has no source filter (plan T11).
+                if source.is_some() {
+                    return Err(invalid(
+                        "insights action 'discover' does not support source",
+                    ));
+                }
                 let report = flare_insights::discover::mine(
                     &store,
                     &flare_insights::discover::DiscoverOptions {

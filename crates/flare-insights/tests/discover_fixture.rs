@@ -229,3 +229,57 @@ fn run_twice_is_stable() {
     let jb = serde_json::to_value(&b.body).unwrap();
     assert_eq!(ja, jb);
 }
+
+fn row(text: String, session_id: String) -> LabelledRow {
+    LabelledRow {
+        text,
+        session_id,
+        expected_group: "g".into(),
+        expected_kind: "none".into(),
+    }
+}
+
+#[test]
+fn prompt_repeated_thousands_of_times_stays_one_cluster() {
+    let rows: Vec<_> = (0..3000)
+        .map(|i| {
+            row(
+                "please run the whole test suite again".into(),
+                format!("s{i}"),
+            )
+        })
+        .collect();
+    let store = load_store(&rows);
+    let report = mine(&store, &opts(DEFAULT_JACCARD_THRESHOLD), now()).unwrap();
+    assert_eq!(report.body.len(), 1);
+    assert_eq!(report.body[0].occurrences, 3000);
+}
+
+#[test]
+fn near_duplicates_still_cluster_transitively() {
+    let texts = [
+        "please run the whole test suite again now",
+        "please run the whole test suite again today",
+        "please run the whole test suite again now today",
+    ];
+    let rows: Vec<_> = texts
+        .iter()
+        .enumerate()
+        .map(|(i, t)| row((*t).into(), format!("s{i}")))
+        .collect();
+    let store = load_store(&rows);
+    let report = mine(&store, &opts(DEFAULT_JACCARD_THRESHOLD), now()).unwrap();
+    assert_eq!(report.body.len(), 1);
+    assert_eq!(report.body[0].occurrences, 3);
+}
+
+#[test]
+fn coverage_counts_sessions_with_untimed_turns() {
+    let rows = load_rows();
+    let store = load_store(&rows);
+    let report = mine(&store, &opts(DEFAULT_JACCARD_THRESHOLD), now()).unwrap();
+    assert_eq!(
+        report.coverage.sessions_missing_turn_timestamps, report.coverage.sessions_in_window,
+        "fixture turns carry no timestamps"
+    );
+}
