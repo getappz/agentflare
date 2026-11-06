@@ -78,6 +78,20 @@ impl InsightsStore {
 
     // ---- sessions ----
 
+    /// Advance source cursors only after every data batch has been saved.
+    pub fn upsert_ingest_bundle(
+        &self,
+        source: &str,
+        bundle: &crate::ingest::IngestBundle,
+    ) -> Result<(), StoreError> {
+        self.upsert_sessions_batch(&bundle.sessions)?;
+        self.upsert_turns_batch(&bundle.turns)?;
+        self.upsert_tool_calls_batch(&bundle.tool_calls)?;
+        self.upsert_file_events_batch(&bundle.file_events)?;
+        self.upsert_subagents_batch(&bundle.subagents)?;
+        self.upsert_file_cursors_batch(source, &bundle.file_cursors)
+    }
+
     pub fn upsert_session(&self, s: &Session) -> Result<(), StoreError> {
         exec_upsert_session(&self.conn, s)
     }

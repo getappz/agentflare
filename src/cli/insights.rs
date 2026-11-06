@@ -48,6 +48,27 @@ mod evidence_tests {
     use super::*;
 
     #[test]
+    fn agent_sync_uses_git_root() {
+        let repo = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(repo.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let nested = repo.path().join("src");
+        std::fs::create_dir(&nested).unwrap();
+        assert_eq!(
+            dunce::canonicalize(sync_project(&nested)).unwrap(),
+            dunce::canonicalize(repo.path()).unwrap()
+        );
+        let non_git = tempfile::tempdir().unwrap();
+        assert_eq!(sync_project(non_git.path()), non_git.path().to_path_buf());
+    }
+
+    #[test]
     fn historical_tool_evidence_can_be_refreshed_without_editing_source_logs() {
         let cli = InsightsArgs::try_parse_from(["insights", "sync", "--force"]).unwrap();
         let Some(InsightsCommands::Sync(args)) = cli.command else {
@@ -159,11 +180,24 @@ fn open_store(db: PathBuf) -> flare_insights::store::InsightsStore {
     })
 }
 
+fn sync_project(cwd: &std::path::Path) -> PathBuf {
+    flare_git_core::branch::repo_toplevel(cwd).unwrap_or_else(|| cwd.to_path_buf())
+}
+
 fn run_sync(db: PathBuf, args: SyncArgs) {
     use std::io::Write;
 
     let store = open_store(db.clone());
-    let config = flare_insights::config::InsightsConfig::default();
+    let mut config = flare_insights::config::InsightsConfig::default();
+    if flare_process::agent_name().is_some() {
+        let cwd = std::env::current_dir().unwrap_or_else(|e| {
+            crate::ui::error(&format!("cannot resolve sync project: {e}"));
+            std::process::exit(1);
+        });
+        let project = sync_project(&cwd);
+        eprintln!("syncing project {}", project.display());
+        config.project = Some(project);
+    }
     let mgr = flare_insights::ingest::IngestManager::new();
     let mut total_sessions = 0;
     let mut total_turns = 0;
@@ -194,29 +228,17 @@ fn run_sync(db: PathBuf, args: SyncArgs) {
     for (source, res) in results {
         match res {
             Ok(bundle) => {
+                if let Err(e) = store.upsert_ingest_bundle(&config.cursor_source(&source), &bundle)
+                {
+                    eprintln!("{source}: store error {e}");
+                    continue;
+                }
                 println!(
                     "{source}: {} sessions {} turns {} tools",
                     bundle.sessions.len(),
                     bundle.turns.len(),
                     bundle.tool_calls.len()
                 );
-                // DRY: transactional bundle via store helpers
-                let _ = store.upsert_sessions_batch(&bundle.sessions);
-                if !bundle.turns.is_empty() {
-                    let _ = store.upsert_turns_batch(&bundle.turns);
-                }
-                if !bundle.tool_calls.is_empty() {
-                    let _ = store.upsert_tool_calls_batch(&bundle.tool_calls);
-                }
-                if !bundle.file_events.is_empty() {
-                    let _ = store.upsert_file_events_batch(&bundle.file_events);
-                }
-                if !bundle.subagents.is_empty() {
-                    let _ = store.upsert_subagents_batch(&bundle.subagents);
-                }
-                if !bundle.file_cursors.is_empty() {
-                    let _ = store.upsert_file_cursors_batch(&source, &bundle.file_cursors);
-                }
                 total_sessions += bundle.sessions.len();
                 total_turns += bundle.turns.len();
                 total_tools += bundle.tool_calls.len();
