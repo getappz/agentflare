@@ -12,10 +12,33 @@ pub struct Analytics {
     pub by_source: HashMap<String, usize>,
     pub by_model: HashMap<String, usize>,
     pub by_project: HashMap<String, usize>,
-    pub by_day: Vec<DailyBucket>,
+    /// Bucketed by session `updated_at` date (not per-turn activity).
+    pub by_day_updated: Vec<DailyBucket>,
     pub tool_freq: HashMap<String, u64>,
     pub file_freq: HashMap<String, usize>,
-    pub cache_hit_rate: f64,
+    /// Fraction of tool calls with a failed/error status; `None` when there are none.
+    pub tool_failure_rate: Option<f64>,
+    /// read / (input + read); `None` on a zero denominator.
+    pub cache_read_share: Option<f64>,
+    /// read / (input + read + write); `None` on a zero denominator.
+    pub cache_prompt_efficiency: Option<f64>,
+    pub coverage: StatsCoverage,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct StatsCoverage {
+    pub sessions_considered: usize,
+    pub unpriced_sessions: usize,
+    pub sessions_missing_timestamps: usize,
+}
+
+fn ratio(num: u64, den: u64) -> Option<f64> {
+    (den > 0).then(|| num as f64 / den as f64)
+}
+
+/// Cache metrics from summed token counts: (read_share, prompt_efficiency).
+pub fn cache_metrics(input: u64, read: u64, write: u64) -> (Option<f64>, Option<f64>) {
+    (ratio(read, input + read), ratio(read, input + read + write))
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -43,8 +66,11 @@ pub fn compute_analytics_with_tools(
     let mut by_model: HashMap<String, usize> = HashMap::new();
     let mut by_project: HashMap<String, usize> = HashMap::new();
     let mut by_day: HashMap<String, DailyBucket> = HashMap::new();
-    let mut cache_read = 0u64;
-    let mut cache_total = 0u64;
+    let (mut t_in, mut t_read, mut t_write) = (0u64, 0u64, 0u64);
+    let mut coverage = StatsCoverage {
+        sessions_considered: sessions.len(),
+        ..Default::default()
+    };
 
     for s in sessions {
         total_tokens += s.tokens.total();
@@ -80,18 +106,21 @@ pub fn compute_analytics_with_tools(
             bucket.cost_usd += c.total_usd;
         }
 
-        cache_read += s.tokens.cache_read;
-        cache_total += s.tokens.cache_read + s.tokens.input;
+        t_in += s.tokens.input;
+        t_read += s.tokens.cache_read;
+        t_write += s.tokens.cache_write;
+        coverage.unpriced_sessions += s.cost.is_none() as usize;
+        coverage.sessions_missing_timestamps += s.started_at.is_none() as usize;
     }
 
     let mut by_day_vec: Vec<DailyBucket> = by_day.into_values().collect();
     by_day_vec.sort_by(|a, b| a.date.cmp(&b.date));
 
-    let cache_hit_rate = if cache_total == 0 {
-        0.0
-    } else {
-        cache_read as f64 / cache_total as f64
-    };
+    let (cache_read_share, cache_prompt_efficiency) = cache_metrics(t_in, t_read, t_write);
+    let failed = tools
+        .iter()
+        .filter(|t| matches!(t.status.as_str(), "failed" | "error"))
+        .count() as u64;
 
     Analytics {
         total_sessions: sessions.len(),
@@ -100,10 +129,13 @@ pub fn compute_analytics_with_tools(
         by_source,
         by_model,
         by_project,
-        by_day: by_day_vec,
+        by_day_updated: by_day_vec,
         tool_freq: tool_frequency(tools),
         file_freq: file_activity(files),
-        cache_hit_rate,
+        tool_failure_rate: ratio(failed, tools.len() as u64),
+        cache_read_share,
+        cache_prompt_efficiency,
+        coverage,
     }
 }
 
