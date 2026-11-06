@@ -2071,7 +2071,7 @@ impl AgentflareMcp {
     }
 
     #[tool(
-        description = "Unified search across 17 sources. type='store' (FTS store docs), 'memory' (brain.db observations), 'session' (past agent sessions), 'code' (leanctx), 'web' (rivalsearch), 'social' (9 platforms), 'news' (5 sources), 'github' (repos), 'academic' (papers, 5 dbs), 'datasets' (4 hubs), 'websites' (crawl), 'weather' (Open-Meteo), 'financial' (SEC EDGAR), 'crypto' (CoinGecko), 'fx' (ECB/Frankfurter), 'indicators' (World Bank), 'youtube' (transcripts), 'bluesky' (profiles+feed). Returns { query, source, total, groups|results }."
+        description = "Unified search across 17 sources. type='store' (FTS store docs), 'memory' (brain.db observations), 'session' (past agent sessions under the current dir), 'code' (leanctx), 'web' (rivalsearch), 'social' (9 platforms), 'news' (5 sources), 'github' (repos), 'academic' (papers, 5 dbs), 'datasets' (4 hubs), 'websites' (crawl), 'weather' (Open-Meteo), 'financial' (SEC EDGAR), 'crypto' (CoinGecko), 'fx' (ECB/Frankfurter), 'indicators' (World Bank), 'youtube' (transcripts), 'bluesky' (profiles+feed). Returns { query, source, total, groups|results }."
     )]
     async fn search(
         &self,

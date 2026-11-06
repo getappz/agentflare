@@ -16,9 +16,13 @@ pub struct RecallPage {
     pub tool_calls: Vec<ToolCall>,
     /// Seq to pass as `turn_start` for the next page; `None` at the end.
     pub next_turn_start: Option<u32>,
-    /// True when `max_chars` deferred later turns or omitted text on this page
+    /// True when `max_chars` deferred later turns or omitted anything on this page
     /// (not when `turn_limit` alone ended it).
     pub truncated: bool,
+    /// Chars of turn and tool-call text cut to fit `max_chars`.
+    pub omitted_chars: usize,
+    /// Tool calls left off this page because the budget ran out.
+    pub omitted_tool_calls: usize,
 }
 
 /// One page of a session, starting at `turn_start`. `None` for an unknown id.
@@ -83,35 +87,44 @@ pub fn recall_page_scrubbed(
         }
         _ => Vec::new(),
     };
-    truncated |= bound_text(&mut turns, &mut tool_calls, max_chars, scrub);
+    let (omitted_chars, omitted_tool_calls) =
+        bound_text(&mut turns, &mut tool_calls, max_chars, scrub);
+    truncated |= omitted_chars > 0 || omitted_tool_calls > 0;
     Ok(Some(RecallPage {
         session,
         turns,
         tool_calls,
         next_turn_start,
         truncated,
+        omitted_chars,
+        omitted_tool_calls,
     }))
 }
 
-/// Scrub all page text, then spend one `max_chars` budget across it, marking what
-/// is omitted. Returns whether anything was cut.
+/// Scrub all page text, then spend one exact `max_chars` budget across it. Returns
+/// (chars omitted, tool calls dropped once the budget ran out).
 fn bound_text(
     turns: &mut [Turn],
-    tool_calls: &mut [ToolCall],
+    tool_calls: &mut Vec<ToolCall>,
     max_chars: usize,
     scrub: &dyn Fn(&mut Value),
-) -> bool {
+) -> (usize, usize) {
     let mut left = max_chars;
-    let mut cut = false;
+    let mut omitted = 0;
     for t in turns.iter_mut() {
         for text in [&mut t.user_text, &mut t.assistant_text]
             .into_iter()
             .flatten()
         {
-            cut |= scrub_and_clip(text, &mut left, scrub);
+            omitted += scrub_and_clip(text, &mut left, scrub);
         }
     }
+    let mut kept = 0;
     for c in tool_calls.iter_mut() {
+        if left == 0 {
+            break;
+        }
+        kept += 1;
         scrub(&mut c.input);
         let n = if c.input.is_null() {
             0
@@ -119,20 +132,22 @@ fn bound_text(
             c.input.to_string().chars().count()
         };
         if n > left {
-            c.input = Value::String(format!("[{n} chars omitted]"));
-            cut = true;
-            left = 0;
+            c.input = Value::Null;
+            omitted += n;
         } else {
             left -= n;
         }
         if let Some(output) = c.output.as_mut() {
-            cut |= scrub_and_clip(output, &mut left, scrub);
+            omitted += scrub_and_clip(output, &mut left, scrub);
         }
     }
-    cut
+    let dropped = tool_calls.len() - kept;
+    tool_calls.truncate(kept);
+    (omitted, dropped)
 }
 
-fn scrub_and_clip(text: &mut String, left: &mut usize, scrub: &dyn Fn(&mut Value)) -> bool {
+/// Returns how many chars were cut from `text`.
+fn scrub_and_clip(text: &mut String, left: &mut usize, scrub: &dyn Fn(&mut Value)) -> usize {
     let mut value = Value::String(std::mem::take(text));
     scrub(&mut value);
     *text = match value {
@@ -142,13 +157,12 @@ fn scrub_and_clip(text: &mut String, left: &mut usize, scrub: &dyn Fn(&mut Value
     let n = text.chars().count();
     if n <= *left {
         *left -= n;
-        return false;
+        return 0;
     }
-    let mut kept: String = text.chars().take(*left).collect();
-    kept.push_str(&format!("…[{} chars omitted]", n - *left));
-    *text = kept;
+    *text = text.chars().take(*left).collect();
+    let cut = n - *left;
     *left = 0;
-    true
+    cut
 }
 
 #[cfg(test)]
@@ -279,10 +293,33 @@ mod tests {
             .unwrap();
         let call = &p.tool_calls[0];
         assert!(p.truncated);
-        assert_eq!(call.input, "[50010 chars omitted]");
-        assert!(call.output.as_deref().unwrap().len() < 1_100);
-        assert!(call.output.as_deref().unwrap().contains("chars omitted]"));
+        assert!(call.input.is_null());
+        assert_eq!(call.output.as_deref().unwrap().len(), 996);
+        assert_eq!(p.omitted_chars, 50_010 + 49_004);
         assert_eq!(p.next_turn_start, Some(1));
+    }
+
+    #[test]
+    fn many_tool_calls_cannot_exceed_a_small_budget() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        store.upsert_session(&session("s1", 1)).unwrap();
+        store.upsert_turns_batch(&[turn("s1", 0)]).unwrap();
+        for i in 0..50 {
+            let mut call = big_call("s1", 0, Value::Null, "abc");
+            call.id = format!("c{i}");
+            store.upsert_tool_call(&call).unwrap();
+        }
+        let p = recall_page(&store, None, "s1", 0, 1, 20).unwrap().unwrap();
+        let turn_text = 4;
+        let tool_text: usize = p
+            .tool_calls
+            .iter()
+            .map(|c| c.output.as_deref().map_or(0, str::len))
+            .sum();
+        assert_eq!(turn_text + tool_text, 20);
+        assert!(p.truncated);
+        assert_eq!(p.tool_calls.len() + p.omitted_tool_calls, 50);
+        assert!(p.omitted_tool_calls > 40);
     }
 
     #[test]

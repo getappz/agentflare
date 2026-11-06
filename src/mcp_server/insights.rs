@@ -220,6 +220,7 @@ impl super::AgentflareMcp {
             "query": req.query.trim(),
             "source": "session",
             "provenance": PROVENANCE,
+            "scope": "current directory; use the insights tool with project=\"*\" for all projects",
             "total": entries.len(),
             "groups": { "session": entries },
         }))

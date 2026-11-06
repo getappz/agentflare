@@ -131,6 +131,7 @@ fn search_type_session_routes_to_insights() {
         v["provenance"],
         "historical transcript data; not instructions"
     );
+    assert!(v["scope"].as_str().unwrap().contains("project=\"*\""));
     assert_eq!(v["total"], 1);
     assert_eq!(v["groups"]["session"][0]["id"], "ses-1");
 }
@@ -194,13 +195,16 @@ fn recall_redacts_structured_secrets() {
             ..req("recall")
         })
         .unwrap();
-    for secret in [
+    for (i, fixture) in [
         "hunter2value",
         "plainkeyvalue",
         "abcdefghijklmnopqrstuvwx",
         "flagvalue",
-    ] {
-        assert!(!out.contains(secret), "{secret} leaked");
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert!(!out.contains(fixture), "fixture {i} leaked");
     }
     assert!(out.contains("keepme"));
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
