@@ -291,13 +291,6 @@ fn unified_diff(path: &Path, before: &str, after: &str) -> String {
     out
 }
 
-fn is_learned_doc(path: &Path) -> bool {
-    matches!(
-        path.file_name().and_then(|n| n.to_str()),
-        Some("AGENTS.md" | "CLAUDE.md" | "insights.md")
-    )
-}
-
 fn is_source_log_path(path: &Path) -> bool {
     // Normalised so the guard also holds for Windows separators.
     let s = path.to_string_lossy().replace('\\', "/");
@@ -382,6 +375,18 @@ fn resolve_target(
     global: bool,
     cwd: &Path,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if p.target_path.is_none() {
+        match p.kind.as_str() {
+            "rule" | "skill" => {}
+            "memory_fact" => {
+                return Err(
+                    "memory_fact proposals are promoted by `reflect accept`, not applied to a file"
+                        .into(),
+                );
+            }
+            k => return Err(format!("kind '{k}' has no applyable target").into()),
+        }
+    }
     let path = if let Some(tp) = p.target_path.as_deref() {
         let raw = PathBuf::from(tp);
         if raw.is_absolute() {
@@ -425,13 +430,6 @@ fn resolve_target(
             path.display()
         )
         .into());
-    }
-    if p.kind != "skill"
-        && !path.ends_with("SKILL.md")
-        && !is_learned_doc(&path)
-        && p.target_path.is_none()
-    {
-        return Err(format!("kind '{}' has no applyable target", p.kind).into());
     }
     Ok(path)
 }
@@ -939,6 +937,44 @@ mod tests {
                 .as_deref(),
             Some(hash.as_str())
         );
+    }
+
+    fn seed_kind(store: &InsightsStore, kind: &str) -> i64 {
+        let c = candidate(kind, "demo", "k", "T", "some text", 1, 1, vec![]);
+        store.upsert_proposal_candidate(&c).unwrap();
+        store.list_proposals(None).unwrap()[0].id
+    }
+
+    #[test]
+    fn apply_refuses_memory_fact_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("AGENTS.md");
+        std::fs::write(&target, "# Agent\n").unwrap();
+        let store = InsightsStore::open_in_memory().unwrap();
+        let id = seed_kind(&store, "memory_fact");
+        let err = apply(&store, id, true, false, dir.path()).unwrap_err();
+        assert!(err.to_string().contains("reflect accept"), "{err}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "# Agent\n");
+        let row = store.get_proposal(id).unwrap().unwrap();
+        assert_eq!(row.status, ProposalStatus::Proposed);
+        assert!(row.applied_hash.is_none());
+    }
+
+    #[test]
+    fn apply_refuses_command_and_none_kinds() {
+        for kind in ["command", "none", "bogus"] {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("AGENTS.md");
+            std::fs::write(&target, "# Agent\n").unwrap();
+            let store = InsightsStore::open_in_memory().unwrap();
+            let id = seed_kind(&store, kind);
+            let err = apply(&store, id, true, false, dir.path()).unwrap_err();
+            assert!(err.to_string().contains("has no applyable target"), "{err}");
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "# Agent\n");
+            let row = store.get_proposal(id).unwrap().unwrap();
+            assert_eq!(row.status, ProposalStatus::Proposed);
+            assert!(row.applied_hash.is_none());
+        }
     }
 
     #[test]
