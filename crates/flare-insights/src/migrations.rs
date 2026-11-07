@@ -149,6 +149,10 @@ pub fn migrations() -> Migrations<'static> {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 snoozed_until TEXT
+            );
+            CREATE TABLE insights_proposal_aliases (
+                alias TEXT PRIMARY KEY,
+                fingerprint TEXT NOT NULL
             );",
         ),
     ])

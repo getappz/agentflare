@@ -90,7 +90,6 @@ fn scan_corrections(store: &InsightsStore, days: u32) -> Result<usize, Box<dyn s
             if !is_correction(&text) {
                 continue;
             }
-            let key: String = text.chars().take(200).collect();
             let ev = EvidenceRef {
                 source: s.source.as_str().into(),
                 session_id: s.id.clone(),
@@ -101,7 +100,7 @@ fn scan_corrections(store: &InsightsStore, days: u32) -> Result<usize, Box<dyn s
             }
             .with_excerpt(&text);
             let group = groups
-                .entry((s.project.clone(), key))
+                .entry((s.project.clone(), text.clone()))
                 .or_insert_with(|| CorrectionGroup {
                     title: text.chars().take(80).collect(),
                     text: text.clone(),
@@ -131,50 +130,39 @@ fn scan_corrections(store: &InsightsStore, days: u32) -> Result<usize, Box<dyn s
 }
 
 /// Upsert a mined cluster. Its identity must survive new evidence and a changed destination:
-/// `cluster_id` and the draft both move when a member joins, so the fingerprint comes from
-/// member text alone, and an existing ledger row for any member wins. That keeps a rejected
-/// proposal rejected when the same request recurs.
+/// `cluster_id` and the draft both move when a member joins, so identity comes from member
+/// text alone. Every member seen is recorded as an alias of the proposal, so a rejected
+/// proposal stays rejected even after the members it was first seen with leave the cluster.
 fn upsert_mined(
     store: &InsightsStore,
     p: &flare_insights::discover::Proposal,
 ) -> Result<(), Box<dyn std::error::Error>> {
     const MINED: &str = "mined";
-    let existing = p
+    let mut aliases: Vec<String> = p
         .examples
         .iter()
         .filter_map(|e| e.excerpt.as_deref())
         .map(|text| fingerprint(MINED, "", text))
-        .find_map(|fp| {
-            store
-                .get_proposal_by_fingerprint(&fp)
-                .transpose()
-                .map(|row| row.map(|r| r.fingerprint))
-        })
-        .transpose()?;
-    let draft_key: String = EvidenceRef {
-        source: String::new(),
-        session_id: String::new(),
-        turn_seq: None,
-        tool_call_id: None,
-        at: None,
-        excerpt: None,
-    }
-    .with_excerpt(&p.draft)
-    .excerpt
-    .unwrap_or_default();
+        .collect();
+    aliases.sort_unstable();
+    aliases.dedup();
     let kind = format!("{:?}", p.destination).to_lowercase();
     let mut c = candidate(
         &kind,
         "",
-        &draft_key,
+        &p.draft,
         &p.draft.chars().take(80).collect::<String>(),
         &p.draft,
         p.distinct_sessions as i64,
         p.occurrences as i64,
         p.examples.clone(),
     );
-    c.fingerprint = existing.unwrap_or_else(|| fingerprint(MINED, "", &draft_key));
+    c.fingerprint = match store.proposal_for_aliases(&aliases)? {
+        Some(existing) => existing,
+        None => fingerprint(MINED, "", &p.draft),
+    };
     store.upsert_proposal_candidate(&c)?;
+    store.add_proposal_aliases(&c.fingerprint, &aliases)?;
     Ok(())
 }
 
@@ -233,8 +221,7 @@ pub(crate) fn accept(
         .ok_or_else(|| format!("no proposal {id}"))?;
     if p.kind == "memory_fact" {
         // The fingerprint keeps two corrections with the same slug from sharing one memory.
-        let id_part: String = p.fingerprint.chars().take(12).collect();
-        let topic = format!("insights/{}/{}-{id_part}", p.kind, slug(&p.title));
+        let topic = format!("insights/{}/{}-{}", p.kind, slug(&p.title), p.fingerprint);
         let project = (!p.project.is_empty()).then_some(p.project.as_str());
         crate::memory::observations::save_keyed(
             conn,
@@ -361,10 +348,7 @@ mod tests {
             )
             .unwrap();
         let fp = store.get_proposal(id).unwrap().unwrap().fingerprint;
-        assert_eq!(
-            topic,
-            format!("insights/memory_fact/use-pnpm-{}", &fp[..12])
-        );
+        assert_eq!(topic, format!("insights/memory_fact/use-pnpm-{fp}"));
         assert_eq!(
             store.get_proposal(id).unwrap().unwrap().status,
             ProposalStatus::Accepted
@@ -418,6 +402,87 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, ProposalStatus::Rejected);
         assert_eq!(rows[0].occurrence_count, 2);
+    }
+
+    #[test]
+    fn rejection_survives_a_chain_of_overlapping_rescans() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        upsert_mined(&store, &mined("aaa", &["aaa"], Destination::Skill)).unwrap();
+        let id = store.list_proposals(None).unwrap()[0].id;
+        store
+            .set_proposal_status(id, ProposalStatus::Rejected, None)
+            .unwrap();
+        upsert_mined(&store, &mined("aaa", &["aaa", "bbb"], Destination::Skill)).unwrap();
+        upsert_mined(&store, &mined("bbb", &["bbb", "ccc"], Destination::Skill)).unwrap();
+        let rows = store.list_proposals(None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, ProposalStatus::Rejected);
+    }
+
+    #[test]
+    fn open_mined_proposal_follows_a_changed_destination() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        upsert_mined(&store, &mined("aaa", &["aaa"], Destination::Skill)).unwrap();
+        upsert_mined(&store, &mined("aaa", &["aaa", "bbb"], Destination::Rule)).unwrap();
+        assert_eq!(store.list_proposals(None).unwrap()[0].kind, "rule");
+    }
+
+    #[test]
+    fn long_corrections_differing_late_stay_separate() {
+        use flare_insights::model::*;
+        let store = InsightsStore::open_in_memory().unwrap();
+        store
+            .upsert_session(&Session {
+                id: "a".into(),
+                source: SessionSource::Codex,
+                project: "demo".into(),
+                project_path: None,
+                title: None,
+                model: None,
+                status: SessionStatus::Completed,
+                awaiting_reason: None,
+                started_at: None,
+                updated_at: Utc::now(),
+                ended_at: None,
+                duration_secs: None,
+                tokens: TokenUsage {
+                    input: 0,
+                    output: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning: 0,
+                },
+                cost: None,
+                cost_basis: CostBasis::Unknown,
+                pricing_key: None,
+                turn_count: 0,
+                tool_call_count: 0,
+                subagent_count: 0,
+                tags: vec![],
+                starred: false,
+                pid: None,
+                cwd: None,
+            })
+            .unwrap();
+        let shared = format!("don't {}", "x".repeat(250));
+        let turns: Vec<Turn> = ["one", "two"]
+            .iter()
+            .enumerate()
+            .map(|(i, tail)| Turn {
+                id: format!("t{i}"),
+                session_id: "a".into(),
+                seq: i as u32,
+                user_text: Some(format!("{shared} {tail}")),
+                assistant_text: None,
+                started_at: None,
+                ended_at: None,
+                tokens: None,
+                cost_usd: None,
+            })
+            .collect();
+        store.upsert_turns_batch(&turns).unwrap();
+        assert_eq!(scan_corrections(&store, 30).unwrap(), 2);
+        assert_eq!(store.list_proposals(None).unwrap().len(), 2);
     }
 
     #[test]

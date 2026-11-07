@@ -156,10 +156,10 @@ impl InsightsStore {
         let frozen = old.status == ProposalStatus::Rejected
             || (old.status == ProposalStatus::Snoozed
                 && old.snoozed_until.is_some_and(|u| u > now));
-        let (title, content) = if frozen {
-            (&old.title, &old.proposed_content)
+        let (kind, title, content) = if frozen {
+            (&old.kind, &old.title, &old.proposed_content)
         } else {
-            (&p.title, &p.proposed_content)
+            (&p.kind, &p.title, &p.proposed_content)
         };
         // An expired snooze resurfaces the proposal.
         let status = if old.status == ProposalStatus::Snoozed && !frozen {
@@ -169,7 +169,7 @@ impl InsightsStore {
         };
         tx.execute(
             "UPDATE insights_proposals SET title=?2, proposed_content=?3, session_count=?4,
-             occurrence_count=?5, evidence_json=?6, updated_at=?7, status=?8 WHERE id=?1",
+             occurrence_count=?5, evidence_json=?6, updated_at=?7, status=?8, kind=?9 WHERE id=?1",
             params![
                 old.id,
                 title,
@@ -178,11 +178,46 @@ impl InsightsStore {
                 old.occurrence_count.max(p.occurrence_count),
                 serde_json::to_string(&evidence)?,
                 now.to_rfc3339(),
-                status.as_str()
+                status.as_str(),
+                kind
             ],
         )?;
         tx.commit()?;
         Ok(status)
+    }
+
+    /// The proposal fingerprint any of `aliases` already points at, trying them in order.
+    pub fn proposal_for_aliases(&self, aliases: &[String]) -> Result<Option<String>, StoreError> {
+        for alias in aliases {
+            let hit = self
+                .conn
+                .query_row(
+                    "SELECT fingerprint FROM insights_proposal_aliases WHERE alias=?1",
+                    [alias],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if hit.is_some() {
+                return Ok(hit);
+            }
+        }
+        Ok(None)
+    }
+
+    /// Remember that each alias identifies this proposal. An alias already taken keeps its owner.
+    pub fn add_proposal_aliases(&self, fp: &str, aliases: &[String]) -> Result<(), StoreError> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        for alias in aliases {
+            tx.execute(
+                "INSERT OR IGNORE INTO insights_proposal_aliases(alias, fingerprint) VALUES (?1,?2)",
+                params![alias, fp],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn get_proposal(&self, id: i64) -> Result<Option<ProposalRow>, StoreError> {
