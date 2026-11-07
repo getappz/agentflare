@@ -784,7 +784,7 @@ mod tests {
             (SessionSource::Codex, "b", 4),
         ] {
             for _ in 0..count {
-                let mut s = sample_session(&format!("s{n}"), src, None);
+                let mut s = sample_session(&format!("s{n}"), src.clone(), None);
                 s.project = proj.into();
                 store.upsert_session(&s).unwrap();
                 n += 1;
