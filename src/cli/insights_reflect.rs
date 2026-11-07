@@ -1,5 +1,6 @@
 //! `insights reflect`: turn mined candidates into a decision ledger (scan/accept/reject/snooze).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -30,8 +31,8 @@ pub enum ReflectCommands {
     /// Hide a proposal for a while
     Snooze {
         id: i64,
-        #[arg(long, default_value = "30")]
-        days: i64,
+        #[arg(long, default_value = "30", value_parser = clap::value_parser!(u32).range(1..=36_500))]
+        days: u32,
     },
     /// List proposals
     List {
@@ -47,7 +48,7 @@ fn correction_res() -> &'static [Regex] {
     RES.get_or_init(|| {
         [
             r"^no[, ]+use ",
-            r"^don'?t ",
+            r"^don['’]?t ",
             r"^stop ",
             r"^always ",
             r"^never ",
@@ -63,11 +64,21 @@ fn is_correction(text: &str) -> bool {
     correction_res().iter().any(|r| r.is_match(text))
 }
 
-/// Correction pass over user turns: each distinct normalised correction is one candidate.
+/// One distinct correction, aggregated across the turns that said it.
+struct CorrectionGroup {
+    title: String,
+    text: String,
+    sessions: BTreeSet<String>,
+    occurrences: i64,
+    evidence: Vec<EvidenceRef>,
+}
+
+/// Correction pass over user turns: each distinct normalised correction is one candidate,
+/// counted across every turn and session before the upsert, so rescans stay idempotent.
 fn scan_corrections(store: &InsightsStore, days: u32) -> Result<usize, Box<dyn std::error::Error>> {
-    let since = Utc::now() - Duration::days(days as i64);
-    let mut n = 0;
-    for s in store.sessions_in_window(Some(since), None, None, None)? {
+    let since = Utc::now().checked_sub_signed(Duration::days(days as i64));
+    let mut groups: BTreeMap<(String, String), CorrectionGroup> = BTreeMap::new();
+    for s in store.sessions_in_window(since, None, None, None)? {
         for t in store.get_turns(&s.id)? {
             let Some(raw) = t.user_text.as_deref() else {
                 continue;
@@ -79,7 +90,6 @@ fn scan_corrections(store: &InsightsStore, days: u32) -> Result<usize, Box<dyn s
             if !is_correction(&text) {
                 continue;
             }
-            let title: String = text.chars().take(80).collect();
             let key: String = text.chars().take(200).collect();
             let ev = EvidenceRef {
                 source: s.source.as_str().into(),
@@ -90,20 +100,82 @@ fn scan_corrections(store: &InsightsStore, days: u32) -> Result<usize, Box<dyn s
                 excerpt: None,
             }
             .with_excerpt(&text);
-            store.upsert_proposal_candidate(&candidate(
-                "memory_fact",
-                &s.project,
-                &key,
-                &title,
-                &text,
-                1,
-                1,
-                vec![ev],
-            ))?;
-            n += 1;
+            let group = groups
+                .entry((s.project.clone(), key))
+                .or_insert_with(|| CorrectionGroup {
+                    title: text.chars().take(80).collect(),
+                    text: text.clone(),
+                    sessions: BTreeSet::new(),
+                    occurrences: 0,
+                    evidence: Vec::new(),
+                });
+            group.sessions.insert(s.id.clone());
+            group.occurrences += 1;
+            group.evidence.push(ev);
         }
     }
+    let n = groups.len();
+    for ((project, key), g) in groups {
+        store.upsert_proposal_candidate(&candidate(
+            "memory_fact",
+            &project,
+            &key,
+            &g.title,
+            &g.text,
+            g.sessions.len() as i64,
+            g.occurrences,
+            g.evidence,
+        ))?;
+    }
     Ok(n)
+}
+
+/// Upsert a mined cluster. Its identity must survive new evidence and a changed destination:
+/// `cluster_id` and the draft both move when a member joins, so the fingerprint comes from
+/// member text alone, and an existing ledger row for any member wins. That keeps a rejected
+/// proposal rejected when the same request recurs.
+fn upsert_mined(
+    store: &InsightsStore,
+    p: &flare_insights::discover::Proposal,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const MINED: &str = "mined";
+    let existing = p
+        .examples
+        .iter()
+        .filter_map(|e| e.excerpt.as_deref())
+        .map(|text| fingerprint(MINED, "", text))
+        .find_map(|fp| {
+            store
+                .get_proposal_by_fingerprint(&fp)
+                .transpose()
+                .map(|row| row.map(|r| r.fingerprint))
+        })
+        .transpose()?;
+    let draft_key: String = EvidenceRef {
+        source: String::new(),
+        session_id: String::new(),
+        turn_seq: None,
+        tool_call_id: None,
+        at: None,
+        excerpt: None,
+    }
+    .with_excerpt(&p.draft)
+    .excerpt
+    .unwrap_or_default();
+    let kind = format!("{:?}", p.destination).to_lowercase();
+    let mut c = candidate(
+        &kind,
+        "",
+        &draft_key,
+        &p.draft.chars().take(80).collect::<String>(),
+        &p.draft,
+        p.distinct_sessions as i64,
+        p.occurrences as i64,
+        p.examples.clone(),
+    );
+    c.fingerprint = existing.unwrap_or_else(|| fingerprint(MINED, "", &draft_key));
+    store.upsert_proposal_candidate(&c)?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -160,7 +232,9 @@ pub(crate) fn accept(
         .get_proposal(id)?
         .ok_or_else(|| format!("no proposal {id}"))?;
     if p.kind == "memory_fact" {
-        let topic = format!("insights/{}/{}", p.kind, slug(&p.title));
+        // The fingerprint keeps two corrections with the same slug from sharing one memory.
+        let id_part: String = p.fingerprint.chars().take(12).collect();
+        let topic = format!("insights/{}/{}-{id_part}", p.kind, slug(&p.title));
         let project = (!p.project.is_empty()).then_some(p.project.as_str());
         crate::memory::observations::save_keyed(
             conn,
@@ -202,20 +276,7 @@ impl ReflectArgs {
                 let report = flare_insights::discover::mine(&store, &opts, Utc::now())
                     .unwrap_or_else(|e| fail(format!("discover failed: {e}")));
                 for p in &report.body {
-                    let kind = format!("{:?}", p.destination).to_lowercase();
-                    let c = candidate(
-                        &kind,
-                        "",
-                        &p.cluster_id,
-                        &p.draft.chars().take(80).collect::<String>(),
-                        &p.draft,
-                        p.distinct_sessions as i64,
-                        p.occurrences as i64,
-                        p.examples.clone(),
-                    );
-                    store
-                        .upsert_proposal_candidate(&c)
-                        .unwrap_or_else(|e| fail(e));
+                    upsert_mined(&store, p).unwrap_or_else(|e| fail(e));
                 }
                 let corrections = scan_corrections(&store, days).unwrap_or_else(|e| fail(e));
                 println!(
@@ -233,7 +294,7 @@ impl ReflectArgs {
             ReflectCommands::Snooze { id, days } => decide(
                 id,
                 ProposalStatus::Snoozed,
-                Some(Utc::now() + Duration::days(days)),
+                Some(Utc::now() + Duration::days(i64::from(days))),
             ),
             ReflectCommands::List { status } => {
                 let st = status.as_deref().map(|s| {
@@ -263,11 +324,13 @@ impl ReflectArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flare_insights::discover::{Destination, Proposal};
 
     #[test]
     fn corrections_match_expected_phrases() {
         assert!(is_correction("no, use pnpm here"));
         assert!(is_correction("don't mock the db"));
+        assert!(is_correction("don’t mock the db"));
         assert!(is_correction("use rg instead of grep"));
         assert!(!is_correction("please add a test"));
     }
@@ -297,10 +360,133 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(topic, "insights/memory_fact/use-pnpm");
+        let fp = store.get_proposal(id).unwrap().unwrap().fingerprint;
+        assert_eq!(
+            topic,
+            format!("insights/memory_fact/use-pnpm-{}", &fp[..12])
+        );
         assert_eq!(
             store.get_proposal(id).unwrap().unwrap().status,
             ProposalStatus::Accepted
         );
+    }
+
+    fn mined(draft: &str, members: &[&str], destination: Destination) -> Proposal {
+        Proposal {
+            cluster_id: format!("cluster-{}", members.len()),
+            destination,
+            distinct_sessions: members.len(),
+            eligible_sessions: members.len(),
+            occurrences: members.len(),
+            examples: members
+                .iter()
+                .enumerate()
+                .map(|(i, text)| {
+                    EvidenceRef {
+                        source: "codex".into(),
+                        session_id: format!("s{i}"),
+                        turn_seq: Some(0),
+                        tool_call_id: None,
+                        at: None,
+                        excerpt: None,
+                    }
+                    .with_excerpt(text)
+                })
+                .collect(),
+            draft: draft.into(),
+            rationale: String::new(),
+        }
+    }
+
+    #[test]
+    fn rejected_mined_proposal_stays_rejected_when_the_cluster_changes() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        let first = mined("run the suite", &["run the suite"], Destination::Skill);
+        upsert_mined(&store, &first).unwrap();
+        let id = store.list_proposals(None).unwrap()[0].id;
+        store
+            .set_proposal_status(id, ProposalStatus::Rejected, None)
+            .unwrap();
+        // A new member sorts first, so the draft, cluster id and destination all change.
+        let grown = mined(
+            "again run the suite",
+            &["again run the suite", "run the suite"],
+            Destination::Rule,
+        );
+        upsert_mined(&store, &grown).unwrap();
+        let rows = store.list_proposals(None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, ProposalStatus::Rejected);
+        assert_eq!(rows[0].occurrence_count, 2);
+    }
+
+    #[test]
+    fn corrections_aggregate_turns_and_sessions_and_rescan_is_idempotent() {
+        use flare_insights::model::*;
+        let store = InsightsStore::open_in_memory().unwrap();
+        let session = |id: &str| Session {
+            id: id.into(),
+            source: SessionSource::Codex,
+            project: "demo".into(),
+            project_path: None,
+            title: None,
+            model: None,
+            status: SessionStatus::Completed,
+            awaiting_reason: None,
+            started_at: None,
+            updated_at: Utc::now(),
+            ended_at: None,
+            duration_secs: None,
+            tokens: TokenUsage {
+                input: 0,
+                output: 0,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            cost: None,
+            cost_basis: CostBasis::Unknown,
+            pricing_key: None,
+            turn_count: 0,
+            tool_call_count: 0,
+            subagent_count: 0,
+            tags: vec![],
+            starred: false,
+            pid: None,
+            cwd: None,
+        };
+        let turn = |sid: &str, seq: u32| Turn {
+            id: format!("{sid}-{seq}"),
+            session_id: sid.into(),
+            seq,
+            user_text: Some("don't mock the database please".into()),
+            assistant_text: None,
+            started_at: None,
+            ended_at: None,
+            tokens: None,
+            cost_usd: None,
+        };
+        for sid in ["a", "b"] {
+            store.upsert_session(&session(sid)).unwrap();
+        }
+        store
+            .upsert_turns_batch(&[turn("a", 0), turn("a", 1), turn("b", 0)])
+            .unwrap();
+        for _ in 0..2 {
+            assert_eq!(scan_corrections(&store, 30).unwrap(), 1);
+            let rows = store.list_proposals(None).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!((rows[0].session_count, rows[0].occurrence_count), (2, 3));
+        }
+    }
+
+    #[test]
+    fn snooze_days_must_be_in_range() {
+        for bad in ["0", "-1", "99999999"] {
+            assert!(
+                ReflectArgs::try_parse_from(["reflect", "snooze", "1", "--days", bad]).is_err()
+            );
+        }
+        assert!(ReflectArgs::try_parse_from(["reflect", "snooze", "1", "--days", "7"]).is_ok());
     }
 }

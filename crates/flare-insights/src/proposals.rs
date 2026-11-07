@@ -116,9 +116,14 @@ impl InsightsStore {
     /// unchanged. Any other existing row also refreshes title/content.
     pub fn upsert_proposal_candidate(&self, p: &ProposalRow) -> Result<ProposalStatus, StoreError> {
         let now = Utc::now();
+        // Immediate: a concurrent scan or decision cannot land between the read and the write.
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
         let Some(old) = self.get_proposal_by_fingerprint(&p.fingerprint)? else {
             let ev: Vec<_> = p.evidence.iter().take(MAX_EVIDENCE).collect();
-            self.conn.execute(
+            tx.execute(
                 "INSERT INTO insights_proposals(fingerprint, kind, project, title, proposed_content,
                  target_path, status, session_count, occurrence_count, evidence_json, model_context,
                  created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,'proposed',?7,?8,?9,?10,?11,?11)",
@@ -136,6 +141,7 @@ impl InsightsStore {
                     now.to_rfc3339()
                 ],
             )?;
+            tx.commit()?;
             return Ok(ProposalStatus::Proposed);
         };
         let mut evidence = old.evidence.clone();
@@ -161,7 +167,7 @@ impl InsightsStore {
         } else {
             old.status
         };
-        self.conn.execute(
+        tx.execute(
             "UPDATE insights_proposals SET title=?2, proposed_content=?3, session_count=?4,
              occurrence_count=?5, evidence_json=?6, updated_at=?7, status=?8 WHERE id=?1",
             params![
@@ -175,6 +181,7 @@ impl InsightsStore {
                 status.as_str()
             ],
         )?;
+        tx.commit()?;
         Ok(status)
     }
 
