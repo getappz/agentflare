@@ -299,7 +299,8 @@ fn is_learned_doc(path: &Path) -> bool {
 }
 
 fn is_source_log_path(path: &Path) -> bool {
-    let s = path.to_string_lossy();
+    // Normalised so the guard also holds for Windows separators.
+    let s = path.to_string_lossy().replace('\\', "/");
     s.contains("/.claude/projects/")
         || s.contains("/.codex/")
         || s.contains("/.opencode/")
@@ -317,16 +318,27 @@ fn merge_learned(existing: &str, proposed: &str) -> String {
     if block.is_empty() {
         return existing.to_string();
     }
-    if let Some(idx) = existing.find("## Learned") {
-        let tail = &existing[idx..];
-        if tail.contains(block) {
+    let (mut pos, mut start, mut end) = (0, None, existing.len());
+    for line in existing.split_inclusive('\n') {
+        if start.is_none() {
+            if line.trim_end() == "## Learned" {
+                start = Some(pos);
+            }
+        } else if line.starts_with("# ") || line.starts_with("## ") {
+            end = pos;
+            break;
+        }
+        pos += line.len();
+    }
+    if let Some(start) = start {
+        // Insert at the end of the section, which may not be the end of the file.
+        let section = &existing[start..end];
+        if section.contains(block) {
             return existing.to_string();
         }
-        let mut out = existing.trim_end().to_string();
-        out.push_str("\n\n");
-        out.push_str(block);
-        out.push('\n');
-        return out;
+        let (head, tail) = (&existing[..start], &existing[end..]);
+        let gap = if tail.is_empty() { "" } else { "\n" };
+        return format!("{head}{}\n\n{block}\n{gap}{tail}", section.trim_end());
     }
     let mut out = existing.trim_end().to_string();
     if !out.is_empty() {
@@ -338,23 +350,29 @@ fn merge_learned(existing: &str, proposed: &str) -> String {
     out
 }
 
-fn skill_body(existing: &str, proposed: &str) -> String {
+fn skill_body(existing: &str, proposed: &str) -> Result<String, Box<dyn std::error::Error>> {
     let block = proposed.trim();
-    if !existing.is_empty() && (existing.trim() == block || existing.contains(block)) {
-        return existing.to_string();
+    if !existing.is_empty() && existing.contains(block) {
+        return Ok(existing.to_string());
     }
-    let mut out = block.to_string();
-    if !out.ends_with('\n') {
-        out.push('\n');
+    if !existing.is_empty() {
+        return Err(
+            "skill file already exists with different content; refusing to overwrite".into(),
+        );
     }
-    out
+    Ok(format!("{block}\n"))
 }
 
-fn build_new_content(path: &Path, kind: &str, existing: &str, proposed: &str) -> String {
+fn build_new_content(
+    path: &Path,
+    kind: &str,
+    existing: &str,
+    proposed: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
     if kind == "skill" || path.ends_with("SKILL.md") {
         skill_body(existing, proposed)
     } else {
-        merge_learned(existing, proposed)
+        Ok(merge_learned(existing, proposed))
     }
 }
 
@@ -379,7 +397,12 @@ fn resolve_target(
         } else {
             cwd.join(".claude")
         };
-        base.join("skills").join(slug(&p.title)).join("SKILL.md")
+        // A title with no ASCII alphanumerics slugs to nothing, which would drop the directory.
+        let name = match slug(&p.title) {
+            s if s.is_empty() => format!("skill-{}", &p.fingerprint[..12]),
+            s => s,
+        };
+        base.join("skills").join(name).join("SKILL.md")
     } else {
         // Prefer an existing project doc; otherwise create .claude/rules/insights.md.
         let candidates = [
@@ -444,10 +467,16 @@ pub(crate) fn apply(
     let p = store
         .get_proposal(id)?
         .ok_or_else(|| format!("no proposal {id}"))?;
+    if matches!(
+        p.status,
+        ProposalStatus::Rejected | ProposalStatus::Snoozed | ProposalStatus::Superseded
+    ) {
+        return Err(format!("proposal {id} is {}; not applying it", p.status.as_str()).into());
+    }
     let path = resolve_target(&p, global, cwd)?;
     let before = read_target(&path)?;
     let preview_hash = sha256_hex(before.as_bytes());
-    let after = build_new_content(&path, &p.kind, &before, &p.proposed_content);
+    let after = build_new_content(&path, &p.kind, &before, &p.proposed_content)?;
     let diff = unified_diff(&path, &before, &after);
     if !yes {
         return Ok(diff);
@@ -925,6 +954,76 @@ mod tests {
         assert!(body.contains("keep this section"));
         assert!(body.contains("## Learned"));
         assert!(body.contains("prefer tempfile for fixtures"));
+    }
+
+    #[test]
+    fn apply_inserts_inside_a_learned_section_that_is_not_last() {
+        let existing = "# A\n\n## Learned\n\nold rule\n\n## Setup\n\nkeep\n";
+        assert_eq!(
+            merge_learned(existing, "new rule"),
+            "# A\n\n## Learned\n\nold rule\n\nnew rule\n\n## Setup\n\nkeep\n"
+        );
+        // Text outside the section does not count as already applied.
+        let outside = "## Setup\n\nnew rule\n\n## Learned\n\nold rule\n";
+        assert!(merge_learned(outside, "new rule").ends_with("old rule\n\nnew rule\n"));
+    }
+
+    #[test]
+    fn apply_refuses_rejected_proposal() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("AGENTS.md");
+        let store = InsightsStore::open_in_memory().unwrap();
+        let id = seed_rule_at(&store, &target, "never apply me");
+        store
+            .set_proposal_status(id, ProposalStatus::Rejected, None)
+            .unwrap();
+        let err = apply(&store, id, true, false, dir.path()).unwrap_err();
+        assert!(err.to_string().contains("rejected"), "{err}");
+        assert!(!target.exists());
+        assert_eq!(
+            store.get_proposal(id).unwrap().unwrap().status,
+            ProposalStatus::Rejected
+        );
+    }
+
+    #[test]
+    fn apply_never_overwrites_a_different_skill_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(".claude/skills/demo/SKILL.md");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "hand written\n").unwrap();
+        let store = InsightsStore::open_in_memory().unwrap();
+        let id = seed_rule_at(&store, &target, "mined skill");
+        let err = apply(&store, id, true, false, dir.path()).unwrap_err();
+        assert!(err.to_string().contains("refusing to overwrite"), "{err}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "hand written\n");
+    }
+
+    #[test]
+    fn skill_with_no_ascii_title_still_gets_its_own_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = candidate("skill", "demo", "k", "日本語", "body", 1, 1, vec![]);
+        let path = resolve_target(&c, false, dir.path()).unwrap();
+        let expected = format!("skill-{}", &c.fingerprint[..12]);
+        assert_eq!(
+            path,
+            dir.path()
+                .join(".claude/skills")
+                .join(expected)
+                .join("SKILL.md")
+        );
+    }
+
+    #[test]
+    fn source_log_guard_holds_for_windows_separators() {
+        assert!(is_source_log_path(Path::new(
+            r"C:\Users\x\.claude\projects\a\notes.md"
+        )));
+        assert!(is_source_log_path(Path::new(r"C:\Users\x\.codex\notes.md")));
+        assert!(is_source_log_path(Path::new(
+            "/home/x/.claude/projects/a/notes.md"
+        )));
+        assert!(!is_source_log_path(Path::new(r"C:\repo\AGENTS.md")));
     }
 
     #[test]
