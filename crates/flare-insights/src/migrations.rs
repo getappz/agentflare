@@ -131,6 +131,30 @@ pub fn migrations() -> Migrations<'static> {
         // Claude child row ids became session-scoped; forget cursors once so the
         // next ordinary sync rebuilds files that have not changed on disk.
         M::up("DELETE FROM ingest_file_cursors WHERE source = 'claude_code';"),
+        M::up(
+            "CREATE TABLE insights_proposals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fingerprint TEXT NOT NULL UNIQUE,
+                kind TEXT NOT NULL,
+                project TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL,
+                proposed_content TEXT NOT NULL,
+                target_path TEXT,
+                status TEXT NOT NULL DEFAULT 'proposed',
+                session_count INTEGER NOT NULL DEFAULT 0,
+                occurrence_count INTEGER NOT NULL DEFAULT 0,
+                evidence_json TEXT NOT NULL DEFAULT '[]',
+                model_context TEXT,
+                applied_hash TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                snoozed_until TEXT
+            );
+            CREATE TABLE insights_proposal_aliases (
+                alias TEXT PRIMARY KEY,
+                fingerprint TEXT NOT NULL
+            );",
+        ),
     ])
 }
 
@@ -248,7 +272,7 @@ pub(crate) mod tests {
         let version: i64 = raw
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
     }
 
     #[test]

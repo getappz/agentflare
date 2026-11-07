@@ -44,6 +44,15 @@ pub struct Proposal {
     pub examples: Vec<EvidenceRef>,
     pub draft: String,
     pub rationale: String,
+    /// `member_key` of every distinct member text; excerpts are truncated, so they
+    /// cannot identify a member. Internal to the ledger, not part of the report.
+    #[serde(skip)]
+    pub member_keys: Vec<String>,
+}
+
+/// Stable identity of one normalised member text.
+pub fn member_key(text: &str) -> String {
+    hex::encode(Sha256::digest(text.as_bytes()))
 }
 
 #[derive(Debug, Clone)]
@@ -431,6 +440,10 @@ pub fn mine(
         texts.sort_unstable();
         let draft = texts.first().copied().unwrap_or("").to_string();
 
+        let mut member_keys: Vec<String> = texts.iter().map(|t| member_key(t)).collect();
+        member_keys.sort_unstable();
+        member_keys.dedup();
+
         let mut id_material = texts.join("\n");
         id_material.push('\n');
         for sid in &distinct {
@@ -466,6 +479,7 @@ pub fn mine(
             examples,
             draft,
             rationale,
+            member_keys,
         });
     }
 
