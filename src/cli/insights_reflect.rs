@@ -292,10 +292,10 @@ fn unified_diff(path: &Path, before: &str, after: &str) -> String {
 }
 
 fn is_learned_doc(path: &Path) -> bool {
-    match path.file_name().and_then(|n| n.to_str()) {
-        Some("AGENTS.md" | "CLAUDE.md" | "insights.md") => true,
-        _ => false,
-    }
+    matches!(
+        path.file_name().and_then(|n| n.to_str()),
+        Some("AGENTS.md" | "CLAUDE.md" | "insights.md")
+    )
 }
 
 fn is_source_log_path(path: &Path) -> bool {
@@ -397,13 +397,11 @@ fn resolve_target(
         return Err("source logs are never an apply target".into());
     }
     if under_global_claude(&path) && !global {
-        return Err(
-            format!(
-                "target {} is under $HOME/.claude; pass --global to allow",
-                path.display()
-            )
-            .into(),
-        );
+        return Err(format!(
+            "target {} is under $HOME/.claude; pass --global to allow",
+            path.display()
+        )
+        .into());
     }
     if p.kind != "skill"
         && !path.ends_with("SKILL.md")
@@ -831,16 +829,7 @@ mod tests {
     }
 
     fn seed_rule_at(store: &InsightsStore, target: &Path, content: &str) -> i64 {
-        let mut c = candidate(
-            "rule",
-            "demo",
-            content,
-            "Prefer rg",
-            content,
-            1,
-            1,
-            vec![],
-        );
+        let mut c = candidate("rule", "demo", content, "Prefer rg", content, 1, 1, vec![]);
         c.target_path = Some(target.display().to_string());
         store.upsert_proposal_candidate(&c).unwrap();
         store.list_proposals(None).unwrap()[0].id
@@ -861,7 +850,14 @@ mod tests {
             store.get_proposal(id).unwrap().unwrap().status,
             ProposalStatus::Proposed
         );
-        assert!(store.get_proposal(id).unwrap().unwrap().applied_hash.is_none());
+        assert!(
+            store
+                .get_proposal(id)
+                .unwrap()
+                .unwrap()
+                .applied_hash
+                .is_none()
+        );
     }
 
     #[test]
@@ -874,10 +870,7 @@ mod tests {
         let after = merge_learned(&before, "never skip tests");
         std::fs::write(&target, "# Agent\n\nchanged underneath\n").unwrap();
         let err = recheck_and_write(&target, &preview, &after).unwrap_err();
-        assert!(
-            err.to_string().contains("changed since preview"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("changed since preview"), "{err}");
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
             "# Agent\n\nchanged underneath\n"
@@ -909,7 +902,12 @@ mod tests {
             ProposalStatus::Applied
         );
         assert_eq!(
-            store.get_proposal(id).unwrap().unwrap().applied_hash.as_deref(),
+            store
+                .get_proposal(id)
+                .unwrap()
+                .unwrap()
+                .applied_hash
+                .as_deref(),
             Some(hash.as_str())
         );
     }
