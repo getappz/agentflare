@@ -360,4 +360,61 @@ mod tests {
         );
         assert_eq!(s.get_proposal(id).unwrap().unwrap().title, "new");
     }
+
+    fn file_db() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.db");
+        InsightsStore::open(&path).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn concurrent_upserts_keep_one_row_and_sum_counts() {
+        const N: i64 = 25;
+        let (_dir, path) = file_db();
+        let handles: Vec<_> = (1..=2i64)
+            .map(|t| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let s = InsightsStore::open(&path).unwrap();
+                    for i in 1..=N {
+                        let mut c = cand("k");
+                        // Counts fold with max(), so the final value is the largest submitted.
+                        c.occurrence_count = t * 1000 + i;
+                        s.upsert_proposal_candidate(&c).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let s = InsightsStore::open(&path).unwrap();
+        let rows = s.list_proposals(None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].occurrence_count, 2000 + N);
+    }
+
+    #[test]
+    fn reject_during_rescan_stays_rejected() {
+        let (_dir, path) = file_db();
+        let s = InsightsStore::open(&path).unwrap();
+        s.upsert_proposal_candidate(&cand("k")).unwrap();
+        let id = s.list_proposals(None).unwrap()[0].id;
+        let p2 = path.clone();
+        let scan = std::thread::spawn(move || {
+            let s = InsightsStore::open(&p2).unwrap();
+            for _ in 0..50 {
+                s.upsert_proposal_candidate(&cand("k")).unwrap();
+            }
+        });
+        s.set_proposal_status(id, ProposalStatus::Rejected, None)
+            .unwrap();
+        scan.join().unwrap();
+        assert_eq!(
+            s.get_proposal(id).unwrap().unwrap().status,
+            ProposalStatus::Rejected
+        );
+        assert_eq!(s.list_proposals(None).unwrap().len(), 1);
+    }
 }

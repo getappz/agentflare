@@ -474,4 +474,49 @@ mod forensics_route_tests {
         assert_eq!(body["schema_version"], 1);
         assert!(body["body"].as_array().unwrap().is_empty());
     }
+
+    async fn get_via_handle_conn(db_path: PathBuf, req_path: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // The shared stores need a real file; a missing-DB case reuses another one.
+        let shared = tempfile::tempdir().unwrap();
+        let shared_path = shared.path().join("shared.db");
+        let state = Arc::new(AppState {
+            read_store: Mutex::new(InsightsStore::open(&shared_path).unwrap()),
+            write_store: Mutex::new(InsightsStore::open(&shared_path).unwrap()),
+            db_path,
+            stats_cache: Mutex::new(None),
+        });
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            handle_conn(&mut sock, &state).await
+        });
+        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        c.write_all(format!("GET {req_path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut out = String::new();
+        c.read_to_string(&mut out).await.unwrap();
+        // A panic on the blocking thread would surface here as a JoinError / Err.
+        server.await.unwrap().unwrap();
+        out
+    }
+
+    #[tokio::test]
+    async fn forensics_route_uses_its_own_read_only_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("i.db");
+        InsightsStore::open(&db).unwrap();
+        let resp = get_via_handle_conn(db, "/api/forensics?days=7").await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        let body: serde_json::Value =
+            serde_json::from_str(resp.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body["schema_version"], 1);
+        assert_eq!(body["filters"]["days"], 7);
+
+        let missing = dir.path().join("nope.db");
+        let resp = get_via_handle_conn(missing, "/api/forensics?days=7").await;
+        assert!(resp.starts_with("HTTP/1.1 500"), "{resp}");
+        assert!(resp.contains("\"error\""));
+    }
 }
