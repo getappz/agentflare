@@ -34,12 +34,16 @@ pub struct McpHttpBackend {
 
 impl McpHttpBackend {
     pub fn new(url: String, auth_header: Option<(String, String)>) -> Self {
-        Self::with_timeout_and_circuit_recovery(
-            url,
-            auth_header,
-            DEFAULT_TIMEOUT,
-            CIRCUIT_RECOVERY_TIMEOUT,
-        )
+        Self::with_timeout(url, auth_header, DEFAULT_TIMEOUT)
+    }
+
+    /// Same as [`Self::new`] but with an explicit timeout for downstream I/O.
+    pub fn with_timeout(
+        url: String,
+        auth_header: Option<(String, String)>,
+        timeout: Duration,
+    ) -> Self {
+        Self::with_timeout_and_circuit_recovery(url, auth_header, timeout, CIRCUIT_RECOVERY_TIMEOUT)
     }
 
     /// Same as [`Self::new`] but with an explicit timeout and circuit
