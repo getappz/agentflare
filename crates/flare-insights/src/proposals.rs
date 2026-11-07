@@ -261,6 +261,20 @@ impl InsightsStore {
         Ok(n > 0)
     }
 
+    /// Mark Applied and record the content hash that was written.
+    pub fn set_proposal_applied(&self, id: i64, applied_hash: &str) -> Result<bool, StoreError> {
+        let n = self.conn.execute(
+            "UPDATE insights_proposals SET status=?2, applied_hash=?3, snoozed_until=NULL, updated_at=?4 WHERE id=?1",
+            params![
+                id,
+                ProposalStatus::Applied.as_str(),
+                applied_hash,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn list_proposals(
         &self,
         status: Option<ProposalStatus>,
