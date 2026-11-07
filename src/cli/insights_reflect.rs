@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 
 use chrono::{Duration, Utc};
 use clap::{Parser, Subcommand};
+use flare_insights::discover::member_key;
 use flare_insights::evidence::EvidenceRef;
 use flare_insights::proposals::{ProposalRow, ProposalStatus, fingerprint};
 use flare_insights::store::InsightsStore;
@@ -138,14 +139,11 @@ fn upsert_mined(
     p: &flare_insights::discover::Proposal,
 ) -> Result<(), Box<dyn std::error::Error>> {
     const MINED: &str = "mined";
-    let mut aliases: Vec<String> = p
-        .examples
+    let aliases: Vec<String> = p
+        .member_keys
         .iter()
-        .filter_map(|e| e.excerpt.as_deref())
-        .map(|text| fingerprint(MINED, "", text))
+        .map(|key| fingerprint(MINED, "", key))
         .collect();
-    aliases.sort_unstable();
-    aliases.dedup();
     let kind = format!("{:?}", p.destination).to_lowercase();
     let mut c = candidate(
         &kind,
@@ -159,7 +157,7 @@ fn upsert_mined(
     );
     c.fingerprint = match store.proposal_for_aliases(&aliases)? {
         Some(existing) => existing,
-        None => fingerprint(MINED, "", &p.draft),
+        None => fingerprint(MINED, "", &member_key(&p.draft)),
     };
     store.upsert_proposal_candidate(&c)?;
     store.add_proposal_aliases(&c.fingerprint, &aliases)?;
@@ -379,6 +377,7 @@ mod tests {
                 .collect(),
             draft: draft.into(),
             rationale: String::new(),
+            member_keys: members.iter().map(|text| member_key(text)).collect(),
         }
     }
 
@@ -417,6 +416,47 @@ mod tests {
         let rows = store.list_proposals(None).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, ProposalStatus::Rejected);
+    }
+
+    #[test]
+    fn long_members_sharing_an_excerpt_prefix_stay_separate() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        let shared = "x".repeat(300);
+        let (one, two) = (format!("{shared} one"), format!("{shared} two"));
+        upsert_mined(&store, &mined(&one, &[&one], Destination::Skill)).unwrap();
+        let id = store.list_proposals(None).unwrap()[0].id;
+        store
+            .set_proposal_status(id, ProposalStatus::Rejected, None)
+            .unwrap();
+        upsert_mined(&store, &mined(&two, &[&two], Destination::Skill)).unwrap();
+        let rows = store.list_proposals(None).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].status, ProposalStatus::Proposed);
+    }
+
+    #[test]
+    fn accepting_same_slug_and_fingerprint_prefix_keeps_both_memories() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        let mut ids = Vec::new();
+        for tail in ["a", "b"] {
+            let mut c = candidate("memory_fact", "demo", tail, "Use pnpm", tail, 1, 1, vec![]);
+            c.fingerprint = format!("{}{tail}", "f".repeat(12));
+            store.upsert_proposal_candidate(&c).unwrap();
+            ids.push(store.list_proposals(None).unwrap().last().unwrap().id);
+        }
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::memory::schema::migrate(&mut conn).unwrap();
+        for id in ids {
+            accept(&store, &conn, id).unwrap();
+        }
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM observations WHERE title='Use pnpm'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
     }
 
     #[test]
