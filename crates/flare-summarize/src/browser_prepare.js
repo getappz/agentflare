@@ -14,8 +14,8 @@
     || document.querySelector('#movie_player')?.getPlayerResponse?.()
     || document.querySelector('ytd-watch-flexy')?.playerData);
   const tracks = player.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
-  const track = languages.map(language => tracks.find(t => t.languageCode === language)
-    || tracks.find(t => t.languageCode.split('-')[0] === language.split('-')[0])).find(Boolean);
+  const track = languages.map(language => tracks.find(t => t.languageCode.toLowerCase() === language.toLowerCase())
+    || tracks.find(t => t.languageCode.split('-')[0].toLowerCase() === language.split('-')[0].toLowerCase())).find(Boolean);
   if (!track) throw new Error('No captions in a requested language: ' + languages.join(', '));
   let segments;
   // A request in the rendered page can succeed when the standalone HTTP client fails.

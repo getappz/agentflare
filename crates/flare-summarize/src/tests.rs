@@ -116,6 +116,30 @@ async fn browser_wrong_language_is_rejected_and_closed() {
 }
 
 #[tokio::test]
+async fn browser_accepts_case_insensitive_language_variants() {
+    let mut browser = |action: &str, args: &[String]| {
+        Ok(match action {
+            "eval" if args[0].contains("/* prepare */") => {
+                json!({"count":1,"language":"en-US"}).to_string()
+            }
+            "eval" => {
+                json!({"offset":0,"next":1,"segments":[{"start":0.0,"text":"Hello"}]}).to_string()
+            }
+            _ => String::new(),
+        })
+    };
+    let result = extract_with(
+        "dQw4w9WgXcQ",
+        &["EN-gb".into()],
+        async { Err("blocked".into()) },
+        Some(&mut browser),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.language, "en-US");
+}
+
+#[tokio::test]
 async fn fallback_reads_every_chunk_and_closes_session() {
     let mut offsets = Vec::new();
     let mut closed = false;

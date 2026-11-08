@@ -59,7 +59,11 @@ fn read(
     }
     if !languages.iter().any(|language| {
         language.eq_ignore_ascii_case(&prepared.language)
-            || language.split('-').next() == prepared.language.split('-').next()
+            || language
+                .split('-')
+                .next()
+                .unwrap_or_default()
+                .eq_ignore_ascii_case(prepared.language.split('-').next().unwrap_or_default())
     }) {
         return Err("browser returned captions in an unrequested language".into());
     }

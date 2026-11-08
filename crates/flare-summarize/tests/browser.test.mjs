@@ -50,6 +50,16 @@ test('fails rather than returning captions in an unrequested language', async ()
   await assert.rejects(vm.runInContext(prepare.replace('__LANGUAGES__', '["en"]'), ctx), /language/i);
 });
 
+test('matches caption language tags without regard to case', async () => {
+  for (const requested of ['EN-us', 'EN-gb']) {
+    const ctx = context([{ tStartMs: 0, segs: [{ utf8: 'Hello' }] }], 'en-US');
+    const result = JSON.parse(await vm.runInContext(
+      prepare.replace('__LANGUAGES__', JSON.stringify([requested])), ctx));
+    assert.equal(result.language, 'en-US');
+    assert.equal(result.count, 1);
+  }
+});
+
 function panelContext(initialSegments) {
   const ctx = context([]);
   const renderer = { data: { initialSegments } };
