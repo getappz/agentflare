@@ -407,9 +407,26 @@ fn run_search(db: PathBuf, args: SearchArgs) {
                 hit.turn_seq,
                 s.project,
                 s.title.as_deref().unwrap_or(""),
-                hit.snippet.split_whitespace().collect::<Vec<_>>().join(" ")
+                one_line(&hit.snippet)
             )
         }
+    }
+}
+
+/// Collapse every whitespace run (newlines, tabs) so a hit prints on one line.
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod search_line_tests {
+    use super::one_line;
+
+    #[test]
+    fn search_hit_prints_on_one_line() {
+        let out = one_line("a\nb\r\nc\td\n\n  e\r");
+        assert_eq!(out, "a b c d e");
+        assert!(!out.contains(['\n', '\r', '\t']));
     }
 }
 
