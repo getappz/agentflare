@@ -60,3 +60,25 @@
   `cargo fmt --check`, and `git diff --check`. Independent review: no findings.
 - `gh pr checks 1044` could not connect to api.github.com. Live retrieval and
   remote CI status cannot be verified in this sandbox.
+
+## CI dependency integration follow-up (2026-11-08)
+
+- PR #1044 is reachable in this run. Its `hakari` job fails because the new
+  crate is absent from workspace-hack management and generated dependency
+  features are stale. Reproduced `cargo hakari generate --diff` failure with
+  CI's pinned cargo-hakari 0.9.38 before changing the generated configuration.
+- Added the managed workspace-hack dependency to `flare-summarize`, regenerated
+  the feature manifest, and updated the lockfile without changing dependency
+  versions. All three exact CI checks now pass: `cargo hakari generate --diff`,
+  `cargo hakari manage-deps --dry-run`, and `cargo hakari verify`.
+- Fresh `cargo fmt --check`, six browser JavaScript fixtures, and
+  `git diff --check` pass. Remote CI still describes the previously pushed
+  revision until this commit is pushed and checks rerun.
+- Fresh Rust verification passes: the `flare-summarize` suite, crate clippy
+  with `--all-targets -- -D warnings`, and `agentflare-skill-registry` tests
+  (84 unit tests and the golden-query integration test, including builtin
+  summarize skill materialization). Registry compilation reports existing
+  `agentflare-config` warnings.
+- All six `cargo test --test summarize_cli --locked` integration tests pass,
+  including CLI options, early validation, and serving the builtin skill.
+  The full CLI build also reports existing unsafe-code warnings.
