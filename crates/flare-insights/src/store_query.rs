@@ -771,4 +771,37 @@ mod tests {
         let rows = store.sessions_in_window(None, None, None, None).unwrap();
         assert_eq!(rows.len(), 1);
     }
+
+    #[test]
+    fn stats_window_reads_one_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("i.db");
+        let store = InsightsStore::open(&path).unwrap();
+        let mut n = 0;
+        for (src, proj, count) in [
+            (SessionSource::Codex, "a", 3),
+            (SessionSource::ClaudeCode, "a", 2),
+            (SessionSource::Codex, "b", 4),
+        ] {
+            for _ in 0..count {
+                let mut s = sample_session(&format!("s{n}"), src.clone(), None);
+                s.project = proj.into();
+                store.upsert_session(&s).unwrap();
+                n += 1;
+            }
+        }
+        let a = store.stats_window(&StatsWindow::default()).unwrap();
+        assert_eq!(a.total_sessions, 9);
+        assert_eq!(a.by_source.values().sum::<usize>(), a.total_sessions);
+        assert_eq!(a.by_project.values().sum::<usize>(), a.total_sessions);
+
+        let other = InsightsStore::open(&path).unwrap();
+        other
+            .upsert_session(&sample_session("late", SessionSource::Codex, None))
+            .unwrap();
+        assert_eq!(a.total_sessions, 9);
+        let b = store.stats_window(&StatsWindow::default()).unwrap();
+        assert_eq!(b.total_sessions, 10);
+        assert_eq!(b.by_source.values().sum::<usize>(), 10);
+    }
 }
