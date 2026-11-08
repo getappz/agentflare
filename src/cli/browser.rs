@@ -256,7 +256,7 @@ fn exec(
 /// `observe` filters against the full snapshot before any truncation --
 /// capping first (as `exec` does for direct display) can push a matching
 /// line past the cut and silently miss it.
-fn exec_raw(
+pub(super) fn exec_raw(
     session: &str,
     action: &str,
     positionals: &[String],

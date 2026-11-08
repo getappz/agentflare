@@ -69,6 +69,7 @@ tools any MCP-capable agent can call:
 | **Friction logging** (`vent`) | Append-only per-repo JSONL of tool/workflow friction as it happens; a classifier auto-files the actionable entries as backlog items. |
 | **GitHub ops** (`flare_git` MCP tool, `git` CLI) | PRs, issues, releases, and workflow runs against GitHub — including a bounded `pr_wait` poll — on top of the branch-protection/provenance git shim. |
 | **Skills** (`skill`) | Registry for `SKILL.md` playbooks — search (BM25), load, and eval, so an agent can pull in a project-specific procedure on demand. |
+| **[Summarize](docs-site/src/content/docs/reference/summarize.md)** (`summarize` CLI + bundled skill) | Retrieve timestamped YouTube captions through direct HTTP, then browser fallback; the calling agent writes the summary. |
 | **Auth vault** (`auth`, `vault`) | Encrypted credential storage for agent auth profiles (rotation, cooldown, health scoring); `vault` separately holds lightweight per-project secrets (unlock/lock/print-env). |
 | **Global search** (`search` MCP tool) | One entrypoint across 17 sources — store, memory, code, web, social, news, GitHub, academic, datasets, websites, weather, financial, crypto, fx, indicators, YouTube, Bluesky. |
 | **`@mention` references** | Inline `@I…`/`@A…`/`@search:…` references in tool output resolve across items, artifacts, and search results. |

@@ -11,20 +11,27 @@ struct BuiltinSkill {
     companions: &'static [(&'static str, &'static str)],
 }
 
-const BUILTIN_SKILLS: &[BuiltinSkill] = &[BuiltinSkill {
-    name: "pm",
-    skill_md: include_str!("../../../.claude/skills/pm/SKILL.md"),
-    companions: &[
-        (
-            "reference/read-recipe.md",
-            include_str!("../../../.claude/skills/pm/reference/read-recipe.md"),
-        ),
-        (
-            "reference/rubric.md",
-            include_str!("../../../.claude/skills/pm/reference/rubric.md"),
-        ),
-    ],
-}];
+const BUILTIN_SKILLS: &[BuiltinSkill] = &[
+    BuiltinSkill {
+        name: "pm",
+        skill_md: include_str!("../../../.claude/skills/pm/SKILL.md"),
+        companions: &[
+            (
+                "reference/read-recipe.md",
+                include_str!("../../../.claude/skills/pm/reference/read-recipe.md"),
+            ),
+            (
+                "reference/rubric.md",
+                include_str!("../../../.claude/skills/pm/reference/rubric.md"),
+            ),
+        ],
+    },
+    BuiltinSkill {
+        name: "summarize",
+        skill_md: include_str!("../../../.claude/skills/summarize/SKILL.md"),
+        companions: &[],
+    },
+];
 
 /// Names of all skills compiled into the binary.
 pub fn names() -> Vec<&'static str> {
@@ -82,6 +89,18 @@ mod tests {
     #[test]
     fn get_returns_none_for_unknown() {
         assert!(get("definitely-not-a-real-skill-xyz").is_none());
+    }
+
+    #[test]
+    fn summarize_is_available_and_materialized() {
+        let (body, _) = get("summarize").expect("builtin summarize skill");
+        assert!(body.contains("agentflare summarize"));
+        let tmp = tempfile::tempdir().unwrap();
+        materialize(tmp.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("summarize/SKILL.md")).unwrap(),
+            body
+        );
     }
 
     #[test]

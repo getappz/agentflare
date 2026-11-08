@@ -96,6 +96,7 @@ agentflare-store = { path = "crates/agentflare-store" }
 flare-channels = { path = "crates/flare-channels" }
 flare-docs = { path = "crates/flare-docs" }
 flare-browser = { path = "crates/flare-browser" }
+flare-summarize = { path = "crates/flare-summarize" }
 flare-git-core = { path = "crates/flare-git-core" }
 flare-proxy = { path = "crates/flare-proxy" }
 flare-vault = { path = "crates/flare-vault" }
