@@ -160,6 +160,9 @@ where
     }
     let direct = fetch.await.and_then(|transcript| {
         transcript.validate()?;
+        if !matches_language(&transcript.language, languages) {
+            return Err("direct retrieval returned captions in an unrequested language".into());
+        }
         Ok(transcript)
     });
     let error = match direct {
@@ -173,6 +176,17 @@ where
     };
     browser::extract(id, languages, runner).map_err(|fallback| {
         format!("direct retrieval failed: {error}; browser fallback failed: {fallback}")
+    })
+}
+
+fn matches_language(actual: &str, requested: &[String]) -> bool {
+    requested.iter().any(|language| {
+        language.eq_ignore_ascii_case(actual)
+            || language
+                .split('-')
+                .next()
+                .unwrap_or_default()
+                .eq_ignore_ascii_case(actual.split('-').next().unwrap_or_default())
     })
 }
 

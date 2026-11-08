@@ -57,14 +57,7 @@ fn read(
     if prepared.count == 0 || prepared.count > 100_000 {
         return Err("empty or excessively large browser transcript".into());
     }
-    if !languages.iter().any(|language| {
-        language.eq_ignore_ascii_case(&prepared.language)
-            || language
-                .split('-')
-                .next()
-                .unwrap_or_default()
-                .eq_ignore_ascii_case(prepared.language.split('-').next().unwrap_or_default())
-    }) {
+    if !crate::matches_language(&prepared.language, languages) {
         return Err("browser returned captions in an unrequested language".into());
     }
     let mut segments = Vec::with_capacity(prepared.count);

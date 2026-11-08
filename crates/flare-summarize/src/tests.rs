@@ -69,6 +69,16 @@ async fn direct_success_does_not_launch_browser() {
 }
 
 #[tokio::test]
+async fn direct_wrong_language_is_rejected() {
+    let mut fetched = transcript("Bonjour");
+    fetched.language = "fr".into();
+    let error = extract_with("dQw4w9WgXcQ", &["en".into()], async { Ok(fetched) }, None)
+        .await
+        .unwrap_err();
+    assert!(error.contains("unrequested language"), "{error}");
+}
+
+#[tokio::test]
 async fn fetch_only_reports_failure() {
     let error = extract_with(
         "dQw4w9WgXcQ",

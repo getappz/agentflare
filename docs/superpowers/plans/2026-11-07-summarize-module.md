@@ -47,3 +47,16 @@
   with `source=fetch`. Browser fallback is fixture-tested; its live path was
   not exercised because the sidecar is not installed in this environment.
 - Final implementation is in the claimed worktree `.worktrees/task/457`.
+
+## Resumed validation (2026-11-08)
+
+- Direct results now use the same case-insensitive language/variant validation
+  as browser results. A wrong-language direct result triggers fallback, or an
+  explicit error in fetch-only mode. The regression test failed before the fix.
+- Shared mbx targets are read-only in the dispatched sandbox; verification uses
+  absolute-path Cargo with `/tmp/agentflare-457-target` instead.
+- Fresh verification passed: 12 transcript unit tests, 9 summary integration
+  tests, browser JavaScript fixtures, crate clippy with `-D warnings`,
+  `cargo fmt --check`, and `git diff --check`. Independent review: no findings.
+- `gh pr checks 1044` could not connect to api.github.com. Live retrieval and
+  remote CI status cannot be verified in this sandbox.
