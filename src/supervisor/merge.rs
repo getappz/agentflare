@@ -156,46 +156,44 @@ pub(super) fn handle_ci_green(
         CONFLICT_REPAIR_SILENT_KEY,
         CONFLICT_REPAIR_COMPLETED_KEY,
     );
-    // Namespaced ("pr-approval:<id>", not the bare item id): the
-    // underlying set is keyed globally across every gate type in
-    // this file (see `dispatch_item`'s "plan:" comment) -- an
-    // unnamespaced key here silently starves this card of its
-    // once-per-gate notify if the item was already gated for an
-    // unrelated reason earlier in its life (e.g. the go/no-go
-    // decision gate below, or `skip_item`), since that gate's call
-    // already consumed the bare-id token (item #587).
-    //
-    // A GitHub-review block gets its own card (and its own once-per-item
-    // key): telling the human to attach the approval label there would
-    // be wrong -- the label can't merge a review-blocked PR -- and when
-    // the review later lands with the label still missing, the plain
-    // label card is still owed.
+    // The durable notification ledger queues subsequent updates; the
+    // process-local guard below only suppresses repeated GitHub comments.
     let label_missing = !labels.iter().any(|l| l == PR_APPROVAL_LABEL);
     match merge {
         CiGreenMerge::Allowed { .. } => {
-            if label_missing && first_time_gated(&format!("pr-approval:{}", item.id)) {
+            if label_missing {
                 notify_pr_approval_gate(
                     item,
                     folder_path,
                     number,
                     PrApprovalBlocker::ApprovalLabel,
+                    merge.head_sha(),
                 );
-                post_missing_approval_pr_comment(mcp, item, folder_path, number, PR_APPROVAL_LABEL);
+                if first_time_gated(&format!("pr-approval:{}", item.id)) {
+                    post_missing_approval_pr_comment(
+                        mcp,
+                        item,
+                        folder_path,
+                        number,
+                        PR_APPROVAL_LABEL,
+                    );
+                }
             }
         }
         CiGreenMerge::BlockedOnReview {
             changes_requested, ..
         } => {
+            notify_pr_approval_gate(
+                item,
+                folder_path,
+                number,
+                PrApprovalBlocker::GitHubReview {
+                    changes_requested,
+                    label_missing,
+                },
+                merge.head_sha(),
+            );
             if first_time_gated(&format!("pr-review:{}", item.id)) {
-                notify_pr_approval_gate(
-                    item,
-                    folder_path,
-                    number,
-                    PrApprovalBlocker::GitHubReview {
-                        changes_requested,
-                        label_missing,
-                    },
-                );
                 post_github_review_block_pr_comment(
                     mcp,
                     item,
@@ -517,9 +515,7 @@ pub(super) fn merge_or_repair_findings(
             number,
             "unresolved review-bot findings hold the merge",
         );
-        if item_gated(mcp, item, label_id_by_name)
-            && first_time_gated(&format!("pr-gated:{}", item.id))
-        {
+        if item_gated(mcp, item, label_id_by_name) {
             notify_human_gate(
                 item,
                 &format!(
@@ -528,7 +524,9 @@ pub(super) fn merge_or_repair_findings(
                      and review findings remain or could not be checked."
                 ),
             );
-            post_item_dispatch_gate_pr_comment(mcp, item, folder_path, number);
+            if first_time_gated(&format!("pr-gated:{}", item.id)) {
+                post_item_dispatch_gate_pr_comment(mcp, item, folder_path, number);
+            }
         }
     }
     if review.dispatch_needed() {

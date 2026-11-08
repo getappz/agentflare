@@ -289,6 +289,31 @@ pub fn migrations() -> Migrations<'static> {
             created_at  INTEGER NOT NULL
         );",
         ),
+        M::up(
+            "CREATE TABLE IF NOT EXISTS store_notify_sent (
+            item_id       TEXT NOT NULL,
+            event_key     TEXT NOT NULL,
+            first_sent_at INTEGER NOT NULL,
+            latest_text   TEXT NOT NULL DEFAULT '',
+            updated_at    INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (item_id, event_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_store_notify_sent_item
+            ON store_notify_sent(item_id);
+
+        CREATE TABLE IF NOT EXISTS store_notify_digest (
+            item_id     TEXT NOT NULL,
+            event_key   TEXT NOT NULL,
+            latest_text TEXT NOT NULL,
+            seq         INTEGER NOT NULL DEFAULT 0,
+            name        TEXT NOT NULL DEFAULT '',
+            updated_at  INTEGER NOT NULL,
+            revision    INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (item_id, event_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_store_notify_digest_updated
+            ON store_notify_digest(updated_at DESC);",
+        ),
     ])
 }
 

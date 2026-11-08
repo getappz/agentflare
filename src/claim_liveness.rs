@@ -390,7 +390,6 @@ pub(crate) fn run_sweep(
     }
     for r in &released {
         if r.parked_at_cap
-            && crate::supervisor::first_time_gated(&r.item_id)
             && let Ok(Some(item)) =
                 mcp.with_backend_db(|conn| agentflare_backend::item::get(conn, &r.item_id).ok())
         {
