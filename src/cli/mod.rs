@@ -134,7 +134,7 @@ pub enum Commands {
     Auth(auth::AuthArgs),
     /// Agent-first browser automation (open, snapshot, click, fill, read, ...).
     Browser(browser::BrowserArgs),
-    /// Retrieve a YouTube transcript for the calling agent to summarize.
+    /// Summarize a YouTube video with references, or extract its transcript.
     Summarize(summarize::SummarizeArgs),
     /// Serve live-shareable artifact pages from AI agent sessions.
     Artifacts(artifacts::ArtifactsArgs),

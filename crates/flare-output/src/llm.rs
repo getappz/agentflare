@@ -23,9 +23,25 @@ pub struct RealLlm;
 impl Llm for RealLlm {
     fn call(&self, prompt: &str) -> Result<String, CavemanError> {
         if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
-            return call_via_api(&api_key, prompt);
+            return call_via_api(&api_key, prompt, None);
         }
-        call_via_cli(prompt)
+        call_via_cli(prompt, None, false)
+    }
+}
+
+/// A configurable text-only model call. CLI customizations, tools, MCP and persistence are disabled.
+/// Other callers using `RealLlm` retain their existing behavior.
+#[derive(Default)]
+pub struct TextLlm {
+    pub model: Option<String>,
+}
+
+impl Llm for TextLlm {
+    fn call(&self, prompt: &str) -> Result<String, CavemanError> {
+        if let Some(api_key) = env_model("ANTHROPIC_API_KEY") {
+            return call_via_api(&api_key, prompt, self.model.as_deref());
+        }
+        call_via_cli(prompt, self.model.as_deref(), true)
     }
 }
 
@@ -36,15 +52,25 @@ fn env_model(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
 }
 
-fn call_via_api(api_key: &str, prompt: &str) -> Result<String, CavemanError> {
-    let model = env_model("FLARE_OUTPUT_MODEL")
+fn api_body(prompt: &str, model_override: Option<&str>) -> serde_json::Value {
+    let model = model_override
+        .map(str::to_owned)
+        .or_else(|| env_model("FLARE_OUTPUT_MODEL"))
         .or_else(|| env_model("CAVEMAN_MODEL"))
         .unwrap_or_else(|| "claude-sonnet-4-5".to_string());
-    let body = serde_json::json!({
+    serde_json::json!({
         "model": model,
         "max_tokens": 8192,
         "messages": [{"role": "user", "content": prompt}],
-    });
+    })
+}
+
+fn call_via_api(
+    api_key: &str,
+    prompt: &str,
+    model_override: Option<&str>,
+) -> Result<String, CavemanError> {
+    let body = api_body(prompt, model_override);
     let resp = ureq::post("https://api.anthropic.com/v1/messages")
         .set("x-api-key", api_key)
         .set("anthropic-version", "2023-06-01")
@@ -61,11 +87,38 @@ fn call_via_api(api_key: &str, prompt: &str) -> Result<String, CavemanError> {
         .ok_or_else(|| CavemanError::Llm("API response missing content[0].text".to_string()))
 }
 
-fn call_via_cli(prompt: &str) -> Result<String, CavemanError> {
+fn cli_args(model: Option<&str>, text_only: bool) -> Vec<String> {
+    let mut args = vec!["--print".to_string()];
+    if let Some(model) = model {
+        args.extend(["--model".into(), model.into()]);
+    }
+    if text_only {
+        args.extend(
+            [
+                "--safe-mode",
+                "--tools",
+                "",
+                "--strict-mcp-config",
+                "--mcp-config",
+                "{\"mcpServers\":{}}",
+                "--disable-slash-commands",
+                "--no-session-persistence",
+            ]
+            .map(str::to_owned),
+        );
+    }
+    args
+}
+
+fn call_via_cli(
+    prompt: &str,
+    model: Option<&str>,
+    text_only: bool,
+) -> Result<String, CavemanError> {
     let claude_bin =
         which::which("claude").map_or_else(|_| "claude".to_string(), |p| p.display().to_string());
     let mut child = flare_process::command(&claude_bin)
-        .arg("--print")
+        .args(cli_args(model, text_only))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -133,6 +186,22 @@ impl Llm for FakeLlm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_model_options_override_model_and_disable_cli_tools() {
+        let body = api_body("summarize", Some("explicit-model"));
+        assert_eq!(body["model"], "explicit-model");
+        assert_eq!(body["messages"][0]["content"], "summarize");
+        let args = cli_args(Some("explicit-model"), true);
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--model", "explicit-model"])
+        );
+        assert!(args.windows(2).any(|pair| pair == ["--tools", ""]));
+        assert!(args.contains(&"--no-session-persistence".to_string()));
+        assert!(args.contains(&"--safe-mode".to_string()));
+        assert_eq!(cli_args(None, false), ["--print"]);
+    }
 
     #[test]
     fn fake_llm_returns_queued_responses_in_order() {

@@ -1,6 +1,8 @@
 //! Fetch-first transcript extraction for the summarize workflow.
 
 mod browser;
+pub mod references;
+pub mod summary;
 
 use serde::{Deserialize, Serialize};
 use std::future::Future;

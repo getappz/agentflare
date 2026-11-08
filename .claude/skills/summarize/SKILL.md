@@ -8,10 +8,12 @@ description: Retrieve and summarize YouTube video transcripts using agentflare s
 Retrieve the transcript with the separate summarize module:
 
 ```sh
-agentflare summarize 'https://www.youtube.com/watch?v=VIDEO_ID' --json > /tmp/video-transcript.json
+agentflare summarize 'https://www.youtube.com/watch?v=VIDEO_ID' --extract --json > /tmp/video-transcript.json
 ```
 
-The command tries direct caption requests first and then agentflare's browser in a temporary session. It retrieves captions; you write the summary using your existing model. No separate summarization API key is needed.
+In `--extract` mode, the command tries direct caption requests first and then agentflare's browser in a temporary session. It retrieves captions; you write the summary using your existing model. No separate summarization API key is needed for this agent workflow.
+
+For a standalone CLI-generated summary, omit `--extract`. The CLI uses the existing Anthropic API configuration or authenticated Claude CLI. Configure `--length short|medium|long|xl|xxl`, `--summary-language`, `--prompt` / `--prompt-file`, and `--model` as requested; `--format text|markdown|json` controls rendering (`md` is an alias). `--json` is a shortcut for JSON output. `--language` continues to select caption languages. Summary JSON includes structured `summary`, `references`, and `warnings` alongside the transcript metadata and segments. Use `--extract --format md --timestamps` for a timestamp-linked transcript without a model call.
 
 - Use `--language en` (repeat for ordered preferences) when a language is requested. Otherwise the command defaults to English.
 - Use `--fetch-only` to disable browser fallback.
@@ -23,7 +25,7 @@ The command tries direct caption requests first and then agentflare's browser in
 
 ## Collect references by default
 
-For every video summary, retrieve the video description as well as the captions. The transcript CLI JSON currently contains captions and metadata, but not the description. Spoken references such as “link in the description” require this separate retrieval.
+For every video summary, retrieve the video description as well as the captions. The `--extract --json` output contains captions and metadata, but not the description, so the agent workflow requires this separate retrieval. The standalone CLI summary mode retrieves description links automatically; check its `warnings` for inaccessible references. Spoken references such as “link in the description” require the actual description URLs.
 
 Fetch the YouTube watch-page HTML directly and parse `ytInitialPlayerResponse.videoDetails.shortDescription`. Use a JSON decoder on the object after the `ytInitialPlayerResponse` assignment, rather than a regex over the description string, so escaped URLs are decoded correctly. If direct fetching fails or the description is missing, use agentflare's browser to expand and read the full description. A generic page reader may return only YouTube's navigation/footer; that does not establish that the description has no links.
 
