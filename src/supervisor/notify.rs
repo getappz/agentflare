@@ -413,9 +413,6 @@ pub(crate) fn notify_pr_approval_gate(
     blocker: PrApprovalBlocker,
     head_sha: Option<&str>,
 ) {
-    if test_notify_disabled() {
-        return;
-    }
     let Some(repo) = crate::github::RepoId::resolve_from_remote(std::path::Path::new(folder_path))
     else {
         return;
@@ -724,6 +721,38 @@ mod pr_approval_card_tests {
             owner: "o".into(),
             repo: "r".into(),
         }
+    }
+
+    #[test]
+    fn pr_approval_entry_point_uses_fake_sender_and_durable_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        for args in [
+            vec!["init"],
+            vec!["remote", "add", "origin", "https://github.com/o/r.git"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir.path())
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        }
+        let (_, sent) = with_fake_notifications(|| {
+            for sha in ["first", "first", "updated"] {
+                notify_pr_approval_gate(
+                    &item(),
+                    dir.path().to_str().unwrap(),
+                    7,
+                    PrApprovalBlocker::ApprovalLabel,
+                    Some(sha),
+                );
+            }
+        });
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("pull/7"));
     }
 
     #[test]
