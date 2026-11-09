@@ -15,7 +15,9 @@ mod truncate;
 mod types;
 
 pub use backend::Backend;
-pub use config::{ConfigError, GatewayConfig, ServerConfig, parse as parse_config};
+pub use config::{
+    ConfigError, GatewayConfig, MAX_TIMEOUT_SECS, ServerConfig, parse as parse_config,
+};
 pub use error::{GatewayError, suggest};
 pub use mcp_http::McpHttpBackend;
 pub use mcp_stdio::{DEFAULT_TIMEOUT, McpStdioBackend};

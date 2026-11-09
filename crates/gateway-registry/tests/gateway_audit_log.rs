@@ -25,6 +25,7 @@ async fn execute_appends_an_audit_log_entry_without_leaking_raw_args() {
             args: vec![],
             auth_ref: None,
             auth_env: None,
+            timeout_secs: None,
         },
     );
     let config = GatewayConfig { servers };
