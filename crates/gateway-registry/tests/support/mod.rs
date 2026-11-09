@@ -14,7 +14,7 @@
 use rmcp::{
     ServerHandler,
     handler::server::wrapper::Parameters,
-    model::{Implementation, ServerCapabilities, ServerInfo},
+    model::{Implementation, ServerCapabilities, ServerConfig},
     schemars, tool, tool_handler, tool_router,
     transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
@@ -53,8 +53,8 @@ impl HttpFixtureServer {
 
 #[tool_handler]
 impl ServerHandler for HttpFixtureServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("gateway-fixture-http-server", "0.1.0"))
     }
 }
