@@ -8,6 +8,7 @@ pub mod prompts;
 pub mod quality;
 pub mod recall_bench;
 pub mod relations;
+mod remember_redact;
 pub mod schema;
 pub mod search;
 pub mod sessions;

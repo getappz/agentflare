@@ -139,7 +139,11 @@ pub fn handle_remember(input: RememberInput) -> Result<String, String> {
     remember_in(&open_db()?, input)
 }
 
-fn remember_in(conn: &rusqlite::Connection, input: RememberInput) -> Result<String, String> {
+pub(super) fn remember_in(
+    conn: &rusqlite::Connection,
+    input: RememberInput,
+) -> Result<String, String> {
+    let (input, redacted) = super::remember_redact::redact_input(input);
     let outcome = observations::save_keyed(
         conn,
         input.session_id.as_deref(),
@@ -169,7 +173,10 @@ fn remember_in(conn: &rusqlite::Connection, input: RememberInput) -> Result<Stri
         index_embedding(conn, id, &input.title, &input.content, status == "updated");
     }
     let mut out = json!({"status": status, "id": id});
-    let warnings = lint_retrieval_card(&input.title, &input.content);
+    let mut warnings = lint_retrieval_card(&input.title, &input.content);
+    if redacted {
+        warnings.push("secret-like text was redacted before storing".into());
+    }
     if !warnings.is_empty() {
         out["warnings"] = json!(warnings);
     }
