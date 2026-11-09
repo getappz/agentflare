@@ -189,3 +189,25 @@ fn forced_check_merge_cannot_bypass_the_gate() {
     assert_eq!(r["status"], "needs_input");
     assert_eq!(group_of(&s, &id), "needs_input");
 }
+
+#[test]
+fn repeated_hold_unverified_sends_only_one_immediate_card() {
+    let (s, id, _t, _r) = setup(true, None);
+    let (_, sent) = crate::supervisor::with_fake_notifications(|| {
+        for _ in 0..3 {
+            assert!(s.hold_unverified(&id).unwrap().is_some());
+        }
+        // Simulate a retry that restores the item state before trying again:
+        // the persisted notification ledger still suppresses the new card.
+        s.with_backend_db(|conn| {
+            let item = agentflare_backend::item::get(conn, &id).unwrap();
+            let state =
+                agentflare_backend::state::first_in_group(conn, &item.project_id, "started")
+                    .unwrap();
+            agentflare_backend::item::update_state(conn, &id, &state.id).unwrap();
+        })
+        .unwrap();
+        assert!(s.hold_unverified(&id).unwrap().is_some());
+    });
+    assert_eq!(sent.len(), 1, "{sent:?}");
+}
