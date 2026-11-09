@@ -190,6 +190,11 @@ export function registerAutopilot(on: On, context: AutopilotContext): { step($: 
   // The session must be idle for idleMinutes before a pull: finished, aborted, or errored turns restart the wait.
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
+    // An in-flight poll can re-arm the timer after turn start; cancel it so it cannot fire during capture.
+    if (e.agentId === undefined) {
+      timer?.cancel()
+      timer = null
+    }
     if (context.capture) {
       await captureTurn($, e, context.capture)
     }
