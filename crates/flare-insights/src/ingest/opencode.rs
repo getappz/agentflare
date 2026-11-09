@@ -492,7 +492,7 @@ fn ingest_messages_for_session(
                         let tool_id = if call_id == "unknown" {
                             format!("{}-{}-{}", session_id, seq, tools.len())
                         } else {
-                            call_id.clone()
+                            super::scoped_id(session_id, &call_id)
                         };
                         // DRY file_event
                         if let Some(path) = extract_file_path(tool, &input) {

@@ -128,18 +128,45 @@ pub fn migrations() -> Migrations<'static> {
              ALTER TABLE sessions ADD COLUMN cost_basis TEXT;
              ALTER TABLE sessions ADD COLUMN pricing_key TEXT;",
         ),
+        // Claude child row ids became session-scoped; forget cursors once so the
+        // next ordinary sync rebuilds files that have not changed on disk.
+        M::up("DELETE FROM ingest_file_cursors WHERE source = 'claude_code';"),
+        M::up(
+            "CREATE TABLE insights_proposals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fingerprint TEXT NOT NULL UNIQUE,
+                kind TEXT NOT NULL,
+                project TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL,
+                proposed_content TEXT NOT NULL,
+                target_path TEXT,
+                status TEXT NOT NULL DEFAULT 'proposed',
+                session_count INTEGER NOT NULL DEFAULT 0,
+                occurrence_count INTEGER NOT NULL DEFAULT 0,
+                evidence_json TEXT NOT NULL DEFAULT '[]',
+                model_context TEXT,
+                applied_hash TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                snoozed_until TEXT
+            );
+            CREATE TABLE insights_proposal_aliases (
+                alias TEXT PRIMARY KEY,
+                fingerprint TEXT NOT NULL
+            );",
+        ),
     ])
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::model::*;
     use crate::store::InsightsStore;
     use chrono::{TimeZone, Utc};
     use rusqlite::Connection;
 
-    fn session(id: &str) -> Session {
+    pub(crate) fn session(id: &str) -> Session {
         Session {
             id: id.into(),
             source: SessionSource::ClaudeCode,
@@ -245,7 +272,36 @@ mod tests {
         let version: i64 = raw
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 4);
+    }
+
+    #[test]
+    fn upgrade_forgets_claude_cursors_once_and_keeps_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("insights.db");
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute_batch(V1_DDL).unwrap();
+            raw.execute_batch(
+                "INSERT INTO ingest_file_cursors(source, path, mtime_ms, size)
+                 VALUES ('claude_code', '/a.jsonl', 1, 1), ('codex', '/b.jsonl', 1, 1);",
+            )
+            .unwrap();
+        }
+        let store = InsightsStore::open(&path).unwrap();
+        assert!(store.load_file_cursors("claude_code").unwrap().is_empty());
+        assert_eq!(store.load_file_cursors("codex").unwrap().len(), 1);
+
+        store
+            .upsert_file_cursors_batch("claude_code", &[("/a.jsonl".into(), 2, 2)])
+            .unwrap();
+        drop(store);
+        let store = InsightsStore::open(&path).unwrap();
+        assert_eq!(
+            store.load_file_cursors("claude_code").unwrap().len(),
+            1,
+            "later opens keep new cursors"
+        );
     }
 
     #[test]

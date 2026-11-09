@@ -476,6 +476,7 @@ mod asset_tests;
 mod autopilot_next_work_tests;
 mod autopilot_tests;
 mod comment_tests;
+mod insights_tool;
 mod item_commit_failure_tests;
 mod item_doctor_tests;
 mod item_force_tests;

@@ -32,6 +32,42 @@ pub enum InsightsCommands {
     Watch(WatchArgs),
     /// Check health of insights DB and sources (claude/codex/opencode/cursor)
     Doctor(DoctorArgs),
+    /// Forensic detectors: repeats, failed-tool streaks, big outputs, cost, cache
+    Forensics(ForensicsArgs),
+    /// Discover recurring user requests as printed proposals (never writes files)
+    Discover(DiscoverArgs),
+    /// Review proposals: scan, accept, reject, snooze
+    Reflect(super::insights_reflect::ReflectArgs),
+}
+
+#[derive(Parser, Debug)]
+pub struct ForensicsArgs {
+    #[arg(long, default_value = "7")]
+    pub days: u32,
+    /// Only sessions whose cwd/project path is under this path
+    #[arg(long)]
+    pub project: Option<String>,
+    #[arg(long)]
+    pub source: Option<String>,
+    #[arg(long)]
+    pub session: Option<String>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Parser, Debug)]
+pub struct DiscoverArgs {
+    #[arg(long, default_value = "30")]
+    pub days: u32,
+    /// Only sessions whose cwd/project path is under this path
+    #[arg(long)]
+    pub project: Option<String>,
+    #[arg(long, default_value = "2")]
+    pub min_sessions: usize,
+    #[arg(long, default_value = "3")]
+    pub min_count: usize,
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -148,6 +184,9 @@ impl InsightsArgs {
             InsightsCommands::Serve(args) => run_serve(db_path, args),
             InsightsCommands::Watch(args) => run_watch(db_path, args),
             InsightsCommands::Doctor(args) => run_doctor(db_path, args),
+            InsightsCommands::Forensics(args) => run_forensics(db_path, args),
+            InsightsCommands::Discover(args) => run_discover(db_path, args),
+            InsightsCommands::Reflect(args) => args.run(db_path),
         }
     }
 }
@@ -165,11 +204,8 @@ fn run_sync(db: PathBuf, args: SyncArgs) {
     let store = open_store(db.clone());
     let config = flare_insights::config::InsightsConfig::default();
     let mgr = flare_insights::ingest::IngestManager::new();
-    let mut total_sessions = 0;
-    let mut total_turns = 0;
-    let mut total_tools = 0;
-    let mut total_files = 0;
-    let mut total_subs = 0;
+    let mut totals = flare_insights::store::IngestStats::default();
+    let mut failed_sources = 0usize;
     let mut printed_progress = false;
     let empty_cursors = args
         .force
@@ -193,41 +229,30 @@ fn run_sync(db: PathBuf, args: SyncArgs) {
     }
     for (source, res) in results {
         match res {
-            Ok(bundle) => {
-                println!(
-                    "{source}: {} sessions {} turns {} tools",
-                    bundle.sessions.len(),
-                    bundle.turns.len(),
-                    bundle.tool_calls.len()
-                );
-                // DRY: transactional bundle via store helpers
-                let _ = store.upsert_sessions_batch(&bundle.sessions);
-                if !bundle.turns.is_empty() {
-                    let _ = store.upsert_turns_batch(&bundle.turns);
+            // One transaction per source: cursors only advance when every row landed.
+            Ok(bundle) => match store.commit_ingest(&source, &bundle) {
+                Ok(stats) => {
+                    println!(
+                        "{source}: {} sessions {} turns {} tools",
+                        stats.sessions, stats.turns, stats.tool_calls
+                    );
+                    totals += stats;
                 }
-                if !bundle.tool_calls.is_empty() {
-                    let _ = store.upsert_tool_calls_batch(&bundle.tool_calls);
+                Err(e) => {
+                    eprintln!("{source}: error committing: {e}");
+                    failed_sources += 1;
                 }
-                if !bundle.file_events.is_empty() {
-                    let _ = store.upsert_file_events_batch(&bundle.file_events);
-                }
-                if !bundle.subagents.is_empty() {
-                    let _ = store.upsert_subagents_batch(&bundle.subagents);
-                }
-                if !bundle.file_cursors.is_empty() {
-                    let _ = store.upsert_file_cursors_batch(&source, &bundle.file_cursors);
-                }
-                total_sessions += bundle.sessions.len();
-                total_turns += bundle.turns.len();
-                total_tools += bundle.tool_calls.len();
-                total_files += bundle.file_events.len();
-                total_subs += bundle.subagents.len();
-            }
+            },
             Err(e) => eprintln!("{source}: error {e}"),
         }
     }
     println!(
-        "synced {total_sessions} sessions {total_turns} turns {total_tools} tools {total_files} files {total_subs} subs -> {}",
+        "synced {} sessions {} turns {} tools {} files {} subs -> {}",
+        totals.sessions,
+        totals.turns,
+        totals.tool_calls,
+        totals.file_events,
+        totals.subagents,
         db.display()
     );
     if args.prune_days > 0 {
@@ -237,22 +262,20 @@ fn run_sync(db: PathBuf, args: SyncArgs) {
             Err(e) => eprintln!("prune error: {e}"),
         }
     }
+    if failed_sources > 0 {
+        std::process::exit(1);
+    }
 }
 
 fn run_list(db: PathBuf, args: ListArgs) {
     let store = open_store(db);
     let sessions = store
-        .list_sessions(args.limit, args.offset)
+        .list_sessions_filtered(args.source.as_deref(), None, args.limit, args.offset)
         .unwrap_or_default();
     if args.json {
         println!("{}", serde_json::to_string_pretty(&sessions).unwrap());
     } else {
         for s in sessions {
-            if let Some(filter) = &args.source
-                && s.source.as_str() != filter
-            {
-                continue;
-            }
             let cost = s
                 .cost
                 .as_ref()
@@ -375,44 +398,72 @@ fn run_search(db: PathBuf, args: SearchArgs) {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&res).unwrap());
     } else {
-        for s in res {
+        for hit in res {
+            let s = &hit.session;
             println!(
-                "{:<36} {:<12} {} {}",
+                "{:<36} {:<12} seq={:<4} {} {} | {}",
                 s.id,
                 s.source.as_str(),
+                hit.turn_seq,
                 s.project,
-                s.title.as_deref().unwrap_or("")
+                s.title.as_deref().unwrap_or(""),
+                one_line(&hit.snippet)
             )
         }
     }
 }
 
+/// Collapse every whitespace run (newlines, tabs) so a hit prints on one line.
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod search_line_tests {
+    use super::one_line;
+
+    #[test]
+    fn search_hit_prints_on_one_line() {
+        let out = one_line("a\nb\r\nc\td\n\n  e\r");
+        assert_eq!(out, "a b c d e");
+        assert!(!out.contains(['\n', '\r', '\t']));
+    }
+}
+
 fn run_stats(db: PathBuf, args: StatsArgs) {
     let store = open_store(db);
-    let sessions = store.list_sessions(10000, 0).unwrap_or_default();
-    let tools = store.list_tool_calls(100000).unwrap_or_default();
-    let files = store.list_file_events(100000).unwrap_or_default();
-    let analytics =
-        flare_insights::analytics::compute_analytics_with_tools(&sessions, &tools, &files);
+    let analytics = match store.stats_window(&Default::default()) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("stats failed: {e}");
+            std::process::exit(1);
+        }
+    };
     if args.json {
         println!("{}", serde_json::to_string_pretty(&analytics).unwrap());
     } else {
+        let pct = |v: Option<f64>| v.map_or("n/a".to_string(), |v| format!("{:.1}%", v * 100.0));
         println!(
-            "sessions: {} tokens: {} cost: ${:.2} cache_hit: {:.1}% tools:{} files:{}",
+            "sessions: {} tokens: {} cost: ${:.2} cache_read_share: {} cache_prompt_efficiency: {} (unpriced: {}, sessions missing turn timestamps: {})",
             analytics.total_sessions,
             analytics.total_tokens,
             analytics.total_cost_usd,
-            analytics.cache_hit_rate * 100.0,
-            tools.len(),
-            files.len()
+            pct(analytics.cache_read_share),
+            pct(analytics.cache_prompt_efficiency),
+            analytics.coverage.unpriced_sessions,
+            analytics.coverage.sessions_missing_turn_timestamps,
         );
         println!("by_source: {:?}", analytics.by_source);
         println!("by_project: {:?}", analytics.by_project);
-        let top_tools = flare_insights::analytics::top_tools(&tools, 5);
-        let top_files = flare_insights::analytics::top_files(&files, 5);
-        println!("top_tools: {:?}", top_tools);
-        println!("top_files: {:?}", top_files);
-        for b in &analytics.by_day {
+        fn top<V: Copy + Ord>(m: &std::collections::HashMap<String, V>) -> Vec<(&String, V)> {
+            let mut v: Vec<_> = m.iter().map(|(k, v)| (k, *v)).collect();
+            v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+            v.truncate(5);
+            v
+        }
+        println!("top_tools: {:?}", top(&analytics.tool_freq));
+        println!("top_files: {:?}", top(&analytics.file_freq));
+        for b in &analytics.by_day_updated {
             println!("{}: {} sessions ${:.2}", b.date, b.sessions, b.cost_usd);
         }
     }
@@ -552,5 +603,149 @@ fn run_doctor(db: PathBuf, args: DoctorArgs) {
                 if *present { "found" } else { "missing" }
             );
         }
+    }
+}
+
+fn run_forensics(db: PathBuf, args: ForensicsArgs) {
+    let store = open_store(db);
+    let opts = flare_insights::forensics::ForensicsOptions {
+        days: args.days,
+        project_prefix: args.project,
+        source: args.source,
+        session_id: args.session,
+    };
+    let report = flare_insights::forensics::compute(&store, &opts, chrono::Utc::now())
+        .unwrap_or_else(|e| {
+            eprintln!("forensics failed: {e}");
+            std::process::exit(1);
+        });
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        return;
+    }
+    println!(
+        "forensics: last {} days, {} sessions ({} unpriced)",
+        args.days, report.coverage.sessions_in_window, report.coverage.unpriced_sessions
+    );
+    for f in &report.body {
+        match (&f.value, &f.unavailable_reason) {
+            (_, Some(why)) => println!("{}: unavailable ({why})", f.id),
+            (Some(v), None) => println!("{}: {}", f.id, v),
+            (None, None) => println!("{}: -", f.id),
+        }
+    }
+}
+
+fn run_discover(db: PathBuf, args: DiscoverArgs) {
+    let store = open_store(db);
+    let opts = flare_insights::discover::DiscoverOptions {
+        days: args.days,
+        project_prefix: args.project,
+        min_sessions: args.min_sessions,
+        min_count: args.min_count,
+        jaccard_threshold: flare_insights::discover::DEFAULT_JACCARD_THRESHOLD,
+    };
+    let report =
+        flare_insights::discover::mine(&store, &opts, chrono::Utc::now()).unwrap_or_else(|e| {
+            eprintln!("discover failed: {e}");
+            std::process::exit(1);
+        });
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        return;
+    }
+    println!(
+        "discover: last {} days, {} proposals ({} eligible sessions)",
+        args.days,
+        report.body.len(),
+        report.coverage.eligible_sessions
+    );
+    for p in &report.body {
+        println!(
+            "[{:?}] sessions={} occurrences={} — {}",
+            p.destination, p.distinct_sessions, p.occurrences, p.draft
+        );
+        println!("  rationale: {}", p.rationale);
+    }
+}
+
+#[cfg(test)]
+mod forensics_args_tests {
+    use super::*;
+
+    #[test]
+    fn forensics_flags_parse_with_defaults() {
+        let a = InsightsArgs::try_parse_from(["insights", "forensics"]).unwrap();
+        let Some(InsightsCommands::Forensics(f)) = a.command else {
+            panic!("expected forensics")
+        };
+        assert_eq!((f.days, f.json, f.project.is_none()), (7, false, true));
+        let a = InsightsArgs::try_parse_from([
+            "insights",
+            "forensics",
+            "--days",
+            "3",
+            "--project",
+            "/p",
+            "--source",
+            "codex",
+            "--session",
+            "s1",
+            "--json",
+        ])
+        .unwrap();
+        let Some(InsightsCommands::Forensics(f)) = a.command else {
+            panic!("expected forensics")
+        };
+        assert_eq!(f.days, 3);
+        assert_eq!(f.project.as_deref(), Some("/p"));
+        assert_eq!(f.source.as_deref(), Some("codex"));
+        assert_eq!(f.session.as_deref(), Some("s1"));
+        assert!(f.json);
+    }
+}
+
+#[cfg(test)]
+mod discover_args_tests {
+    use super::*;
+
+    #[test]
+    fn discover_flags_parse_with_defaults() {
+        let a = InsightsArgs::try_parse_from(["insights", "discover"]).unwrap();
+        let Some(InsightsCommands::Discover(d)) = a.command else {
+            panic!("expected discover")
+        };
+        assert_eq!(
+            (
+                d.days,
+                d.min_sessions,
+                d.min_count,
+                d.json,
+                d.project.is_none()
+            ),
+            (30, 2, 3, false, true)
+        );
+        let a = InsightsArgs::try_parse_from([
+            "insights",
+            "discover",
+            "--days",
+            "14",
+            "--project",
+            "/p",
+            "--min-sessions",
+            "4",
+            "--min-count",
+            "5",
+            "--json",
+        ])
+        .unwrap();
+        let Some(InsightsCommands::Discover(d)) = a.command else {
+            panic!("expected discover")
+        };
+        assert_eq!(d.days, 14);
+        assert_eq!(d.project.as_deref(), Some("/p"));
+        assert_eq!(d.min_sessions, 4);
+        assert_eq!(d.min_count, 5);
+        assert!(d.json);
     }
 }

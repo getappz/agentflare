@@ -29,6 +29,7 @@ struct AppState {
     // background resync, which is worse than the per-request reopen this
     // replaced.
     read_store: Mutex<InsightsStore>,
+    db_path: PathBuf,
     write_store: Mutex<InsightsStore>,
     stats_cache: Mutex<Option<(Instant, serde_json::Value)>>,
 }
@@ -42,10 +43,13 @@ pub async fn serve(db_path: PathBuf, port: u16) -> anyhow::Result<()> {
     println!("  GET /api/sessions/:id");
     println!("  GET /api/search?q=hello&limit=20");
     println!("  GET /api/stats");
+    println!("  GET /api/forensics?days=7&project=/path");
+    println!("  GET /api/discover?days=30&project=/path");
 
     let state = Arc::new(AppState {
         read_store: Mutex::new(InsightsStore::open(&db_path)?),
         write_store: Mutex::new(InsightsStore::open(&db_path)?),
+        db_path,
         stats_cache: Mutex::new(None),
     });
 
@@ -106,7 +110,26 @@ async fn handle_conn(
         return write_html_response(socket, &html).await;
     }
 
-    let (status, body) = route_request(state, route, query);
+    // Forensics/discover scan whole tables, so they get their own connection on a
+    // blocking thread rather than holding the shared read lock against every other route.
+    let (status, body) = if route == "/api/forensics" || route == "/api/discover" {
+        let db_path = state.db_path.clone();
+        let query = query.map(str::to_string);
+        let route = route.to_string();
+        tokio::task::spawn_blocking(move || match InsightsStore::open_read_only(&db_path) {
+            Ok(store) => {
+                if route == "/api/discover" {
+                    discover_response(&store, query.as_deref())
+                } else {
+                    forensics_response(&store, query.as_deref())
+                }
+            }
+            Err(e) => (500, serde_json::json!({"error": e.to_string()})),
+        })
+        .await?
+    } else {
+        route_request(state, route, query)
+    };
 
     let status_text = match status {
         200 => "OK",
@@ -115,6 +138,44 @@ async fn handle_conn(
         _ => "OK",
     };
     write_response(socket, status, status_text, &body).await
+}
+
+fn forensics_response(store: &InsightsStore, query: Option<&str>) -> (u16, serde_json::Value) {
+    let params = parse_query(query);
+    let opts = crate::forensics::ForensicsOptions {
+        days: params.get("days").and_then(|v| v.parse().ok()).unwrap_or(7),
+        project_prefix: params.get("project").cloned(),
+        source: params.get("source").cloned(),
+        session_id: params.get("session").cloned(),
+    };
+    match crate::forensics::compute(store, &opts, chrono::Utc::now()) {
+        Ok(r) => (200, serde_json::to_value(&r).unwrap()),
+        Err(e) => (500, serde_json::json!({"error": e.to_string()})),
+    }
+}
+
+fn discover_response(store: &InsightsStore, query: Option<&str>) -> (u16, serde_json::Value) {
+    let params = parse_query(query);
+    let opts = crate::discover::DiscoverOptions {
+        days: params
+            .get("days")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30),
+        project_prefix: params.get("project").cloned(),
+        min_sessions: params
+            .get("min_sessions")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2),
+        min_count: params
+            .get("min_count")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3),
+        jaccard_threshold: crate::discover::DEFAULT_JACCARD_THRESHOLD,
+    };
+    match crate::discover::mine(store, &opts, chrono::Utc::now()) {
+        Ok(r) => (200, serde_json::to_value(&r).unwrap()),
+        Err(e) => (500, serde_json::json!({"error": e.to_string()})),
+    }
 }
 
 /// Synchronous request handling -- the store lock never has to survive
@@ -173,12 +234,16 @@ fn route_request(
                 .get("limit")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(20);
+            let offset = params
+                .get("offset")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
             let opts = crate::search::SearchOptions {
                 query: q,
                 source: params.get("source").cloned(),
                 project: params.get("project").cloned(),
                 limit,
-                offset: 0,
+                offset,
                 include_files: true,
                 include_tools: true,
             };
@@ -192,11 +257,10 @@ fn route_request(
                 .map(|(t, _)| t.elapsed() < STATS_CACHE_TTL)
                 .unwrap_or(false);
             if !fresh {
-                let sessions = store.list_sessions(10000, 0).unwrap_or_default();
-                let tools = store.list_tool_calls(100000).unwrap_or_default();
-                let files = store.list_file_events(100000).unwrap_or_default();
-                let analytics =
-                    crate::analytics::compute_analytics_with_tools(&sessions, &tools, &files);
+                let analytics = match store.stats_window(&Default::default()) {
+                    Ok(a) => a,
+                    Err(e) => return (500, serde_json::json!({"error": e.to_string()})),
+                };
                 *cache = Some((Instant::now(), serde_json::to_value(&analytics).unwrap()));
             }
             (200, cache.as_ref().unwrap().1.clone())
@@ -320,7 +384,7 @@ async function load(){
     <div class="stat"><div class="label">Sessions</div><div class="value">${stats.total_sessions ?? 0}</div></div>
     <div class="stat"><div class="label">Tokens</div><div class="value">${fmtTokens(stats.total_tokens)}</div></div>
     <div class="stat"><div class="label">Cost</div><div class="value">${fmtCost(stats.total_cost_usd)}</div></div>
-    <div class="stat"><div class="label">Cache hit</div><div class="value">${((stats.cache_hit_rate ?? 0) * 100).toFixed(0)}%</div></div>
+    <div class="stat"><div class="label">Cache read share</div><div class="value">${stats.cache_read_share == null ? '-' : (stats.cache_read_share * 100).toFixed(0) + '%'}</div></div>
   `;
   document.querySelector('#sessions tbody').innerHTML = sessions.map(s => `
     <tr>
@@ -383,5 +447,76 @@ mod urlencoding {
         Ok(std::borrow::Cow::Owned(
             String::from_utf8_lossy(&out).into_owned(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod forensics_route_tests {
+    use super::*;
+
+    #[test]
+    fn forensics_route_returns_report() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        let (status, body) = forensics_response(&store, Some("days=3&project=/x"));
+        assert_eq!(status, 200);
+        assert_eq!(body["filters"]["days"], 3);
+        assert_eq!(body["filters"]["project"], "/x");
+        assert_eq!(body["schema_version"], 1);
+    }
+
+    #[test]
+    fn discover_route_returns_report() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        let (status, body) = discover_response(&store, Some("days=14&project=/x"));
+        assert_eq!(status, 200);
+        assert_eq!(body["filters"]["days"], 14);
+        assert_eq!(body["filters"]["project"], "/x");
+        assert_eq!(body["schema_version"], 1);
+        assert!(body["body"].as_array().unwrap().is_empty());
+    }
+
+    async fn get_via_handle_conn(db_path: PathBuf, req_path: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // The shared stores need a real file; a missing-DB case reuses another one.
+        let shared = tempfile::tempdir().unwrap();
+        let shared_path = shared.path().join("shared.db");
+        let state = Arc::new(AppState {
+            read_store: Mutex::new(InsightsStore::open(&shared_path).unwrap()),
+            write_store: Mutex::new(InsightsStore::open(&shared_path).unwrap()),
+            db_path,
+            stats_cache: Mutex::new(None),
+        });
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            handle_conn(&mut sock, &state).await
+        });
+        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        c.write_all(format!("GET {req_path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut out = String::new();
+        c.read_to_string(&mut out).await.unwrap();
+        // A panic on the blocking thread would surface here as a JoinError / Err.
+        server.await.unwrap().unwrap();
+        out
+    }
+
+    #[tokio::test]
+    async fn forensics_route_uses_its_own_read_only_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("i.db");
+        InsightsStore::open(&db).unwrap();
+        let resp = get_via_handle_conn(db, "/api/forensics?days=7").await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        let body: serde_json::Value =
+            serde_json::from_str(resp.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body["schema_version"], 1);
+        assert_eq!(body["filters"]["days"], 7);
+
+        let missing = dir.path().join("nope.db");
+        let resp = get_via_handle_conn(missing, "/api/forensics?days=7").await;
+        assert!(resp.starts_with("HTTP/1.1 500"), "{resp}");
+        assert!(resp.contains("\"error\""));
     }
 }
