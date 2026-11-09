@@ -1,5 +1,5 @@
 import type { On } from 'claude-code'
-import { autopilotState, setAutopilotMode, type Mode } from './autopilot'
+import { autopilotState, clearCurrentItem, setAutopilotMode, type Mode } from './autopilot'
 import type { Current } from './compaction'
 import { refreshBriefing } from './briefing'
 import type { AutopilotClient } from './mcp'
@@ -10,7 +10,7 @@ type FlareContext = {
   agent: string
 }
 
-const USAGE = 'usage: /flare status | autopilot on|off|once | doctor | briefing refresh'
+const USAGE = 'usage: /flare status | autopilot on|off|once | doctor | briefing refresh | clear'
 const MODES: readonly string[] = ['on', 'off', 'once']
 
 export function flareCommand(on: On, { client, current, agent }: FlareContext): void {
@@ -19,6 +19,10 @@ export function flareCommand(on: On, { client, current, agent }: FlareContext): 
     const c = client()
     if (!c) return { text: 'agentflare MCP is not connected.' }
     const [sub, arg] = e.args.trim().split(/\s+/)
+    if (sub === 'clear' || sub === 'done') {
+      await clearCurrentItem($)
+      return { text: 'current item cleared' }
+    }
     if (sub === 'autopilot' && MODES.includes(arg ?? '')) {
       setAutopilotMode($, arg as Mode)
       return { text: `autopilot: ${arg}` }
