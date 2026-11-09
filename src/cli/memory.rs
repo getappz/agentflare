@@ -62,6 +62,21 @@ pub enum MemoryCommands {
         #[arg(long, default_value = "200")]
         batch: usize,
     },
+    /// Cluster similar observations into evidence-backed belief proposals in the
+    /// Insights ledger (no LLM). Review with `insights reflect list|show|accept`.
+    Consolidate {
+        #[arg(long)]
+        project: Option<String>,
+        /// Minimum token-set Jaccard overlap to join a cluster
+        #[arg(long, default_value = "0.2")]
+        threshold: f64,
+        /// Smallest cluster worth proposing
+        #[arg(long, default_value = "3")]
+        min_size: usize,
+        /// Print the clusters that would be proposed; write nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Score recall on the real brain.db from a JSONL cases file
     /// ({"query": "...", "expect": ["topic_key or title"]} per line):
     /// lexical vs hybrid, hit@k / hit@1 / MRR.
@@ -210,6 +225,58 @@ impl MemoryArgs {
                             ));
                         }
                     },
+                }
+            }
+            MemoryCommands::Consolidate {
+                project,
+                threshold,
+                min_size,
+                dry_run,
+            } => {
+                if dry_run {
+                    let shown = crate::memory::store::open()
+                        .map_err(|e| e.to_string())
+                        .and_then(|conn| {
+                            super::memory_consolidate::preview(
+                                &conn,
+                                project.as_deref(),
+                                threshold,
+                                min_size,
+                            )
+                            .map_err(|e| e.to_string())
+                        });
+                    match shown {
+                        Ok(text) => print!("{text}"),
+                        Err(e) => {
+                            crate::ui::error(&e);
+                            std::process::exit(1);
+                        }
+                    }
+                    return;
+                }
+                let result = flare_insights::store::InsightsStore::open(
+                    &crate::handoff::default_insights_db(),
+                )
+                .map_err(|e| e.to_string())
+                .and_then(|store| {
+                    let conn = crate::memory::store::open().map_err(|e| e.to_string())?;
+                    super::memory_consolidate::scan(
+                        &store,
+                        &conn,
+                        project.as_deref(),
+                        threshold,
+                        min_size,
+                    )
+                    .map_err(|e| e.to_string())
+                });
+                match result {
+                    Ok(n) => println!(
+                        "consolidate: {n} belief proposal(s) in the ledger; review with `agentflare insights reflect list --status proposed`"
+                    ),
+                    Err(e) => {
+                        crate::ui::error(&e);
+                        std::process::exit(1);
+                    }
                 }
             }
             MemoryCommands::Bench { cases, project, k } => {
