@@ -15,8 +15,8 @@ agentflare-config = { path = "../agentflare-config" }
 agentflare-store = { path = "../agentflare-store" }
 dirs = "6"
 flare-process = { path = "../flare-process" }
-rmcp = { version = "1.8.0", optional = true }
-rusqlite = { version = "0.40", features = ["bundled"] }
+rmcp = { version = "3.9.0", optional = true }
+rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 skill-registry = { package = "agentflare-skill-registry", path = "../skill-registry" }
