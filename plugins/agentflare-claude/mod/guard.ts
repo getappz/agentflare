@@ -50,9 +50,10 @@ type GuardContext = {
   agent: string
   // guardTimeoutMs is enforced in mcp.ts (connect), not here.
   options: { readOnlyAutoAllow: boolean; guardTimeoutMs: number }
+  onItemDone?: () => void
 }
 
-export function registerGuard(on: On, { client, agent, options }: GuardContext): void {
+export function registerGuard(on: On, { client, agent, options, onItemDone }: GuardContext): void {
   const mutating = new Set(MUTATING_TOOLS)
   const checked = new Set([...MUTATING_TOOLS, ...CHECKED_TOOLS])
   // Mutating tools are observed too: a successful edit makes earlier verification stale.
@@ -96,6 +97,17 @@ export function registerGuard(on: On, { client, agent, options }: GuardContext):
     }
 
     const r = await next(e)
+    if (tool === 'mcp__flare__item' && !r.isError) {
+      const action = typeof tool_input.action === 'string' ? tool_input.action : flat.action
+      if (action === 'done' || action === 'release') {
+        onItemDone?.()
+        try {
+          await $.state.set({ plugin: 'agentflare', key: 'currentItemId' }, null)
+        } catch {
+          // Best effort state clear.
+        }
+      }
+    }
     if (c && observed.has(tool)) {
       // The Bash record has no exit code; core marks a non-zero exit as isError. Never invent a 0.
       const reported = (r as { result?: { exitCode?: unknown } }).result?.exitCode

@@ -115,13 +115,14 @@ impl InsightsWatcher {
         let mut tools = 0;
         for (source, res) in mgr.scan_all(config, store, |_, _, _| {}) {
             let Ok(bundle) = res else { continue };
-            if let Err(e) = store.upsert_ingest_bundle(&config.cursor_source(&source), &bundle) {
-                eprintln!("{source}: store error {e}");
-                continue;
+            match store.commit_ingest(&config.cursor_source(&source), &bundle) {
+                Ok(stats) => {
+                    sess += stats.sessions;
+                    turns += stats.turns;
+                    tools += stats.tool_calls;
+                }
+                Err(e) => eprintln!("{source}: error committing: {e}"),
             }
-            sess += bundle.sessions.len();
-            turns += bundle.turns.len();
-            tools += bundle.tool_calls.len();
         }
         (sess, turns, tools)
     }

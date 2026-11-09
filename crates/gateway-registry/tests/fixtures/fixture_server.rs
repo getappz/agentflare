@@ -5,7 +5,7 @@
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters,
-    model::{Implementation, ServerCapabilities, ServerInfo},
+    model::{Implementation, ServerCapabilities, ServerConfig},
     schemars, tool, tool_handler, tool_router,
     transport::stdio,
 };
@@ -17,6 +17,12 @@ struct EchoRequest {
     text: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SleepRequest {
+    #[schemars(description = "Milliseconds to sleep before returning")]
+    ms: u64,
+}
+
 #[derive(Clone, Default)]
 struct FixtureServer;
 
@@ -25,6 +31,12 @@ impl FixtureServer {
     #[tool(description = "Echoes the given text back, prefixed with 'echo: '.")]
     fn echo(&self, Parameters(EchoRequest { text }): Parameters<EchoRequest>) -> String {
         format!("echo: {text}")
+    }
+
+    #[tool(description = "Sleeps for ms milliseconds then returns ok.")]
+    async fn sleep(&self, Parameters(SleepRequest { ms }): Parameters<SleepRequest>) -> String {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        "slept".to_string()
     }
 
     /// Never returns — simulates one specific downstream tool call wedging
@@ -53,8 +65,8 @@ impl FixtureServer {
 
 #[tool_handler]
 impl ServerHandler for FixtureServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("gateway-fixture-server", "0.1.0"))
     }
 }

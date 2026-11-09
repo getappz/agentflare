@@ -35,6 +35,7 @@ function stub(on: any, o: Opts = {}) {
   on('session.messages', () => ({ value: o.messages ?? [{ role: 'assistant', text: 'done', toolUses: [] }] }))
   on('prompt.submit', (_: any, e: any) => { if (o.submitFailsOnce && submits++ === 0) throw new Error('nope'); seen.woke.push(e.text); return { text: e.text } })
   on('session.start', (_: any, e: any) => ({ cwd: e.cwd }))
+  on('turn.start', (_: any, e: any) => ({ turnId: e?.turnId ?? 't1' }))
   on('turn.complete', (_: any, e: any) => ({ text: e.answer }))
   return { clock, seen }
 }
@@ -97,7 +98,7 @@ test('the same held item wakes once', { options: { autopilot: 'on', idleMinutes:
   await $.session.start(START)
   await $.turn.complete(TURN)
   await $.turn.complete(TURN)
-  expect(seen.nextWork).toHaveLength(2)
+  expect(seen.nextWork).toHaveLength(1)
   expect(seen.woke).toHaveLength(1)
 })
 
@@ -218,7 +219,7 @@ test('a hot reload does not re-wake the item persisted as current', { options: {
   const { seen } = stub(on, { persisted: { currentItemId: 'abc' } })
   await $.session.start(START)
   await $.turn.complete(TURN)
-  expect(seen.nextWork).toHaveLength(1)
+  expect(seen.nextWork).toHaveLength(0)
   expect(seen.woke).toHaveLength(0)
 })
 
@@ -256,4 +257,48 @@ test('/flare autopilot off cancels a pending idle timer', { options: { autopilot
   await $.command.run({ command: 'flare', args: 'autopilot off' })
   await clock.advance(5 * 60_000)
   expect(seen.nextWork).toHaveLength(0)
+})
+
+test('timer cancelled when a turn starts', { options: { autopilot: 'on', idleMinutes: 1 } }, async ($, on) => {
+  const { clock, seen } = stub(on)
+  await $.session.start(START)
+  await $.turn.complete(TURN)
+  await clock.advance(30_000)
+  await $.turn.start({ text: 'user question', turnId: 't2' })
+  await clock.advance(60_000)
+  expect(seen.nextWork).toHaveLength(0)
+})
+
+test('re-armed after an aborted turn', { options: { autopilot: 'on', idleMinutes: 1 } }, async ($, on) => {
+  const { clock, seen } = stub(on)
+  await $.session.start(START)
+  await $.turn.complete({ reason: 'aborted', answer: '', durationMs: 1, isAborted: true, turnId: 't1' })
+  expect(seen.nextWork).toHaveLength(0)
+  await clock.advance(60_000)
+  expect(seen.nextWork).toHaveLength(1)
+})
+
+test('no next_work call while currentItemId is set', { options: { autopilot: 'on', idleMinutes: 0 } }, async ($, on) => {
+  const { seen } = stub(on, { persisted: { currentItemId: 'xyz' } })
+  await $.session.start(START)
+  await $.turn.complete(TURN)
+  expect(seen.nextWork).toHaveLength(0)
+  expect(seen.woke).toHaveLength(0)
+})
+
+test('item done clears current item and unblocks next_work', { options: { autopilot: 'on', idleMinutes: 0 } }, async ($, on) => {
+  const { seen } = stub(on)
+  await $.session.start(START)
+  await $.turn.complete(TURN)
+  expect(seen.nextWork).toHaveLength(1)
+  expect(seen.woke).toHaveLength(1)
+
+  // A second turn does not call next_work because an item is in progress.
+  await $.turn.complete(TURN)
+  expect(seen.nextWork).toHaveLength(1)
+
+  // Clearing the item unblocks next_work.
+  await $.command.run({ command: 'flare', args: 'clear' })
+  await $.turn.complete(TURN)
+  expect(seen.nextWork).toHaveLength(2)
 })

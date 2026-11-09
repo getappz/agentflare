@@ -146,7 +146,7 @@ fn try_session_table_dynamic(conn: &rusqlite::Connection, config: &InsightsConfi
         Ok(s) => s,
         Err(_) => return vec![],
     };
-    let col_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+    let col_names: Vec<String> = stmt.column_names().map(|s| s.to_string()).collect();
     let find = |candidates: &[&str]| -> Option<usize> {
         for cand in candidates {
             if let Some(pos) = col_names.iter().position(|c| c == *cand) {
@@ -529,7 +529,7 @@ fn ingest_messages_for_session(
                         let tool_id = if call_id == "unknown" {
                             format!("{}-{}-{}", session_id, seq, tools.len())
                         } else {
-                            call_id.clone()
+                            super::scoped_id(session_id, &call_id)
                         };
                         // DRY file_event
                         if let Some(path) = extract_file_path(tool, &input) {
@@ -662,10 +662,11 @@ mod tests {
                 INSERT INTO {table} VALUES ('provider', 'p', 'totally-new', NULL, 1000000, 0, 0.0),
                     ('estimated', 'p', 'claude-sonnet-4', NULL, 1000000, 0, NULL),
                     ('unknown', 'p', 'totally-new', NULL, 1000000, 0, NULL);")).unwrap();
+            let config = InsightsConfig::default();
             let sessions = if legacy {
-                try_sessions_table(&conn)
+                try_sessions_table(&conn, &config)
             } else {
-                try_session_table_dynamic(&conn)
+                try_session_table_dynamic(&conn, &config)
             };
             let provider = sessions.iter().find(|s| s.id == "provider").unwrap();
             assert_eq!(provider.cost_basis, crate::model::CostBasis::Provider);

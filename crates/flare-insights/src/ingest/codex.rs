@@ -182,7 +182,7 @@ fn parse_codex_jsonl(path: &std::path::Path) -> Option<(Session, Vec<Turn>, Vec<
                 .unwrap_or(input);
             tool_indices.insert(call_id.clone(), tool_calls.len());
             tool_calls.push(ToolCall {
-                id: call_id,
+                id: super::scoped_id(&id, &call_id),
                 session_id: id.clone(),
                 turn_seq: seq.max(1),
                 name,
@@ -338,5 +338,22 @@ mod tests {
         );
         assert_eq!(tools[0].status, "completed");
         assert_eq!(tools[1].status, "pending");
+    }
+
+    #[test]
+    fn sessions_sharing_a_call_id_commit_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = serde_json::json!({"payload":{"type":"function_call","call_id":"shared","name":"exec_command","arguments":"{}"}});
+        let mut bundle = crate::ingest::IngestBundle::default();
+        for name in ["one.jsonl", "two.jsonl"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, record.to_string()).unwrap();
+            let (session, _, tools) = parse_codex_jsonl(&path).unwrap();
+            bundle.sessions.push(session);
+            bundle.tool_calls.extend(tools);
+        }
+        let store = crate::store::InsightsStore::open_in_memory().unwrap();
+        let stats = store.commit_ingest("codex", &bundle).unwrap();
+        assert_eq!((stats.sessions, stats.tool_calls), (2, 2));
     }
 }

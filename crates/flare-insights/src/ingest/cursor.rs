@@ -441,7 +441,7 @@ fn ingest_composer(
         for idv in ids {
             if let Some(id) = idv.as_str() {
                 subagents.push(Subagent {
-                    id: id.to_string(),
+                    id: super::scoped_id(composer_id, id),
                     session_id: composer_id.to_string(),
                     parent_tool_call_id: None,
                     kind: "cursor_subagent".into(),
@@ -562,7 +562,7 @@ fn tool_from_bubble(
         .get("toolCallId")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+        .map(|s| super::scoped_id(composer_id, s))
         .unwrap_or_else(|| {
             // Multiple tool bubbles in one turn can share name+seq; include
             // bubbleId so fallback IDs stay unique across the session.
@@ -1097,6 +1097,17 @@ mod tests {
         let b = tool_from_bubble("comp", 1, &bubble_b, None).unwrap();
         assert_eq!(a.id, "comp-1-Read-b-a");
         assert_eq!(b.id, "comp-1-Read-b-b");
+        assert_ne!(a.id, b.id);
+    }
+
+    #[test]
+    fn provider_tool_call_id_is_scoped_by_composer() {
+        let bubble = serde_json::json!({
+            "bubbleId": "b",
+            "toolFormerData": {"name": "Read", "toolCallId": "shared", "params": {}}
+        });
+        let a = tool_from_bubble("comp-a", 1, &bubble, None).unwrap();
+        let b = tool_from_bubble("comp-b", 1, &bubble, None).unwrap();
         assert_ne!(a.id, b.id);
     }
 }

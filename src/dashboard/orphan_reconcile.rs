@@ -442,7 +442,6 @@ fn restore_ready_for_work(
     });
 
     if at_cap
-        && crate::supervisor::first_time_gated(item_id)
         && let Ok(Some(item)) =
             mcp.with_backend_db(|conn| agentflare_backend::item::get(conn, item_id).ok())
     {
@@ -771,9 +770,8 @@ pub(super) fn handle_terminal_job_failure(job: &agentflare_jobs::AgentJob) {
         ..Default::default()
     });
 
-    if crate::supervisor::first_time_gated(item_id)
-        && let Ok(Some(item)) =
-            mcp.with_backend_db(|conn| agentflare_backend::item::get(conn, item_id).ok())
+    if let Ok(Some(item)) =
+        mcp.with_backend_db(|conn| agentflare_backend::item::get(conn, item_id).ok())
     {
         crate::supervisor::notify_human_gate(
             &item,
