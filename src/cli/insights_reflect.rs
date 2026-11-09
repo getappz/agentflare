@@ -176,7 +176,7 @@ fn upsert_mined(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn candidate(
+pub(super) fn candidate(
     kind: &str,
     project: &str,
     key: &str,
@@ -229,10 +229,20 @@ pub(crate) fn accept(
         .get_proposal(id)?
         .ok_or_else(|| format!("no proposal {id}"))?;
     if p.kind == "memory_fact" {
+        let evidence = super::memory_consolidate::evidence_ids(&p.proposed_content);
         // The fingerprint keeps two corrections with the same slug from sharing one memory.
-        let topic = format!("insights/{}/{}-{}", p.kind, slug(&p.title), p.fingerprint);
+        // A consolidated belief's title follows its representative member, so its
+        // identity is the fingerprint alone or a refinement would fork a second row.
+        let topic = if evidence.is_empty() {
+            format!("insights/{}/{}-{}", p.kind, slug(&p.title), p.fingerprint)
+        } else {
+            format!("insights/{}/belief-{}", p.kind, p.fingerprint)
+        };
         let project = (!p.project.is_empty()).then_some(p.project.as_str());
-        crate::memory::observations::save_keyed(
+        // A consolidated belief is refined on re-accept (topic_key upsert bumps
+        // revision_count); the fingerprint idempotency key would no-op it.
+        let idem = evidence.is_empty().then_some(p.fingerprint.as_str());
+        let saved = crate::memory::observations::save_keyed(
             conn,
             None,
             "learning",
@@ -242,8 +252,11 @@ pub(crate) fn accept(
             project,
             Some("project"),
             Some(&topic),
-            Some(&p.fingerprint),
+            idem,
         )?;
+        use crate::memory::observations::SaveOutcome::{Created, Duplicate, Updated};
+        let (Created(belief) | Updated(belief) | Duplicate(belief)) = saved;
+        super::memory_consolidate::link_evidence(conn, belief, &evidence)?;
     }
     store.set_proposal_status(id, ProposalStatus::Accepted, None)?;
     Ok(())

@@ -62,6 +62,18 @@ pub enum MemoryCommands {
         #[arg(long, default_value = "200")]
         batch: usize,
     },
+    /// Cluster similar observations into evidence-backed belief proposals in the
+    /// Insights ledger (no LLM). Review with `insights reflect list|show|accept`.
+    Consolidate {
+        #[arg(long)]
+        project: Option<String>,
+        /// Minimum token-set Jaccard overlap to join a cluster
+        #[arg(long, default_value = "0.4")]
+        threshold: f64,
+        /// Smallest cluster worth proposing
+        #[arg(long, default_value = "3")]
+        min_size: usize,
+    },
     /// Sync observations with a shared GitHub branch so other workstations
     /// see the same facts. Defaults to this repo's `origin` remote; set
     /// AGENTFLARE_MEMORY_SYNC_REPO=owner/repo to point elsewhere
@@ -199,6 +211,33 @@ impl MemoryArgs {
                             ));
                         }
                     },
+                }
+            }
+            MemoryCommands::Consolidate {
+                project,
+                threshold,
+                min_size,
+            } => {
+                let result = flare_insights::store::InsightsStore::open(
+                    &crate::handoff::default_insights_db(),
+                )
+                .map_err(|e| e.to_string())
+                .and_then(|store| {
+                    let conn = crate::memory::store::open().map_err(|e| e.to_string())?;
+                    super::memory_consolidate::scan(
+                        &store,
+                        &conn,
+                        project.as_deref(),
+                        threshold,
+                        min_size,
+                    )
+                    .map_err(|e| e.to_string())
+                });
+                match result {
+                    Ok(n) => println!(
+                        "consolidate: {n} belief proposal(s) in the ledger; review with `agentflare insights reflect list --status proposed`"
+                    ),
+                    Err(e) => crate::ui::error(&e),
                 }
             }
             MemoryCommands::Sync => run_sync(),
