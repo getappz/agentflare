@@ -113,7 +113,7 @@ fn try_session_table_dynamic(conn: &rusqlite::Connection) -> Vec<Session> {
         Ok(s) => s,
         Err(_) => return vec![],
     };
-    let col_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+    let col_names: Vec<String> = stmt.column_names().map(|s| s.to_string()).collect();
     let find = |candidates: &[&str]| -> Option<usize> {
         for cand in candidates {
             if let Some(pos) = col_names.iter().position(|c| c == *cand) {
