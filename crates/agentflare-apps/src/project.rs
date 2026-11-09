@@ -207,6 +207,7 @@ mod tests {
                 args: vec![],
                 auth_ref: None,
                 auth_env: None,
+                timeout_secs: None,
             },
         );
         let tools = ToolsManifest { servers };
@@ -235,6 +236,7 @@ mod tests {
                 auth_ref: Some("billing_token".to_string()),
                 auth_env: Some("BILLING_TOKEN".to_string()),
                 auth_header: None,
+                timeout_secs: None,
             },
         );
         let tools = ToolsManifest { servers };
@@ -267,6 +269,7 @@ mod tests {
                 args: vec![],
                 auth_ref: Some("pricing_token".to_string()),
                 auth_env: Some("PRICING_TOKEN".to_string()),
+                timeout_secs: None,
             },
         );
         let tools = ToolsManifest { servers };

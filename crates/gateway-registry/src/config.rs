@@ -4,6 +4,8 @@
 
 use std::collections::HashMap;
 
+pub const MAX_TIMEOUT_SECS: u64 = 900;
+
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct GatewayConfig {
     #[serde(default)]
@@ -21,6 +23,8 @@ pub enum ServerConfig {
         auth_ref: Option<String>,
         #[serde(default)]
         auth_env: Option<String>,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
     },
     McpHttp {
         url: String,
@@ -37,12 +41,14 @@ pub enum ServerConfig {
         /// ever actually sent for.
         #[serde(default)]
         auth_header: Option<String>,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
     },
 }
 
 /// `parse`'s error type: either a TOML syntax/shape error, or a config that
 /// parses fine but fails a semantic check `serde` can't express on its own
-/// (currently just the `auth_ref`/`auth_env` pairing below).
+/// (such as `auth_ref`/`auth_env` pairing or `timeout_secs` bounds).
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error(transparent)]
@@ -57,24 +63,41 @@ pub enum ConfigError {
         auth_ref: Option<String>,
         auth_env: Option<String>,
     },
+    #[error("server '{server}': timeout_secs must be between 1 and {max} (got {got})")]
+    InvalidTimeout { server: String, got: u64, max: u64 },
 }
 
 pub fn parse(toml_str: &str) -> Result<GatewayConfig, ConfigError> {
     let cfg: GatewayConfig = toml::from_str(toml_str)?;
     for (name, server) in &cfg.servers {
-        let (auth_ref, auth_env) = match server {
+        let (auth_ref, auth_env, timeout_secs) = match server {
             ServerConfig::McpStdio {
-                auth_ref, auth_env, ..
-            } => (auth_ref, auth_env),
+                auth_ref,
+                auth_env,
+                timeout_secs,
+                ..
+            } => (auth_ref, auth_env, *timeout_secs),
             ServerConfig::McpHttp {
-                auth_ref, auth_env, ..
-            } => (auth_ref, auth_env),
+                auth_ref,
+                auth_env,
+                timeout_secs,
+                ..
+            } => (auth_ref, auth_env, *timeout_secs),
         };
         if auth_ref.is_some() != auth_env.is_some() {
             return Err(ConfigError::IncompleteAuthConfig {
                 server: name.clone(),
                 auth_ref: auth_ref.clone(),
                 auth_env: auth_env.clone(),
+            });
+        }
+        if let Some(got) = timeout_secs
+            && (got == 0 || got > MAX_TIMEOUT_SECS)
+        {
+            return Err(ConfigError::InvalidTimeout {
+                server: name.clone(),
+                got,
+                max: MAX_TIMEOUT_SECS,
             });
         }
     }
@@ -103,6 +126,7 @@ mod tests {
             args,
             auth_ref,
             auth_env,
+            timeout_secs,
         } = cfg.servers.get("narsil").unwrap()
         else {
             panic!("expected McpStdio");
@@ -111,6 +135,7 @@ mod tests {
         assert_eq!(args, &vec!["--repos".to_string(), ".".to_string()]);
         assert_eq!(auth_ref.as_deref(), Some("narsil_token"));
         assert_eq!(auth_env.as_deref(), Some("NARSIL_TOKEN"));
+        assert_eq!(*timeout_secs, None);
     }
 
     #[test]
@@ -193,6 +218,7 @@ mod tests {
             auth_ref,
             auth_env,
             auth_header,
+            timeout_secs,
         } = cfg.servers.get("narsil").unwrap()
         else {
             panic!("expected McpHttp");
@@ -201,6 +227,74 @@ mod tests {
         assert_eq!(auth_ref.as_deref(), Some("narsil_token"));
         assert_eq!(auth_env.as_deref(), Some("NARSIL_TOKEN"));
         assert_eq!(auth_header.as_deref(), Some("X-Api-Key"));
+        assert_eq!(*timeout_secs, None);
+    }
+
+    #[test]
+    fn parses_mcp_stdio_with_timeout_secs() {
+        let cfg = parse(
+            r#"
+            [servers.rea]
+            kind = "mcp_stdio"
+            command = "rea"
+            timeout_secs = 300
+            "#,
+        )
+        .unwrap();
+        let ServerConfig::McpStdio { timeout_secs, .. } = cfg.servers.get("rea").unwrap() else {
+            panic!("expected McpStdio");
+        };
+        assert_eq!(*timeout_secs, Some(300));
+    }
+
+    #[test]
+    fn parses_mcp_http_with_timeout_secs() {
+        let cfg = parse(
+            r#"
+            [servers.long_http]
+            kind = "mcp_http"
+            url = "https://example.com/mcp"
+            timeout_secs = 60
+            "#,
+        )
+        .unwrap();
+        let ServerConfig::McpHttp { timeout_secs, .. } = cfg.servers.get("long_http").unwrap()
+        else {
+            panic!("expected McpHttp");
+        };
+        assert_eq!(*timeout_secs, Some(60));
+    }
+
+    #[test]
+    fn timeout_secs_zero_is_rejected() {
+        let err = parse(
+            r#"
+            [servers.zero]
+            kind = "mcp_stdio"
+            command = "zero"
+            timeout_secs = 0
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidTimeout { server, got, max } if server == "zero" && got == 0 && max == 900)
+        );
+    }
+
+    #[test]
+    fn timeout_secs_over_max_is_rejected() {
+        let err = parse(
+            r#"
+            [servers.over]
+            kind = "mcp_http"
+            url = "https://example.com/mcp"
+            timeout_secs = 901
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidTimeout { server, got, max } if server == "over" && got == 901 && max == 900)
+        );
     }
 
     #[test]
