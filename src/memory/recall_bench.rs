@@ -48,6 +48,9 @@ pub fn run(
     project: Option<&str>,
     k: usize,
 ) -> Result<String, String> {
+    if k > 50 {
+        return Err("k must not exceed 50 (search caps results at 50)".into());
+    }
     let cases: Vec<Case> = cases_jsonl
         .lines()
         .filter(|l| !l.trim().is_empty())
@@ -123,5 +126,6 @@ mod tests {
         .unwrap();
         assert_eq!((hit, hit1, mrr), (0.5, 0.5, 0.5));
         assert!(run(&conn, cases, Some("p"), 3).unwrap().contains("lexical"));
+        assert!(run(&conn, cases, Some("p"), 51).is_err());
     }
 }

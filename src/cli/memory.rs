@@ -221,7 +221,10 @@ impl MemoryArgs {
                     });
                 match result {
                     Ok(out) => print!("{out}"),
-                    Err(e) => crate::ui::error(&e),
+                    Err(e) => {
+                        crate::ui::error(&e);
+                        std::process::exit(1);
+                    }
                 }
             }
             MemoryCommands::Sync => run_sync(),
