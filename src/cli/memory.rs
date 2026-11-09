@@ -68,11 +68,14 @@ pub enum MemoryCommands {
         #[arg(long)]
         project: Option<String>,
         /// Minimum token-set Jaccard overlap to join a cluster
-        #[arg(long, default_value = "0.4")]
+        #[arg(long, default_value = "0.2")]
         threshold: f64,
         /// Smallest cluster worth proposing
         #[arg(long, default_value = "3")]
         min_size: usize,
+        /// Print the clusters that would be proposed; write nothing
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Sync observations with a shared GitHub branch so other workstations
     /// see the same facts. Defaults to this repo's `origin` remote; set
@@ -217,7 +220,26 @@ impl MemoryArgs {
                 project,
                 threshold,
                 min_size,
+                dry_run,
             } => {
+                if dry_run {
+                    let shown = crate::memory::store::open()
+                        .map_err(|e| e.to_string())
+                        .and_then(|conn| {
+                            super::memory_consolidate::preview(
+                                &conn,
+                                project.as_deref(),
+                                threshold,
+                                min_size,
+                            )
+                            .map_err(|e| e.to_string())
+                        });
+                    match shown {
+                        Ok(text) => print!("{text}"),
+                        Err(e) => crate::ui::error(&e),
+                    }
+                    return;
+                }
                 let result = flare_insights::store::InsightsStore::open(
                     &crate::handoff::default_insights_db(),
                 )

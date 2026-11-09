@@ -22,6 +22,7 @@ const KIND: &str = "memory_fact";
 // flare-code: O(n^2) pairwise scan over the newest CAP observations; switch to
 // an FTS/minhash candidate index if memory grows past a few thousand rows.
 const CAP: usize = 500;
+const MAX_CLUSTER: usize = 12;
 const STOP: &[&str] = &[
     "the", "and", "for", "with", "that", "this", "from", "not", "are", "was", "but", "its", "use",
     "has", "have", "into", "when", "then", "than", "can", "will", "via", "per", "all", "any",
@@ -70,9 +71,12 @@ fn clusters(obs: &[Observation], threshold: f64, min_size: usize) -> Vec<Vec<usi
         let r = find(&mut parent, i);
         groups.entry(r).or_default().push(i);
     }
+    // Single-link chains unrelated notes together at low thresholds (a real
+    // brain.db at 0.15 produced a 25-row git/CI/worktree blob), so oversized
+    // groups are dropped rather than proposed as one belief.
     groups
         .into_values()
-        .filter(|g| g.len() >= min_size)
+        .filter(|g| (min_size..=MAX_CLUSTER).contains(&g.len()))
         .collect()
 }
 
@@ -135,16 +139,13 @@ pub(crate) fn link_evidence(
     Ok(n)
 }
 
-/// Cluster observations (per project) and upsert one ledger candidate per
-/// cluster. Returns the number of clusters proposed. Idempotent: a cluster
-/// that gains a member keeps its fingerprint through member-id aliases.
-pub(crate) fn scan(
-    store: &InsightsStore,
+/// Clusters of observations as `(project, members)`, one project at a time.
+fn grouped(
     conn: &rusqlite::Connection,
     project: Option<&str>,
     threshold: f64,
     min_size: usize,
-) -> Result<usize, Box<dyn std::error::Error>> {
+) -> rusqlite::Result<Vec<(String, Vec<Observation>)>> {
     let mut by_project: BTreeMap<String, Vec<Observation>> = BTreeMap::new();
     for o in observations::list_recent(conn, project, None, CAP)? {
         // Skip already-consolidated beliefs and personal-scope rows.
@@ -159,43 +160,84 @@ pub(crate) fn scan(
                 .push(o);
         }
     }
-    let mut proposed = 0;
-    for (proj, obs) in &by_project {
-        for group in clusters(obs, threshold, min_size) {
-            let members: Vec<&Observation> = group.iter().map(|&i| &obs[i]).collect();
-            let (title, content) = belief(&members);
-            let aliases: Vec<String> = members
-                .iter()
-                .map(|o| fingerprint("belief", proj, &format!("obs:{}", o.id)))
-                .collect();
-            let evidence = members
-                .iter()
-                .map(|o| EvidenceRef {
-                    source: "memory".into(),
-                    session_id: format!("obs:{}", o.id),
-                    turn_seq: None,
-                    tool_call_id: None,
-                    at: None,
-                    excerpt: Some(o.title.clone()),
-                })
-                .collect();
-            let mut c = candidate(
-                KIND,
-                proj,
-                &aliases[0],
-                &title,
-                &content,
-                0,
-                members.len() as i64,
-                evidence,
-            );
-            if let Some(existing) = store.proposal_for_aliases(&aliases)? {
-                c.fingerprint = existing;
-            }
-            store.upsert_proposal_candidate(&c)?;
-            store.add_proposal_aliases(&c.fingerprint, &aliases)?;
-            proposed += 1;
+    Ok(by_project
+        .into_iter()
+        .flat_map(|(proj, obs)| {
+            clusters(&obs, threshold, min_size)
+                .into_iter()
+                .map(|g| (proj.clone(), g.iter().map(|&i| obs[i].clone()).collect()))
+                .collect::<Vec<_>>()
+        })
+        .collect())
+}
+
+/// What `scan` would propose, one line per cluster plus its members; writes nothing.
+pub(crate) fn preview(
+    conn: &rusqlite::Connection,
+    project: Option<&str>,
+    threshold: f64,
+    min_size: usize,
+) -> rusqlite::Result<String> {
+    let mut out = String::new();
+    for (proj, members) in grouped(conn, project, threshold, min_size)? {
+        let refs: Vec<&Observation> = members.iter().collect();
+        out.push_str(&format!(
+            "[{proj}] n={} {}\n",
+            members.len(),
+            belief(&refs).0
+        ));
+        for m in &members {
+            out.push_str(&format!("    #{} {}\n", m.id, m.title));
         }
+    }
+    Ok(out)
+}
+
+/// Cluster observations (per project) and upsert one ledger candidate per
+/// cluster. Returns the number of clusters proposed. Idempotent: a cluster
+/// that gains a member keeps its fingerprint through member-id aliases.
+pub(crate) fn scan(
+    store: &InsightsStore,
+    conn: &rusqlite::Connection,
+    project: Option<&str>,
+    threshold: f64,
+    min_size: usize,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut proposed = 0;
+    for (proj, obs) in &grouped(conn, project, threshold, min_size)? {
+        let members: Vec<&Observation> = obs.iter().collect();
+        let (title, content) = belief(&members);
+        let aliases: Vec<String> = members
+            .iter()
+            .map(|o| fingerprint("belief", proj, &format!("obs:{}", o.id)))
+            .collect();
+        let evidence = members
+            .iter()
+            .map(|o| EvidenceRef {
+                source: "memory".into(),
+                session_id: format!("obs:{}", o.id),
+                turn_seq: None,
+                tool_call_id: None,
+                at: None,
+                excerpt: Some(o.title.clone()),
+            })
+            .collect();
+        let mut c = candidate(
+            KIND,
+            proj,
+            &aliases[0],
+            &title,
+            &content,
+            0,
+            members.len() as i64,
+            evidence,
+        );
+        if let Some(existing) = store.proposal_for_aliases(&aliases)? {
+            c.fingerprint = existing;
+        }
+        store.upsert_proposal_candidate(&c)?;
+        store.add_proposal_aliases(&c.fingerprint, &aliases)?;
+        proposed += 1;
     }
     Ok(proposed)
 }
@@ -234,13 +276,13 @@ mod tests {
 
     fn seed_cluster(conn: &rusqlite::Connection, project: &str) -> Vec<i64> {
         [
-            "cargo target dir shared across worktrees breaks builds set CARGO_TARGET_DIR task local",
-            "worktree builds clobber shared cargo target dir use task local CARGO_TARGET_DIR",
-            "never share cargo target dir between worktrees; set task local CARGO_TARGET_DIR",
+            "build cache dir shared across worktrees breaks builds set BUILD_CACHE_DIR task local",
+            "worktree builds clobber shared build cache dir use task local BUILD_CACHE_DIR",
+            "never share build cache dir between worktrees; set task local BUILD_CACHE_DIR",
         ]
         .iter()
         .enumerate()
-        .map(|(i, c)| save(conn, &format!("cargo target gotcha {i}"), c, project))
+        .map(|(i, c)| save(conn, &format!("build cache gotcha {i}"), c, project))
         .collect()
     }
 
@@ -264,6 +306,38 @@ mod tests {
     }
 
     #[test]
+    fn oversized_chain_clusters_are_not_proposed() {
+        let conn = db();
+        for i in 0..=MAX_CLUSTER {
+            save(
+                &conn,
+                &format!("target dir note {i}"),
+                "build cache dir worktrees task local BUILD_CACHE_DIR gotcha",
+                "p",
+            );
+        }
+        assert_eq!(preview(&conn, Some("p"), 0.4, 3).unwrap(), "");
+    }
+
+    #[test]
+    fn preview_lists_clusters_with_members_and_writes_nothing() {
+        let conn = db();
+        let ids = seed_cluster(&conn, "p");
+        save(
+            &conn,
+            "celld reference",
+            "audit of denoland celld harness semantics",
+            "p",
+        );
+        let out = preview(&conn, Some("p"), 0.4, 3).unwrap();
+        assert!(out.starts_with("[p] n=3 "), "{out}");
+        for id in ids {
+            assert!(out.contains(&format!("#{id} ")), "{out}");
+        }
+        assert!(!out.contains("celld reference"), "{out}");
+    }
+
+    #[test]
     fn rescan_is_idempotent_and_a_new_member_keeps_the_same_proposal() {
         let conn = db();
         let store = InsightsStore::open_in_memory().unwrap();
@@ -273,8 +347,8 @@ mod tests {
         assert_eq!(store.list_proposals(None).unwrap().len(), 1);
         save(
             &conn,
-            "cargo target gotcha 3",
-            "shared cargo target dir across worktrees: set task local CARGO_TARGET_DIR",
+            "build cache gotcha 3",
+            "shared build cache dir across worktrees: set task local BUILD_CACHE_DIR",
             "p",
         );
         scan(&store, &conn, Some("p"), 0.4, 3).unwrap();
@@ -304,19 +378,19 @@ mod tests {
         save(
             &conn2,
             "a",
-            "cargo target dir task local CARGO_TARGET_DIR",
+            "build cache dir task local BUILD_CACHE_DIR",
             "x",
         );
         save(
             &conn2,
             "b",
-            "cargo target dir task local CARGO_TARGET_DIR",
+            "build cache dir task local BUILD_CACHE_DIR",
             "y",
         );
         save(
             &conn2,
             "c",
-            "cargo target dir task local CARGO_TARGET_DIR",
+            "build cache dir task local BUILD_CACHE_DIR",
             "z",
         );
         assert_eq!(scan(&store2, &conn2, None, 0.4, 3).unwrap(), 0);
@@ -348,8 +422,8 @@ mod tests {
         // A fourth member arrives; rescan + re-accept refines the same belief row.
         save(
             &conn,
-            "cargo target gotcha 3",
-            "shared cargo target dir across worktrees: set task local CARGO_TARGET_DIR",
+            "build cache gotcha 3",
+            "shared build cache dir across worktrees: set task local BUILD_CACHE_DIR",
             "p",
         );
         scan(&store, &conn, Some("p"), 0.4, 3).unwrap();
