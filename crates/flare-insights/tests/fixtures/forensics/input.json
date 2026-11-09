@@ -1,0 +1,30 @@
+{
+  "sessions": [
+    {"id": "c1", "source": "claude_code", "cwd": "/w/p", "cost": 10.0, "basis": "estimated", "input": 1000, "read": 3000, "write": 100, "updated_at": "2026-01-05T00:00:00Z"},
+    {"id": "c2", "source": "claude_code", "cwd": "/w/p", "cost": 2.0, "basis": "estimated", "input": 500, "read": 0, "write": 0, "updated_at": "2026-01-06T00:00:00Z"},
+    {"id": "c3", "source": "claude_code", "cwd": "/w/p", "cost": null, "basis": "unknown", "input": 10, "read": 10, "write": 0, "updated_at": "2026-01-06T00:00:00Z"},
+    {"id": "x1", "source": "codex", "cwd": "/w/p", "cost": null, "basis": "unknown", "input": 100, "read": 400, "write": 0, "updated_at": "2026-01-06T00:00:00Z"},
+    {"id": "u1", "source": "cursor", "cwd": "/w/other", "cost": 1.0, "basis": "estimated", "input": 50, "read": 0, "write": 0, "updated_at": "2026-01-07T00:00:00Z"},
+    {"id": "old", "source": "claude_code", "cwd": "/w/p", "cost": 99.0, "basis": "estimated", "input": 1, "read": 1, "write": 0, "updated_at": "2025-11-01T00:00:00Z"}
+  ],
+  "turns": [
+    {"session": "c1", "seq": 1, "user_text": "Please run the full test suite now"},
+    {"session": "c1", "seq": 2, "user_text": "please   run the FULL test suite now\n<system-reminder>noise</system-reminder>"},
+    {"session": "c2", "seq": 1, "user_text": "<SYSTEM_MESSAGE>x</SYSTEM_MESSAGE>Please run the full test suite now"},
+    {"session": "c2", "seq": 2, "user_text": "ok thanks"},
+    {"session": "c3", "seq": 1, "user_text": "ok thanks"}
+  ],
+  "tools": [
+    {"id": "t1", "session": "c1", "turn_seq": 1, "name": "Bash", "status": "failed"},
+    {"id": "t2", "session": "c1", "turn_seq": 1, "name": "Bash", "status": "ok"},
+    {"id": "t3", "session": "c1", "turn_seq": 2, "name": "Read", "status": "ok", "output_len": 40000},
+    {"id": "t4", "session": "c2", "turn_seq": 1, "name": "Bash", "status": "failed"},
+    {"id": "t5", "session": "c2", "turn_seq": 2, "name": "Read", "status": "ok", "output_len": 39999},
+    {"id": "t6", "session": "x1", "turn_seq": 1, "name": "Bash", "status": "failed"},
+    {"id": "t7", "session": "x1", "turn_seq": 1, "name": "Bash", "status": "failed"},
+    {"id": "t8", "session": "c3", "turn_seq": 1, "name": "Bash", "status": "ok"},
+    {"id": "t9", "session": "c3", "turn_seq": 1, "name": "Bash", "status": "failed"},
+    {"id": "t10", "session": "c3", "turn_seq": 2, "name": "Write", "status": "failed"},
+    {"id": "t11", "session": "c3", "turn_seq": 2, "name": "Edit", "status": "ok"}
+  ]
+}

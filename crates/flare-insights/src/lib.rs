@@ -15,14 +15,22 @@
 //! - api: REST + WebSocket push
 
 pub mod analytics;
+pub mod capability;
 pub mod config;
+pub mod discover;
+pub mod evidence;
 pub mod export;
+pub mod forensics;
 pub mod handoff;
 pub mod ingest;
+pub mod migrations;
 pub mod model;
+pub mod proposals;
+pub mod recall;
 pub mod replay;
 pub mod search;
 pub mod store;
+pub mod store_query;
 
 pub mod api;
 

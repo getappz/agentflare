@@ -50,7 +50,7 @@ agentflare insights list --limit 20               # recent first
 agentflare insights list --source claude_code --json
 agentflare insights show <session_id> --json
 agentflare insights search "websocket reconnection" --limit 10
-agentflare insights stats --json                  # tokens/cost/cache + by_day
+agentflare insights stats --json                  # tokens/cost/cache + by_day_updated
 agentflare insights export --format deepeval --output eval.jsonl
 agentflare insights handoff <id> --target codex --verbosity full
 agentflare insights serve --port 3456             # 127.0.0.1 REST + WS

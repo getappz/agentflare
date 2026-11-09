@@ -312,6 +312,8 @@ mod tests {
                 reasoning: 0,
             },
             cost: None,
+            cost_basis: flare_insights::model::CostBasis::Unknown,
+            pricing_key: None,
             turn_count: 2,
             tool_call_count: 0,
             subagent_count: 0,
@@ -483,7 +485,7 @@ mod tests {
             .scan(&Default::default(), &Default::default(), &mut |_, _| {})
             .unwrap();
         let session = &bundle.sessions[0];
-        assert!(session.cwd.is_none());
+        assert_eq!(session.cwd, session.project_path);
         assert!(session.project_path.is_some());
         let store =
             flare_insights::store::InsightsStore::open(&tmp.path().join("observatory.db")).unwrap();
@@ -689,6 +691,8 @@ mod tests {
                 reasoning: 0,
             },
             cost: None,
+            cost_basis: flare_insights::model::CostBasis::Unknown,
+            pricing_key: None,
             turn_count: 1,
             tool_call_count: 0,
             subagent_count: 0,

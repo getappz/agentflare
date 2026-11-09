@@ -23,6 +23,8 @@ const AUTOPILOT_MODE = { plugin: 'agentflare', key: 'autopilotMode' } as const
 
 // Module state resets on hot reload (the timer is cancelled before it is re-armed, so at most one is live).
 let mode: Mode = 'off'
+// Persisted mode is restored once per module load (hot reload); afterwards memory is the source of truth.
+let modeRestored = false
 let paused: string | null = null
 let timer: Timer | null = null
 const notified = new Set<string>()
@@ -41,6 +43,7 @@ export const autopilotState = {
  */
 export function setAutopilotMode($: EngineInterface, next: Mode): void {
   mode = next
+  modeRestored = true
   paused = null
   timer?.cancel()
   timer = null
@@ -86,17 +89,22 @@ async function pause($: EngineInterface, reason: string): Promise<'paused'> {
   return 'paused'
 }
 
+async function restoreMode($: EngineInterface): Promise<void> {
+  if (modeRestored) return
+  modeRestored = true
+  try {
+    const saved = (await $.state.get(AUTOPILOT_MODE)).value as Mode | undefined
+    if (saved === 'on' || saved === 'once' || saved === 'off') mode = saved
+  } catch {
+    // Non-fatal if state read fails.
+  }
+}
+
 async function step($: EngineInterface): Promise<StepResult> {
   const { client, agent, options, current, setCurrent } = ctx
   const c = client()
 
-  // A hot reload resets the module's mode; check persisted mode if set.
-  try {
-    const saved = (await $.state.get(AUTOPILOT_MODE)).value as Mode | undefined
-    if (saved && (saved === 'on' || saved === 'once' || saved === 'off')) mode = saved
-  } catch {
-    // Non-fatal if state read fails.
-  }
+  await restoreMode($)
   if (mode === 'off' || !c) return 'idle'
 
   // Never switch items while one is in progress (no next_work call while currentItemId is set).
@@ -168,6 +176,7 @@ async function pollAndRearm($: EngineInterface): Promise<void> {
 export function registerAutopilot(on: On, context: AutopilotContext): { step($: EngineInterface): Promise<StepResult> } {
   ctx = context
   mode = context.options.autopilot
+  modeRestored = false
 
   // Cancel the idle timer at turn start so it cannot fire while a turn runs.
   on('turn.start', async ($, e, next) => {
@@ -185,10 +194,7 @@ export function registerAutopilot(on: On, context: AutopilotContext): { step($: 
       await captureTurn($, e, context.capture)
     }
     if (e.agentId !== undefined) return result
-    try {
-      const saved = (await $.state.get(AUTOPILOT_MODE)).value as Mode | undefined
-      if (saved && (saved === 'on' || saved === 'once' || saved === 'off')) mode = saved
-    } catch {}
+    await restoreMode($)
     timer?.cancel()
     timer = null
     if (mode !== 'off') {

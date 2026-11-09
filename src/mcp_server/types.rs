@@ -1395,13 +1395,21 @@ pub(crate) struct WebhookRequest {
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ProjectRequest {
-    #[schemars(description = "Action: info|list|archive|unarchive")]
+    #[schemars(description = "Action: info|list|archive|unarchive|rename|delete")]
     pub(crate) action: String,
     #[schemars(
-        description = "Target project (name or UUID from `project action=list`) for archive/unarchive. Defaults to the project this repo is linked to."
+        description = "Target project (name or UUID from `project action=list`) for archive/unarchive/rename/delete. Defaults to the project this repo is linked to, except for delete, where it is required."
     )]
     #[serde(default)]
     pub(crate) project: Option<String>,
+    #[schemars(description = "New name for the project (required for action=rename)")]
+    #[serde(default)]
+    pub(crate) name: Option<String>,
+    #[schemars(
+        description = "Optional new identifier (e.g. 'CLI', 'PROJ') for action=rename; omitted keeps the current identifier"
+    )]
+    #[serde(default)]
+    pub(crate) identifier: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
@@ -1473,7 +1481,7 @@ pub(crate) struct SearchRequest {
     #[schemars(description = "Search query")]
     pub(crate) query: String,
     #[schemars(
-        description = "Search type: 'store' (default, FTS across store docs), 'memory' (brain.db observations), 'code' (leanctx ctx_search), 'web' (rivalsearch internet), 'social' (9 platforms), 'news' (5 sources), 'github' (repos), 'academic' (papers), 'datasets' (hubs), 'websites' (crawl), 'weather' (Open-Meteo), 'financial' (SEC), 'crypto' (CoinGecko), 'fx' (ECB rates), 'indicators' (World Bank), 'youtube' (transcripts), 'bluesky' (profiles), 'all' (fan out to store+memory+code, fused by RRF k=60 into one ranked hit list), 'all+web' (all plus the web arm)"
+        description = "Search type: 'store' (default, FTS across store docs), 'memory' (brain.db observations), 'session' (past agent sessions under the current dir, local insights index; use the insights tool with project=\"*\" for all), 'code' (leanctx ctx_search), 'web' (rivalsearch internet), 'social' (9 platforms), 'news' (5 sources), 'github' (repos), 'academic' (papers), 'datasets' (hubs), 'websites' (crawl), 'weather' (Open-Meteo), 'financial' (SEC), 'crypto' (CoinGecko), 'fx' (ECB rates), 'indicators' (World Bank), 'youtube' (transcripts), 'bluesky' (profiles), 'all' (fan out to store+memory+code, fused by RRF k=60 into one ranked hit list), 'all+web' (all plus the web arm)"
     )]
     #[serde(default)]
     pub(crate) r#type: Option<String>,
@@ -1663,4 +1671,45 @@ pub(crate) struct AutopilotRequest {
     pub(crate) max_cost_usd: Option<f64>,
     #[serde(default)]
     pub(crate) rate_limit_pct: Option<f64>,
+}
+
+/// Read-only access to the local insights index (past agent sessions).
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub(crate) struct InsightsRequest {
+    #[schemars(description = "search | recall | forensics | discover")]
+    pub(crate) action: String,
+    #[schemars(description = "Search text (search)")]
+    #[serde(default)]
+    pub(crate) query: Option<String>,
+    #[schemars(description = "Session id (recall; optional filter for forensics)")]
+    #[serde(default)]
+    pub(crate) session_id: Option<String>,
+    #[schemars(description = "Agent source filter, e.g. claude-code|codex|opencode|cursor")]
+    #[serde(default)]
+    pub(crate) source: Option<String>,
+    #[schemars(description = "Project path prefix; defaults to the current dir, \"*\" = all")]
+    #[serde(default)]
+    pub(crate) project: Option<String>,
+    #[schemars(
+        description = "Look-back window in days (forensics default 7, discover default 30)"
+    )]
+    #[serde(default)]
+    pub(crate) since_days: Option<u32>,
+    #[schemars(description = "Max hits (search, default 20, capped at 100)")]
+    #[serde(default)]
+    pub(crate) limit: Option<usize>,
+    #[schemars(description = "Hits to skip (search)")]
+    #[serde(default)]
+    pub(crate) offset: Option<usize>,
+    #[schemars(description = "First turn seq to return (recall, default 0)")]
+    #[serde(default)]
+    pub(crate) turn_start: Option<u32>,
+    #[schemars(description = "Max turns per page (recall, default 20, capped at 100)")]
+    #[serde(default)]
+    pub(crate) turn_limit: Option<usize>,
+    #[schemars(
+        description = "Max text chars per page including tool calls (recall, default 12000, capped at 100000); omitted_chars and omitted_tool_calls report what was cut"
+    )]
+    #[serde(default)]
+    pub(crate) max_chars: Option<usize>,
 }

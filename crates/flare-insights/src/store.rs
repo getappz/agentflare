@@ -8,15 +8,49 @@ use crate::model::{Session, SessionSource, SessionStatus, TokenUsage, ToolCall, 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("sqlite: {0}")]
-    Sqlite(#[from] rusqlite::Error),
+    Sqlite(rusqlite::Error),
+    #[error("parse: {0}")]
+    Parse(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("migration: {0}")]
+    Migration(#[from] rusqlite_migration::Error),
+}
+
+/// Carried inside `rusqlite::Error::FromSqlConversionFailure` so row mappers can
+/// report an unparseable column; `From<rusqlite::Error>` lifts it to `StoreError::Parse`.
+#[derive(Debug)]
+struct BadColumn(String);
+impl std::fmt::Display for BadColumn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for BadColumn {}
+
+impl From<rusqlite::Error> for StoreError {
+    fn from(e: rusqlite::Error) -> Self {
+        if let rusqlite::Error::FromSqlConversionFailure(_, _, inner) = &e {
+            if let Some(b) = inner.downcast_ref::<BadColumn>() {
+                return Self::Parse(b.0.clone());
+            }
+        }
+        Self::Sqlite(e)
+    }
+}
+
+fn bad_column(col: &str, value: &str) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        0,
+        rusqlite::types::Type::Text,
+        Box::new(BadColumn(format!("unparseable {col} {value:?}"))),
+    )
 }
 
 pub struct InsightsStore {
-    conn: Connection,
+    pub(crate) conn: Connection,
 }
 
 impl InsightsStore {
@@ -31,135 +65,15 @@ impl InsightsStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(path)?;
-        let s = Self { conn };
-        s.migrate()?;
-        Ok(s)
+        let mut conn = Connection::open(path)?;
+        migrate(&mut conn)?;
+        Ok(Self { conn })
     }
 
     pub fn open_in_memory() -> Result<Self, StoreError> {
-        let conn = Connection::open_in_memory()?;
-        let s = Self { conn };
-        s.migrate()?;
-        Ok(s)
-    }
-
-    fn migrate(&self) -> Result<(), StoreError> {
-        self.conn.execute_batch(
-            r#"
-            PRAGMA journal_mode=WAL;
-            PRAGMA foreign_keys=ON;
-
-            CREATE TABLE IF NOT EXISTS sessions (
-                id TEXT PRIMARY KEY,
-                source TEXT NOT NULL,
-                project TEXT NOT NULL,
-                project_path TEXT,
-                title TEXT,
-                model TEXT,
-                status TEXT NOT NULL,
-                awaiting_reason TEXT,
-                started_at TEXT,
-                updated_at TEXT NOT NULL,
-                ended_at TEXT,
-                duration_secs INTEGER,
-                input_tokens INTEGER NOT NULL DEFAULT 0,
-                output_tokens INTEGER NOT NULL DEFAULT 0,
-                cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-                cache_write_tokens INTEGER NOT NULL DEFAULT 0,
-                reasoning_tokens INTEGER NOT NULL DEFAULT 0,
-                cost_usd REAL,
-                turn_count INTEGER NOT NULL DEFAULT 0,
-                tool_call_count INTEGER NOT NULL DEFAULT 0,
-                subagent_count INTEGER NOT NULL DEFAULT 0,
-                tags TEXT NOT NULL DEFAULT '[]',
-                starred INTEGER NOT NULL DEFAULT 0,
-                pid INTEGER,
-                cwd TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS turns (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                seq INTEGER NOT NULL,
-                user_text TEXT,
-                assistant_text TEXT,
-                started_at TEXT,
-                ended_at TEXT,
-                input_tokens INTEGER,
-                output_tokens INTEGER,
-                cost_usd REAL,
-                UNIQUE(session_id, seq)
-            );
-
-            CREATE TABLE IF NOT EXISTS tool_calls (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                turn_seq INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                input TEXT NOT NULL,
-                output TEXT,
-                status TEXT NOT NULL,
-                duration_ms INTEGER,
-                created_at TEXT
-            );
-
-            CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(
-                session_id, user_text, assistant_text,
-                content='turns', content_rowid='rowid',
-                tokenize='trigram'
-            );
-            CREATE TRIGGER IF NOT EXISTS turns_ai AFTER INSERT ON turns BEGIN
-                INSERT INTO turns_fts(rowid, session_id, user_text, assistant_text)
-                VALUES (new.rowid, new.session_id, new.user_text, new.assistant_text);
-            END;
-            CREATE TRIGGER IF NOT EXISTS turns_ad AFTER DELETE ON turns BEGIN
-                INSERT INTO turns_fts(turns_fts, rowid, session_id, user_text, assistant_text)
-                VALUES('delete', old.rowid, old.session_id, old.user_text, old.assistant_text);
-            END;
-            CREATE TRIGGER IF NOT EXISTS turns_au AFTER UPDATE ON turns BEGIN
-                INSERT INTO turns_fts(turns_fts, rowid, session_id, user_text, assistant_text)
-                VALUES('delete', old.rowid, old.session_id, old.user_text, old.assistant_text);
-                INSERT INTO turns_fts(rowid, session_id, user_text, assistant_text)
-                VALUES (new.rowid, new.session_id, new.user_text, new.assistant_text);
-            END;
-
-            CREATE TABLE IF NOT EXISTS file_events (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                path TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS subagents (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                parent_tool_call_id TEXT,
-                kind TEXT NOT NULL,
-                status TEXT NOT NULL,
-                task TEXT
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at);
-            CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project);
-            CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
-            CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id);
-            CREATE INDEX IF NOT EXISTS idx_tool_calls_session ON tool_calls(session_id);
-            CREATE INDEX IF NOT EXISTS idx_tool_calls_name ON tool_calls(name);
-            CREATE INDEX IF NOT EXISTS idx_file_events_session ON file_events(session_id);
-            CREATE INDEX IF NOT EXISTS idx_file_events_path ON file_events(path);
-
-            CREATE TABLE IF NOT EXISTS ingest_file_cursors (
-                source TEXT NOT NULL,
-                path TEXT NOT NULL,
-                mtime_ms INTEGER NOT NULL,
-                size INTEGER NOT NULL,
-                PRIMARY KEY (source, path)
-            );
-            "#,
-        )?;
-        Ok(())
+        let mut conn = Connection::open_in_memory()?;
+        migrate(&mut conn)?;
+        Ok(Self { conn })
     }
 
     // ---- sessions ----
@@ -287,21 +201,10 @@ impl InsightsStore {
 
     pub fn upsert_turn(&self, t: &Turn) -> Result<(), StoreError> {
         self.conn.execute(
-            r#"INSERT INTO turns(id, session_id, seq, user_text, assistant_text, started_at, ended_at, input_tokens, output_tokens, cost_usd)
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
-               ON CONFLICT(id) DO UPDATE SET session_id=excluded.session_id, seq=excluded.seq, user_text=excluded.user_text, assistant_text=excluded.assistant_text, started_at=excluded.started_at, ended_at=excluded.ended_at, input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens, cost_usd=excluded.cost_usd"#,
-            params![
-                t.id,
-                t.session_id,
-                t.seq as i64,
-                t.user_text,
-                t.assistant_text,
-                t.started_at.map(|v| v.to_rfc3339()),
-                t.ended_at.map(|v| v.to_rfc3339()),
-                t.tokens.as_ref().map(|tok| tok.input as i64),
-                t.tokens.as_ref().map(|tok| tok.output as i64),
-                t.cost_usd,
-            ],
+            r#"INSERT INTO turns(id, session_id, seq, user_text, assistant_text, started_at, ended_at, input_tokens, output_tokens, cost_usd, cache_read_tokens, cache_write_tokens, reasoning_tokens)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+               ON CONFLICT(id) DO UPDATE SET session_id=excluded.session_id, seq=excluded.seq, user_text=excluded.user_text, assistant_text=excluded.assistant_text, started_at=excluded.started_at, ended_at=excluded.ended_at, input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens, cost_usd=excluded.cost_usd, cache_read_tokens=excluded.cache_read_tokens, cache_write_tokens=excluded.cache_write_tokens, reasoning_tokens=excluded.reasoning_tokens"#,
+            rusqlite::params_from_iter(turn_params(t)),
         )?;
         Ok(())
     }
@@ -310,21 +213,10 @@ impl InsightsStore {
         let tx = self.conn.unchecked_transaction()?;
         for t in turns {
             tx.execute(
-                r#"INSERT INTO turns(id, session_id, seq, user_text, assistant_text, started_at, ended_at, input_tokens, output_tokens, cost_usd)
-                   VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
-                   ON CONFLICT(id) DO UPDATE SET user_text=excluded.user_text, assistant_text=excluded.assistant_text, input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens, cost_usd=excluded.cost_usd"#,
-                params![
-                    t.id,
-                    t.session_id,
-                    t.seq as i64,
-                    t.user_text,
-                    t.assistant_text,
-                    t.started_at.map(|v| v.to_rfc3339()),
-                    t.ended_at.map(|v| v.to_rfc3339()),
-                    t.tokens.as_ref().map(|tok| tok.input as i64),
-                    t.tokens.as_ref().map(|tok| tok.output as i64),
-                    t.cost_usd,
-                ],
+                r#"INSERT INTO turns(id, session_id, seq, user_text, assistant_text, started_at, ended_at, input_tokens, output_tokens, cost_usd, cache_read_tokens, cache_write_tokens, reasoning_tokens)
+                   VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+                   ON CONFLICT(id) DO UPDATE SET session_id=excluded.session_id, seq=excluded.seq, user_text=excluded.user_text, assistant_text=excluded.assistant_text, started_at=excluded.started_at, ended_at=excluded.ended_at, input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens, cost_usd=excluded.cost_usd, cache_read_tokens=excluded.cache_read_tokens, cache_write_tokens=excluded.cache_write_tokens, reasoning_tokens=excluded.reasoning_tokens"#,
+                rusqlite::params_from_iter(turn_params(t)),
             )?;
         }
         tx.commit()?;
@@ -343,6 +235,25 @@ impl InsightsStore {
         Ok(out)
     }
 
+    /// Up to `limit` turns from `seq >= start`, in order.
+    pub fn get_turns_page(
+        &self,
+        session_id: &str,
+        start: u32,
+        limit: usize,
+    ) -> Result<Vec<Turn>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM turns WHERE session_id=?1 AND seq>=?2 ORDER BY seq ASC LIMIT ?3",
+        )?;
+        let limit = limit.min(i64::MAX as usize) as i64;
+        let rows = stmt.query_map(params![session_id, start, limit], row_to_turn)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     // ---- tool_calls ----
 
     pub fn upsert_tool_call(&self, tc: &ToolCall) -> Result<(), StoreError> {
@@ -350,17 +261,7 @@ impl InsightsStore {
             r#"INSERT INTO tool_calls(id, session_id, turn_seq, name, input, output, status, duration_ms, created_at)
                VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
                ON CONFLICT(id) DO UPDATE SET session_id=excluded.session_id, turn_seq=excluded.turn_seq, name=excluded.name, input=excluded.input, output=excluded.output, status=excluded.status, duration_ms=excluded.duration_ms, created_at=excluded.created_at"#,
-            params![
-                tc.id,
-                tc.session_id,
-                tc.turn_seq as i64,
-                tc.name,
-                serde_json::to_string(&tc.input).unwrap(),
-                tc.output,
-                tc.status,
-                tc.duration_ms.map(|v| v as i64),
-                tc.created_at.map(|v| v.to_rfc3339()),
-            ],
+            rusqlite::params_from_iter(tool_call_params(tc)),
         )?;
         Ok(())
     }
@@ -372,17 +273,7 @@ impl InsightsStore {
                 r#"INSERT INTO tool_calls(id, session_id, turn_seq, name, input, output, status, duration_ms, created_at)
                    VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
                     ON CONFLICT(id) DO UPDATE SET session_id=excluded.session_id, turn_seq=excluded.turn_seq, name=excluded.name, input=excluded.input, output=excluded.output, status=excluded.status, duration_ms=excluded.duration_ms, created_at=excluded.created_at"#,
-                params![
-                    tc.id,
-                    tc.session_id,
-                    tc.turn_seq as i64,
-                    tc.name,
-                    serde_json::to_string(&tc.input).unwrap(),
-                    tc.output,
-                    tc.status,
-                    tc.duration_ms.map(|v| v as i64),
-                    tc.created_at.map(|v| v.to_rfc3339()),
-                ],
+                rusqlite::params_from_iter(tool_call_params(tc)),
             )?;
         }
         tx.commit()?;
@@ -394,6 +285,25 @@ impl InsightsStore {
             .conn
             .prepare("SELECT * FROM tool_calls WHERE session_id=?1 ORDER BY turn_seq ASC")?;
         let rows = stmt.query_map(params![session_id], row_to_tool_call)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Tool calls for turns `first..=last`, in call order.
+    pub fn get_tool_calls_in_turns(
+        &self,
+        session_id: &str,
+        first: u32,
+        last: u32,
+    ) -> Result<Vec<ToolCall>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM tool_calls WHERE session_id=?1 AND turn_seq BETWEEN ?2 AND ?3
+             ORDER BY turn_seq ASC, rowid ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id, first, last], row_to_tool_call)?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
@@ -514,40 +424,206 @@ impl InsightsStore {
     ) -> Result<(), StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         for (path, mtime_ms, size) in entries {
-            tx.execute(
-                "INSERT INTO ingest_file_cursors(source, path, mtime_ms, size) VALUES (?1,?2,?3,?4)
-                 ON CONFLICT(source, path) DO UPDATE SET mtime_ms=excluded.mtime_ms, size=excluded.size",
-                params![source, path.to_string_lossy(), mtime_ms, *size as i64],
-            )?;
+            exec_upsert_file_cursor(&tx, source, path, *mtime_ms, *size)?;
         }
         tx.commit()?;
         Ok(())
     }
 
-    /// DRY transactional session+turns+tools+files+subagents
-    pub fn upsert_session_bundle(
+    /// Commit one source's scan atomically: every session in the bundle has
+    /// its children replaced (delete + plain insert, so a rewritten file with
+    /// shifted `seq` numbers cannot collide), then the file cursors advance.
+    /// Any failure rolls the whole bundle back, cursors included, so the
+    /// files are re-read on the next sync instead of hidden until `--force`.
+    pub fn commit_ingest(
         &self,
-        s: &Session,
-        turns: &[Turn],
-        tools: &[ToolCall],
-        files: &[crate::model::FileEvent],
-        subs: &[crate::model::Subagent],
-    ) -> Result<(), StoreError> {
-        self.upsert_session(s)?;
-        if !turns.is_empty() {
-            self.upsert_turns_batch(turns)?;
+        source: &str,
+        bundle: &crate::ingest::IngestBundle,
+    ) -> Result<IngestStats, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut stats = IngestStats::default();
+        for s in &bundle.sessions {
+            for table in ["turns", "tool_calls", "file_events", "subagents"] {
+                tx.execute(
+                    &format!("DELETE FROM {table} WHERE session_id=?1"),
+                    params![s.id],
+                )?;
+            }
+            exec_upsert_session(&tx, s)?;
+            stats.sessions += 1;
         }
-        if !tools.is_empty() {
-            self.upsert_tool_calls_batch(tools)?;
+        for t in &bundle.turns {
+            stats.turns += tx.execute(
+                "INSERT INTO turns(id, session_id, seq, user_text, assistant_text, started_at, ended_at, input_tokens, output_tokens, cost_usd, cache_read_tokens, cache_write_tokens, reasoning_tokens)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                rusqlite::params_from_iter(turn_params(t)),
+            )?;
         }
-        if !files.is_empty() {
-            self.upsert_file_events_batch(files)?;
+        for tc in last_per_id(&bundle.tool_calls, |t| (&t.session_id, &t.id)) {
+            // A moved call keeps its subagent links, which live in the owning session.
+            if let Some((owner, new_id)) =
+                move_foreign_row_aside(&tx, "tool_calls", &tc.id, &tc.session_id)?
+            {
+                tx.execute(
+                    "UPDATE subagents SET parent_tool_call_id = ?1
+                     WHERE parent_tool_call_id = ?2 AND session_id = ?3",
+                    params![new_id, tc.id, owner],
+                )?;
+            }
+            stats.tool_calls += tx.execute(
+                "INSERT INTO tool_calls(id, session_id, turn_seq, name, input, output, status, duration_ms, created_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                rusqlite::params_from_iter(tool_call_params(tc)),
+            )?;
         }
-        if !subs.is_empty() {
-            self.upsert_subagents_batch(subs)?;
+        for e in &bundle.file_events {
+            stats.file_events += tx.execute(
+                "INSERT INTO file_events(id, session_id, path, kind, at) VALUES (?1,?2,?3,?4,?5)",
+                params![e.id, e.session_id, e.path, e.kind, e.at.to_rfc3339()],
+            )?;
         }
-        Ok(())
+        for s in last_per_id(&bundle.subagents, |s| (&s.session_id, &s.id)) {
+            move_foreign_row_aside(&tx, "subagents", &s.id, &s.session_id)?;
+            stats.subagents += tx.execute(
+                "INSERT INTO subagents(id, session_id, parent_tool_call_id, kind, status, task) VALUES (?1,?2,?3,?4,?5,?6)",
+                params![s.id, s.session_id, s.parent_tool_call_id, s.kind, s.status, s.task],
+            )?;
+        }
+        for (path, mtime_ms, size) in &bundle.file_cursors {
+            exec_upsert_file_cursor(&tx, source, path, *mtime_ms, *size)?;
+        }
+        tx.commit()?;
+        Ok(stats)
     }
+}
+
+/// Keep only the last row per `(session_id, id)`, in original order. A
+/// transcript can repeat a child id; a plain INSERT would fail and roll back
+/// the whole source, so the repeat replaces the earlier row as upserts used to.
+fn last_per_id<'a, T>(items: &'a [T], key: impl Fn(&'a T) -> (&'a str, &'a str)) -> Vec<&'a T> {
+    let last: std::collections::HashMap<_, _> =
+        items.iter().enumerate().map(|(i, t)| (key(t), i)).collect();
+    items
+        .iter()
+        .enumerate()
+        .filter(|(i, t)| last[&key(t)] == *i)
+        .map(|(_, t)| t)
+        .collect()
+}
+
+/// Child ids are global primary keys. A row another session already holds under
+/// `id` (a pre-scoping id that happens to read `session:raw`) must not roll back
+/// this source's commit, so re-key it to a free id within its own session and
+/// keep it there. Returns the owning session and the row's new id when one moved.
+fn move_foreign_row_aside(
+    conn: &Connection,
+    table: &str,
+    id: &str,
+    session_id: &str,
+) -> Result<Option<(String, String)>, StoreError> {
+    let owner: Option<String> = conn
+        .query_row(
+            &format!("SELECT session_id FROM {table} WHERE id = ?1 AND session_id <> ?2"),
+            params![id, session_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(owner) = owner else {
+        return Ok(None);
+    };
+    let mut new_id = format!("{owner}:{id}");
+    while conn
+        .query_row(
+            &format!("SELECT 1 FROM {table} WHERE id = ?1"),
+            params![new_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some()
+    {
+        new_id = format!("{owner}:{new_id}");
+    }
+    conn.execute(
+        &format!("UPDATE {table} SET id = ?1 WHERE id = ?2"),
+        params![new_id, id],
+    )?;
+    Ok(Some((owner, new_id)))
+}
+
+/// Rows written by one [`InsightsStore::commit_ingest`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct IngestStats {
+    pub sessions: usize,
+    pub turns: usize,
+    pub tool_calls: usize,
+    pub file_events: usize,
+    pub subagents: usize,
+}
+
+impl std::ops::AddAssign for IngestStats {
+    fn add_assign(&mut self, o: Self) {
+        self.sessions += o.sessions;
+        self.turns += o.turns;
+        self.tool_calls += o.tool_calls;
+        self.file_events += o.file_events;
+        self.subagents += o.subagents;
+    }
+}
+
+fn exec_upsert_file_cursor(
+    conn: &Connection,
+    source: &str,
+    path: &Path,
+    mtime_ms: i64,
+    size: u64,
+) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT INTO ingest_file_cursors(source, path, mtime_ms, size) VALUES (?1,?2,?3,?4)
+         ON CONFLICT(source, path) DO UPDATE SET mtime_ms=excluded.mtime_ms, size=excluded.size",
+        params![source, path.to_string_lossy(), mtime_ms, size as i64],
+    )?;
+    Ok(())
+}
+
+/// Positional params shared by the tool_call upserts and `commit_ingest` (`?1..?9`).
+fn tool_call_params(tc: &ToolCall) -> [Box<dyn rusqlite::ToSql + '_>; 9] {
+    [
+        Box::new(&tc.id),
+        Box::new(&tc.session_id),
+        Box::new(tc.turn_seq as i64),
+        Box::new(&tc.name),
+        Box::new(serde_json::to_string(&tc.input).unwrap()),
+        Box::new(&tc.output),
+        Box::new(&tc.status),
+        Box::new(tc.duration_ms.map(|v| v as i64)),
+        Box::new(tc.created_at.map(|v| v.to_rfc3339())),
+    ]
+}
+
+fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    crate::migrations::migrations().to_latest(conn)?;
+    Ok(())
+}
+
+/// Positional params shared by the single and batch turn upserts (`?1..?13`).
+fn turn_params(t: &Turn) -> [Box<dyn rusqlite::ToSql + '_>; 13] {
+    let tok = t.tokens.as_ref();
+    [
+        Box::new(&t.id),
+        Box::new(&t.session_id),
+        Box::new(t.seq as i64),
+        Box::new(&t.user_text),
+        Box::new(&t.assistant_text),
+        Box::new(t.started_at.map(|v| v.to_rfc3339())),
+        Box::new(t.ended_at.map(|v| v.to_rfc3339())),
+        Box::new(tok.map(|v| v.input as i64)),
+        Box::new(tok.map(|v| v.output as i64)),
+        Box::new(t.cost_usd),
+        Box::new(tok.map(|v| v.cache_read as i64)),
+        Box::new(tok.map(|v| v.cache_write as i64)),
+        Box::new(tok.map(|v| v.reasoning as i64)),
+    ]
 }
 
 fn exec_upsert_session(conn: &Connection, s: &Session) -> Result<(), StoreError> {
@@ -557,8 +633,8 @@ fn exec_upsert_session(conn: &Connection, s: &Session) -> Result<(), StoreError>
             id,source,project,project_path,title,model,status,awaiting_reason,
             started_at,updated_at,ended_at,duration_secs,
             input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,reasoning_tokens,
-            cost_usd,turn_count,tool_call_count,subagent_count,tags,starred,pid,cwd
-        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)
+            cost_usd,turn_count,tool_call_count,subagent_count,tags,starred,pid,cwd,cost_basis,pricing_key
+        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27)
         ON CONFLICT(id) DO UPDATE SET
             source=excluded.source, project=excluded.project, project_path=excluded.project_path,
             title=excluded.title, model=excluded.model, status=excluded.status,
@@ -569,7 +645,7 @@ fn exec_upsert_session(conn: &Connection, s: &Session) -> Result<(), StoreError>
             reasoning_tokens=excluded.reasoning_tokens, cost_usd=excluded.cost_usd,
             turn_count=excluded.turn_count, tool_call_count=excluded.tool_call_count,
             subagent_count=excluded.subagent_count, tags=excluded.tags, starred=excluded.starred,
-            pid=excluded.pid, cwd=excluded.cwd
+            pid=excluded.pid, cwd=excluded.cwd, cost_basis=excluded.cost_basis, pricing_key=excluded.pricing_key
         "#,
         params![
             s.id,
@@ -597,12 +673,14 @@ fn exec_upsert_session(conn: &Connection, s: &Session) -> Result<(), StoreError>
             if s.starred { 1 } else { 0 },
             s.pid.map(|v| v as i64),
             s.cwd,
+            s.cost_basis.as_str(),
+            s.pricing_key,
         ],
     )?;
     Ok(())
 }
 
-fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
+pub(crate) fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
     let source_str: String = row.get("source")?;
     let status_str: String = row.get("status")?;
     let awaiting_str: Option<String> = row.get("awaiting_reason")?;
@@ -610,7 +688,10 @@ fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
     let updated: String = row.get("updated_at")?;
     let ended: Option<String> = row.get("ended_at")?;
     let tags_str: String = row.get("tags")?;
-    let parse_dt = |s: String| s.parse::<DateTime<Utc>>().unwrap_or_else(|_| Utc::now());
+    let parse_opt = |s: String| s.parse::<DateTime<Utc>>().ok();
+    let updated_at = updated
+        .parse::<DateTime<Utc>>()
+        .map_err(|_| bad_column("updated_at", &updated))?;
     Ok(Session {
         id: row.get("id")?,
         source: serde_json::from_str(&source_str).unwrap_or(SessionSource::Unknown(source_str)),
@@ -620,9 +701,9 @@ fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
         model: row.get("model")?,
         status: serde_json::from_str(&status_str).unwrap_or(SessionStatus::Idle),
         awaiting_reason: awaiting_str.and_then(|s| serde_json::from_str(&s).ok()),
-        started_at: started.map(parse_dt),
-        updated_at: parse_dt(updated),
-        ended_at: ended.map(parse_dt),
+        started_at: started.and_then(parse_opt),
+        updated_at,
+        ended_at: ended.and_then(parse_opt),
         duration_secs: row
             .get::<_, Option<i64>>("duration_secs")?
             .map(|v| v as u64),
@@ -642,6 +723,12 @@ fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
                 cache_read_usd: 0.0,
                 cache_write_usd: 0.0,
             }),
+        cost_basis: match row.get::<_, Option<String>>("cost_basis")?.as_deref() {
+            Some("provider") => crate::model::CostBasis::Provider,
+            Some("estimated") => crate::model::CostBasis::Estimated,
+            _ => crate::model::CostBasis::Unknown,
+        },
+        pricing_key: row.get("pricing_key")?,
         turn_count: row.get::<_, i64>("turn_count")? as u32,
         tool_call_count: row.get::<_, i64>("tool_call_count")? as u32,
         subagent_count: row.get::<_, i64>("subagent_count")? as u32,
@@ -656,24 +743,19 @@ fn row_to_turn(row: &rusqlite::Row) -> rusqlite::Result<Turn> {
     let started: Option<String> = row.get("started_at")?;
     let ended: Option<String> = row.get("ended_at")?;
     let parse_dt = |s: String| s.parse::<DateTime<Utc>>().ok();
-    let input: Option<i64> = row.get("input_tokens")?;
-    let output: Option<i64> = row.get("output_tokens")?;
-    let tokens = match (input, output) {
-        (Some(i), Some(o)) => Some(TokenUsage {
+    let col = |name: &str| {
+        row.get::<_, Option<i64>>(name)
+            .map(|v| v.unwrap_or(0) as u64)
+    };
+    let tokens = match row.get::<_, Option<i64>>("input_tokens")? {
+        Some(i) => Some(TokenUsage {
             input: i as u64,
-            output: o as u64,
-            cache_read: 0,
-            cache_write: 0,
-            reasoning: 0,
+            output: col("output_tokens")?,
+            cache_read: col("cache_read_tokens")?,
+            cache_write: col("cache_write_tokens")?,
+            reasoning: col("reasoning_tokens")?,
         }),
-        (Some(i), None) => Some(TokenUsage {
-            input: i as u64,
-            output: 0,
-            cache_read: 0,
-            cache_write: 0,
-            reasoning: 0,
-        }),
-        _ => None,
+        None => None,
     };
     Ok(Turn {
         id: row.get("id")?,
@@ -692,7 +774,7 @@ fn row_to_file_event(row: &rusqlite::Row) -> rusqlite::Result<crate::model::File
     let at_str: String = row.get("at")?;
     let at = at_str
         .parse::<DateTime<Utc>>()
-        .unwrap_or_else(|_| Utc::now());
+        .map_err(|_| bad_column("at", &at_str))?;
     Ok(crate::model::FileEvent {
         id: row.get("id")?,
         session_id: row.get("session_id")?,
@@ -728,4 +810,239 @@ fn row_to_tool_call(row: &rusqlite::Row) -> rusqlite::Result<ToolCall> {
         duration_ms: row.get::<_, Option<i64>>("duration_ms")?.map(|v| v as u64),
         created_at: created.and_then(|s| s.parse::<DateTime<Utc>>().ok()),
     })
+}
+
+#[cfg(test)]
+mod commit_tests {
+    use super::*;
+    use crate::ingest::IngestBundle;
+    use crate::migrations::tests::session;
+
+    fn turn(id: &str, session_id: &str, seq: u32) -> Turn {
+        Turn {
+            id: id.into(),
+            session_id: session_id.into(),
+            seq,
+            user_text: Some(format!("turn {id}")),
+            assistant_text: None,
+            started_at: None,
+            ended_at: None,
+            tokens: None,
+            cost_usd: None,
+        }
+    }
+
+    fn tool_call(id: &str, session_id: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            session_id: session_id.into(),
+            turn_seq: 1,
+            name: "Read".into(),
+            input: serde_json::json!({}),
+            output: None,
+            status: "ok".into(),
+            duration_ms: None,
+            created_at: None,
+        }
+    }
+
+    fn bundle(sessions: Vec<Session>, turns: Vec<Turn>) -> IngestBundle {
+        IngestBundle {
+            sessions,
+            turns,
+            file_cursors: vec![(PathBuf::from("/logs/s1.jsonl"), 10, 20)],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn failed_commit_leaves_cursor_unadvanced() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        let b = bundle(vec![session("s1")], vec![turn("t1", "not-in-bundle", 1)]);
+        assert!(store.commit_ingest("claude_code", &b).is_err());
+        assert!(store.load_file_cursors("claude_code").unwrap().is_empty());
+        assert!(store.get_session("s1").unwrap().is_none());
+    }
+
+    #[test]
+    fn second_commit_does_not_duplicate_children() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        let mut b = bundle(
+            vec![session("s1")],
+            vec![turn("a", "s1", 1), turn("b", "s1", 2)],
+        );
+        b.tool_calls = vec![tool_call("tc1", "s1")];
+        b.file_events = vec![crate::model::FileEvent {
+            id: "fe1".into(),
+            session_id: "s1".into(),
+            path: "/p".into(),
+            kind: "edit".into(),
+            at: Utc::now(),
+        }];
+        b.subagents = vec![crate::model::Subagent {
+            id: "sub1".into(),
+            session_id: "s1".into(),
+            parent_tool_call_id: None,
+            kind: "task".into(),
+            status: "done".into(),
+            task: None,
+        }];
+        let first = store.commit_ingest("claude_code", &b).unwrap();
+        let second = store.commit_ingest("claude_code", &b).unwrap();
+        assert_eq!(first, second);
+        assert_eq!((first.sessions, first.turns, first.tool_calls), (1, 2, 1));
+        assert_eq!((first.file_events, first.subagents), (1, 1));
+        assert_eq!(store.get_turns("s1").unwrap().len(), 2);
+        assert_eq!(store.get_tool_calls("s1").unwrap().len(), 1);
+        assert_eq!(store.get_file_events("s1").unwrap().len(), 1);
+        assert_eq!(store.get_subagents("s1").unwrap().len(), 1);
+        let cursors = store.load_file_cursors("claude_code").unwrap();
+        assert_eq!(cursors.get(Path::new("/logs/s1.jsonl")), Some(&(10, 20)));
+    }
+
+    #[test]
+    fn repeated_child_ids_in_one_session_do_not_roll_back() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        let mut b = bundle(vec![session("s1")], vec![turn("a", "s1", 1)]);
+        let mut dup = tool_call("tc1", "s1");
+        dup.name = "second".into();
+        b.tool_calls = vec![tool_call("tc1", "s1"), dup];
+        let sub = |task: &str| crate::model::Subagent {
+            id: "sub1".into(),
+            session_id: "s1".into(),
+            parent_tool_call_id: None,
+            kind: "task".into(),
+            status: "done".into(),
+            task: Some(task.into()),
+        };
+        b.subagents = vec![sub("old"), sub("new")];
+        let stats = store.commit_ingest("claude_code", &b).unwrap();
+        assert_eq!((stats.tool_calls, stats.subagents), (1, 1));
+        assert_eq!(store.get_tool_calls("s1").unwrap()[0].name, "second");
+        assert_eq!(
+            store.get_subagents("s1").unwrap()[0].task.as_deref(),
+            Some("new")
+        );
+    }
+
+    #[test]
+    fn legacy_row_holding_a_scoped_id_is_kept_and_does_not_block_the_commit() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        let sub = |id: &str, session: &str, parent: Option<&str>| crate::model::Subagent {
+            id: id.into(),
+            session_id: session.into(),
+            parent_tool_call_id: parent.map(str::to_string),
+            kind: "task".into(),
+            status: "done".into(),
+            task: None,
+        };
+        let mut legacy = bundle(vec![session("old")], vec![]);
+        let mut legacy_call = tool_call("s:call", "old");
+        legacy_call.name = "legacy".into();
+        legacy.tool_calls = vec![legacy_call];
+        legacy.subagents = vec![sub("s:sub", "old", Some("s:call"))];
+        store.commit_ingest("codex", &legacy).unwrap();
+
+        let mut new = bundle(vec![session("s")], vec![]);
+        new.tool_calls = vec![tool_call("s:call", "s")];
+        new.subagents = vec![sub("s:sub", "s", Some("s:call"))];
+        new.file_cursors = vec![("/s.jsonl".into(), 1, 1)];
+        let stats = store.commit_ingest("codex", &new).unwrap();
+        assert_eq!((stats.tool_calls, stats.subagents), (1, 1));
+        assert!(store
+            .load_file_cursors("codex")
+            .unwrap()
+            .contains_key(std::path::Path::new("/s.jsonl")));
+
+        assert_eq!(store.get_tool_calls("s").unwrap()[0].id, "s:call");
+        let kept = store.get_tool_calls("old").unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            (kept[0].id.as_str(), kept[0].name.as_str()),
+            ("old:s:call", "legacy")
+        );
+        let kept_sub = store.get_subagents("old").unwrap();
+        assert_eq!(kept_sub[0].id, "old:s:sub");
+        assert_eq!(
+            kept_sub[0].parent_tool_call_id.as_deref(),
+            Some("old:s:call")
+        );
+        assert_eq!(
+            store.get_subagents("s").unwrap()[0]
+                .parent_tool_call_id
+                .as_deref(),
+            Some("s:call")
+        );
+    }
+
+    #[test]
+    fn occupied_rekey_destination_does_not_block_the_commit() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        let sub = |id: &str, session: &str, parent: Option<&str>| crate::model::Subagent {
+            id: id.into(),
+            session_id: session.into(),
+            parent_tool_call_id: parent.map(str::to_string),
+            kind: "task".into(),
+            status: "done".into(),
+            task: None,
+        };
+        let mut legacy = bundle(vec![session("old")], vec![]);
+        legacy.tool_calls = vec![tool_call("s:call", "old"), tool_call("old:s:call", "old")];
+        legacy.subagents = vec![
+            sub("s:sub", "old", Some("s:call")),
+            sub("old:s:sub", "old", Some("old:s:call")),
+        ];
+        store.commit_ingest("codex", &legacy).unwrap();
+
+        let mut new = bundle(vec![session("s")], vec![]);
+        new.tool_calls = vec![tool_call("s:call", "s")];
+        new.subagents = vec![sub("s:sub", "s", Some("s:call"))];
+        new.file_cursors = vec![("/s.jsonl".into(), 1, 1)];
+        store.commit_ingest("codex", &new).unwrap();
+        assert!(store
+            .load_file_cursors("codex")
+            .unwrap()
+            .contains_key(std::path::Path::new("/s.jsonl")));
+
+        assert_eq!(store.get_tool_calls("s").unwrap()[0].id, "s:call");
+        let mut kept: Vec<_> = store
+            .get_tool_calls("old")
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        kept.sort();
+        assert_eq!(kept, ["old:old:s:call", "old:s:call"]);
+        let parents: std::collections::HashMap<_, _> = store
+            .get_subagents("old")
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.id, s.parent_tool_call_id))
+            .collect();
+        assert_eq!(parents["old:old:s:sub"].as_deref(), Some("old:old:s:call"));
+        assert_eq!(parents["old:s:sub"].as_deref(), Some("old:s:call"));
+    }
+
+    #[test]
+    fn rewrite_with_shifted_seq_succeeds() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        let b = bundle(
+            vec![session("s1")],
+            vec![turn("a", "s1", 1), turn("b", "s1", 2), turn("c", "s1", 3)],
+        );
+        store.commit_ingest("claude_code", &b).unwrap();
+        let b = bundle(
+            vec![session("s1")],
+            vec![turn("d", "s1", 1), turn("e", "s1", 2)],
+        );
+        let stats = store.commit_ingest("claude_code", &b).unwrap();
+        assert_eq!(stats.turns, 2);
+        let ids: Vec<String> = store
+            .get_turns("s1")
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(ids, ["d", "e"]);
+    }
 }

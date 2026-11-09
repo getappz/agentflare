@@ -397,6 +397,10 @@ pub fn run(agent: Option<&str>, json: bool) {
     }
 
     let mbx = crate::mbx::MbxStatus::collect();
+    // Advisory only: never part of `healthy`. Liveness (DB reachable) and
+    // readiness (embedding model) are reported separately from quality counts;
+    // quality never writes and never fails the exit code.
+    let memory = crate::memory::quality::MemoryQualityReport::collect();
     // Advisory only: never part of `healthy`, so an unset name cannot make
     // `doctor` exit non-zero.
     let machine_name = crate::github::bridge::config::read_machine_name();
@@ -410,6 +414,7 @@ pub fn run(agent: Option<&str>, json: bool) {
             stale_rules: &'a [StaleRule],
             stale_hooks: &'a [StaleHook],
             mbx: &'a crate::mbx::MbxStatus,
+            memory: &'a crate::memory::quality::MemoryQualityReport,
             machine_name: Option<&'a str>,
             healthy: bool,
         }
@@ -420,6 +425,7 @@ pub fn run(agent: Option<&str>, json: bool) {
                 stale_rules: &stale,
                 stale_hooks: &stale_hooks,
                 mbx: &mbx,
+                memory: &memory,
                 machine_name: machine_name.as_deref(),
                 healthy,
             })
@@ -466,12 +472,7 @@ pub fn run(agent: Option<&str>, json: bool) {
         }
 
         println!("{}", mbx.format_text());
-        match crate::memory::engine::unavailable_reason() {
-            Some(why) => {
-                println!("semantic search: unavailable ({why}); skill search is keyword-only")
-            }
-            None => println!("semantic search: ok"),
-        }
+        println!("{}", memory.format_text());
         match &machine_name {
             Some(name) => println!("machine-name: {name}"),
             None => println!(

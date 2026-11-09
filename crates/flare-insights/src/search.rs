@@ -1,5 +1,5 @@
-use crate::model::Session;
 use crate::store::InsightsStore;
+use crate::store_query::{SearchFilters, SearchHit};
 
 #[derive(Debug, Clone)]
 pub struct SearchOptions {
@@ -26,82 +26,49 @@ impl Default for SearchOptions {
     }
 }
 
-// DRY: base search over turns FTS
-pub fn search(store: &InsightsStore, opts: &SearchOptions) -> anyhow::Result<Vec<Session>> {
+/// Search turns; returns one [`SearchHit`] per matching session.
+pub fn search(store: &InsightsStore, opts: &SearchOptions) -> anyhow::Result<Vec<SearchHit>> {
     if opts.query.trim().is_empty() {
-        return Ok(store.list_sessions(opts.limit, opts.offset)?);
+        let sessions = store.list_sessions_filtered(
+            opts.source.as_deref(),
+            opts.project.as_deref(),
+            opts.limit,
+            opts.offset,
+        )?;
+        return Ok(sessions
+            .into_iter()
+            .map(|session| SearchHit {
+                session,
+                turn_seq: 0,
+                rank: 0.0,
+                snippet: String::new(),
+            })
+            .collect());
     }
-    let q = flare_search_kit::fts_phrase_query(&opts.query);
-    let mut results = store.search_sessions(&q, opts.limit + opts.offset)?;
 
-    // DRY: optionally extend with file_events/tool_calls matches (for opencode/claude)
-    if opts.include_files || opts.include_tools {
-        let extra = search_by_files_and_tools(store, &opts.query, opts.limit)?;
-        for s in extra {
-            if !results.iter().any(|r| r.id == s.id) {
-                results.push(s);
-            }
-        }
-        // re-sort by updated_at desc and limit
-        results.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
-        results.truncate(opts.limit + opts.offset);
-    }
-
-    if let Some(src) = &opts.source {
-        results.retain(|s| s.source.as_str() == src);
-    }
-    if let Some(proj) = &opts.project {
-        results.retain(|s| s.project == *proj);
-    }
-    let start = opts.offset.min(results.len());
-    let end = (start + opts.limit).min(results.len());
-    Ok(results[start..end].to_vec())
-}
-
-fn search_by_files_and_tools(
-    store: &InsightsStore,
-    query: &str,
-    limit: usize,
-) -> anyhow::Result<Vec<Session>> {
-    let mut out = Vec::new();
-    let q = format!("%{}%", query);
-    // file_events path LIKE
-    if let Ok(sessions) = store.search_sessions_by_file_path(&q, limit) {
-        out.extend(sessions);
-    }
-    // tool_calls name LIKE
-    if let Ok(sessions) = store.search_sessions_by_tool(&q, limit) {
-        for s in sessions {
-            if !out.iter().any(|r: &Session| r.id == s.id) {
-                out.push(s);
-            }
-        }
-    }
-    Ok(out)
+    let f = SearchFilters {
+        source: opts.source.clone(),
+        project_prefix: opts.project.clone(),
+        since: None,
+        limit: opts.limit,
+        offset: opts.offset,
+    };
+    Ok(store.search_hits(&opts.query, &f)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::*;
+    use crate::store_query::SearchHit;
     use chrono::Utc;
-    #[test]
-    fn sanitize() {
-        assert_eq!(
-            flare_search_kit::fts_phrase_query("hello world"),
-            "\"hello\" \"world\""
-        );
-        assert_eq!(flare_search_kit::fts_phrase_query("hello"), "\"hello\"");
-        assert_eq!(flare_search_kit::fts_phrase_query("gpt-4"), "\"gpt-4\"");
-    }
-    #[test]
-    fn search_empty_returns_list() {
-        let store = crate::store::InsightsStore::open_in_memory().unwrap();
-        let s = Session {
-            id: "s1".into(),
-            source: SessionSource::ClaudeCode,
+
+    fn sample_session(id: &str, source: SessionSource, cwd: Option<&str>) -> Session {
+        Session {
+            id: id.into(),
+            source,
             project: "demo".into(),
-            project_path: None,
+            project_path: cwd.map(str::to_string),
             title: None,
             model: None,
             status: SessionStatus::Completed,
@@ -111,24 +78,237 @@ mod tests {
             ended_at: None,
             duration_secs: None,
             tokens: TokenUsage {
-                input: 10,
-                output: 5,
+                input: 0,
+                output: 0,
                 cache_read: 0,
                 cache_write: 0,
                 reasoning: 0,
             },
             cost: None,
+            cost_basis: CostBasis::Unknown,
+            pricing_key: None,
             turn_count: 1,
             tool_call_count: 0,
             subagent_count: 0,
             tags: vec![],
             starred: false,
             pid: None,
-            cwd: None,
-        };
-        store.upsert_session(&s).unwrap();
+            cwd: cwd.map(str::to_string),
+        }
+    }
+
+    fn sample_turn(id: &str, session_id: &str, seq: u32, text: &str) -> Turn {
+        Turn {
+            id: id.into(),
+            session_id: session_id.into(),
+            seq,
+            user_text: Some(text.into()),
+            assistant_text: Some(text.into()),
+            started_at: None,
+            ended_at: None,
+            tokens: None,
+            cost_usd: None,
+        }
+    }
+
+    #[test]
+    fn sanitize() {
+        assert_eq!(
+            flare_search_kit::fts_phrase_query("hello world"),
+            "\"hello\" \"world\""
+        );
+        assert_eq!(flare_search_kit::fts_phrase_query("hello"), "\"hello\"");
+        assert_eq!(flare_search_kit::fts_phrase_query("gpt-4"), "\"gpt-4\"");
+    }
+
+    #[test]
+    fn search_empty_returns_list() {
+        let store = crate::store::InsightsStore::open_in_memory().unwrap();
+        store
+            .upsert_session(&sample_session("s1", SessionSource::ClaudeCode, None))
+            .unwrap();
         let opts = SearchOptions::default();
         let res = search(&store, &opts).unwrap();
         assert_eq!(res.len(), 1);
+        assert_eq!(res[0].session.id, "s1");
+        assert_eq!(res[0].turn_seq, 0);
+        assert_eq!(res[0].rank, 0.0);
+        assert!(res[0].snippet.is_empty());
+    }
+
+    #[test]
+    fn project_filter_survives_limit_smaller_than_other_project_hits() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        let marker = "needlemarker";
+        for i in 0..50 {
+            let id = format!("a{i}");
+            store
+                .upsert_session(&sample_session(&id, SessionSource::Codex, Some("/proj/a")))
+                .unwrap();
+            store
+                .upsert_turn(&sample_turn(&format!("t-{id}"), &id, 1, marker))
+                .unwrap();
+        }
+        for i in 0..5 {
+            let id = format!("b{i}");
+            store
+                .upsert_session(&sample_session(&id, SessionSource::Codex, Some("/proj/b")))
+                .unwrap();
+            store
+                .upsert_turn(&sample_turn(&format!("t-{id}"), &id, 1, marker))
+                .unwrap();
+        }
+        let opts = SearchOptions {
+            query: marker.into(),
+            project: Some("/proj/b".into()),
+            limit: 10,
+            ..Default::default()
+        };
+        let res = search(&store, &opts).unwrap();
+        assert_eq!(res.len(), 5);
+        let mut ids: Vec<_> = res.iter().map(|h| h.session.id.as_str()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 5);
+        for h in &res {
+            assert!(
+                h.session.cwd.as_deref() == Some("/proj/b")
+                    || h.session.project_path.as_deref() == Some("/proj/b")
+            );
+        }
+    }
+
+    #[test]
+    fn one_hit_per_session_even_when_many_turns_match() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        store
+            .upsert_session(&sample_session("multi", SessionSource::ClaudeCode, None))
+            .unwrap();
+        for seq in 1..=8 {
+            store
+                .upsert_turn(&sample_turn(
+                    &format!("t{seq}"),
+                    "multi",
+                    seq,
+                    "sharedphrase content",
+                ))
+                .unwrap();
+        }
+        let opts = SearchOptions {
+            query: "sharedphrase".into(),
+            limit: 20,
+            ..Default::default()
+        };
+        let res = search(&store, &opts).unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].session.id, "multi");
+        assert!(res[0].turn_seq >= 1);
+        assert!(!res[0].snippet.is_empty());
+    }
+
+    #[test]
+    fn empty_query_honours_source_filter() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        store
+            .upsert_session(&sample_session("c1", SessionSource::ClaudeCode, None))
+            .unwrap();
+        store
+            .upsert_session(&sample_session("x1", SessionSource::Codex, None))
+            .unwrap();
+        let opts = SearchOptions {
+            query: String::new(),
+            source: Some("claude_code".into()),
+            limit: 10,
+            ..Default::default()
+        };
+        let res = search(&store, &opts).unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].session.id, "c1");
+        assert_eq!(res[0].turn_seq, 0);
+        assert_eq!(res[0].rank, 0.0);
+        assert!(res[0].snippet.is_empty());
+    }
+
+    #[test]
+    fn two_char_query_uses_like_fallback() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        store
+            .upsert_session(&sample_session("sxy", SessionSource::Codex, None))
+            .unwrap();
+        store
+            .upsert_turn(&sample_turn("t1", "sxy", 1, "find xy here"))
+            .unwrap();
+        store
+            .upsert_session(&sample_session("sno", SessionSource::Codex, None))
+            .unwrap();
+        store
+            .upsert_turn(&sample_turn("t2", "sno", 1, "nothing relevant"))
+            .unwrap();
+        let opts = SearchOptions {
+            query: "xy".into(),
+            limit: 10,
+            ..Default::default()
+        };
+        let res = search(&store, &opts).unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].session.id, "sxy");
+        let _hit: &SearchHit = &res[0];
+    }
+
+    #[test]
+    fn snippet_comes_from_the_column_that_matched() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        store
+            .upsert_session(&sample_session("u", SessionSource::Codex, None))
+            .unwrap();
+        let mut turn = sample_turn("t1", "u", 1, "needleword in the question");
+        turn.assistant_text = Some("an unrelated reply".into());
+        store.upsert_turn(&turn).unwrap();
+        let opts = SearchOptions {
+            query: "needleword".into(),
+            limit: 10,
+            ..Default::default()
+        };
+        let res = search(&store, &opts).unwrap();
+        assert_eq!(res.len(), 1);
+        assert!(
+            res[0].snippet.contains("[needleword]"),
+            "{}",
+            res[0].snippet
+        );
+    }
+
+    #[test]
+    fn tied_hits_page_in_a_stable_order() {
+        for (query, text) in [("zq", "zq short"), ("tiedphrase", "tiedphrase text")] {
+            let store = InsightsStore::open_in_memory().unwrap();
+            for id in ["c", "a", "b"] {
+                store
+                    .upsert_session(&sample_session(id, SessionSource::Codex, None))
+                    .unwrap();
+                store
+                    .upsert_turn(&sample_turn(&format!("t{id}"), id, 1, text))
+                    .unwrap();
+            }
+            store
+                .conn
+                .execute(
+                    "UPDATE sessions SET updated_at = '2026-01-01T00:00:00+00:00'",
+                    [],
+                )
+                .unwrap();
+            let paged: Vec<String> = (0..3)
+                .map(|offset| {
+                    let opts = SearchOptions {
+                        query: query.into(),
+                        limit: 1,
+                        offset,
+                        ..Default::default()
+                    };
+                    search(&store, &opts).unwrap()[0].session.id.clone()
+                })
+                .collect();
+            assert_eq!(paged, ["a", "b", "c"], "query {query}");
+        }
     }
 }

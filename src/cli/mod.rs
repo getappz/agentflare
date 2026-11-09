@@ -23,6 +23,7 @@ mod handoff;
 mod hook;
 mod init;
 mod insights;
+mod insights_reflect;
 mod item;
 mod job;
 mod mcp;

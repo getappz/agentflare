@@ -98,11 +98,17 @@ fn resolve_project_registers_the_worktree_redirected_root_not_the_raw_repo_root(
     // expectation below must be computed the same way.
     let repo_root = dunce::canonicalize(repo_dir.path()).unwrap();
     let run_git = |args: &[&str]| {
-        std::process::Command::new("git")
+        let out = std::process::Command::new("git")
             .args(args)
             .current_dir(&repo_root)
+            .env("AGENTFLARE_GIT_BYPASS", "1")
             .output()
-            .unwrap()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     };
     run_git(&["init", "-b", "master"]);
     run_git(&["config", "user.email", "test@test.com"]);
@@ -268,3 +274,107 @@ fn register_project_dir_refuses_to_steal_a_folder_path_claimed_by_another_projec
 // depend on what markers happen to exist above the OS temp directory on
 // whatever machine runs this — not a property this test can control. The
 // fallback itself is a single trivial `None => return start`.
+
+#[test]
+fn resolve_project_ignores_matching_external_id_with_wrong_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("backend.db");
+    let repo_key = "git:getappz/wrong-source-repo";
+    let s = AgentflareMcp {
+        backend_db_override: Some(db_path.clone()),
+        backend_project_link_override: Some(tmp.path().join("project.json")),
+        backend_repo_key_override: Some(repo_key.to_string()),
+        ..Default::default()
+    };
+    let conn = agentflare_backend::db::open_db(&db_path).unwrap();
+    let ws = AgentflareMcp::resolve_workspace_id(&conn).unwrap();
+    let foreign = agentflare_backend::project::create(
+        &conn,
+        agentflare_backend::project::CreateProject {
+            workspace_id: ws,
+            name: "foreign-bridge".into(),
+            identifier: "FOREIGN".into(),
+            external_source: Some("github".into()),
+            external_id: Some(repo_key.to_string()),
+        },
+    )
+    .unwrap();
+
+    let resolved = s.resolve_project(&conn).unwrap();
+    assert_ne!(
+        resolved.id, foreign.id,
+        "must not adopt a project whose external_source is not agentflare-repo"
+    );
+    assert_eq!(
+        resolved.external_source.as_deref(),
+        Some("agentflare-repo"),
+        "auto-provisioned project must carry the repo source marker"
+    );
+    assert_eq!(resolved.external_id.as_deref(), Some(repo_key));
+}
+
+#[test]
+fn resolve_project_in_linked_worktree_reconnects_to_main_project() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_root = dunce::canonicalize(repo_dir.path()).unwrap();
+
+    let run_git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo_root)
+            .env("AGENTFLARE_GIT_BYPASS", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    };
+    run_git(&["init", "-b", "master"]);
+    run_git(&["config", "user.email", "test@test.com"]);
+    run_git(&["config", "user.name", "Test"]);
+    run_git(&["commit", "--allow-empty", "-m", "initial"]);
+    run_git(&[
+        "remote",
+        "add",
+        "origin",
+        "https://github.com/getappz/cli.git",
+    ]);
+
+    let toplevel = String::from_utf8(run_git(&["rev-parse", "--show-toplevel"]).stdout).unwrap();
+    assert_eq!(
+        dunce::canonicalize(toplevel.trim()).unwrap(),
+        repo_root,
+        "fixture must be rooted at repo_root"
+    );
+    let origin = String::from_utf8(run_git(&["remote", "get-url", "origin"]).stdout).unwrap();
+    assert_eq!(origin.trim(), "https://github.com/getappz/cli.git");
+    let head = String::from_utf8(run_git(&["rev-parse", "HEAD"]).stdout).unwrap();
+    assert!(!head.trim().is_empty(), "fixture must have a commit");
+
+    let scratch = tempfile::tempdir().unwrap();
+    let db_path = scratch.path().join("backend.db");
+    let main_s = AgentflareMcp {
+        backend_db_override: Some(db_path.clone()),
+        backend_project_link_override: Some(repo_root.join(".agentflare").join("project.json")),
+        worktree_repo_root_override: Some(repo_root.clone()),
+        ..Default::default()
+    };
+    let conn = agentflare_backend::db::open_db(&db_path).unwrap();
+    let main_project = main_s.resolve_project(&conn).unwrap();
+
+    // Worktree instance shares worktree_repo_root (main checkout) and has no link file in worktree
+    let wt_s = AgentflareMcp {
+        backend_db_override: Some(db_path.clone()),
+        worktree_repo_root_override: Some(repo_root.clone()),
+        ..Default::default()
+    };
+
+    let wt_project = wt_s.resolve_project(&conn).unwrap();
+    assert_eq!(
+        wt_project.id, main_project.id,
+        "worktree session must resolve to the main project, never fork a duplicate"
+    );
+}

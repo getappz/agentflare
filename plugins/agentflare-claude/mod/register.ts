@@ -40,7 +40,7 @@ export const register: Register = (on, options) => {
   registerGuard(on, {
     client: () => client,
     agent: AGENT,
-    options: { readOnlyAutoAllow: options.readOnlyAutoAllow !== false, guardTimeoutMs },
+    options: { readOnlyAutoAllow: options.readOnlyAutoAllow === true, guardTimeoutMs },
     onItemDone: () => setCurrent({}),
   })
 

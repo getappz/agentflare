@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use walkdir::WalkDir;
 
+use super::scoped_id;
 use crate::config::InsightsConfig;
 use crate::config::PricingTable;
 use crate::ingest::{
@@ -146,8 +147,8 @@ fn parse_claude_jsonl(path: &Path) -> Option<IngestBundle> {
                 .get("id")
                 .or_else(|| v.get("uuid"))
                 .and_then(|id| id.as_str())
-                .unwrap_or(&format!("{}-sub-{}", id, subagents.len()))
-                .to_string();
+                .map(|raw| format!("{id}:{raw}"))
+                .unwrap_or_else(|| format!("{}-sub-{}", id, subagents.len()));
             let task = v
                 .get("task")
                 .or_else(|| v.get("content"))
@@ -198,7 +199,7 @@ fn parse_claude_jsonl(path: &Path) -> Option<IngestBundle> {
                         if let Some(index) = c
                             .get("tool_use_id")
                             .and_then(|id| id.as_str())
-                            .and_then(|id| tool_indices.get(id))
+                            .and_then(|raw| tool_indices.get(&scoped_id(&id, raw)))
                             .copied()
                         {
                             let tool: &mut ToolCall = &mut tool_calls[index];
@@ -221,8 +222,8 @@ fn parse_claude_jsonl(path: &Path) -> Option<IngestBundle> {
                         let call_id = c
                             .get("id")
                             .and_then(|v| v.as_str())
-                            .unwrap_or(&format!("{}-{}-tool-{}", id, seq, tool_calls.len()))
-                            .to_string();
+                            .map(|raw| scoped_id(&id, raw))
+                            .unwrap_or_else(|| format!("{}-{}-tool-{}", id, seq, tool_calls.len()));
                         let name = c
                             .get("name")
                             .and_then(|v| v.as_str())
@@ -273,15 +274,11 @@ fn parse_claude_jsonl(path: &Path) -> Option<IngestBundle> {
         }
     }
 
-    let cost_for_session = {
-        let pricing = PricingTable::default();
-        let c = pricing.cost_for(model.as_deref(), &tokens);
-        if c.total_usd > 0.0 {
-            Some(c)
-        } else {
-            None
-        }
-    };
+    let (cost, cost_basis, pricing_key) =
+        match PricingTable::default().cost_for(model.as_deref(), &tokens) {
+            Some((cost, key)) => (Some(cost), crate::model::CostBasis::Estimated, Some(key)),
+            None => (None, crate::model::CostBasis::Unknown, None),
+        };
     let session = Session {
         id: id.clone(),
         source: SessionSource::ClaudeCode,
@@ -296,7 +293,9 @@ fn parse_claude_jsonl(path: &Path) -> Option<IngestBundle> {
         ended_at: updated_at,
         duration_secs: None,
         tokens: tokens.clone(),
-        cost: cost_for_session,
+        cost,
+        cost_basis,
+        pricing_key,
         turn_count: turns.len() as u32,
         tool_call_count,
         subagent_count: subagents.len() as u32,
@@ -342,6 +341,38 @@ fn extract_text_from_message(msg: Option<&serde_json::Value>) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn claude_cost_basis_tracks_model_availability() {
+        for (model, expected_key) in [
+            (None, None),
+            (Some("totally-new"), None),
+            (Some("claude-sonnet-4-20250514"), Some("claude-sonnet-4")),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("session.jsonl");
+            let record = serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "model": model,
+                    "content": [{"type": "text", "text": "Answer"}],
+                    "usage": {"input_tokens": 1000000}
+                }
+            });
+            std::fs::write(&path, record.to_string()).unwrap();
+            let bundle = parse_claude_jsonl(&path).unwrap();
+            let session = &bundle.sessions[0];
+            assert_eq!(session.pricing_key.as_deref(), expected_key);
+            if expected_key.is_some() {
+                assert_eq!(session.cost_basis, crate::model::CostBasis::Estimated);
+                assert_eq!(session.cost.as_ref().unwrap().total_usd, 3.0);
+            } else {
+                assert_eq!(session.cost_basis, crate::model::CostBasis::Unknown);
+                assert!(session.cost.is_none());
+            }
+        }
+    }
+
     #[test]
     fn tool_results_preserve_output_errors_and_unfinished_calls() {
         let dir = TempDir::new().unwrap();
@@ -378,6 +409,32 @@ mod tests {
         );
         assert_eq!(bundle.tool_calls[1].status, "completed");
         assert_eq!(bundle.tool_calls[2].status, "pending");
+    }
+
+    #[test]
+    fn forked_sessions_sharing_tool_use_ids_both_commit() {
+        let dir = TempDir::new().unwrap();
+        let record = serde_json::json!({"type":"assistant","uuid":"m1","message":{"content":[
+            {"type":"tool_use","id":"toolu_shared","name":"Task","input":{"description":"x"}}
+        ]}})
+        .to_string();
+        let mut bundle = IngestBundle::default();
+        for name in ["parent.jsonl", "fork.jsonl"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, &record).unwrap();
+            let b = parse_claude_jsonl(&path).unwrap();
+            bundle.sessions.extend(b.sessions);
+            bundle.tool_calls.extend(b.tool_calls);
+            bundle.subagents.extend(b.subagents);
+        }
+        let store = crate::store::InsightsStore::open_in_memory().unwrap();
+        let stats = store.commit_ingest("claude_code", &bundle).unwrap();
+        assert_eq!(
+            (stats.sessions, stats.tool_calls, stats.subagents),
+            (2, 2, 2)
+        );
+        assert_eq!(store.get_tool_calls("parent").unwrap().len(), 1);
+        assert_eq!(store.get_tool_calls("fork").unwrap().len(), 1);
     }
     #[test]
     fn empty_dir_returns_empty() {

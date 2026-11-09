@@ -1,0 +1,6 @@
+---
+source: rusqlite_migration/src/errors/tests.rs
+expression: e
+snapshot_kind: text
+---
+rusqlite_migration unknown error (the library might be out of date): rusqlite_migration error in migration hook: unknown

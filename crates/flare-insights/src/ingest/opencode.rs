@@ -113,7 +113,7 @@ fn try_session_table_dynamic(conn: &rusqlite::Connection) -> Vec<Session> {
         Ok(s) => s,
         Err(_) => return vec![],
     };
-    let col_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+    let col_names: Vec<String> = stmt.column_names().map(|s| s.to_string()).collect();
     let find = |candidates: &[&str]| -> Option<usize> {
         for cand in candidates {
             if let Some(pos) = col_names.iter().position(|c| c == *cand) {
@@ -238,24 +238,23 @@ fn try_session_table_dynamic(conn: &rusqlite::Connection) -> Vec<Session> {
             }
         };
 
-        let model_for_cost = model.clone();
-        let cost_for_session = cost
-            .map(|total_usd| crate::model::Cost {
-                total_usd,
-                input_usd: 0.0,
-                output_usd: 0.0,
-                cache_read_usd: 0.0,
-                cache_write_usd: 0.0,
-            })
-            .or_else(|| {
-                let pricing = PricingTable::default();
-                let c = pricing.cost_for(model_for_cost.as_deref(), &tokens);
-                if c.total_usd > 0.0 {
-                    Some(c)
-                } else {
-                    None
-                }
-            });
+        let (cost_for_session, cost_basis, pricing_key) = match cost {
+            Some(total_usd) => (
+                Some(crate::model::Cost {
+                    total_usd,
+                    input_usd: 0.0,
+                    output_usd: 0.0,
+                    cache_read_usd: 0.0,
+                    cache_write_usd: 0.0,
+                }),
+                crate::model::CostBasis::Provider,
+                None,
+            ),
+            None => match PricingTable::default().cost_for(model.as_deref(), &tokens) {
+                Some((cost, key)) => (Some(cost), crate::model::CostBasis::Estimated, Some(key)),
+                None => (None, crate::model::CostBasis::Unknown, None),
+            },
+        };
         out.push(Session {
             id,
             source: SessionSource::OpenCode,
@@ -271,6 +270,8 @@ fn try_session_table_dynamic(conn: &rusqlite::Connection) -> Vec<Session> {
             duration_secs: None,
             tokens,
             cost: cost_for_session,
+            cost_basis,
+            pricing_key,
             turn_count: 0,
             tool_call_count: 0,
             subagent_count: 0,
@@ -312,6 +313,30 @@ fn try_sessions_table(conn: &rusqlite::Connection) -> Vec<Session> {
         let updated_at = updated_at
             .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
             .unwrap_or_else(chrono::Utc::now);
+        let tokens = TokenUsage {
+            input: input.unwrap_or(0) as u64,
+            output: output.unwrap_or(0) as u64,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+        };
+        let (cost, cost_basis, pricing_key) = match cost {
+            Some(total_usd) => (
+                Some(crate::model::Cost {
+                    total_usd,
+                    input_usd: 0.0,
+                    output_usd: 0.0,
+                    cache_read_usd: 0.0,
+                    cache_write_usd: 0.0,
+                }),
+                crate::model::CostBasis::Provider,
+                None,
+            ),
+            None => match PricingTable::default().cost_for(model.as_deref(), &tokens) {
+                Some((cost, key)) => (Some(cost), crate::model::CostBasis::Estimated, Some(key)),
+                None => (None, crate::model::CostBasis::Unknown, None),
+            },
+        };
         out.push(Session {
             id,
             source: SessionSource::OpenCode,
@@ -325,20 +350,10 @@ fn try_sessions_table(conn: &rusqlite::Connection) -> Vec<Session> {
             updated_at,
             ended_at: None,
             duration_secs: None,
-            tokens: TokenUsage {
-                input: input.unwrap_or(0) as u64,
-                output: output.unwrap_or(0) as u64,
-                cache_read: 0,
-                cache_write: 0,
-                reasoning: 0,
-            },
-            cost: cost.map(|total_usd| crate::model::Cost {
-                total_usd,
-                input_usd: 0.0,
-                output_usd: 0.0,
-                cache_read_usd: 0.0,
-                cache_write_usd: 0.0,
-            }),
+            tokens,
+            cost,
+            cost_basis,
+            pricing_key,
             turn_count: 0,
             tool_call_count: 0,
             subagent_count: 0,
@@ -477,7 +492,7 @@ fn ingest_messages_for_session(
                         let tool_id = if call_id == "unknown" {
                             format!("{}-{}-{}", session_id, seq, tools.len())
                         } else {
-                            call_id.clone()
+                            super::scoped_id(session_id, &call_id)
                         };
                         // DRY file_event
                         if let Some(path) = extract_file_path(tool, &input) {
@@ -596,6 +611,39 @@ mod tests {
     use super::*;
     use crate::ingest::Adapter;
     use std::collections::HashMap;
+
+    #[test]
+    fn opencode_cost_basis_preserves_provider_and_fallback() {
+        for legacy in [false, true] {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            let (table, input, output) = if legacy {
+                ("sessions", "input_tokens", "output_tokens")
+            } else {
+                ("session", "tokens_input", "tokens_output")
+            };
+            conn.execute_batch(&format!("CREATE TABLE {table} (id TEXT, project TEXT, model TEXT, updated_at TEXT, {input} INTEGER, {output} INTEGER, cost REAL);
+                INSERT INTO {table} VALUES ('provider', 'p', 'totally-new', NULL, 1000000, 0, 0.0),
+                    ('estimated', 'p', 'claude-sonnet-4', NULL, 1000000, 0, NULL),
+                    ('unknown', 'p', 'totally-new', NULL, 1000000, 0, NULL);")).unwrap();
+            let sessions = if legacy {
+                try_sessions_table(&conn)
+            } else {
+                try_session_table_dynamic(&conn)
+            };
+            let provider = sessions.iter().find(|s| s.id == "provider").unwrap();
+            assert_eq!(provider.cost_basis, crate::model::CostBasis::Provider);
+            assert_eq!(provider.cost.as_ref().unwrap().total_usd, 0.0);
+            assert!(provider.pricing_key.is_none());
+            let estimated = sessions.iter().find(|s| s.id == "estimated").unwrap();
+            assert_eq!(estimated.cost_basis, crate::model::CostBasis::Estimated);
+            assert_eq!(estimated.cost.as_ref().unwrap().total_usd, 3.0);
+            assert_eq!(estimated.pricing_key.as_deref(), Some("claude-sonnet-4"));
+            let unknown = sessions.iter().find(|s| s.id == "unknown").unwrap();
+            assert_eq!(unknown.cost_basis, crate::model::CostBasis::Unknown);
+            assert!(unknown.cost.is_none());
+            assert!(unknown.pricing_key.is_none());
+        }
+    }
 
     fn fixture_db(path: &std::path::Path) {
         let conn = rusqlite::Connection::open(path).unwrap();

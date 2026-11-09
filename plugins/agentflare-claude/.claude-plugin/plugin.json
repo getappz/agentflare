@@ -37,8 +37,8 @@
     "readOnlyAutoAllow": {
       "type": "boolean",
       "title": "Auto-allow read-only tools",
-      "description": "Let the guard allow read-only tool calls without a prompt.",
-      "default": true
+      "description": "Let the guard turn a permission prompt on a read-only tool into an allow. Off by default: it also overrides your own ask rules.",
+      "default": false
     },
     "guardTimeoutMs": {
       "type": "number",

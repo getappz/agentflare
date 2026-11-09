@@ -172,7 +172,7 @@ fn parse_codex_jsonl(path: &std::path::Path) -> Option<(Session, Vec<Turn>, Vec<
                 .unwrap_or(input);
             tool_indices.insert(call_id.clone(), tool_calls.len());
             tool_calls.push(ToolCall {
-                id: call_id,
+                id: super::scoped_id(&id, &call_id),
                 session_id: id.clone(),
                 turn_seq: seq.max(1),
                 name,
@@ -210,6 +210,11 @@ fn parse_codex_jsonl(path: &std::path::Path) -> Option<(Session, Vec<Turn>, Vec<
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "codex".to_string());
 
+    let (cost, cost_basis, pricing_key) =
+        match crate::config::PricingTable::default().cost_for(model.as_deref(), &tokens) {
+            Some((cost, key)) => (Some(cost), crate::model::CostBasis::Estimated, Some(key)),
+            None => (None, crate::model::CostBasis::Unknown, None),
+        };
     let session = Session {
         id: id.clone(),
         source: SessionSource::Codex,
@@ -224,7 +229,9 @@ fn parse_codex_jsonl(path: &std::path::Path) -> Option<(Session, Vec<Turn>, Vec<
         ended_at: updated_at,
         duration_secs: None,
         tokens: tokens.clone(),
-        cost: None,
+        cost,
+        cost_basis,
+        pricing_key,
         turn_count: turns.len() as u32,
         tool_call_count: tool_calls.len() as u32,
         subagent_count: 0,
@@ -268,6 +275,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn codex_unknown_or_missing_model_is_unpriced() {
+        for model in [None, Some("totally-new")] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("session.jsonl");
+            std::fs::write(
+                &path,
+                serde_json::json!({"model":model,"usage":{"input_tokens":100}}).to_string(),
+            )
+            .unwrap();
+            let (session, _, _) = parse_codex_jsonl(&path).unwrap();
+            assert_eq!(session.cost_basis, crate::model::CostBasis::Unknown);
+            assert!(session.cost.is_none());
+            assert!(session.pricing_key.is_none());
+        }
+    }
+
+    #[test]
+    fn codex_known_model_is_estimated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(&path, r#"{"model":"codex-test","role":"assistant","content":"Answer","usage":{"input_tokens":1000000,"output_tokens":1000000}}"#).unwrap();
+        let (session, _, _) = parse_codex_jsonl(&path).unwrap();
+        assert_eq!(session.cost_basis, crate::model::CostBasis::Estimated);
+        assert_eq!(session.pricing_key.as_deref(), Some("codex"));
+        assert_eq!(session.cost.unwrap().total_usd, 11.25);
+    }
+
+    #[test]
     fn tool_outputs_join_by_call_id_and_arguments_are_parsed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
@@ -293,5 +328,22 @@ mod tests {
         );
         assert_eq!(tools[0].status, "completed");
         assert_eq!(tools[1].status, "pending");
+    }
+
+    #[test]
+    fn sessions_sharing_a_call_id_commit_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = serde_json::json!({"payload":{"type":"function_call","call_id":"shared","name":"exec_command","arguments":"{}"}});
+        let mut bundle = crate::ingest::IngestBundle::default();
+        for name in ["one.jsonl", "two.jsonl"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, record.to_string()).unwrap();
+            let (session, _, tools) = parse_codex_jsonl(&path).unwrap();
+            bundle.sessions.push(session);
+            bundle.tool_calls.extend(tools);
+        }
+        let store = crate::store::InsightsStore::open_in_memory().unwrap();
+        let stats = store.commit_ingest("codex", &bundle).unwrap();
+        assert_eq!((stats.sessions, stats.tool_calls), (2, 2));
     }
 }
