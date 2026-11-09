@@ -89,9 +89,9 @@ mod tests {
         schema::migrate(&mut conn).unwrap();
         for (title, content, key) in [
             (
-                "cargo target dir",
-                "set CARGO_TARGET_DIR per task",
-                "cargo-tgt",
+                "build cache dir",
+                "set BUILD_CACHE_DIR per task",
+                "cache-dir",
             ),
             ("git worktree rule", "never edit on master", "wt-rule"),
         ] {
@@ -108,7 +108,7 @@ mod tests {
             )
             .unwrap();
         }
-        let cases = "{\"query\":\"CARGO_TARGET_DIR\",\"expect\":[\"cargo-tgt\"]}\n\
+        let cases = "{\"query\":\"BUILD_CACHE_DIR\",\"expect\":[\"cache-dir\"]}\n\
                      {\"query\":\"nonexistentzzz\",\"expect\":[\"wt-rule\"]}\n";
         let (hit, hit1, mrr) = score(
             &conn,
