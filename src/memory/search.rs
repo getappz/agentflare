@@ -62,7 +62,9 @@ fn build_fts_query(raw: &str) -> String {
         // it through verbatim, which would re-introduce FTS5 syntax-error risk.
         return format!("\"{}\"", raw.replace('"', "\"\""));
     }
-    tokens.join(" ")
+    // OR, not FTS5's implicit AND: a natural-language query must not need every
+    // word in one observation. bm25 still ranks more matching terms higher.
+    tokens.join(" OR ")
 }
 
 /// FTS hits with HIGHER-IS-BETTER scores (negated SQLite bm25 rank).
@@ -348,6 +350,31 @@ mod tests {
         // "***" sanitizes to no tokens; must not be returned verbatim.
         let q = build_fts_query("***");
         assert_eq!(q, "\"***\"");
+    }
+
+    #[test]
+    fn multi_word_query_matches_when_not_all_words_present() {
+        // Regression: tokens were implicitly ANDed, so a natural-language query
+        // with one unmatched word returned nothing (bench hit@5 was 0.10).
+        assert_eq!(
+            build_fts_query("stale cache worktree"),
+            "\"stale\" OR \"cache\" OR \"worktree\""
+        );
+        let conn = new_db();
+        crate::memory::observations::save(
+            &conn,
+            None,
+            "note",
+            "cache gotcha",
+            "the worktree root cache goes stale",
+            None,
+            Some("p"),
+            None,
+            None,
+        )
+        .unwrap();
+        let hits = search(&conn, "why is the worktree cache wrong", Some("p"), None, 5).unwrap();
+        assert_eq!(hits.len(), 1);
     }
 
     #[test]
