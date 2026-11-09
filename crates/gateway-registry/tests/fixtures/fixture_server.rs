@@ -5,7 +5,7 @@
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters,
-    model::{Implementation, ServerCapabilities, ServerInfo},
+    model::{Implementation, ServerCapabilities, ServerConfig},
     schemars, tool, tool_handler, tool_router,
     transport::stdio,
 };
@@ -53,8 +53,8 @@ impl FixtureServer {
 
 #[tool_handler]
 impl ServerHandler for FixtureServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("gateway-fixture-server", "0.1.0"))
     }
 }

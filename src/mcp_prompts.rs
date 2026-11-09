@@ -5,8 +5,7 @@
 //! plugin.
 
 use rmcp::model::{
-    GetPromptRequestParams, GetPromptResult, Prompt, PromptArgument, PromptMessage,
-    PromptMessageRole,
+    GetPromptRequestParams, GetPromptResult, Prompt, PromptArgument, PromptMessage, Role,
 };
 
 const SUB_SKILLS: &[(&str, &str)] = &[
@@ -122,10 +121,7 @@ pub fn get_prompt(
 }
 
 fn assistant_text(msg: impl Into<String>) -> GetPromptResult {
-    GetPromptResult::new(vec![PromptMessage::new_text(
-        PromptMessageRole::Assistant,
-        msg,
-    )])
+    GetPromptResult::new(vec![PromptMessage::new_text(Role::Assistant, msg)])
 }
 
 fn get_optimize_mode(request: &GetPromptRequestParams) -> GetPromptResult {
