@@ -236,7 +236,10 @@ impl MemoryArgs {
                         });
                     match shown {
                         Ok(text) => print!("{text}"),
-                        Err(e) => crate::ui::error(&e),
+                        Err(e) => {
+                            crate::ui::error(&e);
+                            std::process::exit(1);
+                        }
                     }
                     return;
                 }
@@ -259,7 +262,10 @@ impl MemoryArgs {
                     Ok(n) => println!(
                         "consolidate: {n} belief proposal(s) in the ledger; review with `agentflare insights reflect list --status proposed`"
                     ),
-                    Err(e) => crate::ui::error(&e),
+                    Err(e) => {
+                        crate::ui::error(&e);
+                        std::process::exit(1);
+                    }
                 }
             }
             MemoryCommands::Sync => run_sync(),
