@@ -1,7 +1,6 @@
 import type { Register } from 'claude-code'
 import { registerAutopilot } from './autopilot'
 import { refreshBriefing, registerBriefing } from './briefing'
-import { registerCapture } from './capture'
 import { registerCompaction, type Current } from './compaction'
 import { registerGuard } from './guard'
 import { connect, type AutopilotClient } from './mcp'
@@ -42,6 +41,7 @@ export const register: Register = (on, options) => {
     client: () => client,
     agent: AGENT,
     options: { readOnlyAutoAllow: options.readOnlyAutoAllow === true, guardTimeoutMs },
+    onItemDone: () => setCurrent({}),
   })
 
   const briefingCtx = { client: () => client, agent: AGENT }
@@ -49,7 +49,7 @@ export const register: Register = (on, options) => {
   registerCompaction(on, { ...briefingCtx, current: () => current })
   registerSpawn(on, { server: () => client?.server ?? null, agent: AGENT })
   const memoryCapture = options.memoryCapture === 'ask' || options.memoryCapture === 'off' ? options.memoryCapture : 'auto'
-  registerCapture(on, { server: () => client?.server ?? null, options: { memoryCapture }, current: () => current })
+  const captureCtx = { server: () => client?.server ?? null, options: { memoryCapture }, current: () => current }
   const autopilot = options.autopilot === 'on' || options.autopilot === 'once' ? options.autopilot : 'off'
   registerAutopilot(on, {
     client: () => client,
@@ -57,6 +57,7 @@ export const register: Register = (on, options) => {
     options: { autopilot, idleMinutes: Number.isFinite(Number(options.idleMinutes)) ? Number(options.idleMinutes) : 3, maxCostUsd: options.maxCostUsd !== null && options.maxCostUsd !== '' && Number.isFinite(Number(options.maxCostUsd)) ? Number(options.maxCostUsd) : Infinity },
     current: () => current,
     setCurrent,
+    capture: captureCtx,
   })
 
   on('session.start', async ($, e, next) => {
