@@ -1,0 +1,10 @@
+{"query": "should we adopt hindsight agent memory", "expect": ["eval-hindsight-vs-brain-db-2026-11-09"]}
+{"query": "main worktree root cache stale after worktree removed", "expect": ["worktree-repo-root-cache-and-rustfmt-gotchas"]}
+{"query": "rustfmt fails on let chains edition", "expect": ["worktree-repo-root-cache-and-rustfmt-gotchas"]}
+{"query": "decide bench thresholds file ignored by gitignore", "expect": ["decide-bench-harness-794"]}
+{"query": "code review fix changed my main checkout instead of worktree", "expect": ["code-review-fix-edits-main-checkout"]}
+{"query": "spec file contains omitted placeholder lines after PowerShell edit", "expect": ["gotcha-lean-ctx-corrupt-spec-shell"]}
+{"query": "can we vendor celld harness", "expect": ["celld-harness-ref-not-vendor", "celld-ref-audit-flare-workflow"]}
+{"query": "separate agentflow binary or sidecar for workflows", "expect": ["flare-workflow-no-sidecar-agentflow", "spec-adopt-agentflow-flare-workflow-v1"]}
+{"query": "smoke test passes falsely before the model responds", "expect": ["refs-celld-opencode-probe"]}
+{"query": "where do design specs live and how are they published", "expect": ["docs-superpowers-spec-artifact-pattern"]}

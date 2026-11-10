@@ -62,6 +62,32 @@ pub enum MemoryCommands {
         #[arg(long, default_value = "200")]
         batch: usize,
     },
+    /// Cluster similar observations into evidence-backed belief proposals in the
+    /// Insights ledger (no LLM). Review with `insights reflect list|show|accept`.
+    Consolidate {
+        #[arg(long)]
+        project: Option<String>,
+        /// Minimum token-set Jaccard overlap to join a cluster
+        #[arg(long, default_value = "0.2")]
+        threshold: f64,
+        /// Smallest cluster worth proposing
+        #[arg(long, default_value = "3")]
+        min_size: usize,
+        /// Print the clusters that would be proposed; write nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Score recall on the real brain.db from a JSONL cases file
+    /// ({"query": "...", "expect": ["topic_key or title"]} per line):
+    /// lexical vs hybrid, hit@k / hit@1 / MRR.
+    Bench {
+        #[arg(long)]
+        cases: std::path::PathBuf,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value = "5")]
+        k: usize,
+    },
     /// Sync observations with a shared GitHub branch so other workstations
     /// see the same facts. Defaults to this repo's `origin` remote; set
     /// AGENTFLARE_MEMORY_SYNC_REPO=owner/repo to point elsewhere
@@ -199,6 +225,73 @@ impl MemoryArgs {
                             ));
                         }
                     },
+                }
+            }
+            MemoryCommands::Consolidate {
+                project,
+                threshold,
+                min_size,
+                dry_run,
+            } => {
+                if dry_run {
+                    let shown = crate::memory::store::open()
+                        .map_err(|e| e.to_string())
+                        .and_then(|conn| {
+                            super::memory_consolidate::preview(
+                                &conn,
+                                project.as_deref(),
+                                threshold,
+                                min_size,
+                            )
+                            .map_err(|e| e.to_string())
+                        });
+                    match shown {
+                        Ok(text) => print!("{text}"),
+                        Err(e) => {
+                            crate::ui::error(&e);
+                            std::process::exit(1);
+                        }
+                    }
+                    return;
+                }
+                let result = flare_insights::store::InsightsStore::open(
+                    &crate::handoff::default_insights_db(),
+                )
+                .map_err(|e| e.to_string())
+                .and_then(|store| {
+                    let conn = crate::memory::store::open().map_err(|e| e.to_string())?;
+                    super::memory_consolidate::scan(
+                        &store,
+                        &conn,
+                        project.as_deref(),
+                        threshold,
+                        min_size,
+                    )
+                    .map_err(|e| e.to_string())
+                });
+                match result {
+                    Ok(n) => println!(
+                        "consolidate: {n} belief proposal(s) in the ledger; review with `agentflare insights reflect list --status proposed`"
+                    ),
+                    Err(e) => {
+                        crate::ui::error(&e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            MemoryCommands::Bench { cases, project, k } => {
+                let result = std::fs::read_to_string(&cases)
+                    .map_err(|e| format!("{}: {e}", cases.display()))
+                    .and_then(|text| {
+                        let conn = crate::memory::store::open().map_err(|e| e.to_string())?;
+                        crate::memory::recall_bench::run(&conn, &text, project.as_deref(), k)
+                    });
+                match result {
+                    Ok(out) => print!("{out}"),
+                    Err(e) => {
+                        crate::ui::error(&e);
+                        std::process::exit(1);
+                    }
                 }
             }
             MemoryCommands::Sync => run_sync(),

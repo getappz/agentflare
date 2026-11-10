@@ -28,6 +28,7 @@ mod item;
 mod job;
 mod mcp;
 mod memory;
+mod memory_consolidate;
 mod message;
 mod optimize;
 mod pr;

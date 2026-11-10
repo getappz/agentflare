@@ -9,6 +9,7 @@ pub mod leases;
 pub mod maintenance;
 pub mod migrate;
 pub mod migrations;
+pub mod notify_ledger;
 pub mod retrieval;
 pub mod vector;
 

@@ -46,10 +46,11 @@ use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::{tool::ToolCallContext, wrapper::Parameters},
     model::{
-        AnnotateAble, CallToolRequestParams, CallToolResult, ErrorData, GetPromptRequestParams,
-        GetPromptResult, Implementation, ListPromptsResult, ListResourcesResult, Meta,
-        PaginatedRequestParams, RawResource, ReadResourceRequestParams, ReadResourceResult,
-        ResourceContents, ServerCapabilities, ServerInfo,
+        CallToolRequestParams, CallToolResponse, ContentBlock, ErrorData, GetPromptRequestParams,
+        GetPromptResponse, Implementation, ListPromptsResult, ListResourcesResult,
+        PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse,
+        ReadResourceResult, RequestMetaObject, Resource, ResourceContents, ServerCapabilities,
+        ServerConfig,
     },
     schemars,
     service::{RequestContext, RoleServer},
@@ -857,15 +858,25 @@ impl AgentflareMcp {
         {
             return main.clone();
         }
-        let main = if flare_git_core::branch::is_linked_worktree(&root) {
-            flare_git_core::branch::main_worktree_root(&root).unwrap_or_else(|| root.clone())
-        } else {
-            root.clone()
+        let Some(main) = Self::main_root_of(&root) else {
+            // Not cached: a transient git failure must not stick for the process.
+            return root;
         };
         if let Ok(mut guard) = cache.lock() {
             guard.insert(root, main.clone());
         }
         main
+    }
+
+    /// The main checkout for `root`: `root` itself unless it is a linked
+    /// worktree. `None` when `root` is a linked worktree whose main checkout
+    /// can't be resolved.
+    pub(crate) fn main_root_of(root: &std::path::Path) -> Option<std::path::PathBuf> {
+        if flare_git_core::branch::is_linked_worktree(root) {
+            flare_git_core::branch::main_worktree_root(root)
+        } else {
+            Some(root.to_path_buf())
+        }
     }
 
     /// Test-only constructor: an isolated instance backed entirely by the
@@ -2097,20 +2108,13 @@ impl AgentflareMcp {
     /// `RequestContext<RoleServer>`.
     fn list_resources_sync(&self) -> ListResourcesResult {
         let runtime = optimize::load_runtime();
-        let sessions_resource = RawResource {
-            description: Some(format!("{} tracked sessions", runtime.sessions.len())),
-            mime_type: Some("application/json".to_string()),
-            ..RawResource::new("agentflare://sessions", "Active sessions")
-        };
-        let nudges_resource = RawResource {
-            description: Some("All nudge types agentflare can emit".to_string()),
-            mime_type: Some("application/json".to_string()),
-            ..RawResource::new("agentflare://nudges", "Optimization nudges")
-        };
-        ListResourcesResult::with_all_items(vec![
-            sessions_resource.no_annotation(),
-            nudges_resource.no_annotation(),
-        ])
+        let sessions_resource = Resource::new("agentflare://sessions", "Active sessions")
+            .with_description(format!("{} tracked sessions", runtime.sessions.len()))
+            .with_mime_type("application/json");
+        let nudges_resource = Resource::new("agentflare://nudges", "Optimization nudges")
+            .with_description("All nudge types agentflare can emit")
+            .with_mime_type("application/json");
+        ListResourcesResult::with_all_items(vec![sessions_resource, nudges_resource])
     }
 
     /// Pure logic backing [`ServerHandler::read_resource`]; kept as a plain
@@ -2212,42 +2216,46 @@ impl ServerHandler for AgentflareMcp {
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
         let tool_name = request.name.to_string();
-        let progress_token = request.meta.as_ref().and_then(Meta::get_progress_token);
+        let progress_token = request
+            .meta
+            .as_ref()
+            .and_then(RequestMetaObject::get_progress_token);
         let progress_sender =
             progress_token.map(|token| ProgressSender::new(context.peer.clone(), token));
         let tcc = ToolCallContext::new(self, request, context);
         let mut result = PROGRESS_SENDER
             .scope(progress_sender, Self::tool_router().call(tcc))
             .await?;
-        let mut content_json =
-            serde_json::to_value(&result.content).unwrap_or(serde_json::Value::Null);
-        if let Some(arr) = content_json.as_array_mut()
-            && let Some(first) = arr.first_mut()
-            && let Some(text) = first.get("text").and_then(|v| v.as_str())
-            && let Ok(mut json) = serde_json::from_str::<serde_json::Value>(text)
-            && let Some(hint) = next_hint(&tool_name, &json)
-            && let serde_json::Value::Object(ref mut map) = json
-        {
-            map.insert("next".into(), serde_json::Value::String(hint));
-            let new_text = serde_json::to_string_pretty(&map).unwrap_or_else(|_| text.into());
-            first["text"] = serde_json::Value::String(new_text);
-            result.content = serde_json::from_value(content_json).unwrap_or(result.content);
-        }
-        // Inter-agent messages waiting for this session ride along on any
-        // other agentflare tool result -- the delivery path for hosts whose
-        // hooks can't inject context.
-        if tool_name != "message"
-            && let Some(note) = self.message_piggyback()
-        {
-            result.content.push(rmcp::model::Content::text(note));
+        if let CallToolResponse::Complete(complete) = &mut result {
+            let mut content_json =
+                serde_json::to_value(&complete.content).unwrap_or(serde_json::Value::Null);
+            if let Some(arr) = content_json.as_array_mut()
+                && let Some(first) = arr.first_mut()
+                && let Some(text) = first.get("text").and_then(|v| v.as_str())
+                && let Ok(mut json) = serde_json::from_str::<serde_json::Value>(text)
+                && let Some(hint) = next_hint(&tool_name, &json)
+                && let serde_json::Value::Object(ref mut map) = json
+            {
+                map.insert("next".into(), serde_json::Value::String(hint));
+                let new_text = serde_json::to_string_pretty(&map).unwrap_or_else(|_| text.into());
+                first["text"] = serde_json::Value::String(new_text);
+                if let Ok(content) = serde_json::from_value(content_json) {
+                    complete.content = content;
+                }
+            }
+            if tool_name != "message"
+                && let Some(note) = self.message_piggyback()
+            {
+                complete.content.push(ContentBlock::text(note));
+            }
         }
         Ok(result)
     }
 
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
@@ -2272,8 +2280,9 @@ impl ServerHandler for AgentflareMcp {
         &self,
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, ErrorData> {
+    ) -> Result<ReadResourceResponse, ErrorData> {
         self.read_resource_sync(request.uri.as_str())
+            .map(Into::into)
     }
 
     async fn list_prompts(
@@ -2290,10 +2299,12 @@ impl ServerHandler for AgentflareMcp {
         &self,
         request: GetPromptRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<GetPromptResult, ErrorData> {
-        crate::mcp_prompts::get_prompt(&request, self.agent.as_deref()).ok_or_else(|| {
-            ErrorData::invalid_params(format!("Unknown prompt: {}", request.name), None)
-        })
+    ) -> Result<GetPromptResponse, ErrorData> {
+        crate::mcp_prompts::get_prompt(&request, self.agent.as_deref())
+            .map(Into::into)
+            .ok_or_else(|| {
+                ErrorData::invalid_params(format!("Unknown prompt: {}", request.name), None)
+            })
     }
 }
 

@@ -520,6 +520,7 @@ pub(crate) fn run_discovery_tick(
     auth_conn: &rusqlite::Connection,
     host_policy: agentflare_resource_gate::Policy,
 ) -> DiscoveryTickResult {
+    notify_hourly_digest(mcp);
     let mut result = DiscoveryTickResult {
         dispatched: 0,
         skipped: 0,
@@ -659,9 +660,7 @@ pub(crate) fn run_discovery_tick(
                         "agentflare-supervisor: item #{} ({}) is ready-for-work but gated pending a go/no-go decision ({NEEDS_DECISION_LABEL})",
                         item.sequence_id, item.id
                     );
-                    if first_time_gated(&item.id) {
-                        notify_human_gate(&item, "gated pending a go/no-go decision");
-                    }
+                    notify_human_gate(&item, "gated pending a go/no-go decision");
                     result.waiting += 1;
                     continue;
                 }
@@ -837,9 +836,7 @@ fn skip_item(
         label_id_by_name.get(NEEDS_MANUAL_LABEL).map(String::as_str),
         &format!("## supervisor — skipped\n\n{reason}. Run `agentflare work` manually."),
     );
-    if first_time_gated(&item.id) {
-        notify_human_gate(item, &reason);
-    }
+    notify_human_gate(item, &reason);
 }
 
 fn ask_item(
@@ -981,15 +978,9 @@ fn dispatch_item(
         // `urgent`/`high` item, that would otherwise leave them stalled
         // silently and indefinitely. `"pending"`/`"rejected"` already had
         // their notification at submit/reject time, so only `"none"` pings.
-        // `first_time_gated` is the same once-per-item-per-process idiom
-        // `run_discovery_tick` already uses for `NEEDS_DECISION_LABEL`, so
-        // this fires once per gate rather than once per tick. Namespaced
-        // ("plan:<id>", not the bare item id) because the underlying set is
-        // keyed globally across every gate type in this file -- an
-        // unnamespaced key here would consume the same token the PR-approval
-        // card (`notify_pr_approval_gate`) checks for the same item later in
-        // its life, silently suppressing that card for every auto-gated item.
-        if status == "none" && first_time_gated(&format!("plan:{}", item.id)) {
+        // Notification repeats enter the durable digest; only comments
+        // retain the process-local one-shot suppression.
+        if status == "none" {
             let reason = "auto-gated: needs a plan — call item(action=\"submit_plan\", \
                            plan_asset_id=...) before this item can be dispatched";
             notify_human_gate(item, reason);
@@ -1002,24 +993,26 @@ fn dispatch_item(
             // touch labels the way `record_supervisor_action` does -- this
             // item keeps `ready-for-work` by design (see `WaitingOnPlan`'s
             // doc comment) so the very next tick re-checks it once approved.
-            let outcome = mcp.with_backend_db(|conn| {
-                agentflare_backend::comment::create(
-                    conn,
-                    &item.id,
-                    &crate::claims::owner_id(),
-                    &format!("## supervisor — waiting on plan\n\n{reason}"),
-                )
-            });
-            let comment_err = match outcome {
-                Ok(Ok(_)) => None,
-                Ok(Err(e)) => Some(e.to_string()),
-                Err(e) => Some(e.to_string()),
-            };
-            if let Some(e) = comment_err {
-                eprintln!(
-                    "agentflare-supervisor: failed to record plan-gate comment on item #{} ({}): {e}",
-                    item.sequence_id, item.id
-                );
+            if first_time_gated(&format!("plan:{}", item.id)) {
+                let outcome = mcp.with_backend_db(|conn| {
+                    agentflare_backend::comment::create(
+                        conn,
+                        &item.id,
+                        &crate::claims::owner_id(),
+                        &format!("## supervisor — waiting on plan\n\n{reason}"),
+                    )
+                });
+                let comment_err = match outcome {
+                    Ok(Ok(_)) => None,
+                    Ok(Err(e)) => Some(e.to_string()),
+                    Err(e) => Some(e.to_string()),
+                };
+                if let Some(e) = comment_err {
+                    eprintln!(
+                        "agentflare-supervisor: failed to record plan-gate comment on item #{} ({}): {e}",
+                        item.sequence_id, item.id
+                    );
+                }
             }
         }
         return DispatchOutcome::WaitingOnPlan;
@@ -1697,11 +1690,11 @@ pub(crate) fn run_review_sweep(
                     // per item, the same way the dispatch-gate notice does
                     // (item #341).
                     result.stray_claimed += 1;
+                    let reason = claimed_stray_notice(&candidate.item, number, holder);
                     if first_time_gated(&format!("pr-claimed:{}", candidate.item.id)) {
-                        let reason = claimed_stray_notice(&candidate.item, number, holder);
                         eprintln!("agentflare-supervisor: {reason}");
-                        notify_human_gate(&candidate.item, &reason);
                     }
+                    notify_human_gate(&candidate.item, &reason);
                     continue;
                 }
                 let restored = mcp.with_backend_db(|conn| {
@@ -2264,16 +2257,17 @@ fn stale_stage_label(labels: &[String]) -> Option<&'static str> {
         .find(|l| labels.iter().any(|have| have == l))
 }
 
-/// One-shot per item (namespaced separately from `notify_pr_approval_gate`'s
-/// plain `item.id` key in `first_time_gated` -- the same item can hit both
-/// gates at different points in its life and each must fire once on its
-/// own): posts a GitHub-visible comment, swaps the PR's stage label to
+/// Posts a one-shot GitHub-visible comment, swaps the PR's stage label to
 /// `NEEDS_HUMAN_PR_LABEL`, and pings Telegram the first time this sweep sees
 /// a real merge conflict on it while `auto_resolve_conflicts_enabled` is
 /// off. Without this, `handle_pr_status`'s `Conflicting` arm would just
 /// silently `skip` the item forever -- unlike `Passing`'s missing-approval
 /// gate, nothing else in the sweep would ever surface it.
 fn notify_conflict_gate(item: &agentflare_backend::item::Item, folder_path: &str, number: u64) {
+    notify_human_gate(
+        item,
+        &format!("PR #{number} has a merge conflict with its base branch"),
+    );
     if !first_time_gated(&format!("conflict:{}", item.id)) {
         return;
     }
@@ -2288,10 +2282,6 @@ fn notify_conflict_gate(item: &agentflare_backend::item::Item, folder_path: &str
         Some(IN_REVIEW_PR_LABEL),
         NEEDS_HUMAN_PR_LABEL,
         message,
-    );
-    notify_human_gate(
-        item,
-        &format!("PR #{number} has a merge conflict with its base branch"),
     );
 }
 

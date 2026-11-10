@@ -8,7 +8,7 @@ description: Retrieve and summarize YouTube video transcripts using agentflare s
 Retrieve the transcript with the separate summarize module:
 
 ```sh
-agentflare summarize 'https://www.youtube.com/watch?v=VIDEO_ID' --extract --json > /tmp/video-transcript.json
+T=$(mktemp "${TMPDIR:-/tmp}/video-transcript.XXXXXX") && agentflare summarize 'https://www.youtube.com/watch?v=VIDEO_ID' --extract --json > "$T"  # read "$T" below
 ```
 
 In `--extract` mode, the command tries direct caption requests first and then agentflare's browser in a temporary session. It retrieves captions; you write the summary using your existing model. No separate summarization API key is needed for this agent workflow.

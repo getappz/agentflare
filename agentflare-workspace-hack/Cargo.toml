@@ -37,7 +37,7 @@ hashbrown = { version = "0.17", default-features = false, features = ["default-h
 httparse = { version = "1" }
 icu_locale_core = { version = "2", default-features = false, features = ["alloc", "zerovec"] }
 icu_provider = { version = "2", default-features = false, features = ["alloc", "baked", "sync"] }
-indexmap = { version = "2" }
+indexmap = { version = "2", features = ["serde"] }
 litemap = { version = "0.8", default-features = false, features = ["alloc"] }
 memchr = { version = "2" }
 num-traits = { version = "0.2", default-features = false, features = ["i128", "std"] }
@@ -48,8 +48,8 @@ rand_core = { version = "0.6", default-features = false, features = ["std"] }
 regex = { version = "1" }
 regex-syntax = { version = "0.8" }
 reqwest = { version = "0.13", default-features = false, features = ["cookies", "json", "rustls", "socks", "stream"] }
-rmcp = { version = "1", features = ["client", "transport-child-process", "transport-io", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
-rusqlite = { version = "0.40", features = ["bundled", "limits"] }
+rmcp = { version = "3", features = ["client", "transport-child-process", "transport-io", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
+rusqlite = { version = "0.41", features = ["bundled", "limits"] }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", features = ["alloc", "rc"] }
 serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
@@ -79,7 +79,7 @@ aho-corasick = { version = "1" }
 cc = { version = "1", default-features = false, features = ["parallel"] }
 chrono = { version = "0.4", features = ["serde"] }
 hashbrown = { version = "0.17", default-features = false, features = ["default-hasher"] }
-indexmap = { version = "2" }
+indexmap = { version = "2", features = ["serde"] }
 memchr = { version = "2" }
 num-traits = { version = "0.2", default-features = false, features = ["i128", "std"] }
 proc-macro2 = { version = "1" }
@@ -89,7 +89,7 @@ regex-syntax = { version = "0.8" }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", features = ["alloc", "rc"] }
 serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
-syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", features = ["full", "visit-mut"] }
+syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", features = ["extra-traits", "full", "visit-mut"] }
 syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 typenum = { version = "1", default-features = false, features = ["const-generics"] }
 

@@ -9,7 +9,7 @@ use super::observations::Observation;
 use super::store;
 use super::{observations, relations, search, sessions, summaries};
 
-fn open_db() -> Result<rusqlite::Connection, String> {
+pub(super) fn open_db() -> Result<rusqlite::Connection, String> {
     store::open().map_err(|e| format!("cannot open brain.db: {e}"))
 }
 
@@ -139,7 +139,12 @@ pub fn handle_remember(input: RememberInput) -> Result<String, String> {
     remember_in(&open_db()?, input)
 }
 
-fn remember_in(conn: &rusqlite::Connection, input: RememberInput) -> Result<String, String> {
+pub(super) fn remember_in(
+    conn: &rusqlite::Connection,
+    input: RememberInput,
+) -> Result<String, String> {
+    super::remember_redact::check_identity(&input)?;
+    let (input, redacted) = super::remember_redact::redact_input(input);
     let outcome = observations::save_keyed(
         conn,
         input.session_id.as_deref(),
@@ -169,7 +174,10 @@ fn remember_in(conn: &rusqlite::Connection, input: RememberInput) -> Result<Stri
         index_embedding(conn, id, &input.title, &input.content, status == "updated");
     }
     let mut out = json!({"status": status, "id": id});
-    let warnings = lint_retrieval_card(&input.title, &input.content);
+    let mut warnings = lint_retrieval_card(&input.title, &input.content);
+    if redacted {
+        warnings.push(super::remember_redact::REDACTED_WARNING.into());
+    }
     if !warnings.is_empty() {
         out["warnings"] = json!(warnings);
     }
@@ -277,7 +285,7 @@ fn recall_cache() -> &'static Mutex<RecallCache> {
 /// Best-effort invalidation of one observation's project after a mutation.
 /// Failures (poisoned lock, missing row) are ignored: the TTL bounds any
 /// staleness, so invalidation must never fail the write itself.
-fn invalidate_project_of(conn: &rusqlite::Connection, id: i64) {
+pub(super) fn invalidate_project_of(conn: &rusqlite::Connection, id: i64) {
     let project = observations::get(conn, id)
         .ok()
         .flatten()
@@ -707,72 +715,7 @@ pub fn handle_compact(input: CompactInput) -> Result<String, String> {
     .to_string())
 }
 
-#[derive(Debug, Deserialize)]
-pub struct CurateInput {
-    pub action: String,
-    pub id: i64,
-    pub title: Option<String>,
-    pub content: Option<String>,
-    pub r#type: Option<String>,
-    pub pinned: Option<bool>,
-}
-
-pub fn handle_curate(input: CurateInput) -> Result<String, String> {
-    if input.action == "update"
-        && input
-            .r#type
-            .as_deref()
-            .is_some_and(|t| t.eq_ignore_ascii_case(LESSON_TYPE))
-    {
-        return Err(
-            "type 'lesson' is reserved: use action=promote with evidence_ids and confidence".into(),
-        );
-    }
-    let conn = open_db()?;
-    match input.action.as_str() {
-        "update" => {
-            let ok = observations::update(
-                &conn,
-                input.id,
-                input.title.as_deref(),
-                input.content.as_deref(),
-                input.r#type.as_deref(),
-                input.pinned,
-            )
-            .map_err(|e| format!("update: {e}"))?;
-            if ok {
-                invalidate_project_of(&conn, input.id);
-            }
-            Ok(json!({"status": if ok { "updated" } else { "not_found" }}).to_string())
-        }
-        "delete" => {
-            let ok =
-                observations::soft_delete(&conn, input.id).map_err(|e| format!("delete: {e}"))?;
-            if ok {
-                invalidate_project_of(&conn, input.id);
-            }
-            Ok(json!({"status": if ok { "deleted" } else { "not_found" }}).to_string())
-        }
-        "pin" => {
-            let ok = observations::pin(&conn, input.id, true).map_err(|e| format!("pin: {e}"))?;
-            if ok {
-                invalidate_project_of(&conn, input.id);
-            }
-            Ok(json!({"status": if ok { "pinned" } else { "not_found" }}).to_string())
-        }
-        "unpin" => {
-            let ok =
-                observations::pin(&conn, input.id, false).map_err(|e| format!("unpin: {e}"))?;
-            if ok {
-                invalidate_project_of(&conn, input.id);
-            }
-            Ok(json!({"status": if ok { "unpinned" } else { "not_found" }}).to_string())
-        }
-        other => Err(format!(
-            "unknown action '{other}'; use update, delete, pin, or unpin"
-        )),
-    }
-}
+pub use super::curate::{CurateInput, handle_curate};
 
 #[cfg(test)]
 mod tests {

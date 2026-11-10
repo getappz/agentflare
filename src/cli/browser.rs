@@ -263,7 +263,15 @@ pub(super) fn exec_raw(
     extra: &[String],
     auto_install: bool,
 ) -> Result<String, String> {
-    let (backend, path_env) = if auto_install && crate::browser_install::needs_install() {
+    use std::io::IsTerminal;
+    let (backend, path_env) = if auto_install
+        && crate::browser_install::needs_install()
+        && !std::io::stdout().is_terminal()
+    {
+        // stdout is piped (e.g. `--json > file`): keep progress off it.
+        eprintln!("agent-browser not found — installing via mise (one-time)…");
+        crate::browser_install::ensure_agent_browser(auto_install)?
+    } else if auto_install && crate::browser_install::needs_install() {
         crate::ui::with_spinner(
             "agent-browser not found — installing via mise (prebuilt binary, one-time, usually under a minute)…",
             "agent-browser install finished",

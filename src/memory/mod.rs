@@ -1,4 +1,5 @@
 mod bench;
+mod curate;
 pub mod embeddings;
 pub mod engine;
 pub mod mcp;
@@ -6,7 +7,9 @@ pub mod observations;
 mod promotion;
 pub mod prompts;
 pub mod quality;
+pub mod recall_bench;
 pub mod relations;
+mod remember_redact;
 pub mod schema;
 pub mod search;
 pub mod sessions;

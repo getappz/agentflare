@@ -27,6 +27,7 @@ fn config_with_fixture() -> GatewayConfig {
             args: vec![],
             auth_ref: None,
             auth_env: None,
+            timeout_secs: None,
         },
     );
     GatewayConfig { servers }
@@ -73,6 +74,7 @@ async fn execute_dispatches_to_an_mcp_http_backend() {
             auth_ref: None,
             auth_env: None,
             auth_header: None,
+            timeout_secs: None,
         },
     );
     let config = GatewayConfig { servers };
@@ -141,6 +143,7 @@ async fn one_failing_backend_does_not_block_the_others() {
             args: vec![],
             auth_ref: None,
             auth_env: None,
+            timeout_secs: None,
         },
     );
     servers.insert(
@@ -150,6 +153,7 @@ async fn one_failing_backend_does_not_block_the_others() {
             args: vec![],
             auth_ref: None,
             auth_env: None,
+            timeout_secs: None,
         },
     );
     let config = GatewayConfig { servers };
