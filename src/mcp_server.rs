@@ -858,15 +858,25 @@ impl AgentflareMcp {
         {
             return main.clone();
         }
-        let main = if flare_git_core::branch::is_linked_worktree(&root) {
-            flare_git_core::branch::main_worktree_root(&root).unwrap_or_else(|| root.clone())
-        } else {
-            root.clone()
+        let Some(main) = Self::main_root_of(&root) else {
+            // Not cached: a transient git failure must not stick for the process.
+            return root;
         };
         if let Ok(mut guard) = cache.lock() {
             guard.insert(root, main.clone());
         }
         main
+    }
+
+    /// The main checkout for `root`: `root` itself unless it is a linked
+    /// worktree. `None` when `root` is a linked worktree whose main checkout
+    /// can't be resolved.
+    pub(crate) fn main_root_of(root: &std::path::Path) -> Option<std::path::PathBuf> {
+        if flare_git_core::branch::is_linked_worktree(root) {
+            flare_git_core::branch::main_worktree_root(root)
+        } else {
+            Some(root.to_path_buf())
+        }
     }
 
     /// Test-only constructor: an isolated instance backed entirely by the
