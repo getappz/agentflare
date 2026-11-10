@@ -38,6 +38,7 @@ mod run;
 mod serve;
 pub(crate) mod skill;
 mod store;
+mod summarize;
 mod uninstall;
 mod update;
 mod vault;
@@ -134,6 +135,8 @@ pub enum Commands {
     Auth(auth::AuthArgs),
     /// Agent-first browser automation (open, snapshot, click, fill, read, ...).
     Browser(browser::BrowserArgs),
+    /// Summarize a YouTube video with references, or extract its transcript.
+    Summarize(summarize::SummarizeArgs),
     /// Serve live-shareable artifact pages from AI agent sessions.
     Artifacts(artifacts::ArtifactsArgs),
     /// Hand a work product to another agent's inbox.
@@ -225,6 +228,7 @@ impl Commands {
             Self::Vault(cmd) => cmd.run(),
             Self::Auth(cmd) => cmd.run(),
             Self::Browser(cmd) => cmd.run(),
+            Self::Summarize(cmd) => cmd.run(),
             Self::Artifacts(cmd) => cmd.run(),
             Self::Handoff(cmd) => cmd.run(),
             Self::GithubBridge(cmd) => cmd.run(),

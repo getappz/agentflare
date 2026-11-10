@@ -1,0 +1,19 @@
+[package]
+name = "flare-summarize"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "Apache-2.0"
+description = "Fetch-first YouTube transcripts with an agentflare browser fallback"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["time"] }
+url = "2"
+youtube-transcript-api = "0.1.0"
+agentflare-workspace-hack = { version = "0.1", path = "../../agentflare-workspace-hack" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "test-util"] }
+
