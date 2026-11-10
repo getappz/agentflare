@@ -378,3 +378,34 @@ fn resolve_project_in_linked_worktree_reconnects_to_main_project() {
         "worktree session must resolve to the main project, never fork a duplicate"
     );
 }
+
+/// A linked worktree must resolve to the main checkout, a plain repo to
+/// itself — the redirect `worktree_repo_root` applies when no override is set.
+#[test]
+fn main_root_of_redirects_linked_worktree_to_main_checkout() {
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        flare_git_core::shell::run_in(dir, args).unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+    };
+    let parent = tempfile::tempdir().unwrap();
+    let main = parent.path().join("main");
+    std::fs::create_dir_all(&main).unwrap();
+    git(&main, &["init", "-b", "master"]);
+    git(&main, &["config", "user.email", "test@test.com"]);
+    git(&main, &["config", "user.name", "Test"]);
+    git(&main, &["commit", "--allow-empty", "-m", "initial"]);
+    let wt = parent.path().join("wt");
+    git(
+        &main,
+        &["worktree", "add", "-b", "wt-branch", wt.to_str().unwrap()],
+    );
+
+    let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap();
+    assert_eq!(
+        canon(&AgentflareMcp::main_root_of(&wt).unwrap()),
+        canon(&main)
+    );
+    assert_eq!(
+        canon(&AgentflareMcp::main_root_of(&main).unwrap()),
+        canon(&main)
+    );
+}
