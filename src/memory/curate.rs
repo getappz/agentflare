@@ -38,6 +38,19 @@ pub(super) fn curate_in(conn: &rusqlite::Connection, input: CurateInput) -> Resu
             // Same redaction as `remember`: an update must not be a way around it.
             let (title, t) = redact_opt(input.title.as_deref());
             let (content, c) = redact_opt(input.content.as_deref());
+            // An update that is wholly a secret would overwrite good content with a marker.
+            for (changed, v) in [(t, &title), (c, &content)] {
+                if changed
+                    && v.as_deref()
+                        .is_some_and(super::remember_redact::only_placeholders)
+                {
+                    return Err(
+                        "update blocked: the new value is entirely secret-like text; \
+                                it would replace the stored value with a redaction marker"
+                            .into(),
+                    );
+                }
+            }
             let ok = observations::update(
                 conn,
                 input.id,

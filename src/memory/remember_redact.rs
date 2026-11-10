@@ -12,6 +12,25 @@ pub(super) fn redact_opt(text: Option<&str>) -> (Option<String>, bool) {
     (redacted, changed)
 }
 
+/// True when `text` is nothing but `[REDACTED:..]` placeholders (and whitespace):
+/// storing it would replace real content with a marker.
+pub(super) fn only_placeholders(text: &str) -> bool {
+    let mut rest = text;
+    let mut kept = String::new();
+    while let Some(i) = rest.find("[REDACTED") {
+        kept.push_str(&rest[..i]);
+        match rest[i..].find(']') {
+            Some(j) => rest = &rest[i + j + 1..],
+            None => {
+                kept.push_str(&rest[i..]);
+                rest = "";
+            }
+        }
+    }
+    kept.push_str(rest);
+    kept.trim().is_empty()
+}
+
 /// Rejects a secret-like value in a field stored and synced as an identity key.
 /// Redacting would change what the row is keyed on, so refuse instead; the error
 /// names the field and pattern class, never the value.
@@ -162,5 +181,31 @@ mod tests {
         assert!(out.contains("redacted"), "{out}");
         let out = curate_in(&conn, update(Some("clean title".into()), None)).unwrap();
         assert!(!out.contains("redacted"), "{out}");
+    }
+
+    #[test]
+    fn curate_update_refuses_a_wholly_secret_value() {
+        let conn = db();
+        let saved: serde_json::Value =
+            serde_json::from_str(&remember_in(&conn, base()).unwrap()).unwrap();
+        let id = saved["id"].as_i64().unwrap();
+        let err = curate_in(
+            &conn,
+            CurateInput {
+                action: "update".into(),
+                id,
+                title: None,
+                content: Some(token()),
+                r#type: None,
+                pinned: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("entirely secret-like"), "{err}");
+        let obs = observations::get(&conn, id).unwrap().unwrap();
+        assert_eq!(
+            obs.content, "plain note",
+            "stored content must be untouched"
+        );
     }
 }
