@@ -81,6 +81,22 @@ impl Adapter for AntigravityAdapter {
             if cursors.get(path) == Some(&cursor) && !metadata_changed {
                 continue;
             }
+            if config.project.is_some() {
+                let project = match workspaces.get(&transcript_id(path)) {
+                    Some(workspace) => Some(workspace.to_string_lossy().into_owned()),
+                    None => match super::common::jsonl_project(path) {
+                        Ok(project) => project,
+                        // Unreadable file: skip it instead of failing the scan.
+                        Err(_) => continue,
+                    },
+                };
+                if !config.matches_project(project.as_deref()) {
+                    if project.is_some() {
+                        bundle.file_cursors.push((path.clone(), cursor.0, cursor.1));
+                    }
+                    continue;
+                }
+            }
             if let Some(mut b) = parse_antigravity_jsonl(path, &config.pricing) {
                 for session in &mut b.sessions {
                     if let Some(workspace) = workspaces
@@ -161,31 +177,7 @@ pub(crate) fn parse_antigravity_jsonl(path: &Path, pricing: &PricingTable) -> Op
         return None;
     }
 
-    // Antigravity logs are stored at <brain>/<conversation-id>/.system_generated/logs/transcript.jsonl
-    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    let id = match file_name.strip_suffix(".transcript.jsonl") {
-        Some(stem) if !stem.is_empty() => stem.to_string(),
-        _ => path
-            .parent()
-            .and_then(|p| {
-                if p.file_name().and_then(|n| n.to_str()) == Some("logs") {
-                    p.parent()
-                } else {
-                    Some(p)
-                }
-            })
-            .and_then(|p| {
-                if p.file_name().and_then(|n| n.to_str()) == Some(".system_generated") {
-                    p.parent()
-                } else {
-                    Some(p)
-                }
-            })
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-            .to_string(),
-    };
+    let id = transcript_id(path);
 
     let mut tokens = TokenUsage {
         input: 0,
@@ -444,7 +436,38 @@ fn extract_model_from_settings(content: &str) -> Option<String> {
     None
 }
 
-fn extract_workspace_from_text(content: &str) -> Option<String> {
+fn transcript_id(path: &Path) -> String {
+    if let Some(stem) = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|name| name.strip_suffix(".transcript.jsonl"))
+        .filter(|s| !s.is_empty())
+    {
+        return stem.to_string();
+    }
+    // Native logs live at <conversation-id>/.system_generated/logs/transcript.jsonl.
+    path.parent()
+        .and_then(|p| {
+            if p.file_name().and_then(|n| n.to_str()) == Some("logs") {
+                p.parent()
+            } else {
+                Some(p)
+            }
+        })
+        .and_then(|p| {
+            if p.file_name().and_then(|n| n.to_str()) == Some(".system_generated") {
+                p.parent()
+            } else {
+                Some(p)
+            }
+        })
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+pub(crate) fn extract_workspace_from_text(content: &str) -> Option<String> {
     for prefix in [
         "Command Working Directory: ",
         "Active Workspaces:\n- ",
@@ -453,7 +476,7 @@ fn extract_workspace_from_text(content: &str) -> Option<String> {
         if let Some(idx) = content.find(prefix) {
             let after = &content[idx + prefix.len()..];
             let line = after.lines().next().unwrap_or("").trim();
-            if !line.is_empty() && line.starts_with('/') {
+            if line.starts_with('/') || Path::new(line).is_absolute() {
                 return Some(line.to_string());
             }
         }

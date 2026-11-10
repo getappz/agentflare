@@ -17,6 +17,18 @@ All external OSS projects, docs, and APIs referenced to build `flare-insights` (
 | **Claude-Code-Agent-Monitor** (hoangsonww) | https://github.com/hoangsonww/Claude-Code-Agent-Monitor | Node+React+SQLite+WebSocket, Kanban (Working/Waiting/Completed/Error/Abandoned), `awaiting_reason`, MCP server `mcp/` |
 | **Cogpit** | https://cogpit.dev/ | Open-source control room for Claude Code (SDK) + Codex (App Server) — live turns/tools/diffs, approve/interrupt/steer/rewind/branch, worktree↔PR link |
 
+### Sync performance research (2026-11-04)
+
+| Implementation | Verified behavior | Application here |
+|----------------|-------------------|------------------|
+| [Observer OpenCode reader](https://github.com/superbasedapp/observer/blob/9081edd2/internal/adapter/opencode/adapter.go) | Queries message and part update timestamps after a saved watermark. | A reference for future row-level OpenCode ingestion; not implemented in this change. |
+| [Moraine Cursor poller](https://github.com/eric-tramel/moraine/blob/main/crates/moraine-ingest-core/src/sqlite_poll.rs) | Checks DB/WAL fingerprints, then hashes relevant KV values and emits changed keys. | Confirms WAL-aware cache invalidation; hashing still requires reading relevant values. |
+| [aiusage Cursor reader](https://github.com/juliantanx/aiusage/blob/main/packages/cli/src/commands/parse-cursor.ts) | Uses indexed key ranges; current code rereads existing conversations because creation-time cutoffs miss later bubble updates. | Use indexed composer prefix bounds; avoid creation-time-only incremental filtering. |
+| [tokentop Cursor parser](https://github.com/tokentopapp/agent-cursor/blob/main/src/parser.ts) | Invalidates composer aggregates when the DB is dirty because bubbles can change without composer lastUpdatedAt changing. | Do not treat composer timestamps alone as proof that bubble content is unchanged. |
+
+The implemented fast paths are unchanged DB/WAL skips and project filtering before
+session body parsing. Changed SQL sources still reload eligible sessions.
+
 ## 2. Observability / tracing — export sinks
 
 | Project | URL | What we reused |

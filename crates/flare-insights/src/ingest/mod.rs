@@ -33,7 +33,7 @@ pub enum IngestError {
     Unsupported(String),
 }
 
-/// Per-source `path -> (mtime_ms, size)` cache from the last successful sync,
+/// Per-source `path -> (mtime, size)` cache from the last successful sync,
 /// used by file-walking adapters to skip re-parsing unchanged session files.
 pub type FileCursors = HashMap<PathBuf, (i64, u64)>;
 
@@ -102,7 +102,9 @@ impl IngestManager {
         let mut out = Vec::new();
         for a in &self.adapters {
             let name = a.source_name().to_string();
-            let cursors = store.load_file_cursors(&name).unwrap_or_default();
+            let cursors = store
+                .load_file_cursors(&config.cursor_source(&name))
+                .unwrap_or_default();
             let res = a.scan(config, &cursors, &mut |done, total| {
                 on_progress(&name, done, total)
             });

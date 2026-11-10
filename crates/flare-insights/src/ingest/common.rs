@@ -3,7 +3,8 @@
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use std::path::Path;
+use std::io::BufRead;
+use std::path::{Path, PathBuf};
 
 use crate::model::{Cost, TokenUsage};
 
@@ -18,6 +19,66 @@ pub fn file_cursor(path: &Path) -> Option<(i64, u64)> {
         .ok()?
         .as_millis() as i64;
     Some((mtime_ms, meta.len()))
+}
+
+/// Track the WAL too: live SQLite writes need not modify the main database.
+pub(crate) fn sqlite_file_cursors(path: &Path) -> std::io::Result<Vec<(PathBuf, i64, u64)>> {
+    let mut wal = path.as_os_str().to_os_string();
+    wal.push("-wal");
+    [path.to_path_buf(), PathBuf::from(wal)]
+        .into_iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let (mtime, size) = match std::fs::metadata(&path) {
+                // Read-only SQLite opens can recreate an empty WAL after checkpointing.
+                Ok(meta) if index == 1 && meta.len() == 0 => (0, 0),
+                Ok(meta) => (
+                    meta.modified()?
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_err(std::io::Error::other)?
+                        .as_nanos() as i64,
+                    meta.len(),
+                ),
+                // Persist absence so a removed WAL invalidates the cache only once.
+                Err(e) if index == 1 && e.kind() == std::io::ErrorKind::NotFound => (0, 0),
+                Err(e) => return Err(e),
+            };
+            Ok((path, mtime, size))
+        })
+        .collect()
+}
+
+/// Read only enough JSONL records to identify a session's originating project.
+pub(crate) fn jsonl_project(path: &Path) -> std::io::Result<Option<String>> {
+    for line in std::io::BufReader::new(std::fs::File::open(path)?).lines() {
+        let line = line?;
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if let Some(cwd) = value
+            .get("cwd")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                value
+                    .get("payload")
+                    .and_then(|p| p.get("cwd"))
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+            })
+        {
+            return Ok(Some(cwd.to_string()));
+        }
+        if value["type"] == "USER_INPUT" || value["source"] == "USER_EXPLICIT" {
+            if let Some(workspace) = value["content"]
+                .as_str()
+                .and_then(super::antigravity::extract_workspace_from_text)
+            {
+                return Ok(Some(workspace));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Try multiple timestamp formats: RFC3339, epoch ms, epoch sec.
