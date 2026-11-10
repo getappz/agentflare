@@ -45,6 +45,16 @@ impl Adapter for CodexAdapter {
             if cursors.get(path) == Some(&cursor) {
                 continue; // unchanged since last sync
             }
+            if config.project.is_some() {
+                // Unreadable file: skip it (no cursor, retried next sync) instead of failing the scan.
+                let Ok(project) = super::common::jsonl_project(path) else {
+                    continue;
+                };
+                if !config.matches_project(project.as_deref()) {
+                    bundle.file_cursors.push((path.clone(), cursor.0, cursor.1));
+                    continue;
+                }
+            }
             if let Some((s, turns, tools)) = parse_codex_jsonl(path) {
                 bundle.sessions.push(s);
                 bundle.turns.extend(turns);

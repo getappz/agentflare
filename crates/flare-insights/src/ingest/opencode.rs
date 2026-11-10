@@ -5,7 +5,9 @@
 use crate::config::InsightsConfig;
 use crate::config::PricingTable;
 use crate::ingest::{
-    common::{extract_file_path, extract_tokens, file_kind_for_tool, parse_timestamp},
+    common::{
+        extract_file_path, extract_tokens, file_kind_for_tool, parse_timestamp, sqlite_file_cursors,
+    },
     Adapter, FileCursors, IngestBundle, IngestError,
 };
 use crate::model::{Session, SessionSource, SessionStatus, TokenUsage, ToolCall, Turn};
@@ -19,26 +21,40 @@ impl Adapter for OpenCodeAdapter {
     fn scan(
         &self,
         config: &InsightsConfig,
-        _cursors: &FileCursors,
+        cursors: &FileCursors,
         on_progress: &mut dyn FnMut(usize, usize),
     ) -> Result<IngestBundle, IngestError> {
-        // Single small SQLite DB queried directly -- no per-file walk/reparse
-        // cost here, so the file-cursor skip cache doesn't apply.
-        on_progress(1, 1);
         let Some(db_path) = config.sources.get("opencode") else {
             return Ok(IngestBundle::default());
         };
         if !db_path.exists() {
             return Ok(IngestBundle::default());
         }
-        let conn = rusqlite::Connection::open(db_path)?;
-        let mut bundle = IngestBundle::default();
+        let file_cursors = sqlite_file_cursors(db_path)?;
+        on_progress(1, 1);
+        if file_cursors
+            .iter()
+            .all(|(path, mtime, size)| cursors.get(path) == Some(&(*mtime, *size)))
+        {
+            return Ok(IngestBundle::default());
+        }
+        let conn = rusqlite::Connection::open_with_flags(
+            db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        // Acquire one read snapshot before schema fallbacks can hide a source lock.
+        let _snapshot = conn.unchecked_transaction()?;
+        conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))?;
+        let mut bundle = IngestBundle {
+            file_cursors,
+            ..Default::default()
+        };
 
         // Try current schema: session + message + part
-        let sessions = try_session_table_dynamic(&conn);
+        let sessions = try_session_table_dynamic(&conn, config);
         if sessions.is_empty() {
             // legacy fallback
-            let legacy = try_sessions_table(&conn);
+            let legacy = try_sessions_table(&conn, config);
             bundle.sessions = legacy;
             return Ok(bundle);
         }
@@ -77,14 +93,24 @@ impl Adapter for OpenCodeAdapter {
         }
 
         // DRY: subagents are child sessions (parent_id != null) - fetch via SQL
-        if let Ok(mut stmt) =
-            conn.prepare("SELECT id, parent_id FROM session WHERE parent_id IS NOT NULL LIMIT 1000")
-        {
+        let limit = if config.project.is_some() {
+            ""
+        } else {
+            " LIMIT 1000"
+        };
+        if let Ok(mut stmt) = conn.prepare(&format!(
+            "SELECT id, parent_id FROM session WHERE parent_id IS NOT NULL{limit}"
+        )) {
             if let Ok(rows) =
                 stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
             {
+                let session_ids: std::collections::HashSet<String> =
+                    bundle.sessions.iter().map(|s| s.id.clone()).collect();
                 for row in rows.filter_map(|r| r.ok()) {
                     let (child_id, parent_id) = row;
+                    if !session_ids.contains(&parent_id) {
+                        continue;
+                    }
                     bundle.subagents.push(crate::model::Subagent {
                         id: child_id.clone(),
                         session_id: parent_id.clone(),
@@ -105,10 +131,17 @@ impl Adapter for OpenCodeAdapter {
     }
 }
 
-fn try_session_table_dynamic(conn: &rusqlite::Connection) -> Vec<Session> {
-    let stmt = match conn
-        .prepare("SELECT * FROM session ORDER BY time_updated DESC LIMIT 1000")
-        .or_else(|_| conn.prepare("SELECT * FROM session LIMIT 1000"))
+fn try_session_table_dynamic(conn: &rusqlite::Connection, config: &InsightsConfig) -> Vec<Session> {
+    let limit = if config.project.is_some() {
+        ""
+    } else {
+        " LIMIT 1000"
+    };
+    let mut stmt = match conn
+        .prepare(&format!(
+            "SELECT * FROM session ORDER BY time_updated DESC{limit}"
+        ))
+        .or_else(|_| conn.prepare(&format!("SELECT * FROM session{limit}")))
     {
         Ok(s) => s,
         Err(_) => return vec![],
@@ -135,14 +168,7 @@ fn try_session_table_dynamic(conn: &rusqlite::Connection) -> Vec<Session> {
     let time_updated_idx = find(&["time_updated", "updated_at", "timeUpdated"]);
     let time_created_idx = find(&["time_created", "created_at", "timeCreated"]);
 
-    let mut stmt2 = match conn
-        .prepare("SELECT * FROM session ORDER BY time_updated DESC LIMIT 1000")
-        .or_else(|_| conn.prepare("SELECT * FROM session LIMIT 1000"))
-    {
-        Ok(s) => s,
-        Err(_) => return vec![],
-    };
-    let mut rows = match stmt2.query([]) {
+    let mut rows = match stmt.query([]) {
         Ok(r) => r,
         Err(_) => return vec![],
     };
@@ -154,6 +180,9 @@ fn try_session_table_dynamic(conn: &rusqlite::Connection) -> Vec<Session> {
             .unwrap_or_else(|| "opencode".to_string());
         let directory: Option<String> = find(&["directory", "path"])
             .and_then(|idx| row.get::<_, Option<String>>(idx).ok().flatten());
+        if !config.matches_project(directory.as_deref()) {
+            continue;
+        }
         let title: Option<String> =
             title_idx.and_then(|idx| row.get::<_, Option<String>>(idx).ok().flatten());
         let model: Option<String> = model_idx
@@ -286,10 +315,15 @@ fn try_session_table_dynamic(conn: &rusqlite::Connection) -> Vec<Session> {
     out
 }
 
-fn try_sessions_table(conn: &rusqlite::Connection) -> Vec<Session> {
+fn try_sessions_table(conn: &rusqlite::Connection, config: &InsightsConfig) -> Vec<Session> {
     let mut out = Vec::new();
+    let limit = if config.project.is_some() {
+        ""
+    } else {
+        " LIMIT 1000"
+    };
     let mut stmt = match conn.prepare(
-        "SELECT id, project, model, updated_at, input_tokens, output_tokens, cost FROM sessions LIMIT 1000",
+        &format!("SELECT id, project, model, updated_at, input_tokens, output_tokens, cost FROM sessions{limit}"),
     ) {
         Ok(s) => s,
         Err(_) => return out,
@@ -310,6 +344,9 @@ fn try_sessions_table(conn: &rusqlite::Connection) -> Vec<Session> {
     };
     for row in rows.filter_map(|r| r.ok()) {
         let (id, project, model, updated_at, input, output, cost) = row;
+        if !config.matches_project(project.as_deref()) {
+            continue;
+        }
         let updated_at = updated_at
             .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
             .unwrap_or_else(chrono::Utc::now);
@@ -625,10 +662,11 @@ mod tests {
                 INSERT INTO {table} VALUES ('provider', 'p', 'totally-new', NULL, 1000000, 0, 0.0),
                     ('estimated', 'p', 'claude-sonnet-4', NULL, 1000000, 0, NULL),
                     ('unknown', 'p', 'totally-new', NULL, 1000000, 0, NULL);")).unwrap();
+            let config = InsightsConfig::default();
             let sessions = if legacy {
-                try_sessions_table(&conn)
+                try_sessions_table(&conn, &config)
             } else {
-                try_session_table_dynamic(&conn)
+                try_session_table_dynamic(&conn, &config)
             };
             let provider = sessions.iter().find(|s| s.id == "provider").unwrap();
             assert_eq!(provider.cost_basis, crate::model::CostBasis::Provider);
@@ -679,6 +717,144 @@ mod tests {
     }
 
     #[test]
+    fn locked_source_is_retried_without_a_file_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("opencode.db");
+        fixture_db(&source);
+        let config = InsightsConfig {
+            sources: [("opencode".into(), source.clone())].into(),
+            ..Default::default()
+        };
+        let conn = rusqlite::Connection::open(&source).unwrap();
+        let before = sqlite_file_cursors(&source).unwrap();
+        conn.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        let locked = OpenCodeAdapter.scan(&config, &FileCursors::default(), &mut |_, _| {});
+        conn.execute_batch("ROLLBACK;").unwrap();
+        assert!(
+            locked.is_err(),
+            "a locked source must not return cacheable partial data"
+        );
+        assert_eq!(sqlite_file_cursors(&source).unwrap(), before);
+        let retried = OpenCodeAdapter
+            .scan(&config, &FileCursors::default(), &mut |_, _| {})
+            .unwrap();
+        assert_eq!(retried.sessions.len(), 2);
+    }
+
+    #[test]
+    fn failed_storage_does_not_advance_sync_cursors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("opencode.db");
+        fixture_db(&source);
+        let conn = rusqlite::Connection::open(&source).unwrap();
+        conn.execute_batch("INSERT INTO message VALUES ('m1', 'ses-new', 2000, '{\"role\":\"user\"}');
+            INSERT INTO part VALUES ('p1', 'm1', 'ses-new', '{\"type\":\"text\",\"text\":\"retry me\"}');").unwrap();
+        drop(conn);
+        let db = tmp.path().join("insights.db");
+        let store = crate::store::InsightsStore::open(&db).unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_turn BEFORE INSERT ON turns BEGIN SELECT RAISE(FAIL, 'injected write failure'); END;").unwrap();
+        let config = InsightsConfig {
+            sources: [("opencode".into(), source)].into(),
+            ..Default::default()
+        };
+        crate::ingest::watcher::InsightsWatcher::rescan_and_store(&config, &store);
+        assert!(store.load_file_cursors("opencode").unwrap().is_empty());
+        conn.execute_batch("DROP TRIGGER fail_turn;").unwrap();
+        assert_eq!(
+            crate::ingest::watcher::InsightsWatcher::rescan_and_store(&config, &store),
+            (2, 1, 0)
+        );
+        assert_eq!(
+            store.get_turns("ses-new").unwrap()[0].user_text.as_deref(),
+            Some("retry me")
+        );
+    }
+
+    #[test]
+    fn unchanged_database_skips_reparse_with_live_wal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("opencode.db");
+        fixture_db(&db);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+            UPDATE session SET title='live' WHERE id='ses-new';",
+        )
+        .unwrap();
+        assert!(
+            std::fs::metadata(db.with_extension("db-wal"))
+                .unwrap()
+                .len()
+                > 0
+        );
+        let config = InsightsConfig {
+            sources: [("opencode".into(), db.clone())].into(),
+            ..Default::default()
+        };
+        let store = crate::store::InsightsStore::open_in_memory().unwrap();
+        let first = OpenCodeAdapter
+            .scan(&config, &FileCursors::default(), &mut |_, _| {})
+            .unwrap();
+        assert_eq!(first.sessions[0].title.as_deref(), Some("live"));
+        store
+            .upsert_file_cursors_batch("opencode", &first.file_cursors)
+            .unwrap();
+        let cursors = store.load_file_cursors("opencode").unwrap();
+        let unchanged = OpenCodeAdapter
+            .scan(&config, &cursors, &mut |_, _| {})
+            .unwrap();
+        assert!(
+            unchanged.sessions.is_empty(),
+            "unchanged DB and WAL must skip ingestion"
+        );
+        assert!(unchanged.file_cursors.is_empty());
+
+        let main_before = super::super::common::file_cursor(&db).unwrap();
+        conn.execute(
+            "UPDATE session SET title='new WAL content' WHERE id='ses-new'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(super::super::common::file_cursor(&db), Some(main_before));
+        let changed = OpenCodeAdapter
+            .scan(&config, &cursors, &mut |_, _| {})
+            .unwrap();
+        assert_eq!(
+            changed.sessions[0].title.as_deref(),
+            Some("new WAL content")
+        );
+        store
+            .upsert_file_cursors_batch("opencode", &changed.file_cursors)
+            .unwrap();
+        let cursors = store.load_file_cursors("opencode").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        drop(conn);
+        let checkpointed = OpenCodeAdapter
+            .scan(&config, &cursors, &mut |_, _| {})
+            .unwrap();
+        assert_eq!(checkpointed.sessions.len(), 2);
+        store
+            .upsert_file_cursors_batch("opencode", &checkpointed.file_cursors)
+            .unwrap();
+        let cursors = store.load_file_cursors("opencode").unwrap();
+        assert!(OpenCodeAdapter
+            .scan(&config, &cursors, &mut |_, _| {})
+            .unwrap()
+            .sessions
+            .is_empty());
+        assert_eq!(
+            OpenCodeAdapter
+                .scan(&config, &FileCursors::default(), &mut |_, _| {})
+                .unwrap()
+                .sessions
+                .len(),
+            2
+        );
+    }
+
+    #[test]
     fn scan_orders_newest_first_and_sets_cwd_from_directory() {
         let tmp = tempfile::tempdir().unwrap();
         let db = tmp.path().join("opencode.db");
@@ -691,6 +867,7 @@ mod tests {
             retention_days: 30,
             sources,
             pricing: PricingTable::default(),
+            project: None,
         };
         let mut progress = |_: usize, _: usize| {};
         let bundle = OpenCodeAdapter

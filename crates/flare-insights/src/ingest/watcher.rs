@@ -115,7 +115,7 @@ impl InsightsWatcher {
         let mut tools = 0;
         for (source, res) in mgr.scan_all(config, store, |_, _, _| {}) {
             let Ok(bundle) = res else { continue };
-            match store.commit_ingest(&source, &bundle) {
+            match store.commit_ingest(&config.cursor_source(&source), &bundle) {
                 Ok(stats) => {
                     sess += stats.sessions;
                     turns += stats.turns;
