@@ -171,14 +171,16 @@ fn budget_policy_changes_are_rejected_before_native_redispatch() {
 fn recovered_cursor_launch_restores_autonomy_and_streaming() {
     let role_args = vec!["--resume".to_string(), "session-379".to_string()];
     let args = work_item_launch_args("cursor", &[], &role_args);
+    // Streaming is added per role by `run_headless(request_json = true)`.
+    let argv = crate::agent_launch::headless_full_args(agent_registry::Agent::Cursor, true, &args);
     assert_eq!(
-        args,
+        argv,
         [
+            "--output-format",
+            "stream-json",
             "--force",
             "--trust",
             "--approve-mcps",
-            "--output-format",
-            "stream-json",
             "--resume",
             "session-379"
         ]

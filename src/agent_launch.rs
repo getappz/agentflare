@@ -876,7 +876,8 @@ fn run_headless_impl(
         routed_args.extend(model.args(agent));
     }
     let full_args = headless_full_args(spec.id, request_json, &routed_args);
-    let reply_format = structured_output(spec.id).map(|s| s.format);
+    let structured = structured_output(spec.id);
+    let reply_format = structured.map(|s| s.format);
     let Some(argv) = headless_argv(spec.id, &binary, &full_args) else {
         return HeadlessOutcome::NotHeadless(format!(
             "{} has no headless print mode",
@@ -1017,7 +1018,7 @@ fn run_headless_impl(
         owner.and_then(job_id_of_owner),
         StallConfig::from_env(),
         request_json
-            && reply_format == Some(ReplyFormat::ResultObject)
+            && structured.is_some_and(|s| s.ends_at_result)
             && claude_json_output(&full_args),
     );
     // Always taken (read + removed), win or lose, regardless of whether it
@@ -1119,12 +1120,12 @@ pub(crate) fn parse_claude_reply(raw: &str) -> (String, Option<String>, Option<f
 
 /// Every role dispatched through `real_agent_send_hook` (`work_item_pipeline`)
 /// — implementer, task-reviewer, re-reviewer, AND the judge — shares that
-/// hook, and `build_extra_args` (`cli::work`) forces `--output-format
-/// stream-json` for every `ReplyFormat::ResultObject` agent regardless of
-/// role.
-/// `run_headless`'s captured stdout is therefore that raw multi-line
+/// hook, and `build_extra_args` (`cli::work`) pins every
+/// `ReplyFormat::ResultObject` agent's structured output (`stream-json`, or
+/// whole-reply `json` where only that is verified) regardless of role.
+/// `run_headless`'s captured stdout may therefore be that raw (multi-line)
 /// transcript, not plain reply text; `parse_claude_reply` is what pulls the
-/// real reply off its final line. Other agents' headless output is already
+/// real reply off its final line (or the whole-stdout object). Other agents' headless output is already
 /// plain text, so this is a no-op for them. See `parse_claude_reply`'s doc
 /// comment for why this call exists at all (item #489).
 pub(crate) fn clean_agent_reply(agent: &str, raw: String) -> String {

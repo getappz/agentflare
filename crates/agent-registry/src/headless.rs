@@ -31,6 +31,11 @@ pub struct Structured {
     pub args: &'static [&'static str],
     /// The shape the agent emits under `args`.
     pub format: ReplyFormat,
+    /// The CLI's terminal `result` event is its last word, so the run may be
+    /// ended shortly after it even if background tools still hold the
+    /// process open. Verified for Claude Code only; elsewhere an early
+    /// result-shaped line could cut off unfinished work as a "success".
+    pub ends_at_result: bool,
 }
 
 /// Shape of a structured reply; selects the parser.
@@ -57,6 +62,7 @@ pub fn headless_cli(agent: Agent) -> Option<HeadlessCli> {
             structured: Some(Structured {
                 args: &["--output-format", "stream-json", "--verbose"],
                 format: ReplyFormat::ResultObject,
+                ends_at_result: true,
             }),
             resume: Some("--resume"),
         },
@@ -71,6 +77,7 @@ pub fn headless_cli(agent: Agent) -> Option<HeadlessCli> {
             structured: Some(Structured {
                 args: &["--output-format", "stream-json"],
                 format: ReplyFormat::ResultObject,
+                ends_at_result: false,
             }),
             resume: Some("--resume"),
         },
@@ -82,6 +89,7 @@ pub fn headless_cli(agent: Agent) -> Option<HeadlessCli> {
             structured: Some(Structured {
                 args: &["--output-format", "json"],
                 format: ReplyFormat::ResultObject,
+                ends_at_result: false,
             }),
             resume: Some("--conversation"),
         },
@@ -99,6 +107,7 @@ pub fn headless_cli(agent: Agent) -> Option<HeadlessCli> {
             structured: Some(Structured {
                 args: &["--json"],
                 format: ReplyFormat::CodexEvents,
+                ends_at_result: false,
             }),
             // `codex exec resume <id>`.
             resume: Some("resume"),

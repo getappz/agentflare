@@ -899,7 +899,7 @@
     }
 
     #[test]
-    fn headless_full_args_prepends_json_output_when_caller_pins_no_output_format() {
+    fn headless_full_args_prepends_structured_output_when_caller_pins_no_output_format() {
         let extra = vec!["--model".to_string(), "sonnet".to_string()];
         let args = headless_full_args(Agent::ClaudeCode, true, &extra);
         assert_eq!(

@@ -31,21 +31,24 @@ model = "sonnet"
 }
 
 #[test]
-fn build_extra_args_includes_bypass_and_streaming_output_for_claude() {
-    // Plain `--output-format json` writes NOTHING to stdout/stderr until
-    // the entire run finishes (confirmed by hand: 0 bytes for 54s+ on a
-    // trivial 2-tool-call task) — run_captured's idle-timeout (default
-    // 300s) then kills any real task before it can finish, every time.
-    // `stream-json` (+ the `--verbose` it requires) emits one JSON
-    // object per turn/tool-call as it happens, giving a genuine
-    // liveness signal; its final line carries the same {"result":...}
-    // shape `parse_claude_reply` already expects.
+fn build_extra_args_carries_no_output_format_shared_across_roles() {
+    // These args reach every role of a dispatch, which can run different
+    // agents: an implementer's format flag (Codex `--json`) would make a
+    // Claude judge's `pins_output_format` skip its own `stream-json`. Each
+    // role's format comes from `headless_full_args` instead (#859 review).
+    for agent in [
+        agent_registry::Agent::ClaudeCode,
+        agent_registry::Agent::Codex,
+        agent_registry::Agent::Cursor,
+    ] {
+        let args = build_extra_args(agent, None, None, None);
+        assert!(
+            !agent_registry::pins_output_format(&args),
+            "{agent:?}: {args:?}"
+        );
+    }
     let args = build_extra_args(agent_registry::Agent::ClaudeCode, None, None, None);
     assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
-    assert!(args.contains(&"--output-format".to_string()));
-    assert!(args.contains(&"stream-json".to_string()));
-    assert!(!args.contains(&"json".to_string()));
-    assert!(args.contains(&"--verbose".to_string()));
     assert!(!args.iter().any(|a| a.starts_with("--max-turns")));
 }
 
@@ -61,13 +64,7 @@ fn build_extra_args_for_codex_keeps_sandbox_and_disables_prompts() {
     let args = build_extra_args(agent_registry::Agent::Codex, None, None, None);
     assert_eq!(
         args,
-        vec![
-            "--sandbox",
-            "workspace-write",
-            "-c",
-            "approval_policy=\"never\"",
-            "--json"
-        ]
+        vec!["--sandbox", "workspace-write", "-c", "approval_policy=\"never\""]
     );
 }
 
