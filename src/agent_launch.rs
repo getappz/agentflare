@@ -2,7 +2,9 @@
 // Finds the agent binary on PATH, maps --model/--mode to agent-native
 // flags, and executes with pass-through args and inherited stdio.
 use agent_registry::detect::find_binary;
-use agent_registry::{Agent, AgentSpec, Tier, headless_args, json_output_args};
+use agent_registry::{
+    Agent, AgentSpec, ReplyFormat, Tier, headless_args, pins_output_format, structured_output,
+};
 use flare_process::available_output_bytes;
 use std::io::Read;
 use std::path::Path;
@@ -514,41 +516,28 @@ pub enum HeadlessOutcome {
     Failed(String),
 }
 
-/// Print-mode argv tail: the registry's JSON-output flags (when the caller
-/// asked for a structured reply) followed by `extra_args` — unless
-/// `extra_args` already pin `--output-format` themselves, in which case the
-/// caller's choice stands and no second `--output-format` is emitted.
-///
-/// `cli::work::build_extra_args` pins `stream-json` for liveness. Emitting
-/// `--output-format json` ahead of it made the CLI (last flag wins) stream
-/// multi-line output that `parse_json_reply` then failed to parse as one
-/// object, so every Claude Code `agentflare work` dispatch silently lost its
-/// `session_id` and `total_cost_usd` — the SDD loop's `--resume` between fix
-/// rounds never fired in real dispatch (audit 2026-09-24, finding #1).
+/// Print-mode argv tail: the agent's structured-output flags (when the
+/// caller asked for a structured reply) followed by `extra_args` — unless
+/// `extra_args` already pin an output format, in which case the caller's
+/// choice stands (see `agent_registry::pins_output_format`).
 pub(crate) fn headless_full_args(
     agent: Agent,
     request_json: bool,
     extra_args: &[String],
 ) -> Vec<String> {
-    let pins_output_format = extra_args.iter().any(|a| {
-        a == "--output-format"
-            || a.starts_with("--output-format=")
-            || a == "--stream-json"
-            || a == "--json"
-    });
-    let mut full_args: Vec<String> = Vec::with_capacity(extra_args.len() + 2);
+    let mut full_args: Vec<String> = Vec::with_capacity(extra_args.len() + 3);
     if request_json
-        && !pins_output_format
-        && let Some(flags) = json_output_args(agent)
+        && !pins_output_format(extra_args)
+        && let Some(structured) = structured_output(agent)
     {
-        full_args.extend(flags.iter().map(|s| (*s).to_string()));
+        full_args.extend(structured.args.iter().map(|s| (*s).to_string()));
     }
     full_args.extend(extra_args.iter().cloned());
     full_args
 }
 
 /// Structured reply off a headless run's stdout. Accepts both shapes the
-/// registry's `json_output_args` agents produce: `--output-format json` (the
+/// registry's `ReplyFormat::ResultObject` agents produce: `--output-format json` (the
 /// whole stdout is one object) and `--output-format stream-json` (one object
 /// per line, the final line carrying the same `{"result", "session_id",
 /// "total_cost_usd"}` fields). Anything else comes back as raw text with no
@@ -887,6 +876,7 @@ fn run_headless_impl(
         routed_args.extend(model.args(agent));
     }
     let full_args = headless_full_args(spec.id, request_json, &routed_args);
+    let reply_format = structured_output(spec.id).map(|s| s.format);
     let Some(argv) = headless_argv(spec.id, &binary, &full_args) else {
         return HeadlessOutcome::NotHeadless(format!(
             "{} has no headless print mode",
@@ -1026,7 +1016,9 @@ fn run_headless_impl(
         Some(prompt),
         owner.and_then(job_id_of_owner),
         StallConfig::from_env(),
-        request_json && spec.id == Agent::ClaudeCode && claude_json_output(&full_args),
+        request_json
+            && reply_format == Some(ReplyFormat::ResultObject)
+            && claude_json_output(&full_args),
     );
     // Always taken (read + removed), win or lose, regardless of whether it
     // ends up used below -- otherwise `~/.agentflare/sandbox-diagnostics`
@@ -1034,13 +1026,11 @@ fn run_headless_impl(
     let sandbox_log = take_diagnostic_log(diagnostic_path.as_deref());
     match result {
         Ok(c) if c.success => {
-            if request_json && json_output_args(spec.id).is_some() {
-                let reply = if let Some(event) = c.terminal_result {
-                    reply_from_result_event(&event, &c.stdout)
-                } else if spec.id == Agent::Codex {
-                    parse_codex_reply(&c.stdout)
-                } else {
-                    parse_json_reply(&c.stdout)
+            if let Some(format) = reply_format.filter(|_| request_json) {
+                let reply = match (c.terminal_result, format) {
+                    (Some(event), _) => reply_from_result_event(&event, &c.stdout),
+                    (None, ReplyFormat::CodexEvents) => parse_codex_reply(&c.stdout),
+                    (None, ReplyFormat::ResultObject) => parse_json_reply(&c.stdout),
                 };
                 classify_result_reply(spec.display_name, reply)
             } else {
@@ -1130,14 +1120,18 @@ pub(crate) fn parse_claude_reply(raw: &str) -> (String, Option<String>, Option<f
 /// Every role dispatched through `real_agent_send_hook` (`work_item_pipeline`)
 /// — implementer, task-reviewer, re-reviewer, AND the judge — shares that
 /// hook, and `build_extra_args` (`cli::work`) forces `--output-format
-/// stream-json` for Claude Code and cursor-agent regardless of role.
+/// stream-json` for every `ReplyFormat::ResultObject` agent regardless of
+/// role.
 /// `run_headless`'s captured stdout is therefore that raw multi-line
 /// transcript, not plain reply text; `parse_claude_reply` is what pulls the
 /// real reply off its final line. Other agents' headless output is already
 /// plain text, so this is a no-op for them. See `parse_claude_reply`'s doc
 /// comment for why this call exists at all (item #489).
 pub(crate) fn clean_agent_reply(agent: &str, raw: String) -> String {
-    if agent == Agent::ClaudeCode.as_str() || agent == Agent::Cursor.as_str() {
+    let result_object = agent_registry::agent_by_name(agent)
+        .and_then(structured_output)
+        .is_some_and(|s| s.format == ReplyFormat::ResultObject);
+    if result_object {
         parse_claude_reply(&raw).0
     } else {
         raw

@@ -1,5 +1,6 @@
 pub mod detect;
 pub mod failover;
+pub mod headless;
 pub mod registry;
 pub mod role;
 pub mod router;
@@ -8,9 +9,13 @@ pub use detect::{
     detect_all_with, detect_present, find_binary, resolve_version, resolve_version_with,
 };
 pub use failover::{FailoverConfig, failover_candidates, parse_failover_config};
+pub use headless::{
+    HeadlessCli, ReplyFormat, Structured, autonomous_args, headless_args, headless_cli,
+    pins_output_format, resume_args, structured_output,
+};
 pub use registry::{
-    Agent, AgentSpec, REGISTRY, Tier, agent_by_name, autonomous_args, canonicalize,
-    clinepass_model_for_claude, headless_args, json_output_args, mode_flag, resume_arg, spec,
+    Agent, AgentSpec, REGISTRY, Tier, agent_by_name, canonicalize, clinepass_model_for_claude,
+    mode_flag, spec,
 };
 pub use role::{
     CompiledRole, Effort, PermissionMode, RoleSpec, compile_role, prompt_with_system_fallback,

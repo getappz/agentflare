@@ -252,13 +252,10 @@ pub(crate) fn build_extra_args(
         .flatten()
         .map(|s| s.to_string())
         .collect();
-    use agent_registry::Agent::{ClaudeCode, Cursor};
-    if matches!(agent, ClaudeCode | Cursor) {
-        args.push("--output-format".to_string());
-        args.push("stream-json".to_string());
+    if let Some(structured) = agent_registry::structured_output(agent) {
+        args.extend(structured.args.iter().map(|s| s.to_string()));
     }
-    if agent == ClaudeCode {
-        args.push("--verbose".to_string());
+    if agent == agent_registry::Agent::ClaudeCode {
         if let Some(turns) = max_turns {
             args.push(format!("--max-turns={turns}"));
         }

@@ -61,7 +61,13 @@ fn build_extra_args_for_codex_keeps_sandbox_and_disables_prompts() {
     let args = build_extra_args(agent_registry::Agent::Codex, None, None, None);
     assert_eq!(
         args,
-        vec!["--sandbox", "workspace-write", "-c", "approval_policy=\"never\""]
+        vec![
+            "--sandbox",
+            "workspace-write",
+            "-c",
+            "approval_policy=\"never\"",
+            "--json"
+        ]
     );
 }
 
