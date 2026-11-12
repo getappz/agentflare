@@ -20,6 +20,10 @@ pub struct HeadlessCli {
     /// Flag (or, for Codex, subcommand) placed before a session id to
     /// resume that session.
     pub resume: Option<&'static str>,
+    /// Argv (id appended) that deletes a session, for agents whose service
+    /// outlives the turn and could resume it after we killed the turn.
+    /// `None` = nothing to clean up (or not verified).
+    pub discard: Option<&'static [&'static str]>,
 }
 
 /// An agent's structured-output mode.
@@ -69,6 +73,7 @@ pub fn headless_cli(agent: Agent) -> Option<HeadlessCli> {
                 ends_at_result: true,
             }),
             resume: Some("--resume"),
+            discard: None,
         },
         // `cursor-agent -p`: "Print responses to console (for scripts or
         // non-interactive use)". Headless: `--force` auto-allows commands,
@@ -84,6 +89,7 @@ pub fn headless_cli(agent: Agent) -> Option<HeadlessCli> {
                 ends_at_result: false,
             }),
             resume: Some("--resume"),
+            discard: None,
         },
         // `agy -p`: "Run a single prompt non-interactively and print the
         // response". Only whole-reply `json` is verified for agy.
@@ -96,6 +102,7 @@ pub fn headless_cli(agent: Agent) -> Option<HeadlessCli> {
                 ends_at_result: false,
             }),
             resume: Some("--conversation"),
+            discard: None,
         },
         Agent::Codex => HeadlessCli {
             print: &["exec"],
@@ -115,12 +122,14 @@ pub fn headless_cli(agent: Agent) -> Option<HeadlessCli> {
             }),
             // `codex exec resume <id>`.
             resume: Some("resume"),
+            discard: None,
         },
         Agent::GeminiCli => HeadlessCli {
             print: &["-p"],
             autonomous: &["--yolo"],
             structured: None,
             resume: None,
+            discard: None,
         },
         // `opencode run --auto`: "auto-approve permissions that are not
         // explicitly denied". `--format json`: "raw JSON events";
@@ -134,6 +143,8 @@ pub fn headless_cli(agent: Agent) -> Option<HeadlessCli> {
                 ends_at_result: false,
             }),
             resume: Some("--session"),
+            // `opencode session delete <sessionID>` (1.19): non-interactive.
+            discard: Some(&["session", "delete"]),
         },
         // No subcommand: `cline` starts in act mode and goes headless when
         // stdin is piped (docs.cline.bot/usage/cli-overview). `--auto-approve
@@ -144,6 +155,7 @@ pub fn headless_cli(agent: Agent) -> Option<HeadlessCli> {
             autonomous: &["--auto-approve", "true"],
             structured: None,
             resume: None,
+            discard: None,
         },
         _ => return None,
     };
@@ -195,6 +207,43 @@ pub fn resume_args(agent: Agent, session_id: &str) -> Vec<String> {
         .map(|flag| vec![flag.to_string(), session_id.to_string()])
         .unwrap_or_default()
 }
+
+/// Argv that deletes `session_id`; `None` when the agent has no verified
+/// delete command.
+#[must_use]
+pub fn discard_args(agent: Agent, session_id: &str) -> Option<Vec<String>> {
+    let base = headless_cli(agent)?.discard?;
+    Some(
+        base.iter()
+            .map(|a| (*a).to_string())
+            .chain([session_id.to_string()])
+            .collect(),
+    )
+}
+
+/// Best-effort delete of `session_id` after a turn was killed: never fails
+/// the caller, bounded by `DISCARD_TIMEOUT`, logs on error.
+pub fn discard_session(agent: Agent, session_id: &str) {
+    let Some(cmd_argv) = discard_args(agent, session_id) else {
+        return;
+    };
+    let spec = crate::registry::spec(agent);
+    let Some(binary) = crate::detect::find_binary(spec.binary_names) else {
+        return;
+    };
+    let arg_refs: Vec<&str> = cmd_argv.iter().map(String::as_str).collect();
+    match crate::detect::run_with_timeout(&binary, &arg_refs, DISCARD_TIMEOUT) {
+        Ok((true, _)) => {}
+        Ok((false, out)) => eprintln!(
+            "note: discarding a {} session failed: {}",
+            spec.display_name,
+            out.trim()
+        ),
+        Err(e) => eprintln!("note: discarding a {} session: {e}", spec.display_name),
+    }
+}
+
+const DISCARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// True when `args` already choose an output format, so a caller's pin is
 /// never doubled (a second `--output-format` once lost every session id:
@@ -372,6 +421,15 @@ mod tests {
         assert_eq!(resume_args(Agent::Codex, "s1"), v(&["resume", "s1"]));
         assert_eq!(resume_args(Agent::Opencode, "s1"), v(&["--session", "s1"]));
         assert!(resume_args(Agent::GeminiCli, "s1").is_empty());
+    }
+
+    #[test]
+    fn discard_args_only_for_agents_with_a_verified_delete() {
+        assert_eq!(
+            discard_args(Agent::Opencode, "ses_1"),
+            Some(vec!["session".into(), "delete".into(), "ses_1".into()])
+        );
+        assert_eq!(discard_args(Agent::ClaudeCode, "s1"), None);
     }
 
     #[test]

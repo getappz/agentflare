@@ -210,6 +210,9 @@ fn kill_recorded_agent_processes(worktree_path: &std::path::Path) {
                 kill_recorded_agent_group(pid, alive);
             }
         }
+        if let Some((agent, id)) = &record.session {
+            agent_registry::discard_session(*agent, id);
+        }
         let _ = std::fs::remove_file(&record.record_path);
     }
 }
