@@ -913,14 +913,17 @@ fn run_headless_impl(
             spec.binary_names.join(" / ")
         ));
     };
-    if let Err(msg) = agent_registry::check_headless_flags(spec.id, spec.display_name, &binary) {
-        return HeadlessOutcome::Failed(msg);
-    }
     let mut routed_args = extra_args.to_vec();
     if let Some(model) = crate::decide::model_routing::launch_model(agent, prompt, extra_args) {
         routed_args.extend(model.args(agent));
     }
     let full_args = headless_full_args(spec.id, request_json, &routed_args);
+    let flags = agent_registry::required_flags(spec.id, &full_args);
+    if let Err(msg) =
+        agent_registry::check_headless_flags(spec.id, spec.display_name, &binary, &flags)
+    {
+        return HeadlessOutcome::Failed(msg);
+    }
     let structured = structured_output(spec.id);
     let reply_format = structured.map(|s| s.format);
     let Some(argv) = headless_argv(spec.id, &binary, &full_args) else {

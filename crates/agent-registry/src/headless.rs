@@ -160,22 +160,21 @@ pub fn structured_output(agent: Agent) -> Option<Structured> {
     headless_cli(agent).and_then(|c| c.structured)
 }
 
-/// What `--help` must mention for `agent`'s headless row to still be valid:
-/// the help args (print-mode prefix, so `codex exec --help` lists exec's own
-/// flags) and the long flags we pass (autonomous + structured). Derived from
-/// the row, so there is no second list to keep in sync.
+/// The long flags from `agent`'s row (autonomous + structured) that `argv`
+/// actually passes: what `--help` must still list. Flags the caller supplied
+/// itself are not ours to vouch for, so a user typo is never blamed on the
+/// agent. Derived from the row, so there is no second list to keep in sync.
 #[must_use]
-pub fn required_flags(agent: Agent) -> Option<(Vec<&'static str>, Vec<&'static str>)> {
-    let cli = headless_cli(agent)?;
-    let help = cli.print.iter().copied().chain(["--help"]).collect();
-    let needles = cli
-        .autonomous
+pub fn required_flags(agent: Agent, argv: &[String]) -> Vec<&'static str> {
+    let Some(cli) = headless_cli(agent) else {
+        return Vec::new();
+    };
+    cli.autonomous
         .iter()
         .chain(cli.structured.iter().flat_map(|s| s.args))
         .copied()
-        .filter(|a| a.starts_with("--"))
-        .collect();
-    Some((help, needles))
+        .filter(|f| f.starts_with("--") && argv.iter().any(|a| a == f))
+        .collect()
 }
 
 /// Args that resume `session_id` (`--resume <id>`, `resume <id>` for
@@ -281,21 +280,15 @@ mod tests {
     }
 
     #[test]
-    fn required_flags_derive_from_the_row() {
-        let (help, needles) = required_flags(Agent::Codex).unwrap();
-        assert_eq!(help, ["exec", "--help"]);
-        assert_eq!(needles, ["--sandbox", "--json"]);
-        let (help, needles) = required_flags(Agent::ClaudeCode).unwrap();
-        assert_eq!(help, ["-p", "--help"]);
+    fn required_flags_cover_only_row_flags_actually_passed() {
+        let v = |a: &[&str]| a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let argv = v(&["--sandbox", "workspace-write", "--json", "--typo"]);
+        assert_eq!(required_flags(Agent::Codex, &argv), ["--sandbox", "--json"]);
         assert_eq!(
-            needles,
-            [
-                "--dangerously-skip-permissions",
-                "--output-format",
-                "--verbose"
-            ]
+            required_flags(Agent::Codex, &v(&["--typo"])),
+            [] as [&str; 0]
         );
-        assert!(required_flags(Agent::Windsurf).is_none());
+        assert!(required_flags(Agent::Windsurf, &argv).is_empty());
     }
 
     #[test]

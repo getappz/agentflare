@@ -214,14 +214,17 @@ impl VersionRunner for RealVersionRunner {
     }
 }
 
-/// Run `binary args...` and return stdout+stderr, killing the child if it
-/// is still running after `timeout` (a hung CLI must not linger).
-/// `pub(crate)` so the `--help` flag probe shares this runner.
+/// Run `binary args...` and return `(exited ok, stdout then stderr)`. The
+/// child is killed if still running after `timeout` (a hung CLI must not
+/// linger), and reading the pipes is bounded by the same deadline so a
+/// descendant holding them open can't stall the caller. Only the direct
+/// child is killed, not its process tree: a leaked descendant is the worst
+/// case, never a hang. `pub(crate)` so the `--help` flag probe shares it.
 pub(crate) fn run_with_timeout(
     binary: &Path,
     args: &[&str],
     timeout: Duration,
-) -> Result<String, String> {
+) -> Result<(bool, String), String> {
     use std::io::Read;
     use std::process::Stdio;
     let mut child = std::process::Command::new(binary)
@@ -232,58 +235,61 @@ pub(crate) fn run_with_timeout(
         .spawn()
         .map_err(|e| format!("failed to spawn {}: {e}", binary.display()))?;
     let (tx, rx) = mpsc::channel();
-    let mut readers = Vec::new();
-    for pipe in [
-        child
-            .stdout
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-        child
-            .stderr
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-    ]
-    .into_iter()
-    .flatten()
+    let pipes: [Option<Box<dyn Read + Send>>; 2] = [
+        child.stdout.take().map(|p| Box::new(p) as _),
+        child.stderr.take().map(|p| Box::new(p) as _),
+    ];
+    let mut pending = 0;
+    for (stream, mut pipe) in pipes
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, p)| p.map(|p| (i, p)))
     {
+        pending += 1;
         let tx = tx.clone();
-        readers.push(std::thread::spawn(move || {
+        // fire-and-forget: reader exits when the pipe closes; its result is
+        // collected over the channel under the deadline below.
+        std::thread::spawn(move || {
             let mut buf = Vec::new();
-            let _ = { pipe }.read_to_end(&mut buf);
-            let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
-        }));
+            let _ = pipe.read_to_end(&mut buf);
+            let _ = tx.send((stream, String::from_utf8_lossy(&buf).into_owned()));
+        });
     }
     drop(tx);
 
     let deadline = std::time::Instant::now() + timeout;
-    loop {
+    let ok = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status.success(),
             Ok(None) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(20));
             }
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                // Readers are abandoned, not joined: a grandchild may still
-                // hold the pipes open.
                 return Err(format!("{} timed out after {timeout:?}", binary.display()));
             }
             Err(e) => return Err(format!("failed to wait on {}: {e}", binary.display())),
         }
+    };
+    let mut parts = [String::new(), String::new()];
+    for _ in 0..pending {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(left) {
+            Ok((stream, text)) => parts[stream] = text,
+            Err(_) => break, // a descendant still holds the pipe: use what we have
+        }
     }
-    for r in readers {
-        let _ = r.join();
-    }
-    let text: String = rx.try_iter().collect();
+    Ok((ok, parts.concat()))
+}
+
+/// `--version` probe: any exit status is fine, but empty output is not.
+fn run_version_command(binary: &Path, args: &[&str]) -> Result<String, String> {
+    let (_, text) = run_with_timeout(binary, args, VERSION_TIMEOUT)?;
     if text.trim().is_empty() {
         return Err(format!("{} produced no output", binary.display()));
     }
     Ok(text)
-}
-
-fn run_version_command(binary: &Path, args: &[&str]) -> Result<String, String> {
-    run_with_timeout(binary, args, VERSION_TIMEOUT)
 }
 
 /// Resolve an agent's version, using `cache` when the binary path and mtime

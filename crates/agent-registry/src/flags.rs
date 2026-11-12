@@ -4,12 +4,12 @@
 //! an opaque dispatch error.
 
 use crate::detect::run_with_timeout;
-use crate::headless::required_flags;
+use crate::headless::headless_args;
 use crate::registry::Agent;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 const HELP_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -24,9 +24,10 @@ pub enum FlagProbe {
     Unknown,
 }
 
-/// `(binary path, mtime)` of binaries already verified `Present`. Only
+/// `(binary path, mtime, flags checked)` already verified `Present`. Only
 /// positive verdicts are cached: a transient failure must not stick.
-static VERIFIED: Mutex<Option<HashSet<(PathBuf, u64)>>> = Mutex::new(None);
+type Key = (PathBuf, SystemTime, String);
+static VERIFIED: Mutex<Option<HashSet<Key>>> = Mutex::new(None);
 
 /// True when `needle` appears in `help` as a whole flag (`--json` must not
 /// match `--json-schema`).
@@ -58,31 +59,41 @@ fn judge(help: &str, needles: &[&str]) -> FlagProbe {
     }
 }
 
-/// Preflight for a headless launch of `agent` at `binary`.
+/// Preflight for a headless launch of `agent` at `binary`: `--help` must
+/// still list every one of `flags` (from [`required_flags`](crate::required_flags)).
 ///
 /// # Errors
 ///
 /// `Err` with an "upgrade <agent>: ..." message only when `--help` was
-/// readable and lacks a flag we pass. An undeterminable probe proceeds
-/// (logged), and the cache means each binary build is probed once.
-pub fn check_headless_flags(agent: Agent, display_name: &str, binary: &Path) -> Result<(), String> {
-    check_with(agent, display_name, binary, HELP_TIMEOUT)
+/// readable (exit 0) and lacks a flag we pass. An undeterminable probe
+/// proceeds (logged), and the cache means each binary build is probed once.
+pub fn check_headless_flags(
+    agent: Agent,
+    display_name: &str,
+    binary: &Path,
+    flags: &[&str],
+) -> Result<(), String> {
+    check_with(agent, display_name, binary, flags, HELP_TIMEOUT)
 }
 
 fn check_with(
     agent: Agent,
     display_name: &str,
     binary: &Path,
+    flags: &[&str],
     timeout: Duration,
 ) -> Result<(), String> {
-    let Some((help_args, needles)) = required_flags(agent) else {
+    let Some(print) = headless_args(agent) else {
         return Ok(());
     };
-    let key = std::fs::metadata(binary)
+    if flags.is_empty() {
+        return Ok(());
+    }
+    let help_args: Vec<&str> = print.iter().copied().chain(["--help"]).collect();
+    let key: Option<Key> = std::fs::metadata(binary)
         .and_then(|m| m.modified())
         .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| (binary.to_path_buf(), d.as_secs()));
+        .map(|t| (binary.to_path_buf(), t, flags.join(" ")));
     if let Some(k) = &key
         && VERIFIED
             .lock()
@@ -90,8 +101,11 @@ fn check_with(
     {
         return Ok(());
     }
-    let verdict = run_with_timeout(binary, &help_args, timeout)
-        .map_or(FlagProbe::Unknown, |help| judge(&help, &needles));
+    // A non-zero exit means the help text can't be trusted: Unknown.
+    let verdict = match run_with_timeout(binary, &help_args, timeout) {
+        Ok((true, help)) => judge(&help, flags),
+        _ => FlagProbe::Unknown,
+    };
     match verdict {
         FlagProbe::Present => {
             if let (Some(key), Ok(mut g)) = (key, VERIFIED.lock()) {
@@ -151,6 +165,7 @@ mod fake_cli_tests {
         path
     }
 
+    const FLAGS: &[&str] = &["--sandbox", "--json"];
     const SHORT: Duration = Duration::from_millis(300);
 
     fn codex_help(flags: &str) -> String {
@@ -160,7 +175,7 @@ mod fake_cli_tests {
     #[test]
     fn present_flags_pass_and_are_cached() {
         let bin = fake_cli("ok", &codex_help("--sandbox <MODE>  --json"));
-        assert!(check_with(Agent::Codex, "Codex", &bin, SHORT).is_ok());
+        assert!(check_with(Agent::Codex, "Codex", &bin, FLAGS, SHORT).is_ok());
         // Same (path, mtime): cached, so a missing flag is not re-probed.
         let mtime = std::fs::metadata(&bin).unwrap().modified().unwrap();
         std::fs::write(&bin, "#!/bin/sh\nexit 1\n").unwrap();
@@ -170,13 +185,13 @@ mod fake_cli_tests {
             .unwrap()
             .set_modified(mtime)
             .unwrap();
-        assert!(check_with(Agent::Codex, "Codex", &bin, SHORT).is_ok());
+        assert!(check_with(Agent::Codex, "Codex", &bin, FLAGS, SHORT).is_ok());
     }
 
     #[test]
     fn missing_flag_fails_fast_naming_it() {
         let bin = fake_cli("missing", &codex_help("--sandbox <MODE>"));
-        let err = check_with(Agent::Codex, "Codex", &bin, SHORT).unwrap_err();
+        let err = check_with(Agent::Codex, "Codex", &bin, FLAGS, SHORT).unwrap_err();
         assert!(
             err.contains("upgrade Codex") && err.contains("--json"),
             "{err}"
@@ -186,14 +201,28 @@ mod fake_cli_tests {
     #[test]
     fn crashing_help_is_unknown_and_proceeds() {
         let bin = fake_cli("crash", "exit 1");
-        assert!(check_with(Agent::Codex, "Codex", &bin, SHORT).is_ok());
+        assert!(check_with(Agent::Codex, "Codex", &bin, FLAGS, SHORT).is_ok());
+    }
+
+    #[test]
+    fn nonzero_exit_with_usage_text_is_unknown_not_missing() {
+        let bin = fake_cli("nonzero", &format!("{}; exit 2", codex_help("--sandbox")));
+        assert!(check_with(Agent::Codex, "Codex", &bin, FLAGS, SHORT).is_ok());
+    }
+
+    #[test]
+    fn descendant_holding_pipe_does_not_hang_the_probe() {
+        let bin = fake_cli("grandchild", "sleep 30 &\necho 'Usage: x'");
+        let start = std::time::Instant::now();
+        assert!(check_with(Agent::Codex, "Codex", &bin, FLAGS, SHORT).is_ok());
+        assert!(start.elapsed() < Duration::from_secs(10));
     }
 
     #[test]
     fn hanging_help_times_out_and_proceeds() {
         let bin = fake_cli("hang", "sleep 30");
         let start = std::time::Instant::now();
-        assert!(check_with(Agent::Codex, "Codex", &bin, SHORT).is_ok());
+        assert!(check_with(Agent::Codex, "Codex", &bin, FLAGS, SHORT).is_ok());
         assert!(start.elapsed() < Duration::from_secs(10));
     }
 }
