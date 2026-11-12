@@ -1120,19 +1120,22 @@ pub(crate) fn parse_claude_reply(raw: &str) -> (String, Option<String>, Option<f
 
 /// Every role dispatched through `real_agent_send_hook` (`work_item_pipeline`)
 /// — implementer, task-reviewer, re-reviewer, AND the judge — shares that
-/// hook, and `build_extra_args` (`cli::work`) pins every
-/// `ReplyFormat::ResultObject` agent's structured output (`stream-json`, or
-/// whole-reply `json` where only that is verified) regardless of role.
+/// hook, and `headless_full_args` pins each agent's structured output
+/// regardless of role. For a `stream-json` agent (Claude Code, Cursor)
 /// `run_headless`'s captured stdout may therefore be that raw (multi-line)
 /// transcript, not plain reply text; `parse_claude_reply` is what pulls the
-/// real reply off its final line (or the whole-stdout object). Other agents' headless output is already
-/// plain text, so this is a no-op for them. See `parse_claude_reply`'s doc
+/// real reply off its final line. Other agents' output is already plain
+/// reply text, so this is a no-op for them. See `parse_claude_reply`'s doc
 /// comment for why this call exists at all (item #489).
 pub(crate) fn clean_agent_reply(agent: &str, raw: String) -> String {
-    let result_object = agent_registry::agent_by_name(agent)
+    // Only a stream-json transcript can still be multi-line here; a
+    // whole-reply `json` agent (agy) arrives already unwrapped, and parsing
+    // it again would strip a judge's `{"action":..,"response":..}` to its
+    // `response` string.
+    let stream_transcript = agent_registry::agent_by_name(agent)
         .and_then(structured_output)
-        .is_some_and(|s| s.format == ReplyFormat::ResultObject);
-    if result_object {
+        .is_some_and(|s| s.format == ReplyFormat::ResultObject && s.args.contains(&"stream-json"));
+    if stream_transcript {
         parse_claude_reply(&raw).0
     } else {
         raw

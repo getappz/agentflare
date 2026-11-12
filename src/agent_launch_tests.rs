@@ -628,6 +628,15 @@
     }
 
     #[test]
+    fn clean_agent_reply_keeps_an_already_unwrapped_antigravity_judge_reply() {
+        let raw = r#"{"action":"advance_task","response":"done"}"#.to_string();
+        assert_eq!(
+            clean_agent_reply(Agent::Antigravity.as_str(), raw.clone()),
+            raw
+        );
+    }
+
+    #[test]
     fn clean_agent_reply_parses_cursor_stream_json() {
         let raw = concat!(
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"working..."}]}}"#,
