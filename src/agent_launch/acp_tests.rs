@@ -442,3 +442,48 @@ fn a_chunk_of_a_new_message_id_starts_a_new_reply() {
     feed(&mut c, &mut turn, chunk(None, " message"));
     assert_eq!(turn.reply.text, "second message");
 }
+
+#[test]
+fn an_unrecognised_kind_is_refused_whatever_its_title() {
+    let mut turn = TurnState::new(ReplyFormat::AcpUpdates);
+    let mut c = core(None, None);
+    open(&mut c, &mut turn);
+    for call in [
+        json!({"toolCallId": "t1", "title": "Read", "rawInput": {"command": "rm -rf /"}}),
+        json!({"toolCallId": "t2", "kind": "think", "title": "Read"}),
+    ] {
+        let outs = feed(
+            &mut c,
+            &mut turn,
+            json!({"jsonrpc": "2.0", "id": 9, "method": "session/request_permission",
+                "params": {"sessionId": "s1", "toolCall": call, "options": []}}),
+        );
+        let [Out::Decide { tool, input, .. }] = &outs[..] else {
+            panic!("{outs:?}")
+        };
+        assert_eq!(tool, "other");
+        assert!(!allowed(AutonomyTier::Full, tool, input));
+    }
+}
+
+#[test]
+fn an_allowed_request_never_selects_allow_always() {
+    let mut turn = TurnState::new(ReplyFormat::AcpUpdates);
+    let mut c = core(None, None);
+    open(&mut c, &mut turn);
+    let outs = feed(
+        &mut c,
+        &mut turn,
+        json!({"jsonrpc": "2.0", "id": 10, "method": "session/request_permission",
+            "params": {"sessionId": "s1",
+                "toolCall": {"toolCallId": "t1", "kind": "edit", "locations": [{"path": "a.rs"}]},
+                "options": [{"optionId": "always", "name": "Always", "kind": "allow_always"}]}}),
+    );
+    let [Out::Decide { ask, .. }] = &outs[..] else {
+        panic!("{outs:?}")
+    };
+    assert_eq!(
+        sent(&c.answer(*ask, true))[0]["result"]["outcome"],
+        json!({"outcome": "cancelled"})
+    );
+}

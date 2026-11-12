@@ -56,8 +56,9 @@ pub(crate) fn allowed(tier: AutonomyTier, tool: &str, input: &Value) -> bool {
             _ => return false,
         },
         "WebFetch" => CommandClass::Network,
-        // `Write`, and anything unrecognized: the policy's fail-closed default.
-        _ => CommandClass::Write,
+        "Write" => CommandClass::Write,
+        // A request of no recognised kind can't be classified: refused.
+        _ => return false,
     };
     tier_action(tier, class) == TierAction::Allow
 }
@@ -90,7 +91,8 @@ fn policy_action(call: &Value) -> (String, Value) {
         ),
         "read" | "search" => ("Read".into(), json!({"file_path": path})),
         "fetch" => ("WebFetch".into(), raw()),
-        _ => (s("/title").unwrap_or_else(|| "other".into()), raw()),
+        // Never the agent's `title`: it could name itself "Read".
+        _ => ("other".into(), raw()),
     }
 }
 
@@ -333,15 +335,15 @@ impl AcpCore {
         }]
     }
 
-    /// Answers permission request `ask` once: the first option of the wanted
-    /// kind (`allow_once`, else any `allow*`; likewise `reject*`), or
-    /// `cancelled` when the agent offered none.
+    /// Answers permission request `ask` once: `allow_once` (never
+    /// `allow_always`, which would let later calls skip the policy), or
+    /// `reject_once` else any `reject*`; `cancelled` when none fits.
     pub(crate) fn answer(&mut self, ask: u64, allow: bool) -> Vec<Out> {
         let Some((id, options)) = self.asks.remove(&ask) else {
             return Vec::new();
         };
         let (once, any) = if allow {
-            ("allow_once", "allow")
+            ("allow_once", "allow_once")
         } else {
             ("reject_once", "reject")
         };
