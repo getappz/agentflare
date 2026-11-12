@@ -1343,6 +1343,8 @@
             "CLAUDE_AGENT_SDK_VERSION",
             "CLAUDE_PREVIEW_X",
             "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_GIT_BASH_PATH",
             "CLAUDE_CONFIG_DIR",
             "ANTHROPIC_API_KEY",
             "PATH",

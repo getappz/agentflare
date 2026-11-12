@@ -146,19 +146,25 @@ fn strip_inherited_env(cmd: &mut Command) {
 ///
 /// Empty unless `CLAUDECODE` is set, so a user's own shell-exported
 /// `CLAUDE_CODE_*` config survives a normal launch. Always keeps
-/// `CLAUDE_CODE_USE_*` (Bedrock/Vertex routing), `CLAUDE_CONFIG_DIR` and
-/// `ANTHROPIC_*`; a child Claude re-reads its `settings.json` env itself.
+/// `CLAUDE_CODE_USE_*` (Bedrock/Vertex routing), the user's credential
+/// (`CLAUDE_CODE_OAUTH_TOKEN`), `CLAUDE_CODE_GIT_BASH_PATH` (Windows),
+/// `CLAUDE_CONFIG_DIR` and `ANTHROPIC_*`; a child Claude re-reads its
+/// `settings.json` env itself.
 pub(crate) fn host_session_vars(keys: impl IntoIterator<Item = String>) -> Vec<String> {
     let keys: Vec<String> = keys.into_iter().collect();
     if !keys.iter().any(|k| k == "CLAUDECODE") {
         return Vec::new();
     }
+    let user_owned = |k: &str| {
+        k.starts_with("CLAUDE_CODE_USE_")
+            || matches!(k, "CLAUDE_CODE_OAUTH_TOKEN" | "CLAUDE_CODE_GIT_BASH_PATH")
+    };
     keys.into_iter()
         .filter(|k| {
             matches!(k.as_str(), "CLAUDECODE" | "CLAUDE_PID" | "CLAUDE_EFFORT")
                 || k.starts_with("CLAUDE_AGENT_SDK_")
                 || k.starts_with("CLAUDE_PREVIEW_")
-                || (k.starts_with("CLAUDE_CODE_") && !k.starts_with("CLAUDE_CODE_USE_"))
+                || (k.starts_with("CLAUDE_CODE_") && !user_owned(k))
         })
         .collect()
 }
