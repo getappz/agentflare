@@ -153,7 +153,11 @@ pub(crate) fn agent_send_hook() -> SendMessage {
                 // reports them; 0 otherwise keeps accounting honest (unknown
                 // rather than fabricated).
                 crate::agent_launch::HeadlessOutcome::Ok(reply) => {
-                    budget_launch::record_reply(allocation.as_ref(), cumulative_usage, &reply);
+                    budget_launch::record_reply(
+                        allocation.as_ref(),
+                        cumulative_usage.as_ref(),
+                        &reply,
+                    );
                     Ok(crate::agent_launch::reply_payload(reply))
                 }
                 crate::agent_launch::HeadlessOutcome::UnknownAgent(e)
@@ -349,7 +353,11 @@ pub(crate) fn app_send_hook(
 
             match outcome {
                 crate::agent_launch::HeadlessOutcome::Ok(reply) => {
-                    budget_launch::record_reply(allocation.as_ref(), cumulative_usage, &reply);
+                    budget_launch::record_reply(
+                        allocation.as_ref(),
+                        cumulative_usage.as_ref(),
+                        &reply,
+                    );
                     Ok(crate::agent_launch::reply_payload(reply))
                 }
                 crate::agent_launch::HeadlessOutcome::UnknownAgent(e)

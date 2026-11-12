@@ -20,6 +20,7 @@ mod channels;
 mod chat_channel;
 mod claim_liveness;
 mod claims;
+mod claude_cost;
 mod claude_job_config;
 mod claude_usage;
 mod cli;

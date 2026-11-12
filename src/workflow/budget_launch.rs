@@ -2,26 +2,35 @@ use std::time::Duration;
 
 use flare_workflow::budget::{BudgetAllocation, error};
 
-pub(crate) fn usage_is_cumulative(agent: &str, args: &[String]) -> bool {
-    agent_registry::agent_by_name(agent) == Some(agent_registry::Agent::ClaudeCode)
-        && args.iter().any(|arg| {
-            matches!(
-                arg.as_str(),
-                "--resume" | "-r" | "--continue" | "-c" | "--session-id"
-            ) || arg.starts_with("--resume=")
-                || arg.starts_with("--session-id=")
-        })
+pub(crate) use crate::claude_cost::Launch;
+
+/// `Some` when the agent's reported total is a running session total (Claude Code resuming or
+/// naming a session), so the turn's own cost must be derived from the session ledger.
+pub(crate) fn usage_is_cumulative(agent: &str, args: &[String]) -> Option<Launch> {
+    crate::claude_cost::launch_from_args(agent, args)
 }
 
 pub(crate) fn record_reply(
     allocation: Option<&BudgetAllocation>,
-    cumulative: bool,
+    cumulative: Option<&Launch>,
     reply: &crate::agent_launch::HeadlessReply,
 ) {
     if let Some(allocation) = allocation {
-        // shortcut: resumed totals include prior calls; require durable serialized session baselines before deriving deltas.
-        let cost = if cumulative || (reply.is_error && reply.cost_usd == Some(0.0)) {
+        let cost = if reply.is_error && reply.cost_usd == Some(0.0) {
             None
+        } else if let Some(launch) = cumulative {
+            reply
+                .session_id
+                .as_deref()
+                .zip(reply.cost_usd)
+                .and_then(|(session, total)| {
+                    crate::claude_cost::turn_cost(
+                        &crate::claude_cost::default_path(),
+                        session,
+                        total,
+                        launch,
+                    )
+                })
         } else {
             reply.cost_usd
         };
@@ -104,12 +113,9 @@ mod tests {
             "-c",
             "--session-id=session",
         ] {
-            assert!(usage_is_cumulative("claude-code", &[arg.into()]));
+            assert!(usage_is_cumulative("claude-code", &[arg.into()]).is_some());
         }
-        assert!(!usage_is_cumulative(
-            "claude-code",
-            &["--model=sonnet".into()]
-        ));
+        assert!(usage_is_cumulative("claude-code", &["--model=sonnet".into()]).is_none());
     }
 
     #[tokio::test]
@@ -130,7 +136,11 @@ mod tests {
                         is_error,
                         ..Default::default()
                     };
-                    record_reply(inv.allocation.as_ref(), cumulative, &reply);
+                    record_reply(
+                        inv.allocation.as_ref(),
+                        cumulative.then(Launch::default).as_ref(),
+                        &reply,
+                    );
                     Ok(("done".into(), 0, 0))
                 })
             });

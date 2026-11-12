@@ -1056,7 +1056,7 @@ fn real_agent_send_hook(
                 crate::agent_launch::HeadlessOutcome::Ok(reply) => {
                     crate::workflow::budget_launch::record_reply(
                         allocation.as_ref(),
-                        cumulative_usage,
+                        cumulative_usage.as_ref(),
                         &reply,
                     );
                     let session_id = reply.session_id.clone();
