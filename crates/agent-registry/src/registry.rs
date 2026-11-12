@@ -321,70 +321,6 @@ pub fn spec(agent: Agent) -> &'static AgentSpec {
         .expect("every Agent variant has exactly one REGISTRY entry")
 }
 
-/// The subcommand/flags that put an agent's CLI into non-interactive "print"
-/// mode, to be followed by the prompt as the final argument (e.g. `claude -p
-/// "<prompt>"`, `codex exec "<prompt>"`). `None` for agents with no headless
-/// invocation (editor-embedded, or simply not yet mapped).
-#[allow(dead_code)]
-#[must_use]
-pub fn headless_args(agent: Agent) -> Option<&'static [&'static str]> {
-    match agent {
-        // `cursor-agent -p`: "Print responses to console (for scripts or
-        // non-interactive use)" — confirmed via `cursor-agent --help`.
-        // `agy -p`: "Run a single prompt non-interactively and print the response"
-        Agent::ClaudeCode | Agent::GeminiCli | Agent::Cursor | Agent::Antigravity => Some(&["-p"]),
-        Agent::Codex => Some(&["exec"]),
-        Agent::Opencode => Some(&["run"]),
-        // No subcommand needed: `cline` starts in act mode with auto-approve
-        // on by default, and headless mode triggers automatically when stdin
-        // is piped (confirmed via `cline --help` and docs.cline.bot/usage/cli-overview) —
-        // exactly how this module always delivers the prompt.
-        Agent::Cline => Some(&[]),
-        _ => None,
-    }
-}
-
-/// Autonomy flags for headless work dispatch, appended after print-mode flags.
-/// Codex uses its workspace-write sandbox; other agents use their supported
-/// unattended-mode flags. These are exclusive to `agentflare work`, never
-/// `agentflare run --print`.
-/// `None` (or empty) means the agent has no known bypass flag (the user
-/// must acknowledge via `--timeout` that any hang on missing permission is
-/// acceptable, or the run will stall).
-#[allow(dead_code)]
-#[must_use]
-pub fn autonomous_args(agent: Agent) -> Option<&'static [&'static str]> {
-    match agent {
-        Agent::ClaudeCode | Agent::Antigravity => Some(&["--dangerously-skip-permissions"]),
-        // Keep Codex's sandbox even when bwrap is unavailable (including
-        // Windows/macOS). Explicit exec options replace `--full-auto` without
-        // granting unrestricted host access or waiting for approval prompts.
-        Agent::Codex => Some(&[
-            "--sandbox",
-            "workspace-write",
-            "-c",
-            "approval_policy=\"never\"",
-        ]),
-        Agent::GeminiCli => Some(&["--yolo"]),
-        // `opencode run --auto`: "auto-approve permissions that are not
-        // explicitly denied" — confirmed via `opencode run --help`.
-        Agent::Opencode => Some(&["--auto"]),
-        // Cursor headless: `--force` auto-allows commands; `--trust` skips
-        // the workspace-trust prompt; `--approve-mcps` skips MCP approval.
-        // Omit `--sandbox` — jobs already run under agentflare bwrap; a
-        // second Cursor sandbox would double-constrain or fight user prefs.
-        Agent::Cursor => Some(&["--force", "--trust", "--approve-mcps"]),
-        // `cline --auto-approve <boolean>`: "Set tool auto-approval for all
-        // tools (default: true)" — confirmed via `cline --help`. Passed
-        // explicitly rather than relying on the default, same as every
-        // other agent above: a local config or future CLI version changing
-        // that default shouldn't silently turn a headless dispatch
-        // interactive.
-        Agent::Cline => Some(&["--auto-approve", "true"]),
-        _ => None,
-    }
-}
-
 /// Nearest-capability ClinePass model for a Claude model name/alias — used
 /// when the router picks `Agent::Cline` for a task whose configured `model`
 /// is a Claude name (e.g. a `[router]` rule written before Cline was wired
@@ -418,25 +354,6 @@ pub fn clinepass_model_for_claude(model: &str) -> Option<&'static str> {
     }
 }
 
-/// CLI flags that switch an agent's headless print mode to structured JSON
-/// output (a result object for Claude/Cursor, JSONL events for Codex),
-/// letting `agent_launch::run_headless` capture a provider session id and
-/// (where the provider reports it) a cost instead of treating stdout as an
-/// opaque text reply. `None` for every agent whose JSON schema hasn't been
-/// verified — `run_headless` must fall back to plain-text parsing for those,
-/// never guess a schema.
-#[allow(dead_code)]
-#[must_use]
-pub fn json_output_args(agent: Agent) -> Option<&'static [&'static str]> {
-    match agent {
-        Agent::ClaudeCode | Agent::Cursor | Agent::Antigravity => {
-            Some(&["--output-format", "json"])
-        }
-        Agent::Codex => Some(&["--json"]),
-        _ => None,
-    }
-}
-
 /// The flag that carries `agentflare run --mode <m>` / `agents launch --mode
 /// <m>` to an interactive launch. Claude Code spells it `--permission-mode`
 /// (confirmed via `claude --help`). Codex maps mode to `--sandbox`.
@@ -447,19 +364,6 @@ pub fn mode_flag(agent: Agent) -> &'static str {
         Agent::ClaudeCode => "--permission-mode",
         Agent::Codex => "--sandbox",
         _ => "--mode",
-    }
-}
-
-/// Flag or subcommand that resumes a prior session by id (for Codex,
-/// `codex exec resume <id>`), appended before the id and prompt.
-#[allow(dead_code)]
-#[must_use]
-pub fn resume_arg(agent: Agent) -> Option<&'static str> {
-    match agent {
-        Agent::ClaudeCode | Agent::Cursor => Some("--resume"),
-        Agent::Antigravity => Some("--conversation"),
-        Agent::Codex => Some("resume"),
-        _ => None,
     }
 }
 
@@ -520,59 +424,6 @@ mod tests {
     }
 
     #[test]
-    fn headless_args_map_known_print_modes() {
-        assert_eq!(headless_args(Agent::ClaudeCode), Some(&["-p"][..]));
-        assert_eq!(headless_args(Agent::Codex), Some(&["exec"][..]));
-        assert_eq!(headless_args(Agent::GeminiCli), Some(&["-p"][..]));
-        assert_eq!(headless_args(Agent::Opencode), Some(&["run"][..]));
-        assert_eq!(headless_args(Agent::Cursor), Some(&["-p"][..]));
-        assert_eq!(headless_args(Agent::Antigravity), Some(&["-p"][..]));
-        assert_eq!(headless_args(Agent::Cline), Some(&[][..]));
-    }
-
-    #[test]
-    fn headless_args_none_for_agents_without_a_print_mode() {
-        // Editor-embedded / unmapped agents have no headless invocation.
-        assert_eq!(headless_args(Agent::Windsurf), None);
-        assert_eq!(headless_args(Agent::VscodeCopilot), None);
-    }
-
-    #[test]
-    fn autonomous_args_maps_cursor_to_force_trust_and_approve_mcps() {
-        assert_eq!(
-            autonomous_args(Agent::Cursor),
-            Some(&["--force", "--trust", "--approve-mcps"][..])
-        );
-        assert_eq!(
-            autonomous_args(Agent::Antigravity),
-            Some(&["--dangerously-skip-permissions"][..])
-        );
-    }
-
-    #[test]
-    fn autonomous_args_keeps_codex_sandbox_without_approval_prompts() {
-        assert_eq!(
-            autonomous_args(Agent::Codex),
-            Some(
-                &[
-                    "--sandbox",
-                    "workspace-write",
-                    "-c",
-                    "approval_policy=\"never\""
-                ][..]
-            )
-        );
-    }
-
-    #[test]
-    fn autonomous_args_maps_cline_to_explicit_auto_approve() {
-        assert_eq!(
-            autonomous_args(Agent::Cline),
-            Some(&["--auto-approve", "true"][..])
-        );
-    }
-
-    #[test]
     fn clinepass_model_for_claude_maps_every_known_family() {
         assert_eq!(
             clinepass_model_for_claude("claude-fable-5"),
@@ -599,37 +450,10 @@ mod tests {
     }
 
     #[test]
-    fn json_output_args_maps_structured_cli_output() {
-        assert_eq!(
-            json_output_args(Agent::ClaudeCode),
-            Some(&["--output-format", "json"][..])
-        );
-        assert_eq!(
-            json_output_args(Agent::Cursor),
-            Some(&["--output-format", "json"][..])
-        );
-        assert_eq!(
-            json_output_args(Agent::Antigravity),
-            Some(&["--output-format", "json"][..])
-        );
-        assert_eq!(json_output_args(Agent::Opencode), None);
-        assert_eq!(json_output_args(Agent::Codex), Some(&["--json"][..]));
-    }
-
-    #[test]
     fn mode_flag_maps_codex_sandbox_and_claude_permissions() {
         assert_eq!(mode_flag(Agent::ClaudeCode), "--permission-mode");
         assert_eq!(mode_flag(Agent::Codex), "--sandbox");
         assert_eq!(mode_flag(Agent::Cursor), "--mode");
-    }
-
-    #[test]
-    fn resume_arg_maps_supported_cli_modes() {
-        assert_eq!(resume_arg(Agent::ClaudeCode), Some("--resume"));
-        assert_eq!(resume_arg(Agent::Cursor), Some("--resume"));
-        assert_eq!(resume_arg(Agent::Antigravity), Some("--conversation"));
-        assert_eq!(resume_arg(Agent::Opencode), None);
-        assert_eq!(resume_arg(Agent::Codex), Some("resume"));
     }
 
     #[test]

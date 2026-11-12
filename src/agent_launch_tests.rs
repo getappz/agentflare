@@ -628,6 +628,15 @@
     }
 
     #[test]
+    fn clean_agent_reply_keeps_an_already_unwrapped_antigravity_judge_reply() {
+        let raw = r#"{"action":"advance_task","response":"done"}"#.to_string();
+        assert_eq!(
+            clean_agent_reply(Agent::Antigravity.as_str(), raw.clone()),
+            raw
+        );
+    }
+
+    #[test]
     fn clean_agent_reply_parses_cursor_stream_json() {
         let raw = concat!(
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"working..."}]}}"#,
@@ -899,10 +908,19 @@
     }
 
     #[test]
-    fn headless_full_args_prepends_json_output_when_caller_pins_no_output_format() {
+    fn headless_full_args_prepends_structured_output_when_caller_pins_no_output_format() {
         let extra = vec!["--model".to_string(), "sonnet".to_string()];
         let args = headless_full_args(Agent::ClaudeCode, true, &extra);
-        assert_eq!(args, vec!["--output-format", "json", "--model", "sonnet"]);
+        assert_eq!(
+            args,
+            vec![
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--model",
+                "sonnet"
+            ]
+        );
     }
 
     #[test]
@@ -1037,7 +1055,7 @@
     fn run_headless_with_request_json_parses_a_json_reply_from_the_child() {
         use std::os::unix::fs::PermissionsExt;
         // This file's usual `sh -c <script>` stub-agent idiom doesn't work
-        // with `request_json: true`: it prepends `--output-format json`
+        // with `request_json: true`: it prepends `--output-format stream-json`
         // ahead of `extra_args`, and a real `sh`/bash rejects that as an
         // unrecognized long option before ever reaching `-c` -- so instead
         // this fake binary ignores its argv entirely and always emits a

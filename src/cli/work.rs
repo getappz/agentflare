@@ -228,19 +228,16 @@ fn stage_and_attach_asset(
         .ok_or_else(|| "asset attach response missing id".to_string())
 }
 
-/// Per-agent extra argv inserted before the prompt: the confirmed
-/// autonomy flags, plus — for Claude Code and cursor-agent, the
-/// only agents with a confirmed `--output-format stream-json` headless mode
-/// — that flag (Claude Code also needs `--verbose`, confirmed by hand:
-/// omitting it errors with "--print with stream-json output requires
-/// --verbose", plus any `--max-turns`/`--max-cost-usd` asked for). Others
-/// get only their autonomy flags; a caller-supplied cap is dropped with a
-/// warning rather than guessed at. NOT plain `--output-format json`: it
-/// writes nothing until the run finishes (confirmed by hand: 0 bytes for
-/// 54s+ on a trivial task), so `run_captured`'s idle-timeout (300s default)
-/// kills a real, longer task as a false positive — item #43's cause (and
-/// cursor-agent's default `text` format, item #183's). `parse_claude_reply`
-/// reads the reply off stream-json's final line.
+/// Per-agent extra argv inserted before the prompt: the confirmed autonomy
+/// flags, plus Claude Code's `--max-turns`/`--max-budget-usd` when asked
+/// for (other agents drop a cap with a warning rather than guess at one).
+///
+/// No output-format flags: these args are shared by every role in a
+/// dispatch (implementer, reviewer, judge), which can run different agents,
+/// and one agent's format flag (Codex `--json`) breaks another. Each role's
+/// own format comes from `agent_registry::structured_output` via
+/// `run_headless`'s `request_json` (the pipeline always requests it), which
+/// streams wherever the CLI can — see `agent_registry::Structured`.
 pub(crate) fn build_extra_args(
     agent: agent_registry::Agent,
     max_turns: Option<u64>,
@@ -252,13 +249,7 @@ pub(crate) fn build_extra_args(
         .flatten()
         .map(|s| s.to_string())
         .collect();
-    use agent_registry::Agent::{ClaudeCode, Cursor};
-    if matches!(agent, ClaudeCode | Cursor) {
-        args.push("--output-format".to_string());
-        args.push("stream-json".to_string());
-    }
-    if agent == ClaudeCode {
-        args.push("--verbose".to_string());
+    if agent == agent_registry::Agent::ClaudeCode {
         if let Some(turns) = max_turns {
             args.push(format!("--max-turns={turns}"));
         }

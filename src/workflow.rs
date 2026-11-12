@@ -165,36 +165,19 @@ pub(crate) fn agent_send_hook() -> SendMessage {
     })
 }
 
-/// For agents with a confirmed structured reply mode (see
-/// `agent_registry::json_output_args`), pin `--output-format stream-json`
-/// (plus the `--verbose` Claude Code requires with it) unless the step's own
-/// args already chose an output format, and return whether the reply should
-/// be parsed as JSON. Streaming rather than `json` so the idle timeout sees
-/// progress on a long step — the same reasoning as
-/// `cli::work::build_extra_args`. Returns `false`, touching nothing, for
-/// agents whose JSON reply shape isn't verified.
+/// For agents with a verified structured reply mode
+/// (`agent_registry::structured_output`), pin its flags (streaming where the
+/// CLI supports it) unless the step's own args already chose an output
+/// format, and return whether the reply should be parsed as JSON. Returns
+/// `false`, touching nothing, for agents whose reply shape isn't verified.
 fn pin_stream_json(agent: &str, extra_args: &mut Vec<String>) -> bool {
-    let Some(agent) = agent_registry::agent_by_name(agent) else {
+    let Some(structured) =
+        agent_registry::agent_by_name(agent).and_then(agent_registry::structured_output)
+    else {
         return false;
     };
-    if agent_registry::json_output_args(agent).is_none() {
-        return false;
-    }
-    if agent == agent_registry::Agent::Codex {
-        if !extra_args.iter().any(|a| a == "--json") {
-            extra_args.push("--json".to_string());
-        }
-        return true;
-    }
-    let pinned = extra_args.iter().any(|a| {
-        a == "--output-format" || a.starts_with("--output-format=") || a == "--stream-json"
-    });
-    if !pinned {
-        extra_args.push("--output-format".to_string());
-        extra_args.push("stream-json".to_string());
-        if agent == agent_registry::Agent::ClaudeCode {
-            extra_args.push("--verbose".to_string());
-        }
+    if !agent_registry::pins_output_format(extra_args) {
+        extra_args.extend(structured.args.iter().map(|s| s.to_string()));
     }
     true
 }

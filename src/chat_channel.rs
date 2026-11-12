@@ -141,15 +141,12 @@ fn resume_args(
     chat_id: &str,
     sessions: &std::collections::HashMap<String, String>,
 ) -> Vec<String> {
-    let Some(agent) = agent_registry::agent_by_name(agent_name) else {
-        return Vec::new();
-    };
-    let Some(flag) = agent_registry::resume_arg(agent) else {
-        return Vec::new();
-    };
-    match sessions.get(chat_id) {
-        Some(session_id) => vec![flag.to_string(), session_id.clone()],
-        None => Vec::new(),
+    match (
+        agent_registry::agent_by_name(agent_name),
+        sessions.get(chat_id),
+    ) {
+        (Some(agent), Some(id)) => agent_registry::resume_args(agent, id),
+        _ => Vec::new(),
     }
 }
 
