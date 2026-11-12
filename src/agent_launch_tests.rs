@@ -1343,3 +1343,49 @@
         assert!(!out.stalled, "worktree changes are progress");
         assert!(out.success);
     }
+
+    fn keys(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    // Item #856: launched from inside a Claude Code session, the host's
+    // identity/messaging vars are stripped; routing/auth/config are kept.
+    #[test]
+    fn host_session_vars_strips_host_markers_and_keeps_routing() {
+        let mut got = host_session_vars(keys(&[
+            "CLAUDECODE",
+            "CLAUDE_PID",
+            "CLAUDE_EFFORT",
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_CODE_MESSAGING_TOKEN",
+            "CLAUDE_AGENT_SDK_VERSION",
+            "CLAUDE_PREVIEW_X",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_GIT_BASH_PATH",
+            "CLAUDE_CONFIG_DIR",
+            "ANTHROPIC_API_KEY",
+            "PATH",
+        ]));
+        got.sort();
+        assert_eq!(
+            got,
+            keys(&[
+                "CLAUDECODE",
+                "CLAUDE_AGENT_SDK_VERSION",
+                "CLAUDE_CODE_MESSAGING_TOKEN",
+                "CLAUDE_CODE_SESSION_ID",
+                "CLAUDE_EFFORT",
+                "CLAUDE_PID",
+                "CLAUDE_PREVIEW_X",
+            ])
+        );
+    }
+
+    // Outside a Claude Code session nothing is stripped, so a user's own
+    // shell-exported `CLAUDE_CODE_*` config reaches the agent.
+    #[test]
+    fn host_session_vars_is_empty_outside_a_claude_session() {
+        let ambient = keys(&["CLAUDE_CODE_MAX_OUTPUT_TOKENS", "CLAUDE_PID"]);
+        assert!(host_session_vars(ambient).is_empty());
+    }
