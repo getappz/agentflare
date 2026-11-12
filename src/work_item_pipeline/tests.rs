@@ -48,7 +48,10 @@ fn resume_args_for_empty_when_no_prior_session() {
 fn resume_args_for_empty_for_an_agent_with_no_resume_flag() {
     let mut sessions = std::collections::HashMap::new();
     sessions.insert("gemini-cli".to_string(), "sess-1".to_string());
-    assert_eq!(resume_args_for("gemini-cli", &sessions), Vec::<String>::new());
+    assert_eq!(
+        resume_args_for("gemini-cli", &sessions),
+        Vec::<String>::new()
+    );
 }
 
 #[test]

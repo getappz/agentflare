@@ -189,7 +189,13 @@ impl TurnState {
     /// Codex `exec --json`: the thread id, the last completed agent
     /// message, tool items, and `turn.completed` usage.
     fn codex_line(&mut self, event: &Value) {
-        let Some(kind) = str_at(event, "/type") else {
+        // Only Codex's own `thread.*`/`turn.*`/`item.*` events, so a reply
+        // that merely holds a `{"type":..}` object is not taken for one.
+        let Some(kind) = str_at(event, "/type").filter(|k| {
+            ["thread.", "turn.", "item."]
+                .iter()
+                .any(|p| k.starts_with(p))
+        }) else {
             return;
         };
         self.answered = true;
@@ -223,10 +229,10 @@ impl TurnState {
                     .pointer("/usage/output_tokens")
                     .and_then(Value::as_u64);
             }
-            // `error` may be transient (a reconnect notice), so only
-            // `turn.failed` ends the turn.
-            "turn.failed" | "error" => {
-                self.terminal |= kind == "turn.failed";
+            // A top-level `error` may be transient (a reconnect notice) and
+            // is ignored; only `turn.failed` fails and ends the turn.
+            "turn.failed" => {
+                self.terminal = true;
                 self.reply.is_error = true;
                 self.reply.subtype = Some(kind.to_string());
                 if let Some(message) =
@@ -243,7 +249,9 @@ impl TurnState {
     /// parts (the last one is the reply), `tool_use` parts with their
     /// status, and per-step `step_finish` tokens/cost summed over the turn.
     fn opencode_line(&mut self, event: &Value) {
-        let Some(kind) = str_at(event, "/type") else {
+        // Every opencode event carries `sessionID`; a reply that merely
+        // holds a `{"type":..}` object does not.
+        let (Some(kind), Some(_)) = (str_at(event, "/type"), str_at(event, "/sessionID")) else {
             return;
         };
         self.answered = true;
@@ -497,13 +505,39 @@ mod tests {
 
     #[test]
     fn streamed_text_ignores_an_already_unwrapped_json_reply() {
-        let judge = r#"{"action":"advance_task","response":"done"}"#;
-        for format in [
-            ReplyFormat::ResultObject,
-            ReplyFormat::CodexEvents,
-            ReplyFormat::OpencodeEvents,
+        for reply in [
+            r#"{"action":"advance_task","response":"done"}"#,
+            r#"{"type":"module"}"#,
+            r#"{"type":"error","message":"not a stream event"}"#,
         ] {
-            assert_eq!(TurnState::from_stdout(format, judge).streamed_text(), None);
+            for format in [
+                ReplyFormat::ResultObject,
+                ReplyFormat::CodexEvents,
+                ReplyFormat::OpencodeEvents,
+            ] {
+                assert_eq!(
+                    TurnState::from_stdout(format, reply).streamed_text(),
+                    None,
+                    "{format:?}: {reply}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn codex_transient_error_does_not_fail_a_completed_turn() {
+        let reply = turn(
+            ReplyFormat::CodexEvents,
+            &[
+                r#"{"type":"thread.started","thread_id":"th-1"}"#,
+                r#"{"type":"error","message":"Reconnecting... 1/5"}"#,
+                r#"{"type":"item.completed","item":{"id":"m","type":"agent_message","text":"done"}}"#,
+                r#"{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":2}}"#,
+            ],
+        )
+        .into_reply("");
+        assert!(!reply.is_error);
+        assert_eq!(reply.subtype, None);
+        assert_eq!(reply.text, "done");
     }
 }
