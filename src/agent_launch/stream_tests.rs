@@ -101,3 +101,39 @@ fn an_acp_agent_is_driven_over_stdin_and_its_turn_ends_the_run() {
     // `git push` is network: the unattended policy rejects it.
     assert_eq!(reply.text, "permission: no");
 }
+
+/// One real ACP turn against the installed opencode (default model, a
+/// trivial prompt). Live and billed, so run by hand:
+/// `cargo test -p agentflare --bin agentflare live_opencode_acp_turn -- --ignored --nocapture`.
+#[test]
+#[ignore = "live: needs opencode installed and signed in"]
+fn live_opencode_acp_turn() {
+    let mut cmd = Command::new("opencode");
+    cmd.arg("acp");
+    let cwd = std::env::temp_dir();
+    cmd.current_dir(&cwd);
+    let core = AcpCore::new(cwd, "Reply with exactly: pong".into(), None, None);
+    let started = Instant::now();
+    let out = run_captured_with_completion(
+        cmd,
+        Duration::from_secs(300),
+        Duration::from_secs(120),
+        None,
+        None,
+        StallConfig::from_env(),
+        Some(Stream::Acp(Box::new(core), unattended_approver())),
+    )
+    .unwrap();
+    let turn = out.turn.expect("streamed");
+    let (terminal, tools) = (turn.terminal, turn.tools.len());
+    let reply = turn.into_reply(&out.stdout);
+    println!(
+        "success={} terminal={terminal} tools={tools} elapsed={:?} timed_out={} reply={reply:?}",
+        out.success,
+        started.elapsed(),
+        out.timed_out
+    );
+    assert!(out.success && terminal, "stderr: {}", out.stderr);
+    assert_eq!(reply.text.trim(), "pong");
+    assert!(reply.session_id.is_some());
+}

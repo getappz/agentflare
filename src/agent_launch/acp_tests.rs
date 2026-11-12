@@ -366,3 +366,12 @@ fn session_args_read_resume_and_model_from_a_print_argv() {
     );
     assert_eq!(session_args(Agent::Opencode, &[]), (None, None));
 }
+
+#[test]
+fn acp_is_opt_in_and_the_cli_path_is_the_default() {
+    assert!(!opted_in("opencode", None), "unset: print-mode CLI");
+    assert!(!opted_in("opencode", Some("")));
+    assert!(!opted_in("opencode", Some("codex")));
+    assert!(opted_in("opencode", Some("opencode")));
+    assert!(opted_in("opencode", Some("codex, opencode")));
+}

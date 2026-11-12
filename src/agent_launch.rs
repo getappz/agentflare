@@ -777,7 +777,10 @@ fn run_headless_impl(
     let cwd = explicit_cwd
         .map(Path::to_path_buf)
         .or_else(|| std::env::current_dir().ok());
-    let acp = agent_registry::acp_args(spec.id);
+    // ACP is opt-in per agent (`AGENTFLARE_ACP`); the print-mode CLI stays
+    // the default.
+    let acp = agent_registry::acp_args(spec.id)
+        .filter(|_| acp::opted_in(agent, std::env::var("AGENTFLARE_ACP").ok().as_deref()));
     let (argv, stream) = match acp {
         // An ACP server takes only its own args: the session to resume and
         // the model become session requests, the prompt a `session/prompt`,

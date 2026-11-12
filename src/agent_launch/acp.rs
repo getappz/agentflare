@@ -84,6 +84,13 @@ fn policy_action(call: &Value) -> (String, Value) {
     }
 }
 
+/// Whether `agent` is driven over ACP: only when the operator lists it in
+/// `AGENTFLARE_ACP` (comma-separated agent names, e.g. `opencode`), so an
+/// agent's ACP capability never silently replaces its print-mode CLI.
+pub(crate) fn opted_in(agent: &str, setting: Option<&str>) -> bool {
+    setting.is_some_and(|list| list.split(',').any(|name| name.trim() == agent))
+}
+
 /// The session to resume and the model to select, read from a print-mode
 /// argv (`agent`'s resume flag, `--model`). Nothing else in it applies to an
 /// ACP server.
