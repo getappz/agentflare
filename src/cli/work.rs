@@ -167,7 +167,7 @@ pub(crate) fn format_success_comment(
 
 /// Caps a headless run's reply to `DIAGNOSTIC_TAIL_CHARS` before it's
 /// embedded in the success comment. Item #78's comment thread hit 1,068,249
-/// chars across two comments after `parse_claude_reply`'s raw-text fallback
+/// chars across two comments after the structured reply's raw-text fallback
 /// (last stdout line wasn't the expected `{"result": ...}` shape) returned
 /// an entire `stream-json` transcript as "the reply" — comments must stay
 /// summaries, not unbounded dumps. Content within budget is returned
@@ -2190,7 +2190,7 @@ rotate = true
     #[test]
     fn cap_reply_for_comment_offloads_an_oversized_reply_to_a_retrievable_asset() {
         // Item #78's real trigger: a stream-json transcript whose final line
-        // never matched parse_claude_reply's expected {"result": ...} shape,
+        // never matched the structured reply parser's expected {"result": ...} shape,
         // so its fallback returned the entire raw capture (there, ~1M chars)
         // as "the reply" — this reproduces that shape at smaller scale.
         crate::paths::test_support::with_temp_home(|| {

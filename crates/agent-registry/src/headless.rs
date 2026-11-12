@@ -48,6 +48,10 @@ pub enum ReplyFormat {
     /// Codex `exec --json` JSONL events (`thread.started`,
     /// `item.completed`, `turn.completed`, ...).
     CodexEvents,
+    /// opencode `run --format json` JSONL events (`step_start`, `text`,
+    /// `tool_use`, `step_finish` with tokens/cost), each carrying
+    /// `sessionID`.
+    OpencodeEvents,
 }
 
 /// The headless row for `agent`; `None` when it has no print mode
@@ -119,12 +123,17 @@ pub fn headless_cli(agent: Agent) -> Option<HeadlessCli> {
             resume: None,
         },
         // `opencode run --auto`: "auto-approve permissions that are not
-        // explicitly denied".
+        // explicitly denied". `--format json`: "raw JSON events";
+        // `--session`: "session id to continue" (opencode 1.19).
         Agent::Opencode => HeadlessCli {
             print: &["run"],
             autonomous: &["--auto"],
-            structured: None,
-            resume: None,
+            structured: Some(Structured {
+                args: &["--format", "json"],
+                format: ReplyFormat::OpencodeEvents,
+                ends_at_result: false,
+            }),
+            resume: Some("--session"),
         },
         // No subcommand: `cline` starts in act mode and goes headless when
         // stdin is piped (docs.cline.bot/usage/cli-overview). `--auto-approve
@@ -193,11 +202,29 @@ pub fn resume_args(agent: Agent, session_id: &str) -> Vec<String> {
 #[must_use]
 pub fn pins_output_format(args: &[String]) -> bool {
     args.iter().any(|a| {
-        a == "--output-format"
-            || a.starts_with("--output-format=")
-            || a == "--stream-json"
-            || a == "--json"
+        matches!(
+            a.as_str(),
+            "--output-format" | "--format" | "--stream-json" | "--json"
+        ) || a.starts_with("--output-format=")
+            || a.starts_with("--format=")
     })
+}
+
+/// True when the format `args` finally select (last one wins) is JSON, so
+/// stdout is a structured transcript rather than plain reply text.
+#[must_use]
+pub fn selects_structured_output(args: &[String]) -> bool {
+    args.iter()
+        .enumerate()
+        .filter_map(|(i, arg)| match arg.as_str() {
+            "--json" | "--stream-json" => Some("json"),
+            "--output-format" | "--format" => args.get(i + 1).map(String::as_str),
+            _ => arg
+                .strip_prefix("--output-format=")
+                .or_else(|| arg.strip_prefix("--format=")),
+        })
+        .next_back()
+        .is_some_and(|format| matches!(format, "json" | "stream-json"))
 }
 
 #[cfg(test)]
@@ -272,11 +299,53 @@ mod tests {
             Some(&["--output-format", "json"][..])
         );
         assert_eq!(args(Agent::Codex), Some(&["--json"][..]));
-        assert_eq!(args(Agent::Opencode), None);
+        assert_eq!(args(Agent::Opencode), Some(&["--format", "json"][..]));
+        assert_eq!(args(Agent::GeminiCli), None, "flags unverified");
         assert_eq!(
             structured_output(Agent::Codex).map(|s| s.format),
             Some(ReplyFormat::CodexEvents)
         );
+        assert_eq!(
+            structured_output(Agent::Opencode).map(|s| s.format),
+            Some(ReplyFormat::OpencodeEvents)
+        );
+    }
+
+    #[test]
+    fn every_structured_mode_is_recognised_as_selected() {
+        for agent in [
+            Agent::ClaudeCode,
+            Agent::Cursor,
+            Agent::Antigravity,
+            Agent::Codex,
+            Agent::Opencode,
+        ] {
+            let args: Vec<String> = structured_output(agent)
+                .unwrap()
+                .args
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            assert!(pins_output_format(&args), "{agent:?}");
+            assert!(selects_structured_output(&args), "{agent:?}");
+        }
+    }
+
+    #[test]
+    fn selects_structured_output_honours_the_last_format() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(selects_structured_output(&v(&["--output-format", "json"])));
+        assert!(selects_structured_output(&v(&[
+            "--output-format=stream-json"
+        ])));
+        assert!(selects_structured_output(&v(&["--format=json"])));
+        assert!(!selects_structured_output(&v(&[
+            "--output-format=json",
+            "--output-format",
+            "text"
+        ])));
+        assert!(!selects_structured_output(&v(&["--format", "default"])));
+        assert!(!selects_structured_output(&[]));
     }
 
     #[test]
@@ -301,7 +370,8 @@ mod tests {
             v(&["--conversation", "s1"])
         );
         assert_eq!(resume_args(Agent::Codex, "s1"), v(&["resume", "s1"]));
-        assert!(resume_args(Agent::Opencode, "s1").is_empty());
+        assert_eq!(resume_args(Agent::Opencode, "s1"), v(&["--session", "s1"]));
+        assert!(resume_args(Agent::GeminiCli, "s1").is_empty());
     }
 
     #[test]
@@ -311,6 +381,8 @@ mod tests {
         assert!(pins_output_format(&v(&["--output-format=stream-json"])));
         assert!(pins_output_format(&v(&["--stream-json"])));
         assert!(pins_output_format(&v(&["--json"])));
+        assert!(pins_output_format(&v(&["--format", "default"])));
+        assert!(pins_output_format(&v(&["--format=json"])));
         assert!(!pins_output_format(&v(&["--model", "x"])));
     }
 }
