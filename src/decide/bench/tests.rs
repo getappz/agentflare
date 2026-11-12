@@ -12,6 +12,7 @@ fn json_without_overhead(r: Vec<SiteReport>) -> String {
     render_json(&Report {
         schema: REPORT_SCHEMA,
         backend: "t".into(),
+        synthetic: true,
         sites,
     })
 }
@@ -164,11 +165,27 @@ fn table_has_one_row_per_site_set() {
     let report = Report {
         schema: REPORT_SCHEMA,
         backend: "t".into(),
+        synthetic: true,
         sites: r,
     };
     let table = render_table(&report);
+    assert!(table.contains("SYNTHETIC"));
     assert_eq!(
         table.lines().filter(|l| l.starts_with("| router")).count(),
         2
     );
+}
+
+#[test]
+fn live_backend_simulates_failures_without_network_and_skips_unreplayable_cases() {
+    let mut b = LiveBackend::new(std::time::Duration::from_millis(3000));
+    assert!(!b.synthetic());
+    let case = &builtin_cases("router")[0];
+    b.force(Some(FailureMode::Timeout));
+    assert_eq!(b.ask(case, 0).unwrap_err().latency_us, 3_000_000);
+    b.force(Some(FailureMode::LowConfidence));
+    assert_eq!(b.ask(case, 0).unwrap().confidence, Some(0.05));
+    // No captured question: fails (baseline wins) before any network call.
+    b.force(None);
+    assert!(case.question.is_none() && b.ask(case, 0).is_err());
 }

@@ -11,7 +11,11 @@ fn f(x: Option<f64>, digits: usize) -> String {
 
 /// One markdown table: a row per site/set, then any violated thresholds.
 pub fn render_table(r: &Report) -> String {
-    let mut o = format!("backend: {}\n\n", r.backend);
+    let mut o = format!("backend: {}\n", r.backend);
+    if r.synthetic {
+        o.push_str("SYNTHETIC: simulated Jev answers and latency; measures the harness, not the sites (use --live).\n");
+    }
+    o.push('\n');
     o.push_str(
         "| site | set | n | agree | P | R | base P | base R | cold p50/p95 ms | warm p50/p95 ms | tok +/- | $/1k | failure modes (fail-open) | ovh % | verdict |\n",
     );

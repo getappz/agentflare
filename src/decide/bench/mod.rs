@@ -26,7 +26,23 @@
 //! - latency: nearest-rank p50/p95 in ms; cold = first `cold_calls` calls of
 //!   a set, warm = the rest.
 //! - overhead: harness time outside backend calls / summed backend latency.
+//!
+//! # What the numbers mean
+//! - Baseline: the answer the site's non-Jev path produced when the row was
+//!   captured (`baseline`). The bench replays it; it does not re-run the
+//!   site's code (the sites decide inline inside hooks, with no pure entry
+//!   point), so a baseline regression is invisible here.
+//! - Backends: `FakeBackend` (default) replays the recorded Jev label with
+//!   *virtual* latency, so its report is `synthetic` and measures the
+//!   harness only. `LiveBackend` (`--live`) calls Jev with each case's
+//!   captured question and sanitized features; only those reports measure
+//!   the sites.
+//! - Overhead %: real harness microseconds divided by summed backend latency.
+//!   With the fake backend the denominator is the virtual profile, so the
+//!   figure scales with `--fake-*-ms`; the < 5% acceptance is stated for the
+//!   default profile (1200/350 ms). With `--live` it is against wall time.
 mod backend;
+mod live;
 mod metrics;
 mod render;
 mod thresholds;
@@ -39,6 +55,7 @@ use serde_json::Value;
 use std::time::Instant;
 
 pub use backend::{Backend, Failure, FailureMode, FakeBackend, Profile, Reply};
+pub use live::LiveBackend;
 pub use metrics::{Pct, Prf, count_tokens, percentile};
 pub use render::{render_json, render_table};
 pub use thresholds::{SiteThresholds, Thresholds, Verdict};
@@ -74,6 +91,10 @@ pub struct Case {
     /// fake backend replays.
     #[serde(default)]
     pub label: Option<Value>,
+    /// Typed questions as captured (`BTreeMap<String, Question>`); the live
+    /// backend needs it.
+    #[serde(default)]
+    pub question: Option<Value>,
     #[serde(default)]
     pub confidence: Option<f64>,
     /// Ground truth, when labeled.
@@ -153,6 +174,8 @@ pub struct SiteReport {
 pub struct Report {
     pub schema: u32,
     pub backend: String,
+    /// Simulated backend: the numbers describe the harness, not the sites.
+    pub synthetic: bool,
     pub sites: Vec<SiteReport>,
 }
 

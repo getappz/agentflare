@@ -40,6 +40,10 @@ enum DecideCmd {
         enforce: bool,
         #[arg(long)]
         json: bool,
+        /// Call real Jev (needs AGENTFLARE_JEV=1 + credentials; costs money)
+        /// instead of the fake backend. Only live runs measure the sites.
+        #[arg(long)]
+        live: bool,
         /// Fake backend: virtual cold / warm latency, jitter (ms) and seed.
         #[arg(long, default_value_t = 1200)]
         fake_cold_ms: u64,
@@ -115,6 +119,7 @@ impl DecideArgs {
                 thresholds,
                 enforce,
                 json,
+                live,
                 fake_cold_ms,
                 fake_warm_ms,
                 fake_jitter_ms,
@@ -133,6 +138,7 @@ impl DecideArgs {
                     captured,
                     thresholds.as_deref(),
                     profile,
+                    live,
                     json,
                 ) {
                     Ok(go) if go || !enforce => {}
@@ -263,6 +269,7 @@ fn bench_site(
     captured: bool,
     thresholds: Option<&std::path::Path>,
     profile: bench::Profile,
+    live: bool,
     json: bool,
 ) -> Result<bool, String> {
     let sites: Vec<&str> = if site == "all" {
@@ -298,13 +305,20 @@ fn bench_site(
             cases.extend(bench::builtin_cases(s));
         }
     }
-    let mut backend = bench::FakeBackend::new(profile);
+    let mut backend: Box<dyn bench::Backend> = if live {
+        Box::new(bench::LiveBackend::new(std::time::Duration::from_millis(
+            profile.timeout_ms,
+        )))
+    } else {
+        Box::new(bench::FakeBackend::new(profile))
+    };
     let report = bench::Report {
         schema: bench::REPORT_SCHEMA,
-        backend: bench::Backend::name(&backend),
+        backend: backend.name(),
+        synthetic: backend.synthetic(),
         sites: sites
             .iter()
-            .flat_map(|s| bench::run_site(s, &cases, &mut backend, &thresholds))
+            .flat_map(|s| bench::run_site(s, &cases, backend.as_mut(), &thresholds))
             .collect(),
     };
     if json {

@@ -43,6 +43,11 @@ impl FailureMode {
 
 pub trait Backend {
     fn name(&self) -> String;
+    /// True when numbers come from simulated answers/latency, so they
+    /// measure the harness, not the sites (reports are stamped accordingly).
+    fn synthetic(&self) -> bool {
+        true
+    }
     /// `nth` is the call index within the current set (0 = first).
     fn ask(&mut self, case: &Case, nth: usize) -> Result<Reply, Failure>;
     /// Force every following call into a failure mode (`None` = normal).
