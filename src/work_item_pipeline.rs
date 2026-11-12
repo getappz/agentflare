@@ -992,8 +992,7 @@ fn real_agent_send_hook(
             // which finds the job via `owner` on its own blocking thread.
             let agent_for_reply = agent.clone();
             let launch_allocation = allocation.clone();
-            let cumulative_usage =
-                crate::workflow::budget_launch::usage_is_cumulative(&agent, &all_args);
+            let claude_launch = crate::claude_cost::launch_from_args(&agent, &all_args);
             let outcome = tokio::task::spawn_blocking(move || {
                 // The check reads SQLite, so it runs here on the blocking
                 // pool, not on the shared workflow runtime's worker threads.
@@ -1056,7 +1055,7 @@ fn real_agent_send_hook(
                 crate::agent_launch::HeadlessOutcome::Ok(reply) => {
                     crate::workflow::budget_launch::record_reply(
                         allocation.as_ref(),
-                        cumulative_usage.as_ref(),
+                        claude_launch.as_ref(),
                         &reply,
                     );
                     let session_id = reply.session_id.clone();

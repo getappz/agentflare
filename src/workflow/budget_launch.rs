@@ -2,23 +2,19 @@ use std::time::Duration;
 
 use flare_workflow::budget::{BudgetAllocation, error};
 
-pub(crate) use crate::claude_cost::Launch;
+use crate::claude_cost::Launch;
 
-/// `Some` when the agent's reported total is a running session total (Claude Code resuming or
-/// naming a session), so the turn's own cost must be derived from the session ledger.
-pub(crate) fn usage_is_cumulative(agent: &str, args: &[String]) -> Option<Launch> {
-    crate::claude_cost::launch_from_args(agent, args)
-}
-
+/// Records a reply's cost. For a Claude Code reply (`claude_launch` is `Some`) the reported total
+/// is the session's running total, so the turn's own cost comes from the session ledger.
 pub(crate) fn record_reply(
     allocation: Option<&BudgetAllocation>,
-    cumulative: Option<&Launch>,
+    claude_launch: Option<&Launch>,
     reply: &crate::agent_launch::HeadlessReply,
 ) {
     if let Some(allocation) = allocation {
         let cost = if reply.is_error && reply.cost_usd == Some(0.0) {
             None
-        } else if let Some(launch) = cumulative {
+        } else if let Some(launch) = claude_launch {
             reply
                 .session_id
                 .as_deref()
@@ -103,21 +99,6 @@ fn cap_args(agent: &str, args: &mut Vec<String>, mut max: f64) -> Result<(), Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn resumed_claude_totals_are_not_treated_as_per_call_usage() {
-        for arg in [
-            "--resume",
-            "-r",
-            "--resume=session",
-            "--continue",
-            "-c",
-            "--session-id=session",
-        ] {
-            assert!(usage_is_cumulative("claude-code", &[arg.into()]).is_some());
-        }
-        assert!(usage_is_cumulative("claude-code", &["--model=sonnet".into()]).is_none());
-    }
-
     #[tokio::test]
     async fn resumed_totals_and_zero_cost_errors_keep_their_reservations() {
         use flare_workflow::budget::BudgetOperation;

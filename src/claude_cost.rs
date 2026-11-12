@@ -20,8 +20,18 @@ struct Ledger {
     version: u32,
     /// Session id -> running total (USD) after its last turn.
     #[serde(default)]
-    totals: BTreeMap<String, f64>,
+    totals: BTreeMap<String, Entry>,
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Entry {
+    total: f64,
+    /// Unix seconds of the turn that set `total`; entries older than [`KEEP_SECS`] are dropped.
+    at: u64,
+}
+
+/// A session idle this long is not resumed again, so its total is not worth keeping.
+const KEEP_SECS: u64 = 30 * 24 * 3600;
 
 /// How a Claude launch relates to an earlier session, read from its CLI args.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -32,31 +42,25 @@ pub(crate) struct Launch {
     pub forked_from: Option<String>,
 }
 
-/// `Some` when `agent` is Claude Code and `args` start from or name a session, i.e. its reported
-/// total is not simply this turn's cost.
+/// `Some` for any Claude Code launch (its reported total is the session's running total, so even a
+/// new session's total must be kept for its next turn); `None` for other agents.
 pub(crate) fn launch_from_args(agent: &str, args: &[String]) -> Option<Launch> {
     if agent_registry::agent_by_name(agent) != Some(agent_registry::Agent::ClaudeCode) {
         return None;
     }
     let mut launch = Launch::default();
-    let (mut named, mut fork, mut resume_id) = (false, false, None);
+    let mut fork = false;
+    let mut resume_id = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--resume" | "-r" => {
-                named = true;
                 launch.resumed = true;
                 resume_id = iter.clone().next().filter(|v| !v.starts_with('-')).cloned();
             }
-            "--continue" | "-c" => {
-                named = true;
-                launch.resumed = true;
-            }
-            "--session-id" => named = true,
+            "--continue" | "-c" => launch.resumed = true,
             "--fork-session" => fork = true,
-            a if a.starts_with("--session-id=") => named = true,
             a if a.starts_with("--resume=") => {
-                named = true;
                 launch.resumed = true;
                 resume_id = a.strip_prefix("--resume=").map(str::to_string);
             }
@@ -66,7 +70,7 @@ pub(crate) fn launch_from_args(agent: &str, args: &[String]) -> Option<Launch> {
     if fork {
         launch.forked_from = resume_id;
     }
-    named.then_some(launch)
+    Some(launch)
 }
 
 /// Where the ledger lives.
@@ -74,13 +78,22 @@ pub(crate) fn default_path() -> PathBuf {
     crate::paths::agentflare_dir().join(FILE)
 }
 
+fn newer_version(bytes: &[u8]) -> bool {
+    #[derive(Deserialize)]
+    struct Version {
+        version: u32,
+    }
+    serde_json::from_slice::<Version>(bytes).is_ok_and(|v| v.version > VERSION)
+}
+
 /// `None` = unreadable or from a newer version: leave the file alone.
 fn load(path: &Path) -> Option<Ledger> {
     match std::fs::read(path) {
         Ok(bytes) => match serde_json::from_slice::<Ledger>(&bytes) {
             Ok(l) if l.version == VERSION => Some(l),
-            Ok(_) => None,
-            Err(_) => Some(Ledger {
+            // A newer version may change `totals`' shape, so judge it by `version` alone.
+            _ if newer_version(&bytes) => None,
+            _ => Some(Ledger {
                 version: VERSION,
                 ..Default::default()
             }),
@@ -96,19 +109,33 @@ fn load(path: &Path) -> Option<Ledger> {
 /// The cost of one turn of `session`, given Claude's reported cumulative `total`. Records the new
 /// total for the next turn. Invalid totals (non-finite, negative) cost `None` and record nothing.
 pub(crate) fn turn_cost(path: &Path, session: &str, total: f64, launch: &Launch) -> Option<f64> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    turn_cost_at(path, session, total, launch, now)
+}
+
+fn turn_cost_at(path: &Path, session: &str, total: f64, launch: &Launch, now: u64) -> Option<f64> {
     if !total.is_finite() || total < 0.0 {
         return None;
     }
     let _guard = LEDGER.lock().unwrap_or_else(|e| e.into_inner());
     let ledger = load(path);
-    let kept = |id: &str| ledger.as_ref().and_then(|l| l.totals.get(id).copied());
+    let kept = |id: &str| {
+        ledger
+            .as_ref()
+            .and_then(|l| l.totals.get(id).map(|e| e.total))
+    };
     let cost = match (&launch.forked_from, launch.resumed) {
         (Some(parent), _) => kept(parent).map(|b| (total - b).max(0.0)),
         (None, true) => kept(session).map(|b| (total - b).max(0.0)),
         (None, false) => Some(total),
     };
     if let Some(mut ledger) = ledger {
-        ledger.totals.insert(session.to_string(), total);
+        ledger.totals.retain(|_, e| e.at + KEEP_SECS >= now);
+        ledger
+            .totals
+            .insert(session.to_string(), Entry { total, at: now });
         if let Ok(bytes) = serde_json::to_vec_pretty(&ledger) {
             let _ = crate::atomic_fs::write_bytes_with_fallback(path, &bytes, None);
         }
@@ -134,7 +161,7 @@ mod tests {
     }
 
     fn kept(path: &Path, id: &str) -> Option<f64> {
-        load(path)?.totals.get(id).copied()
+        load(path)?.totals.get(id).map(|e| e.total)
     }
 
     #[test]
@@ -211,9 +238,34 @@ mod tests {
     }
 
     #[test]
+    fn a_plain_new_launch_then_a_resume_yields_the_delta() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = p(&dir);
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let first = launch_from_args("claude-code", &a(&["--model=x"])).unwrap();
+        assert_eq!(turn_cost(&path, "s", 0.4, &first), Some(0.4));
+        let second = launch_from_args("claude-code", &a(&["--resume", "s"])).unwrap();
+        let cost = turn_cost(&path, "s", 0.9, &second).unwrap();
+        assert!((cost - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn stale_sessions_are_dropped_on_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = p(&dir);
+        turn_cost_at(&path, "old", 1.0, &NEW, 1_000);
+        turn_cost_at(&path, "new", 2.0, &NEW, 1_000 + KEEP_SECS + 1);
+        assert_eq!(kept(&path, "old"), None);
+        assert_eq!(kept(&path, "new"), Some(2.0));
+    }
+
+    #[test]
     fn launch_args_are_classified() {
         let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(launch_from_args("claude-code", &a(&["--model=x"])), None);
+        assert_eq!(
+            launch_from_args("claude-code", &a(&["--model=x"])),
+            Some(Launch::default())
+        );
         assert_eq!(launch_from_args("codex", &a(&["--resume", "s"])), None);
         assert_eq!(
             launch_from_args("claude-code", &a(&["--resume", "s"])),

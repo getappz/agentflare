@@ -109,7 +109,7 @@ pub(crate) fn agent_send_hook() -> SendMessage {
             // invoked this closure before the returned future was ever
             // polled/awaited.
             let launch_allocation = allocation.clone();
-            let cumulative_usage = budget_launch::usage_is_cumulative(&agent, &extra_args);
+            let claude_launch = crate::claude_cost::launch_from_args(&agent, &extra_args);
             let outcome = tokio::task::spawn_blocking(move || {
                 // Blocking-pool queue time must not permit a launch after the deadline.
                 if let Err(error) = budget_launch::prepare(
@@ -155,7 +155,7 @@ pub(crate) fn agent_send_hook() -> SendMessage {
                 crate::agent_launch::HeadlessOutcome::Ok(reply) => {
                     budget_launch::record_reply(
                         allocation.as_ref(),
-                        cumulative_usage.as_ref(),
+                        claude_launch.as_ref(),
                         &reply,
                     );
                     Ok(crate::agent_launch::reply_payload(reply))
@@ -326,7 +326,7 @@ pub(crate) fn app_send_hook(
             // `scratch` owned by the *outer* future would be deleted out
             // from under a still-running `run_headless_in` call.
             let launch_allocation = allocation.clone();
-            let cumulative_usage = budget_launch::usage_is_cumulative(&agent, &extra_args);
+            let claude_launch = crate::claude_cost::launch_from_args(&agent, &extra_args);
             let outcome = tokio::task::spawn_blocking(move || {
                 let _scratch = scratch;
                 if let Err(error) = budget_launch::prepare(
@@ -355,7 +355,7 @@ pub(crate) fn app_send_hook(
                 crate::agent_launch::HeadlessOutcome::Ok(reply) => {
                     budget_launch::record_reply(
                         allocation.as_ref(),
-                        cumulative_usage.as_ref(),
+                        claude_launch.as_ref(),
                         &reply,
                     );
                     Ok(crate::agent_launch::reply_payload(reply))
