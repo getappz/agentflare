@@ -20,6 +20,10 @@ pub struct HeadlessCli {
     /// Flag (or, for Codex, subcommand) placed before a session id to
     /// resume that session.
     pub resume: Option<&'static str>,
+    /// Args that start the agent as an Agent Client Protocol server
+    /// (JSON-RPC over stdin/stdout); when set, the launch path drives it over
+    /// ACP instead of `print`. Set only where verified against `--help`.
+    pub acp: Option<&'static [&'static str]>,
 }
 
 /// An agent's structured-output mode.
@@ -52,6 +56,9 @@ pub enum ReplyFormat {
     /// `tool_use`, `step_finish` with tokens/cost), each carrying
     /// `sessionID`.
     OpencodeEvents,
+    /// ACP `session/update` notifications. Fed by the ACP client, which
+    /// answers the agent over stdin, never by plain line parsing.
+    AcpUpdates,
 }
 
 /// The headless row for `agent`; `None` when it has no print mode
@@ -69,6 +76,7 @@ pub fn headless_cli(agent: Agent) -> Option<HeadlessCli> {
                 ends_at_result: true,
             }),
             resume: Some("--resume"),
+            acp: None,
         },
         // `cursor-agent -p`: "Print responses to console (for scripts or
         // non-interactive use)". Headless: `--force` auto-allows commands,
@@ -84,6 +92,7 @@ pub fn headless_cli(agent: Agent) -> Option<HeadlessCli> {
                 ends_at_result: false,
             }),
             resume: Some("--resume"),
+            acp: None,
         },
         // `agy -p`: "Run a single prompt non-interactively and print the
         // response". Only whole-reply `json` is verified for agy.
@@ -96,6 +105,7 @@ pub fn headless_cli(agent: Agent) -> Option<HeadlessCli> {
                 ends_at_result: false,
             }),
             resume: Some("--conversation"),
+            acp: None,
         },
         Agent::Codex => HeadlessCli {
             print: &["exec"],
@@ -115,12 +125,14 @@ pub fn headless_cli(agent: Agent) -> Option<HeadlessCli> {
             }),
             // `codex exec resume <id>`.
             resume: Some("resume"),
+            acp: None,
         },
         Agent::GeminiCli => HeadlessCli {
             print: &["-p"],
             autonomous: &["--yolo"],
             structured: None,
             resume: None,
+            acp: None,
         },
         // `opencode run --auto`: "auto-approve permissions that are not
         // explicitly denied". `--format json`: "raw JSON events";
@@ -134,6 +146,10 @@ pub fn headless_cli(agent: Agent) -> Option<HeadlessCli> {
                 ends_at_result: false,
             }),
             resume: Some("--session"),
+            // `opencode acp`: "start ACP (Agent Client Protocol) server"
+            // (opencode 1.19; `loadSession` and a `model` config option are
+            // advertised).
+            acp: Some(&["acp"]),
         },
         // No subcommand: `cline` starts in act mode and goes headless when
         // stdin is piped (docs.cline.bot/usage/cli-overview). `--auto-approve
@@ -144,6 +160,7 @@ pub fn headless_cli(agent: Agent) -> Option<HeadlessCli> {
             autonomous: &["--auto-approve", "true"],
             structured: None,
             resume: None,
+            acp: None,
         },
         _ => return None,
     };
@@ -184,6 +201,13 @@ pub fn required_flags(agent: Agent, argv: &[String]) -> Vec<&'static str> {
         .copied()
         .filter(|f| f.starts_with("--") && argv.iter().any(|a| a == f))
         .collect()
+}
+
+/// Args that start `agent` as an ACP server; `None` when it isn't driven
+/// over ACP.
+#[must_use]
+pub fn acp_args(agent: Agent) -> Option<&'static [&'static str]> {
+    headless_cli(agent).and_then(|c| c.acp)
 }
 
 /// Args that resume `session_id` (`--resume <id>`, `resume <id>` for
@@ -372,6 +396,13 @@ mod tests {
         assert_eq!(resume_args(Agent::Codex, "s1"), v(&["resume", "s1"]));
         assert_eq!(resume_args(Agent::Opencode, "s1"), v(&["--session", "s1"]));
         assert!(resume_args(Agent::GeminiCli, "s1").is_empty());
+    }
+
+    #[test]
+    fn acp_args_only_where_verified() {
+        assert_eq!(acp_args(Agent::Opencode), Some(&["acp"][..]));
+        assert_eq!(acp_args(Agent::GeminiCli), None, "unverified");
+        assert_eq!(acp_args(Agent::ClaudeCode), None);
     }
 
     #[test]

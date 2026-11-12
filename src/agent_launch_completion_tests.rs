@@ -74,7 +74,7 @@ fn terminal_capture(
         None,
         cancel,
         StallConfig::from_env(),
-        stream,
+        stream.map(Stream::Cli),
     )
     .unwrap()
 }
