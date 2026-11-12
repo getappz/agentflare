@@ -477,7 +477,8 @@ fn an_allowed_request_never_selects_allow_always() {
         json!({"jsonrpc": "2.0", "id": 10, "method": "session/request_permission",
             "params": {"sessionId": "s1",
                 "toolCall": {"toolCallId": "t1", "kind": "edit", "locations": [{"path": "a.rs"}]},
-                "options": [{"optionId": "always", "name": "Always", "kind": "allow_always"}]}}),
+                "options": [{"optionId": "always", "name": "Always", "kind": "allow_always"},
+                    {"optionId": "lookalike", "name": "Once-ish", "kind": "allow_once_for_session"}]}}),
     );
     let [Out::Decide { ask, .. }] = &outs[..] else {
         panic!("{outs:?}")

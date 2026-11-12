@@ -342,21 +342,23 @@ impl AcpCore {
         let Some((id, options)) = self.asks.remove(&ask) else {
             return Vec::new();
         };
-        let (once, any) = if allow {
-            ("allow_once", "allow_once")
-        } else {
-            ("reject_once", "reject")
-        };
         fn kind(option: &Value) -> &str {
             option
                 .get("kind")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
         }
+        // An approval is exactly `allow_once`; only a refusal may fall back
+        // to any `reject*` option.
+        let once = if allow { "allow_once" } else { "reject_once" };
         let pick = options
             .iter()
             .find(|o| kind(o) == once)
-            .or_else(|| options.iter().find(|o| kind(o).starts_with(any)))
+            .or_else(|| {
+                (!allow)
+                    .then(|| options.iter().find(|o| kind(o).starts_with("reject")))
+                    .flatten()
+            })
             .and_then(|o| o.get("optionId").cloned());
         let outcome = match pick {
             Some(option) => json!({"outcome": "selected", "optionId": option}),
