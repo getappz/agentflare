@@ -235,14 +235,11 @@ pub fn discard_session(agent: Agent, session_id: &str) {
     match crate::detect::run_with_timeout(&binary, &arg_refs, DISCARD_TIMEOUT) {
         Ok((true, _)) => {}
         Ok((false, out)) => eprintln!(
-            "note: discarding {} session {session_id} failed: {}",
+            "note: discarding a {} session failed: {}",
             spec.display_name,
             out.trim()
         ),
-        Err(e) => eprintln!(
-            "note: discarding {} session {session_id}: {e}",
-            spec.display_name
-        ),
+        Err(e) => eprintln!("note: discarding a {} session: {e}", spec.display_name),
     }
 }
 

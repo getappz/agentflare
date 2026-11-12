@@ -367,7 +367,9 @@ impl AgentPidRecord {
             self.head,
             agent.as_str()
         );
-        if std::fs::write(&self.path, line).is_ok() {
+        // Atomic: a launcher dying mid-update must not leave the sweep an
+        // unparseable record (it still needs the pid to kill the agent).
+        if crate::atomic_fs::write_bytes_with_fallback(&self.path, line.as_bytes(), None).is_ok() {
             self.session = Some((agent, session_id.to_string()));
         }
     }

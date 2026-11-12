@@ -287,10 +287,18 @@ fn run_captured_with_completion(
     let stdout = reader.join().unwrap_or_default();
     let stderr = err_reader.join().unwrap_or_default();
     let killed_early = stalled || exhausted.is_some();
-    if (timed_out || cancelled || killed_early)
-        && let Some((agent, id)) = pid_record.as_ref().and_then(|r| r.session.as_ref())
-    {
-        agent_registry::discard_session(*agent, id);
+    if timed_out || cancelled || killed_early {
+        // The final parsed stream is authoritative: the pid record is only a
+        // best-effort copy for the next daemon's sweep and may lag or fail.
+        let streamed = turn
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|(t, _)| t.reply.session_id.clone());
+        let recorded = pid_record.as_ref().and_then(|r| r.session.clone());
+        if let Some((agent, id)) = agent.zip(streamed).or(recorded) {
+            agent_registry::discard_session(agent, &id);
+        }
     }
     Ok(Captured {
         success: (status.success() || completed_cleanup)
