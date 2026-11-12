@@ -50,7 +50,11 @@ pub(crate) fn unattended_approver() -> Approver {
 pub(crate) fn allowed(tier: AutonomyTier, tool: &str, input: &Value) -> bool {
     let class = match tool {
         "Read" => CommandClass::Read,
-        "Bash" => classify_command(input.get("command").and_then(Value::as_str).unwrap_or("")),
+        // A command we can't see can't be classified: refused.
+        "Bash" => match input.get("command").and_then(Value::as_str) {
+            Some(command) if !command.trim().is_empty() => classify_command(command),
+            _ => return false,
+        },
         "WebFetch" => CommandClass::Network,
         // `Write`, and anything unrecognized: the policy's fail-closed default.
         _ => CommandClass::Write,
@@ -65,19 +69,25 @@ fn policy_action(call: &Value) -> (String, Value) {
         .iter()
         .find_map(|p| s(p))
         .unwrap_or_default();
+    // Only the command itself: `title` is the agent's own display text.
     let command = match call.pointer("/rawInput/command") {
-        Some(Value::String(c)) => c.clone(),
-        Some(Value::Array(parts)) => parts
-            .iter()
-            .filter_map(Value::as_str)
-            .collect::<Vec<_>>()
-            .join(" "),
-        _ => s("/title").unwrap_or_default(),
+        Some(Value::String(c)) => Some(c.clone()),
+        Some(Value::Array(parts)) => Some(
+            parts
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+        _ => None,
     };
     let raw = || call.get("rawInput").cloned().unwrap_or(Value::Null);
     match call.get("kind").and_then(Value::as_str).unwrap_or("other") {
         "edit" | "delete" | "move" => ("Write".into(), json!({"file_path": path})),
-        "execute" => ("Bash".into(), json!({"command": command})),
+        "execute" => (
+            "Bash".into(),
+            command.map_or_else(|| json!({}), |c| json!({"command": c})),
+        ),
         "read" | "search" => ("Read".into(), json!({"file_path": path})),
         "fetch" => ("WebFetch".into(), raw()),
         _ => (s("/title").unwrap_or_else(|| "other".into()), raw()),
@@ -143,6 +153,9 @@ pub(crate) struct AcpCore {
     /// Open permission requests: ask → (the agent's JSON-RPC id, options).
     asks: HashMap<u64, (Value, Vec<Value>)>,
     next_ask: u64,
+    /// The `messageId` of the reply message being streamed, when the agent
+    /// sends one.
+    message: Option<String>,
 }
 
 impl AcpCore {
@@ -163,6 +176,7 @@ impl AcpCore {
             session: None,
             asks: HashMap::new(),
             next_ask: 0,
+            message: None,
         }
     }
 
@@ -198,7 +212,7 @@ impl AcpCore {
             (Some("session/update"), None)
                 if !self.pending.values().any(|p| *p == Pending::LoadSession) =>
             {
-                update(params.get("update").unwrap_or(&Value::Null), turn);
+                self.update(params.get("update").unwrap_or(&Value::Null), turn);
                 Vec::new()
             }
             (None, Some(id)) => self.response(id.as_u64(), &msg, turn),
@@ -271,12 +285,19 @@ impl AcpCore {
             Pending::SetModel => self.send_prompt(),
             Pending::Prompt => {
                 match result.get("stopReason").and_then(Value::as_str) {
+                    Some("end_turn") => turn.end_turn("success", None),
                     Some("max_tokens") => turn.end_turn("error_max_tokens", None),
                     Some("max_turn_requests") => turn.end_turn("error_max_turns", None),
                     Some(reason @ ("refusal" | "cancelled")) => {
                         turn.end_turn(reason, Some(format!("the agent's turn ended: {reason}")))
                     }
-                    _ => turn.end_turn("success", None),
+                    other => turn.end_turn(
+                        "error",
+                        Some(format!(
+                            "session/prompt ended with no known stopReason ({})",
+                            other.unwrap_or("none")
+                        )),
+                    ),
                 }
                 Vec::new()
             }
@@ -342,6 +363,37 @@ impl AcpCore {
         let msg = json!({"jsonrpc": "2.0", "id": id, "result": {"outcome": outcome}});
         vec![Out::Send(msg.to_string())]
     }
+
+    /// A `session/update` notification's `update`, into `turn`.
+    fn update(&mut self, u: &Value, turn: &mut TurnState) {
+        let s = |k: &str| u.get(k).and_then(Value::as_str).unwrap_or_default();
+        let id = s("toolCallId");
+        match s("sessionUpdate") {
+            "agent_message_chunk" => {
+                // A chunk of another message starts a new reply text.
+                if let Some(message) = u.get("messageId").and_then(Value::as_str)
+                    && self.message.as_deref() != Some(message)
+                {
+                    self.message = Some(message.to_string());
+                    turn.new_message();
+                }
+                if let Some(text) = u.pointer("/content/text").and_then(Value::as_str) {
+                    turn.push_text(text);
+                }
+            }
+            "tool_call" => {
+                let name = Some(s("title"))
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or(s("kind"));
+                turn.tool_started(id, name);
+            }
+            "tool_call_update" => {}
+            _ => return,
+        }
+        if matches!(s("status"), "completed" | "failed") {
+            turn.tool_finished(id);
+        }
+    }
 }
 
 /// The session's selected model, from its `model` config option.
@@ -353,30 +405,6 @@ fn current_model(result: &Value) -> Option<&str> {
         .find(|o| o.get("id").and_then(Value::as_str) == Some("model"))?
         .get("currentValue")?
         .as_str()
-}
-
-/// A `session/update` notification's `update`, into `turn`.
-fn update(u: &Value, turn: &mut TurnState) {
-    let s = |k: &str| u.get(k).and_then(Value::as_str).unwrap_or_default();
-    let id = s("toolCallId");
-    match s("sessionUpdate") {
-        "agent_message_chunk" => {
-            if let Some(text) = u.pointer("/content/text").and_then(Value::as_str) {
-                turn.push_text(text);
-            }
-        }
-        "tool_call" => {
-            let name = Some(s("title"))
-                .filter(|t| !t.is_empty())
-                .unwrap_or(s("kind"));
-            turn.tool_started(id, name);
-        }
-        "tool_call_update" => {}
-        _ => return,
-    }
-    if matches!(s("status"), "completed" | "failed") {
-        turn.tool_finished(id);
-    }
 }
 
 #[cfg(test)]

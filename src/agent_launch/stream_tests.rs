@@ -71,8 +71,19 @@ fn fake_acp_agent() {
 #[test]
 fn an_acp_agent_is_driven_over_stdin_and_its_turn_ends_the_run() {
     let mut cmd = Command::new(std::env::current_exe().unwrap());
-    cmd.args(["--ignored", "--exact", FIXTURE, "--nocapture"])
-        .env("AGENTFLARE_TEST_ACP", "agent");
+    // As `terminal_fixture_command`: with more than one test thread libtest
+    // prints `test NAME ... ok` only once the fixture has finished, so it
+    // never shares a line with the first JSON reply (one thread prints
+    // `test NAME ... ` before it).
+    cmd.args([
+        "--ignored",
+        "--exact",
+        FIXTURE,
+        "--nocapture",
+        "--test-threads=2",
+    ])
+    .env("AGENTFLARE_TEST_ACP", "agent")
+    .env("RUST_TEST_THREADS", "1");
     let core = AcpCore::new(std::env::temp_dir(), "push it".into(), None, None);
     let started = Instant::now();
     let out = run_captured_with_completion(

@@ -9,6 +9,7 @@ use super::turn::TurnState;
 use agent_registry::{ReplyFormat, Structured};
 use std::io::Write;
 use std::process::ChildStdin;
+use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
@@ -44,8 +45,31 @@ pub(crate) struct Live {
 
 struct AcpLink {
     core: AcpCore,
-    stdin: Option<ChildStdin>,
+    /// Lines for the agent's stdin, written in order by a writer thread so
+    /// a full pipe never blocks a holder of [`SharedLive`].
+    lines: Sender<String>,
     approver: Approver,
+}
+
+/// Writes each line sent on the returned channel to `stdin`, in order, on
+/// its own thread.
+fn stdin_writer(stdin: Option<ChildStdin>) -> Sender<String> {
+    let (lines, rx) = channel::<String>();
+    if let Some(mut stdin) = stdin {
+        // fire-and-forget: ends once the run drops `Live` (closing the
+        // channel) or the agent's stdin breaks.
+        std::thread::spawn(move || {
+            for line in rx {
+                if writeln!(stdin, "{line}")
+                    .and_then(|()| stdin.flush())
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+    }
+    lines
 }
 
 impl Live {
@@ -57,7 +81,7 @@ impl Live {
                 true,
                 Some(AcpLink {
                     core: *core,
-                    stdin,
+                    lines: stdin_writer(stdin),
                     approver,
                 }),
             ),
@@ -78,14 +102,10 @@ impl Live {
         };
         for out in outs {
             match out {
+                // A closed channel means the agent's stdin is gone; the run
+                // ends by its own exit or the wait loop.
                 Out::Send(line) => {
-                    let written = acp
-                        .stdin
-                        .as_mut()
-                        .is_some_and(|s| writeln!(s, "{line}").and_then(|()| s.flush()).is_ok());
-                    if !written {
-                        acp.stdin = None;
-                    }
+                    let _ = acp.lines.send(line);
                 }
                 Out::Decide { ask, tool, input } => {
                     let (approver, shared) = (acp.approver.clone(), shared.clone());

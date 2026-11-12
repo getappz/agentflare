@@ -375,3 +375,70 @@ fn acp_is_opt_in_and_the_cli_path_is_the_default() {
     assert!(opted_in("opencode", Some("opencode")));
     assert!(opted_in("opencode", Some("codex, opencode")));
 }
+
+#[test]
+fn an_execute_request_without_its_command_is_refused_whatever_its_title() {
+    let mut turn = TurnState::new(ReplyFormat::AcpUpdates);
+    let mut c = core(None, None);
+    open(&mut c, &mut turn);
+    let outs = feed(
+        &mut c,
+        &mut turn,
+        json!({"jsonrpc": "2.0", "id": 5, "method": "session/request_permission",
+            "params": {"sessionId": "s1", "options": [],
+                "toolCall": {"toolCallId": "t1", "kind": "execute", "title": "ls"}}}),
+    );
+    let [Out::Decide { tool, input, .. }] = &outs[..] else {
+        panic!("{outs:?}")
+    };
+    assert_eq!((tool.as_str(), input), ("Bash", &json!({})));
+    assert!(!allowed(AutonomyTier::Full, tool, input));
+    assert!(!allowed(
+        AutonomyTier::Full,
+        "Bash",
+        &json!({"command": "  "})
+    ));
+    assert!(allowed(
+        AutonomyTier::Full,
+        "Bash",
+        &json!({"command": "ls"})
+    ));
+}
+
+#[test]
+fn a_missing_or_unknown_stop_reason_is_not_success() {
+    for result in [json!({}), json!({"stopReason": "something_new"})] {
+        let mut turn = TurnState::new(ReplyFormat::AcpUpdates);
+        let mut c = core(None, None);
+        open(&mut c, &mut turn);
+        feed(
+            &mut c,
+            &mut turn,
+            json!({"jsonrpc": "2.0", "id": 3, "result": result}),
+        );
+        assert!(turn.terminal);
+        assert!(turn.reply.is_error, "{result}");
+        assert_eq!(turn.reply.subtype.as_deref(), Some("error"));
+    }
+}
+
+#[test]
+fn a_chunk_of_a_new_message_id_starts_a_new_reply() {
+    let mut turn = TurnState::new(ReplyFormat::AcpUpdates);
+    let mut c = core(None, None);
+    open(&mut c, &mut turn);
+    let chunk = |id: Option<&str>, t: &str| {
+        let mut u =
+            json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": t}});
+        if let Some(id) = id {
+            u["messageId"] = json!(id);
+        }
+        update(u)
+    };
+    feed(&mut c, &mut turn, chunk(Some("m1"), "first "));
+    feed(&mut c, &mut turn, chunk(Some("m1"), "message"));
+    assert_eq!(turn.reply.text, "first message");
+    feed(&mut c, &mut turn, chunk(Some("m2"), "second"));
+    feed(&mut c, &mut turn, chunk(None, " message"));
+    assert_eq!(turn.reply.text, "second message");
+}

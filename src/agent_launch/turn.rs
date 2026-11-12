@@ -320,6 +320,11 @@ impl TurnState {
         self.reply.text.push_str(chunk);
     }
 
+    /// The next streamed chunk starts a new message.
+    pub(super) fn new_message(&mut self) {
+        self.text_closed = true;
+    }
+
     /// The turn ended, as `subtype`; `error` makes it a failed turn whose
     /// message replaces the reply text.
     pub(super) fn end_turn(&mut self, subtype: &str, error: Option<String>) {
