@@ -27,6 +27,9 @@ pub struct TurnState {
     pub terminal: bool,
     /// A reply-bearing event was seen; without one, stdout is the reply.
     answered: bool,
+    /// A tool ran since the last streamed text, so the next text chunk
+    /// starts a new message (the reply is the agent's last message).
+    text_closed: bool,
 }
 
 impl TurnState {
@@ -37,6 +40,7 @@ impl TurnState {
             tools: Vec::new(),
             terminal: false,
             answered: false,
+            text_closed: false,
         }
     }
 
@@ -71,6 +75,8 @@ impl TurnState {
             ReplyFormat::ResultObject => self.result_object_line(&event),
             ReplyFormat::CodexEvents => self.codex_line(&event),
             ReplyFormat::OpencodeEvents => self.opencode_line(&event),
+            // Fed through `push_text`/`end_turn` by the ACP client.
+            ReplyFormat::AcpUpdates => {}
         }
         true
     }
@@ -305,7 +311,34 @@ impl TurnState {
         }
     }
 
-    fn tool_started(&mut self, id: &str, name: &str) {
+    /// A streamed chunk of the agent's reply (ACP `agent_message_chunk`).
+    pub(super) fn push_text(&mut self, chunk: &str) {
+        self.answered = true;
+        if std::mem::take(&mut self.text_closed) {
+            self.reply.text.clear();
+        }
+        self.reply.text.push_str(chunk);
+    }
+
+    /// The next streamed chunk starts a new message.
+    pub(super) fn new_message(&mut self) {
+        self.text_closed = true;
+    }
+
+    /// The turn ended, as `subtype`; `error` makes it a failed turn whose
+    /// message replaces the reply text.
+    pub(super) fn end_turn(&mut self, subtype: &str, error: Option<String>) {
+        self.answered = true;
+        self.terminal = true;
+        self.reply.subtype = Some(subtype.to_string());
+        if let Some(message) = error {
+            self.reply.is_error = true;
+            self.reply.text = message;
+        }
+    }
+
+    pub(super) fn tool_started(&mut self, id: &str, name: &str) {
+        self.text_closed = true;
         if !self.tools.iter().any(|t| t.id == id) {
             self.tools.push(ToolCall {
                 id: id.to_string(),
@@ -315,7 +348,7 @@ impl TurnState {
         }
     }
 
-    fn tool_finished(&mut self, id: &str) {
+    pub(super) fn tool_finished(&mut self, id: &str) {
         if let Some(tool) = self.tools.iter_mut().find(|t| t.id == id) {
             tool.finished = true;
         }

@@ -74,7 +74,7 @@ fn terminal_capture(
         None,
         cancel,
         StallConfig::from_env(),
-        stream.map(|s| (Agent::ClaudeCode, s)),
+        stream.map(|s| (Agent::ClaudeCode, Stream::Cli(s))),
     )
     .unwrap()
 }

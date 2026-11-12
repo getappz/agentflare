@@ -11,8 +11,9 @@ pub(crate) fn run_captured_with_stall(
     run_captured_with_completion(cmd, hard_cap, idle_timeout, stdin, cancel_job, stall, None)
 }
 
-/// With `stream` (the agent and its structured mode), every stdout line is
-/// parsed into a `TurnState` as it arrives; when the agent `ends_at_result`,
+/// With `stream` (the agent and how its stdout is read), every stdout line
+/// is parsed into a `TurnState` as it arrives (an ACP agent is also answered
+/// over its stdin, kept open for that); when the agent `ends_at_result`,
 /// its terminal event ends the run a second later even if background tools
 /// still hold the process open. A turn we kill has its agent session
 /// discarded (`agent_registry::discard_session`), best-effort.
@@ -23,13 +24,14 @@ fn run_captured_with_completion(
     stdin: Option<&str>,
     cancel_job: Option<&str>,
     stall: StallConfig,
-    stream: Option<(Agent, agent_registry::Structured)>,
+    stream: Option<(Agent, Stream)>,
 ) -> std::io::Result<Captured> {
-    let agent = stream.map(|(a, _)| a);
+    let agent = stream.as_ref().map(|(a, _)| *a);
     let stream = stream.map(|(_, s)| s);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    if stdin.is_some() {
+    let writes_stdin = stream.as_ref().is_some_and(Stream::writes_stdin);
+    if stdin.is_some() || writes_stdin {
         cmd.stdin(Stdio::piped());
     } else {
         cmd.stdin(Stdio::null());
@@ -74,12 +76,13 @@ fn run_captured_with_completion(
     let activity = Arc::new(AtomicU64::new(0));
     let stop_readers = Arc::new(AtomicBool::new(false));
     let output_progress = Arc::new(std::sync::Mutex::new(OutputProgress::new(Instant::now())));
-    // The turn parsed so far, and when its terminal event ended it (only
-    // recorded for an agent whose terminal event `ends_at_result`).
-    let turn = Arc::new(std::sync::Mutex::new(
-        stream.map(|s| (TurnState::new(s.format), None::<Instant>)),
+    // The turn parsed so far, and when its terminal event ended it.
+    let streaming = stream.is_some();
+    let stream_stdin = child.stdin.take().filter(|_| writes_stdin);
+    let turn: SharedLive = Arc::new(std::sync::Mutex::new(
+        stream.map(|s| Live::new(s, stream_stdin)),
     ));
-    let ends_at_result = stream.is_some_and(|s| s.ends_at_result);
+    stream::start(&turn);
 
     let mut pipe = child.stdout.take().expect("stdout piped above");
     let stdout_activity = activity.clone();
@@ -108,16 +111,8 @@ fn run_captured_with_completion(
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     buf.extend_from_slice(&chunk[..n]);
-                    if stream.is_some()
-                        && let Some((turn, ended_at)) = stdout_turn
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .as_mut()
-                    {
-                        turn.feed(&buf, &mut line_start);
-                        if ends_at_result && turn.terminal && ended_at.is_none() {
-                            *ended_at = Some(Instant::now());
-                        }
+                    if streaming {
+                        stream::feed(&stdout_turn, &buf, &mut line_start);
                     }
                     stdout_activity.fetch_add(n as u64, Ordering::Relaxed);
                     if let Ok(mut p) = stdout_progress.lock() {
@@ -189,7 +184,7 @@ fn run_captured_with_completion(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .as_ref()
-                .and_then(|(t, _)| t.reply.session_id.clone())
+                .and_then(|live| live.turn.reply.session_id.clone())
         {
             record.set_session(agent, &id);
         }
@@ -203,7 +198,7 @@ fn run_captured_with_completion(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
-            .and_then(|(_, at)| *at);
+            .and_then(|live| live.ended_at);
         let completion_ready =
             completed_at.is_some_and(|at| at.elapsed() >= Duration::from_secs(1));
         if completed_at.is_none() && last_activity_at.elapsed() >= idle_timeout {
@@ -294,7 +289,7 @@ fn run_captured_with_completion(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
-            .and_then(|(t, _)| t.reply.session_id.clone());
+            .and_then(|live| live.turn.reply.session_id.clone());
         let recorded = pid_record.as_ref().and_then(|r| r.session.clone());
         if let Some((agent, id)) = agent.zip(streamed).or(recorded) {
             agent_registry::discard_session(agent, &id);
@@ -316,6 +311,6 @@ fn run_captured_with_completion(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
-            .map(|(turn, _)| turn),
+            .map(|live| live.turn),
     })
 }

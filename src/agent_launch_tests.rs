@@ -1162,7 +1162,7 @@ echo \"$@\" >> {}
             None,
             None,
             StallConfig::from_env(),
-            Some((agent_registry::Agent::Opencode, stream)),
+            Some((agent_registry::Agent::Opencode, Stream::Cli(stream))),
         )
         .unwrap();
         // SAFETY: as above.

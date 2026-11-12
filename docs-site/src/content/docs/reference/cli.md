@@ -40,6 +40,14 @@ map.
 | `agentflare wrap claude` / `agentflare unwrap claude` | Install or remove the opt-in Claude shell wrapper (`claude-code` is an alias). |
 | `agentflare agents` | List detected agent CLIs and their versions. |
 
+Headless runs (`work`, chat, reviews) drive each agent through its print-mode
+CLI. `AGENTFLARE_ACP` opts named agents into the Agent Client Protocol instead
+(comma-separated, e.g. `AGENTFLARE_ACP=opencode`; only agents with a verified
+ACP mode qualify, currently opencode). Over ACP, permission requests are
+decided by the approval policy: reads and edits run, network, install and
+destructive actions are refused, and print-mode extras such as `--auto` and
+`--variant` do not apply.
+
 ## Optimization
 
 | Command | Purpose |

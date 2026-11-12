@@ -202,7 +202,10 @@ pub struct Captured {
     pub turn: Option<TurnState>,
 }
 
+pub(crate) mod acp;
+pub(crate) mod stream;
 pub(crate) mod turn;
+use stream::{Live, SharedLive, Stream};
 use turn::TurnState;
 
 include!("agent_launch_progress.rs");
@@ -803,22 +806,53 @@ fn run_headless_impl(
     if let Some(model) = crate::decide::model_routing::launch_model(agent, prompt, extra_args) {
         routed_args.extend(model.args(agent));
     }
-    let full_args = headless_full_args(spec.id, request_json, &routed_args);
-    let flags = agent_registry::required_flags(spec.id, &full_args);
-    if let Err(msg) =
-        agent_registry::check_headless_flags(spec.id, spec.display_name, &binary, &flags)
-    {
-        return HeadlessOutcome::Failed(msg);
-    }
-    // Parsed only when the final argv really selects the JSON stream: a
-    // caller-pinned text format leaves the reply as plain text.
-    let stream = structured_output(spec.id)
-        .filter(|_| request_json && selects_structured_output(&full_args));
-    let Some(argv) = headless_argv(spec.id, &binary, &full_args) else {
-        return HeadlessOutcome::NotHeadless(format!(
-            "{} has no headless print mode",
-            spec.display_name
-        ));
+    let cwd = explicit_cwd
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok());
+    // ACP is opt-in per agent (`AGENTFLARE_ACP`); the print-mode CLI stays
+    // the default.
+    let acp = agent_registry::acp_args(spec.id)
+        .filter(|_| acp::opted_in(agent, std::env::var("AGENTFLARE_ACP").ok().as_deref()));
+    let (argv, stream) = match acp {
+        // An ACP server takes only its own args: the session to resume and
+        // the model become session requests, the prompt a `session/prompt`,
+        // and permissions are decided by the approval policy.
+        Some(acp_args) => {
+            let (resume, model) = acp::session_args(spec.id, &routed_args);
+            let session_cwd = cwd
+                .as_deref()
+                .and_then(|dir| std::path::absolute(dir).ok())
+                .unwrap_or_default();
+            let core = acp::AcpCore::new(session_cwd, prompt.to_string(), resume, model);
+            let mut argv = vec![binary.to_string_lossy().into_owned()];
+            argv.extend(acp_args.iter().map(|a| (*a).to_string()));
+            (
+                argv,
+                Some(Stream::Acp(Box::new(core), acp::unattended_approver())),
+            )
+        }
+        None => {
+            let full_args = headless_full_args(spec.id, request_json, &routed_args);
+            let flags = agent_registry::required_flags(spec.id, &full_args);
+            if let Err(msg) =
+                agent_registry::check_headless_flags(spec.id, spec.display_name, &binary, &flags)
+            {
+                return HeadlessOutcome::Failed(msg);
+            }
+            // Parsed only when the final argv really selects the JSON
+            // stream: a caller-pinned text format leaves the reply as plain
+            // text.
+            let stream = structured_output(spec.id)
+                .filter(|_| request_json && selects_structured_output(&full_args))
+                .map(Stream::Cli);
+            let Some(argv) = headless_argv(spec.id, &binary, &full_args) else {
+                return HeadlessOutcome::NotHeadless(format!(
+                    "{} has no headless print mode",
+                    spec.display_name
+                ));
+            };
+            (argv, stream)
+        }
     };
     // Native Linux and WSL2 run the agent CLI inside a bwrap sandbox, same as
     // `Supervisor::spawn`; Windows and macOS get argv back unchanged (see
@@ -838,9 +872,6 @@ fn run_headless_impl(
     // swallowed silently, so `agentflare_mcp::item_done` fell through to
     // "nothing was ever committed" and reported success anyway (exit 0),
     // leaving real staged/edited work stranded in the worktree.
-    let cwd = explicit_cwd
-        .map(Path::to_path_buf)
-        .or_else(|| std::env::current_dir().ok());
     // Script-shim agents (`.ps1`, or `.cmd`/`.bat` wrapping a sibling
     // `.ps1`) are launched through `powershell.exe -WindowStyle Hidden`
     // rather than the shim itself — see `launch_command`. The rest (native
@@ -948,7 +979,8 @@ fn run_headless_impl(
         cmd,
         hard_cap,
         idle_timeout,
-        Some(prompt),
+        // An ACP prompt goes out as `session/prompt` instead.
+        acp.is_none().then_some(prompt),
         owner.and_then(job_id_of_owner),
         StallConfig::from_env(),
         stream.map(|s| (spec.id, s)),
@@ -958,6 +990,14 @@ fn run_headless_impl(
     // accumulates one file per headless dispatch forever.
     let sandbox_log = take_diagnostic_log(diagnostic_path.as_deref());
     match result {
+        // An ACP server that exits by itself never finished the turn.
+        Ok(c) if c.success && acp.is_some() && !c.turn.as_ref().is_some_and(|t| t.terminal) => {
+            HeadlessOutcome::Failed(format!(
+                "{} exited before its ACP turn ended{}",
+                spec.display_name,
+                diagnostic_suffix(&c, sandbox_log.as_deref())
+            ))
+        }
         Ok(c) if c.success => match c.turn {
             Some(turn) => classify_result_reply(spec.display_name, turn.into_reply(&c.stdout)),
             None => HeadlessOutcome::Ok(HeadlessReply {
