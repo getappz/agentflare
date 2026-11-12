@@ -72,14 +72,9 @@ pub fn run_launch_env(
     cmd.stdout(Stdio::inherit());
     cmd.stderr(Stdio::inherit());
     cmd.stdin(Stdio::inherit());
-    // Item #139: strip an ambient CARGO_TARGET_DIR before it reaches the
-    // launched agent (and everything the agent spawns, including `cargo`).
-    // Cargo's env var always outranks the worktree's `.cargo/config.toml`
-    // (see `isolate_worktree_target_dir` in worktree.rs), so without this the
-    // per-worktree isolation is silently shadowed for every build the agent
-    // runs. `env` overrides (e.g. from a project's `.dev.vars`) are filtered
-    // so they can't reintroduce the var we just stripped.
-    cmd.env_remove("CARGO_TARGET_DIR");
+    // `env` overrides (e.g. from a project's `.dev.vars`) are filtered so
+    // they can't reintroduce the CARGO_TARGET_DIR `strip_inherited_env` drops.
+    strip_inherited_env(&mut cmd);
     for (k, v) in env {
         if k == "CARGO_TARGET_DIR" {
             continue;
@@ -125,6 +120,53 @@ pub fn run_launch_env(
         }
         Err(e) => LaunchOutcome::NotFound(format!("failed to launch {}: {e}", binary.display())),
     }
+}
+
+/// Strips inherited env that must not reach a launched agent (interactive
+/// or headless):
+/// - an ambient `CARGO_TARGET_DIR` (item #139): Cargo's env var always
+///   outranks the worktree's `.cargo/config.toml`, so it would silently
+///   defeat per-worktree isolation for every build the agent runs;
+/// - the host Claude Code session's own markers (item #856), see
+///   [`host_session_vars`].
+fn strip_inherited_env(cmd: &mut Command) {
+    cmd.env_remove("CARGO_TARGET_DIR");
+    let keys = std::env::vars_os().filter_map(|(k, _)| k.into_string().ok());
+    for key in host_session_vars(keys) {
+        cmd.env_remove(key);
+    }
+}
+
+/// The env keys a host Claude Code session sets on its children, to strip
+/// before launching an agent from inside one: identity (`CLAUDECODE`,
+/// `CLAUDE_CODE_SESSION_ID`, `CLAUDE_PID`, ...) and its messaging
+/// socket/token. Inherited, they make the agent believe it is nested in the
+/// host, hand it the host's messaging credentials, and stamp its commits
+/// with the host's session id (flare-git-core `resolve_session_id`).
+///
+/// Empty unless `CLAUDECODE` is set, so a user's own shell-exported
+/// `CLAUDE_CODE_*` config survives a normal launch. Always keeps
+/// `CLAUDE_CODE_USE_*` (Bedrock/Vertex routing), the user's credential
+/// (`CLAUDE_CODE_OAUTH_TOKEN`), `CLAUDE_CODE_GIT_BASH_PATH` (Windows),
+/// `CLAUDE_CONFIG_DIR` and `ANTHROPIC_*`; a child Claude re-reads its
+/// `settings.json` env itself.
+pub(crate) fn host_session_vars(keys: impl IntoIterator<Item = String>) -> Vec<String> {
+    let keys: Vec<String> = keys.into_iter().collect();
+    if !keys.iter().any(|k| k == "CLAUDECODE") {
+        return Vec::new();
+    }
+    let user_owned = |k: &str| {
+        k.starts_with("CLAUDE_CODE_USE_")
+            || matches!(k, "CLAUDE_CODE_OAUTH_TOKEN" | "CLAUDE_CODE_GIT_BASH_PATH")
+    };
+    keys.into_iter()
+        .filter(|k| {
+            matches!(k.as_str(), "CLAUDECODE" | "CLAUDE_PID" | "CLAUDE_EFFORT")
+                || k.starts_with("CLAUDE_AGENT_SDK_")
+                || k.starts_with("CLAUDE_PREVIEW_")
+                || (k.starts_with("CLAUDE_CODE_") && !user_owned(k))
+        })
+        .collect()
 }
 
 /// Captured result of a headless (non-interactive) child process.
@@ -969,9 +1011,7 @@ fn run_headless_impl(
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     }
-    // See the matching strip in `run_launch_env` above (item #139) — same
-    // rationale applies to headless child processes.
-    cmd.env_remove("CARGO_TARGET_DIR");
+    strip_inherited_env(&mut cmd);
     // Item #330: same mbx shim PATH as `run_launch_env`; the bwrap wrapper
     // inherits this env, so the sandbox sees the identical PATH.
     let base_path = std::env::var_os("PATH");
