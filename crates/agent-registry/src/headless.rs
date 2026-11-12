@@ -169,6 +169,23 @@ pub fn structured_output(agent: Agent) -> Option<Structured> {
     headless_cli(agent).and_then(|c| c.structured)
 }
 
+/// The long flags from `agent`'s row (autonomous + structured) that `argv`
+/// actually passes: what `--help` must still list. Flags the caller supplied
+/// itself are not ours to vouch for, so a user typo is never blamed on the
+/// agent. Derived from the row, so there is no second list to keep in sync.
+#[must_use]
+pub fn required_flags(agent: Agent, argv: &[String]) -> Vec<&'static str> {
+    let Some(cli) = headless_cli(agent) else {
+        return Vec::new();
+    };
+    cli.autonomous
+        .iter()
+        .chain(cli.structured.iter().flat_map(|s| s.args))
+        .copied()
+        .filter(|f| f.starts_with("--") && argv.iter().any(|a| a == f))
+        .collect()
+}
+
 /// Args that resume `session_id` (`--resume <id>`, `resume <id>` for
 /// Codex); empty when the agent can't resume.
 #[must_use]
@@ -329,6 +346,18 @@ mod tests {
         ])));
         assert!(!selects_structured_output(&v(&["--format", "default"])));
         assert!(!selects_structured_output(&[]));
+    }
+
+    #[test]
+    fn required_flags_cover_only_row_flags_actually_passed() {
+        let v = |a: &[&str]| a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let argv = v(&["--sandbox", "workspace-write", "--json", "--typo"]);
+        assert_eq!(required_flags(Agent::Codex, &argv), ["--sandbox", "--json"]);
+        assert_eq!(
+            required_flags(Agent::Codex, &v(&["--typo"])),
+            [] as [&str; 0]
+        );
+        assert!(required_flags(Agent::Windsurf, &argv).is_empty());
     }
 
     #[test]

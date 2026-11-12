@@ -772,6 +772,12 @@ fn run_headless_impl(
         routed_args.extend(model.args(agent));
     }
     let full_args = headless_full_args(spec.id, request_json, &routed_args);
+    let flags = agent_registry::required_flags(spec.id, &full_args);
+    if let Err(msg) =
+        agent_registry::check_headless_flags(spec.id, spec.display_name, &binary, &flags)
+    {
+        return HeadlessOutcome::Failed(msg);
+    }
     // Parsed only when the final argv really selects the JSON stream: a
     // caller-pinned text format leaves the reply as plain text.
     let stream = structured_output(spec.id)
