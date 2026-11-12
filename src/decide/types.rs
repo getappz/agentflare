@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 
 /// One typed question. Question ids are NOT sent to the model, so each
 /// question must carry its full meaning in `instructions` and `criteria`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Question {
     /// Pick one option; `criteria` maps option -> description.

@@ -1,0 +1,426 @@
+{
+  "schema": 1,
+  "backend": "fake(seed=7)",
+  "sites": [
+    {
+      "site": "router",
+      "set": "main",
+      "cases": 12,
+      "replayed": 12,
+      "labeled": 12,
+      "agreement": 0.6666666666666666,
+      "jev": {
+        "n": 12,
+        "accuracy": 0.8333333333333334,
+        "precision": 0.85,
+        "recall": 0.8333333333333334
+      },
+      "baseline": {
+        "n": 12,
+        "accuracy": 0.6666666666666666,
+        "precision": 0.75,
+        "recall": 0.6666666666666666
+      },
+      "latency_cold": {
+        "n": 3,
+        "p50_ms": 1244.0,
+        "p95_ms": 1293.0
+      },
+      "latency_warm": {
+        "n": 9,
+        "p50_ms": 390.0,
+        "p95_ms": 441.0
+      },
+      "tokens_added": 255,
+      "tokens_avoided": 4400,
+      "usd_per_1k": 0.01,
+      "failure_modes": [
+        {
+          "mode": "down",
+          "cases": 12,
+          "fail_open": 12,
+          "fail_open_rate": 1.0,
+          "mean_fallback_ms": 1.0
+        },
+        {
+          "mode": "timeout",
+          "cases": 12,
+          "fail_open": 12,
+          "fail_open_rate": 1.0,
+          "mean_fallback_ms": 3000.0
+        },
+        {
+          "mode": "402",
+          "cases": 12,
+          "fail_open": 12,
+          "fail_open_rate": 1.0,
+          "mean_fallback_ms": 603.8333333333334
+        },
+        {
+          "mode": "low_confidence",
+          "cases": 12,
+          "fail_open": 12,
+          "fail_open_rate": 1.0,
+          "mean_fallback_ms": 603.8333333333334
+        }
+      ],
+      "overhead_pct": 0.042078388076179966,
+      "verdict": {
+        "go": true,
+        "violations": []
+      }
+    },
+    {
+      "site": "router",
+      "set": "adversarial",
+      "cases": 5,
+      "replayed": 5,
+      "labeled": 5,
+      "agreement": 0.8,
+      "jev": {
+        "n": 5,
+        "accuracy": 0.4,
+        "precision": 0.16666666666666666,
+        "recall": 0.2222222222222222
+      },
+      "baseline": {
+        "n": 5,
+        "accuracy": 0.6,
+        "precision": 0.38888888888888884,
+        "recall": 0.5555555555555555
+      },
+      "latency_cold": {
+        "n": 3,
+        "p50_ms": 1244.0,
+        "p95_ms": 1293.0
+      },
+      "latency_warm": {
+        "n": 2,
+        "p50_ms": 371.0,
+        "p95_ms": 412.0
+      },
+      "tokens_added": 83,
+      "tokens_avoided": 1200,
+      "usd_per_1k": 0.01,
+      "failure_modes": [
+        {
+          "mode": "down",
+          "cases": 5,
+          "fail_open": 5,
+          "fail_open_rate": 1.0,
+          "mean_fallback_ms": 1.0
+        },
+        {
+          "mode": "timeout",
+          "cases": 5,
+          "fail_open": 5,
+          "fail_open_rate": 1.0,
+          "mean_fallback_ms": 3000.0
+        },
+        {
+          "mode": "402",
+          "cases": 5,
+          "fail_open": 5,
+          "fail_open_rate": 1.0,
+          "mean_fallback_ms": 904.4
+        },
+        {
+          "mode": "low_confidence",
+          "cases": 5,
+          "fail_open": 5,
+          "fail_open_rate": 1.0,
+          "mean_fallback_ms": 904.4
+        }
+      ],
+      "overhead_pct": 0.0011941618752764264,
+      "verdict": {
+        "go": false,
+        "violations": [
+          "precision 0.167 < 0.700",
+          "recall 0.222 < 0.700"
+        ]
+      }
+    },
+    {
+      "site": "skill_rerank",
+      "set": "main",
+      "cases": 8,
+      "replayed": 8,
+      "labeled": 8,
+      "agreement": 0.625,
+      "jev": {
+        "n": 8,
+        "accuracy": 1.0,
+        "precision": 1.0,
+        "recall": 1.0
+      },
+      "baseline": {
+        "n": 8,
+        "accuracy": 0.625,
+        "precision": 0.625,
+        "recall": 0.625
+      },
+      "latency_cold": {
+        "n": 3,
+        "p50_ms": 1220.0,
+        "p95_ms": 1239.0
+      },
+      "latency_warm": {
+        "n": 5,
+        "p50_ms": 382.0,
+        "p95_ms": 421.0
+      },
+      "tokens_added": 280,
+      "tokens_avoided": 8400,
+      "usd_per_1k": 0.01,
+      "failure_modes": [
+        {
+          "mode": "down",
+          "cases": 8,
+          "fail_open": 8,
+          "fail_open_rate": 1.0,
+          "mean_fallback_ms": 1.0
+        },
+        {
+          "mode": "timeout",
+          "cases": 8,
+          "fail_open": 8,
+          "fail_open_rate": 1.0,
+          "mean_fallback_ms": 3000.0
+        },
+        {
+          "mode": "402",
+          "cases": 8,
+          "fail_open": 8,
+          "fail_open_rate": 1.0,
+          "mean_fallback_ms": 703.25
+        },
+        {
+          "mode": "low_confidence",
+          "cases": 8,
+          "fail_open": 8,
+          "fail_open_rate": 1.0,
+          "mean_fallback_ms": 703.25
+        }
+      ],
+      "overhead_pct": 0.0025062211162460006,
+      "verdict": {
+        "go": true,
+        "violations": []
+      }
+    },
+    {
+      "site": "skill_rerank",
+      "set": "adversarial",
+      "cases": 4,
+      "replayed": 4,
+      "labeled": 4,
+      "agreement": 0.75,
+      "jev": {
+        "n": 4,
+        "accuracy": 0.5,
+        "precision": 0.6666666666666666,
+        "recall": 0.5
+      },
+      "baseline": {
+        "n": 4,
+        "accuracy": 0.75,
+        "precision": 1.0,
+        "recall": 0.8333333333333334
+      },
+      "latency_cold": {
+        "n": 3,
+        "p50_ms": 1220.0,
+        "p95_ms": 1239.0
+      },
+      "latency_warm": {
+        "n": 1,
+        "p50_ms": 405.0,
+        "p95_ms": 405.0
+      },
+      "tokens_added": 123,
+      "tokens_avoided": 3600,
+      "usd_per_1k": 0.01,
+      "failure_modes": [
+        {
+          "mode": "down",
+          "cases": 4,
+          "fail_open": 4,
+          "fail_open_rate": 1.0,
+          "mean_fallback_ms": 1.0
+        },
+        {
+          "mode": "timeout",
+          "cases": 4,
+          "fail_open": 4,
+          "fail_open_rate": 1.0,
+          "mean_fallback_ms": 3000.0
+        },
+        {
+          "mode": "402",
+          "cases": 4,
+          "fail_open": 4,
+          "fail_open_rate": 1.0,
+          "mean_fallback_ms": 1019.25
+        },
+        {
+          "mode": "low_confidence",
+          "cases": 4,
+          "fail_open": 4,
+          "fail_open_rate": 1.0,
+          "mean_fallback_ms": 1019.25
+        }
+      ],
+      "overhead_pct": 0.0015452538631346576,
+      "verdict": {
+        "go": false,
+        "violations": [
+          "precision 0.667 < 0.700",
+          "recall 0.500 < 0.700"
+        ]
+      }
+    },
+    {
+      "site": "sdd_judge",
+      "set": "main",
+      "cases": 9,
+      "replayed": 9,
+      "labeled": 9,
+      "agreement": 0.4444444444444444,
+      "jev": {
+        "n": 9,
+        "accuracy": 0.8888888888888888,
+        "precision": 0.8333333333333333,
+        "recall": 0.875
+      },
+      "baseline": {
+        "n": 9,
+        "accuracy": 0.4444444444444444,
+        "precision": 0.16666666666666666,
+        "recall": 0.375
+      },
+      "latency_cold": {
+        "n": 3,
+        "p50_ms": 1213.0,
+        "p95_ms": 1263.0
+      },
+      "latency_warm": {
+        "n": 6,
+        "p50_ms": 407.0,
+        "p95_ms": 446.0
+      },
+      "tokens_added": 204,
+      "tokens_avoided": 27000,
+      "usd_per_1k": 0.01,
+      "failure_modes": [
+        {
+          "mode": "down",
+          "cases": 9,
+          "fail_open": 9,
+          "fail_open_rate": 1.0,
+          "mean_fallback_ms": 1.0
+        },
+        {
+          "mode": "timeout",
+          "cases": 9,
+          "fail_open": 9,
+          "fail_open_rate": 1.0,
+          "mean_fallback_ms": 3000.0
+        },
+        {
+          "mode": "402",
+          "cases": 9,
+          "fail_open": 9,
+          "fail_open_rate": 1.0,
+          "mean_fallback_ms": 677.7777777777778
+        },
+        {
+          "mode": "low_confidence",
+          "cases": 9,
+          "fail_open": 9,
+          "fail_open_rate": 1.0,
+          "mean_fallback_ms": 677.7777777777778
+        }
+      ],
+      "overhead_pct": 0.0015081967213114755,
+      "verdict": {
+        "go": false,
+        "violations": [
+          "agreement 0.444 < 0.600"
+        ]
+      }
+    },
+    {
+      "site": "sdd_judge",
+      "set": "adversarial",
+      "cases": 4,
+      "replayed": 4,
+      "labeled": 4,
+      "agreement": 0.25,
+      "jev": {
+        "n": 4,
+        "accuracy": 0.25,
+        "precision": 0.5,
+        "recall": 0.16666666666666666
+      },
+      "baseline": {
+        "n": 4,
+        "accuracy": 1.0,
+        "precision": 1.0,
+        "recall": 1.0
+      },
+      "latency_cold": {
+        "n": 3,
+        "p50_ms": 1213.0,
+        "p95_ms": 1263.0
+      },
+      "latency_warm": {
+        "n": 1,
+        "p50_ms": 417.0,
+        "p95_ms": 417.0
+      },
+      "tokens_added": 84,
+      "tokens_avoided": 9000,
+      "usd_per_1k": 0.01,
+      "failure_modes": [
+        {
+          "mode": "down",
+          "cases": 4,
+          "fail_open": 4,
+          "fail_open_rate": 1.0,
+          "mean_fallback_ms": 1.0
+        },
+        {
+          "mode": "timeout",
+          "cases": 4,
+          "fail_open": 4,
+          "fail_open_rate": 1.0,
+          "mean_fallback_ms": 3000.0
+        },
+        {
+          "mode": "402",
+          "cases": 4,
+          "fail_open": 4,
+          "fail_open_rate": 1.0,
+          "mean_fallback_ms": 1023.75
+        },
+        {
+          "mode": "low_confidence",
+          "cases": 4,
+          "fail_open": 4,
+          "fail_open_rate": 1.0,
+          "mean_fallback_ms": 1023.75
+        }
+      ],
+      "overhead_pct": 0.0008791208791208792,
+      "verdict": {
+        "go": false,
+        "violations": [
+          "agreement 0.250 < 0.600",
+          "precision 0.500 < 0.600",
+          "recall 0.167 < 0.600"
+        ]
+      }
+    }
+  ]
+}
