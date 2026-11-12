@@ -180,10 +180,7 @@ pub(super) fn spawn_pipeline_recovery_retry(queue: agentflare_jobs::Queue) {
         loop {
             tokio::time::sleep(PIPELINE_RECOVERY_RETRY_INTERVAL).await;
             attempt += 1;
-            match crate::work_item_pipeline::engine()
-                .recover_with(crate::work_item_pipeline::should_recover_at_boot)
-                .await
-            {
+            match crate::work_item_pipeline::recover_at_boot().await {
                 Ok(_) => {
                     eprintln!(
                         "agentflare: work-item pipeline recovery succeeded on attempt {attempt} \

@@ -346,9 +346,33 @@ mod tests {
         });
     }
 
+    /// A suite run from inside a dispatched job inherits its claim owner, and
+    /// `hook_key` then maps every session onto that one identity.
+    struct ClearedJobOwner(Option<std::ffi::OsString>);
+
+    impl ClearedJobOwner {
+        fn new() -> Self {
+            let previous = std::env::var_os("AGENTFLARE_CLAIM_OWNER");
+            // SAFETY: only called inside `with_temp_home`, which holds the
+            // shared environment lock.
+            unsafe { std::env::remove_var("AGENTFLARE_CLAIM_OWNER") };
+            Self(previous)
+        }
+    }
+
+    impl Drop for ClearedJobOwner {
+        fn drop(&mut self) {
+            if let Some(value) = &self.0 {
+                // SAFETY: still under the shared environment lock.
+                unsafe { std::env::set_var("AGENTFLARE_CLAIM_OWNER", value) };
+            }
+        }
+    }
+
     #[test]
     fn stop_instruction_fires_once_per_session() {
         with_temp_home(|| {
+            let _owner = ClearedJobOwner::new();
             assert!(first_time("claude", "s1", "stop"));
             assert!(!first_time("claude", "s1", "stop"));
             assert!(first_time("claude", "s2", "stop"));

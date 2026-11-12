@@ -839,10 +839,7 @@ pub async fn run(host: &str, port: u16, open: bool, yes_expose: bool) {
                 queue.clone(),
             );
             match crate::work_item_pipeline::engine().register_workflow(boot_definition) {
-                Ok(()) => match crate::work_item_pipeline::engine()
-                    .recover_with(crate::work_item_pipeline::should_recover_at_boot)
-                    .await
-                {
+                Ok(()) => match crate::work_item_pipeline::recover_at_boot().await {
                     Ok(_) => start_work_dispatch(&queue),
                     Err(e) => {
                         // A recovery failure is often transient (a locked

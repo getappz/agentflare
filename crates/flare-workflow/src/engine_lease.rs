@@ -120,7 +120,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
 
     /// [`is_leased_elsewhere`](Self::is_leased_elsewhere), minus leases whose
     /// holder is provably dead (see `lease_holder_is_dead`).
-    pub(super) fn held_by_live_executor(&self, state: &WorkflowState<D>) -> bool {
+    pub fn held_by_live_executor(&self, state: &WorkflowState<D>) -> bool {
         self.is_leased_elsewhere(state)
             && !state
                 .lease
@@ -333,6 +333,21 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
     /// run it would otherwise just wait on — if the process that was
     /// executing it died, waiting would never end.
     pub async fn resume_run(&self, run_id: WorkflowRunId) -> WorkflowResult<bool> {
+        self.resume_run_with(run_id, || std::future::ready(Ok(())))
+            .await
+    }
+
+    /// Prepare durable receiver state after claiming the lease, before starting
+    /// the executor. Preparation failure releases ownership without driving work.
+    pub async fn resume_run_with<F, Fut>(
+        &self,
+        run_id: WorkflowRunId,
+        prepare: F,
+    ) -> WorkflowResult<bool>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = WorkflowResult<()>>,
+    {
         let state = self.state_store.load(run_id).await?;
         if matches!(
             state.status,
@@ -346,7 +361,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             .get(&state.workflow_id)
             .cloned()
             .ok_or_else(|| WorkflowError::DefinitionNotFound(state.workflow_id.clone()))?;
-        self.try_resume(&state, definition).await
+        self.try_resume_with(&state, definition, prepare).await
     }
 
     pub(super) async fn try_resume(
@@ -354,6 +369,20 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         state: &WorkflowState<D>,
         definition: Arc<WorkflowDefinition<D>>,
     ) -> WorkflowResult<bool> {
+        self.try_resume_with(state, definition, || std::future::ready(Ok(())))
+            .await
+    }
+
+    async fn try_resume_with<F, Fut>(
+        &self,
+        state: &WorkflowState<D>,
+        definition: Arc<WorkflowDefinition<D>>,
+        prepare: F,
+    ) -> WorkflowResult<bool>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = WorkflowResult<()>>,
+    {
         let run_id = state.run_id;
         if self.held_by_live_executor(state) {
             tracing::info!(run_id = %run_id, holder = ?state.lease.as_ref().map(|l| &l.owner), "Run is held by another live executor; not resuming it here");
@@ -411,6 +440,14 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         }
         if !taken {
             return Ok(false);
+        }
+        let preparation = tokio::select! {
+            result = prepare() => result,
+            _ = self.clone().renew_lease_loop(run_id) => Err(WorkflowError::Store("lease lost during resume preparation".into())),
+        };
+        if let Err(error) = preparation {
+            self.release_lease(run_id).await;
+            return Err(error);
         }
         self.active_workflows.fetch_add(1, Ordering::AcqRel);
         self.spawn_driven(run_id, definition, self.active_workflow_guard(), driving);

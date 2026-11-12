@@ -62,19 +62,30 @@ pub mod test_support {
     // thread — exactly the UB set_var is unsafe for.
     use agent_registry::detect::PATH_LOCK as GLOBAL_STATE_LOCK;
 
-    // Removes AGENTFLARE_HOME_OVERRIDE/FLARE_VAULT_HOME_OVERRIDE on drop --
-    // including on unwind, so a panicking assertion inside `f()` can't leave
-    // the override set for whatever test runs next on another thread once
-    // GLOBAL_STATE_LOCK is released (poisoned-mutex recovery only protects
-    // the lock itself, not env state a previous holder forgot to restore).
-    struct ResetHomeOverrideOnDrop;
-    impl Drop for ResetHomeOverrideOnDrop {
+    /// Owns an isolated home and the shared environment lock across a test scope.
+    /// Do not nest this guard with another home/PATH fixture holding that lock.
+    #[must_use]
+    pub struct TempHome {
+        previous_home: Option<std::ffi::OsString>,
+        previous_vault: Option<std::ffi::OsString>,
+        _dir: tempfile::TempDir,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for TempHome {
         fn drop(&mut self) {
             unsafe {
-                // SAFETY: still under GLOBAL_STATE_LOCK for the duration of
-                // this guard's life.
-                std::env::remove_var("AGENTFLARE_HOME_OVERRIDE");
-                std::env::remove_var("FLARE_VAULT_HOME_OVERRIDE");
+                // SAFETY: the guard releases GLOBAL_STATE_LOCK after restoration.
+                for (name, previous) in [
+                    ("AGENTFLARE_HOME_OVERRIDE", &self.previous_home),
+                    ("FLARE_VAULT_HOME_OVERRIDE", &self.previous_vault),
+                ] {
+                    if let Some(value) = previous {
+                        std::env::set_var(name, value);
+                    } else {
+                        std::env::remove_var(name);
+                    }
+                }
             }
         }
     }
@@ -82,8 +93,8 @@ pub mod test_support {
     /// # Panics
     ///
     /// Panics if a temporary directory cannot be created.
-    pub fn with_temp_home<T>(f: impl FnOnce() -> T) -> T {
-        let _guard = GLOBAL_STATE_LOCK
+    pub fn temp_home() -> TempHome {
+        let guard = GLOBAL_STATE_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // A fresh, uniquely-named directory per call -- not a fixed shared
@@ -94,6 +105,8 @@ pub mod test_support {
         // this replaced (state.rs/vent::capture.rs tests intermittently
         // observed each other's persisted state under parallel execution).
         let dir = tempfile::tempdir().unwrap();
+        let previous_home = std::env::var_os("AGENTFLARE_HOME_OVERRIDE");
+        let previous_vault = std::env::var_os("FLARE_VAULT_HOME_OVERRIDE");
         unsafe {
             // SAFETY: GLOBAL_STATE_LOCK mutex serializes all env mutations;
             // no other thread can read or write these vars concurrently.
@@ -104,7 +117,16 @@ pub mod test_support {
             std::env::set_var("AGENTFLARE_HOME_OVERRIDE", dir.path());
             std::env::set_var("FLARE_VAULT_HOME_OVERRIDE", dir.path());
         };
-        let _reset = ResetHomeOverrideOnDrop;
+        TempHome {
+            previous_home,
+            previous_vault,
+            _dir: dir,
+            _guard: guard,
+        }
+    }
+
+    pub fn with_temp_home<T>(f: impl FnOnce() -> T) -> T {
+        let _home = temp_home();
         f()
     }
 }
@@ -161,25 +183,60 @@ mod tests {
     }
 
     #[test]
-    fn with_temp_home_clears_the_override_env_var_after_returning() {
-        with_temp_home(|| {});
-        // Read the var only while holding the same lock with_temp_home uses to
-        // serialize all env mutation in this binary. Without it, this check
-        // races a concurrent thread's own (correctly scoped) with_temp_home
-        // call: that thread may be transiently holding the var set for its own
-        // closure at the exact moment this assertion reads it, which isn't a
-        // leak on our part — it's a var we were never entitled to observe.
-        let _guard = agent_registry::detect::PATH_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        assert!(
-            std::env::var("AGENTFLARE_HOME_OVERRIDE").is_err(),
-            "AGENTFLARE_HOME_OVERRIDE must not remain set once with_temp_home returns"
-        );
-        assert!(
-            std::env::var("FLARE_VAULT_HOME_OVERRIDE").is_err(),
-            "FLARE_VAULT_HOME_OVERRIDE must not remain set once with_temp_home returns"
-        );
+    fn with_temp_home_restores_overrides_after_return_and_unwind() {
+        const CHILD: &str = "AGENTFLARE_HOME_RESTORE_TEST_CHILD";
+        const HOME: &str = "AGENTFLARE_HOME_OVERRIDE";
+        const VAULT: &str = "FLARE_VAULT_HOME_OVERRIDE";
+        if std::env::var_os(CHILD).is_none() {
+            let outer = tempfile::tempdir().unwrap();
+            for (inherited_home, inherited_vault) in
+                [(true, true), (true, false), (false, true), (false, false)]
+            {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+                child
+                    .args([
+                        "--exact",
+                        "tests::with_temp_home_restores_overrides_after_return_and_unwind",
+                    ])
+                    .env(CHILD, "1");
+                if inherited_home {
+                    child.env(HOME, outer.path().join("agentflare"));
+                } else {
+                    child.env_remove(HOME);
+                }
+                if inherited_vault {
+                    child.env(VAULT, outer.path().join("vault"));
+                } else {
+                    child.env_remove(VAULT);
+                }
+                let output = child.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "home={inherited_home}, vault={inherited_vault}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        }
+        let before = (std::env::var_os(HOME), std::env::var_os(VAULT));
+        for unwind in [false, true] {
+            let result = std::panic::catch_unwind(|| {
+                with_temp_home(|| {
+                    let scoped = std::env::var_os(HOME).unwrap();
+                    assert_eq!(std::env::var_os(VAULT), Some(scoped.clone()));
+                    assert_ne!(Some(scoped), before.0);
+                    assert!(super::home().is_dir());
+                    assert!(!unwind, "exercise panic cleanup");
+                    42
+                })
+            });
+            assert_eq!(result.is_err(), unwind);
+            if let Ok(value) = result {
+                assert_eq!(value, 42);
+            }
+            assert_eq!((std::env::var_os(HOME), std::env::var_os(VAULT)), before);
+        }
     }
 
     #[test]
