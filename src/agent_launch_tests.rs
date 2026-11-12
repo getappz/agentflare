@@ -1,7 +1,7 @@
     use super::*;
     #[cfg(unix)]
     use agent_registry::detect::PATH_LOCK as GLOBAL_STATE_LOCK;
-    use agent_registry::{Agent, Tier};
+    use agent_registry::{Agent, ReplyFormat, Tier};
 
     fn test_registry() -> Vec<AgentSpec> {
         vec![
@@ -586,33 +586,15 @@
         }
     }
 
-    #[test]
-    fn parse_claude_reply_extracts_structured_fields() {
-        let raw = r#"{"result":"Fixed the race by adding a mutex.","session_id":"sess-123","total_cost_usd":0.0842}"#;
-        let (text, session_id, cost) = parse_claude_reply(raw);
-        assert_eq!(text, "Fixed the race by adding a mutex.");
-        assert_eq!(session_id.as_deref(), Some("sess-123"));
-        assert_eq!(cost, Some(0.0842));
+    /// The reply a captured `stdout` of `format` yields, as `run_headless` reads it.
+    fn reply_of(format: ReplyFormat, stdout: &str) -> HeadlessReply {
+        turn::TurnState::from_stdout(format, stdout).into_reply(stdout)
     }
 
     #[test]
-    fn parse_claude_reply_extracts_the_result_from_the_last_line_of_a_stream_json_transcript() {
-        // --output-format stream-json emits one JSON object per line (system
-        // init, tool_use/tool_result, assistant messages, ...) and only the
-        // FINAL line carries the same {"result":...} shape the single-object
-        // `json` format uses — everything before it must be ignored, not
-        // treated as (or blended into) the reply text. This is the exact
-        // shape a judge's raw reply takes (item #489): the first line is a
-        // valid-but-`action`-less JSON object, which `parse_judge_decision`
-        // used to grab if this function wasn't called first.
-        let raw = concat!(
-            r#"{"type":"system","subtype":"init","session_id":"sess-123"}"#,
-            "\n",
-            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"working..."}]}}"#,
-            "\n",
-            r#"{"type":"result","result":"Fixed the race by adding a mutex.","session_id":"sess-123","total_cost_usd":0.0842}"#,
-        );
-        let (text, session_id, cost) = parse_claude_reply(raw);
+    fn untyped_whole_reply_object_extracts_structured_fields() {
+        let raw = r#"{"result":"Fixed the race by adding a mutex.","session_id":"sess-123","total_cost_usd":0.0842}"#;
+        let HeadlessReply { text, session_id, cost_usd: cost, .. } = reply_of(ReplyFormat::ResultObject, raw);
         assert_eq!(text, "Fixed the race by adding a mutex.");
         assert_eq!(session_id.as_deref(), Some("sess-123"));
         assert_eq!(cost, Some(0.0842));
@@ -643,7 +625,7 @@
             "\n",
             r#"{"type":"result","result":"single line content again","session_id":"sess-456"}"#,
         );
-        let (text, session_id, _) = parse_claude_reply(raw);
+        let HeadlessReply { text, session_id, .. } = reply_of(ReplyFormat::ResultObject, raw);
         assert_eq!(text, "single line content again");
         assert_eq!(session_id.as_deref(), Some("sess-456"));
         assert_eq!(
@@ -660,7 +642,7 @@
             r#"{"type":"item.completed","item":{"type":"agent_message","text":"Done"}}"#, "\n",
             r#"{"type":"turn.completed","usage":{"input_tokens":120,"cached_input_tokens":80,"output_tokens":7}}"#,
         );
-        let reply = parse_codex_reply(raw);
+        let reply = reply_of(ReplyFormat::CodexEvents, raw);
         assert_eq!(reply.text, "Done");
         assert_eq!(reply.session_id.as_deref(), Some("thread-123"));
         assert_eq!(reply.input_tokens, Some(120));
@@ -669,20 +651,11 @@
 
     #[test]
     fn codex_jsonl_surfaces_failed_turn() {
-        let reply = parse_codex_reply(
+        let reply = reply_of(ReplyFormat::CodexEvents,
             r#"{"type":"turn.failed","error":{"message":"model unavailable"}}"#,
         );
         assert!(reply.is_error);
         assert_eq!(reply.text, "model unavailable");
-    }
-
-    #[test]
-    fn parse_claude_reply_falls_back_to_raw_text_on_non_json() {
-        let raw = "plain text reply, no JSON here";
-        let (text, session_id, cost) = parse_claude_reply(raw);
-        assert_eq!(text, raw);
-        assert!(session_id.is_none());
-        assert!(cost.is_none());
     }
 
     #[test]
@@ -717,7 +690,7 @@
             cancelled: false,
             stalled: false,
             exhausted: None,
-            terminal_result: None,
+            turn: None,
         };
         assert_eq!(diagnostic_suffix(&c, None), " (no output captured)");
     }
@@ -739,7 +712,7 @@
             cancelled: false,
             stalled: false,
             exhausted: None,
-            terminal_result: None,
+            turn: None,
         };
         let suffix = diagnostic_suffix(&c, None);
         assert!(suffix.contains("last stdout before kill"));
@@ -760,7 +733,7 @@
             cancelled: false,
             stalled: false,
             exhausted: None,
-            terminal_result: None,
+            turn: None,
         };
         let suffix = diagnostic_suffix(&c, None);
         assert!(suffix.contains("last stderr before kill"));
@@ -782,7 +755,7 @@
             cancelled: false,
             stalled: false,
             exhausted: None,
-            terminal_result: None,
+            turn: None,
         };
         let suffix = diagnostic_suffix(&c, Some("level=INFO message=\"tool call\" tool=lean_ctx"));
         assert!(suffix.contains("sandbox-side agent log tail"));
@@ -800,7 +773,7 @@
             cancelled: false,
             stalled: false,
             exhausted: None,
-            terminal_result: None,
+            turn: None,
         };
         let msg = match Ok::<_, std::io::Error>(captured) {
             Ok(c) if c.success => unreachable!(),
@@ -862,8 +835,8 @@
     }
 
     #[test]
-    fn parse_json_reply_extracts_result_session_and_cost() {
-        let reply = parse_json_reply(
+    fn result_object_reply_extracts_result_session_and_cost() {
+        let reply = reply_of(ReplyFormat::ResultObject,
             r#"{"type":"result","result":"pong","session_id":"abc-123","total_cost_usd":0.05}"#,
         );
         assert_eq!(reply.text, "pong");
@@ -872,23 +845,23 @@
     }
 
     #[test]
-    fn parse_json_reply_handles_missing_cost_usd() {
-        let reply = parse_json_reply(r#"{"type":"result","result":"pong","session_id":"abc-123"}"#);
+    fn result_object_reply_handles_missing_cost_usd() {
+        let reply = reply_of(ReplyFormat::ResultObject, r#"{"type":"result","result":"pong","session_id":"abc-123"}"#);
         assert_eq!(reply.text, "pong");
         assert_eq!(reply.session_id.as_deref(), Some("abc-123"));
         assert_eq!(reply.cost_usd, None);
     }
 
     #[test]
-    fn parse_json_reply_falls_back_to_raw_text_on_malformed_json() {
-        let reply = parse_json_reply("not json at all");
+    fn result_object_reply_falls_back_to_raw_text_on_malformed_json() {
+        let reply = reply_of(ReplyFormat::ResultObject, "not json at all");
         assert_eq!(reply.text, "not json at all");
         assert_eq!(reply.session_id, None);
         assert_eq!(reply.cost_usd, None);
     }
 
     #[test]
-    fn parse_json_reply_reads_the_final_line_of_a_stream_json_transcript() {
+    fn result_object_reply_reads_the_final_line_of_a_stream_json_transcript() {
         // What `agentflare work` actually captures: `build_extra_args` pins
         // `--output-format stream-json`, so stdout is one JSON object per
         // event and only the last line carries the result fields. Before
@@ -901,7 +874,7 @@
             "\n",
             r#"{"type":"result","result":"Fixed it.","session_id":"sess-123","total_cost_usd":0.0842}"#,
         );
-        let reply = parse_json_reply(raw);
+        let reply = reply_of(ReplyFormat::ResultObject, raw);
         assert_eq!(reply.text, "Fixed it.");
         assert_eq!(reply.session_id.as_deref(), Some("sess-123"));
         assert_eq!(reply.cost_usd, Some(0.0842));
@@ -956,9 +929,9 @@
     }
 
     #[test]
-    fn parse_json_reply_reads_usage_turns_subtype_and_structured_output() {
+    fn result_object_reply_reads_usage_turns_subtype_and_structured_output() {
         let raw = r#"{"type":"result","subtype":"success","is_error":false,"num_turns":7,"result":"done","session_id":"s-1","total_cost_usd":0.5,"usage":{"input_tokens":100,"cache_creation_input_tokens":20,"cache_read_input_tokens":30,"output_tokens":40},"structured_output":{"action":"advance_task"}}"#;
-        let reply = parse_json_reply(raw);
+        let reply = reply_of(ReplyFormat::ResultObject, raw);
         assert_eq!(reply.subtype.as_deref(), Some("success"));
         assert!(!reply.is_error);
         assert_eq!(reply.num_turns, Some(7));
@@ -974,13 +947,13 @@
     }
 
     #[test]
-    fn parse_json_reply_result_event_without_result_text_yields_empty_text_not_the_transcript() {
+    fn result_object_reply_result_event_without_result_text_yields_empty_text_not_the_transcript() {
         let raw = concat!(
             r#"{"type":"system","subtype":"init","session_id":"s-2"}"#,
             "\n",
             r#"{"type":"result","subtype":"error_max_turns","is_error":true,"session_id":"s-2","num_turns":5}"#,
         );
-        let reply = parse_json_reply(raw);
+        let reply = reply_of(ReplyFormat::ResultObject, raw);
         assert_eq!(reply.text, "");
         assert_eq!(reply.session_id.as_deref(), Some("s-2"));
         assert_eq!(reply.subtype.as_deref(), Some("error_max_turns"));
@@ -990,13 +963,13 @@
 
     #[test]
     fn reply_payload_reports_zero_tokens_when_the_agent_gave_none() {
-        let reply = parse_json_reply("plain text reply");
+        let reply = reply_of(ReplyFormat::ResultObject, "plain text reply");
         assert_eq!(reply_payload(reply), ("plain text reply".to_string(), 0, 0));
     }
 
     #[test]
     fn classify_result_reply_keeps_a_cap_hit_usable_with_its_session() {
-        let reply = parse_json_reply(
+        let reply = reply_of(ReplyFormat::ResultObject,
             r#"{"type":"result","subtype":"error_max_turns","is_error":true,"result":"halfway there","session_id":"s-3"}"#,
         );
         match classify_result_reply("Claude Code", reply) {
@@ -1011,7 +984,7 @@
 
     #[test]
     fn classify_result_reply_fails_on_other_error_subtypes_naming_them() {
-        let reply = parse_json_reply(
+        let reply = reply_of(ReplyFormat::ResultObject,
             r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"boom","session_id":"s-4"}"#,
         );
         match classify_result_reply("Claude Code", reply) {
@@ -1025,7 +998,7 @@
 
     #[test]
     fn classify_result_reply_passes_a_success_through() {
-        let reply = parse_json_reply(r#"{"type":"result","subtype":"success","result":"ok","session_id":"s-5"}"#);
+        let reply = reply_of(ReplyFormat::ResultObject, r#"{"type":"result","subtype":"success","result":"ok","session_id":"s-5"}"#);
         assert!(matches!(
             classify_result_reply("Claude Code", reply),
             HeadlessOutcome::Ok(r) if r.text == "ok"
@@ -1035,8 +1008,9 @@
     #[test]
     fn result_subtype_note_names_the_reason_when_stdout_ends_in_a_result_event() {
         let stdout = "{\"type\":\"system\"}\n{\"type\":\"result\",\"subtype\":\"error_during_execution\"}";
-        assert_eq!(result_subtype_note(stdout), " (error_during_execution)");
-        assert_eq!(result_subtype_note("nothing structured"), "");
+        let turn = turn::TurnState::from_stdout(ReplyFormat::ResultObject, stdout);
+        assert_eq!(result_subtype_note(Some(&turn)), " (error_during_execution)");
+        assert_eq!(result_subtype_note(None), "");
     }
 
     #[test]

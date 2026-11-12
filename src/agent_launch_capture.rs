@@ -8,39 +8,12 @@ pub(crate) fn run_captured_with_stall(
     cancel_job: Option<&str>,
     stall: StallConfig,
 ) -> std::io::Result<Captured> {
-    run_captured_with_completion(cmd, hard_cap, idle_timeout, stdin, cancel_job, stall, false)
+    run_captured_with_completion(cmd, hard_cap, idle_timeout, stdin, cancel_job, stall, None)
 }
 
-// Claude may finish its response before background tools release the process.
-fn claude_json_output(args: &[String]) -> bool {
-    args.iter()
-        .enumerate()
-        .filter_map(|(i, arg)| {
-            if arg == "--output-format" {
-                args.get(i + 1).map(String::as_str)
-            } else {
-                arg.strip_prefix("--output-format=")
-            }
-        })
-        .next_back()
-        .is_some_and(|format| matches!(format, "json" | "stream-json"))
-}
-
-fn claude_result(bytes: &[u8]) -> Option<serde_json::Value> {
-    if bytes.trim_ascii_end().last() != Some(&b'}') {
-        return None;
-    }
-    let event: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    (event.get("type")?.as_str()? == "result"
-        && event.get("subtype")?.is_string()
-        && event.get("is_error")?.is_boolean()
-        && (event
-            .get("result")
-            .is_some_and(serde_json::Value::is_string)
-            || event.get("is_error")?.as_bool()?))
-    .then_some(event)
-}
-
+/// With `stream`, every stdout line is parsed into a `TurnState` as it
+/// arrives; when the agent `ends_at_result`, its terminal event ends the run
+/// a second later even if background tools still hold the process open.
 fn run_captured_with_completion(
     mut cmd: Command,
     hard_cap: Duration,
@@ -48,7 +21,7 @@ fn run_captured_with_completion(
     stdin: Option<&str>,
     cancel_job: Option<&str>,
     stall: StallConfig,
-    detect_claude_result: bool,
+    stream: Option<agent_registry::Structured>,
 ) -> std::io::Result<Captured> {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -97,13 +70,18 @@ fn run_captured_with_completion(
     let activity = Arc::new(AtomicU64::new(0));
     let stop_readers = Arc::new(AtomicBool::new(false));
     let output_progress = Arc::new(std::sync::Mutex::new(OutputProgress::new(Instant::now())));
-    let terminal = Arc::new(std::sync::Mutex::new(None::<(Instant, serde_json::Value)>));
+    // The turn parsed so far, and when its terminal event ended it (only
+    // recorded for an agent whose terminal event `ends_at_result`).
+    let turn = Arc::new(std::sync::Mutex::new(
+        stream.map(|s| (TurnState::new(s.format), None::<Instant>)),
+    ));
+    let ends_at_result = stream.is_some_and(|s| s.ends_at_result);
 
     let mut pipe = child.stdout.take().expect("stdout piped above");
     let stdout_activity = activity.clone();
     let stdout_progress = output_progress.clone();
     let stdout_stop = stop_readers.clone();
-    let stdout_terminal = terminal.clone();
+    let stdout_turn = turn.clone();
     let reader = std::thread::spawn(move || {
         let mut buf: Vec<u8> = Vec::new();
         let mut line_start = 0;
@@ -126,24 +104,15 @@ fn run_captured_with_completion(
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     buf.extend_from_slice(&chunk[..n]);
-                    if detect_claude_result {
-                        let mut result = stdout_terminal.lock().unwrap_or_else(|e| e.into_inner());
-                        if result.is_none() {
-                            // Parse raw bytes so split UTF-8 and large result lines stay intact.
-                            while let Some(end) = buf[line_start..].iter().position(|b| *b == b'\n')
-                            {
-                                let end = line_start + end + 1;
-                                if let Some(event) = claude_result(&buf[line_start..end]) {
-                                    *result = Some((Instant::now(), event));
-                                    break;
-                                }
-                                line_start = end;
-                            }
-                            if result.is_none()
-                                && let Some(event) = claude_result(&buf[line_start..])
-                            {
-                                *result = Some((Instant::now(), event));
-                            }
+                    if stream.is_some()
+                        && let Some((turn, ended_at)) = stdout_turn
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .as_mut()
+                    {
+                        turn.feed(&buf, &mut line_start);
+                        if ends_at_result && turn.terminal && ended_at.is_none() {
+                            *ended_at = Some(Instant::now());
                         }
                     }
                     stdout_activity.fetch_add(n as u64, Ordering::Relaxed);
@@ -215,11 +184,11 @@ fn run_captured_with_completion(
             timed_out = true;
             break status;
         }
-        let completed_at = terminal
+        let completed_at = turn
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
-            .map(|(at, _)| *at);
+            .and_then(|(_, at)| *at);
         let completion_ready =
             completed_at.is_some_and(|at| at.elapsed() >= Duration::from_secs(1));
         if completed_at.is_none() && last_activity_at.elapsed() >= idle_timeout {
@@ -315,10 +284,10 @@ fn run_captured_with_completion(
         cancelled,
         stalled,
         exhausted,
-        terminal_result: terminal
+        turn: turn
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
-            .map(|(_, event)| event),
+            .map(|(turn, _)| turn),
     })
 }
