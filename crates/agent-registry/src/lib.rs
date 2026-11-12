@@ -13,7 +13,7 @@ pub use failover::{FailoverConfig, failover_candidates, parse_failover_config};
 pub use flags::{FlagProbe, check_headless_flags};
 pub use headless::{
     HeadlessCli, ReplyFormat, Structured, autonomous_args, headless_args, headless_cli,
-    pins_output_format, required_flags, resume_args, structured_output,
+    pins_output_format, required_flags, resume_args, selects_structured_output, structured_output,
 };
 pub use registry::{
     Agent, AgentSpec, REGISTRY, Tier, agent_by_name, canonicalize, clinepass_model_for_claude,

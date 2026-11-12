@@ -1,24 +1,6 @@
 const TERMINAL_EVENT: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"verified 🦀","session_id":"fixture-session","total_cost_usd":0.125,"usage":{"input_tokens":30,"output_tokens":7}}"#;
 
 #[test]
-fn terminal_claude_detection_respects_explicit_output_format() {
-    for (flags, expected) in [
-        (vec!["--output-format", "json"], true),
-        (vec!["--output-format=stream-json"], true),
-        (
-            vec!["--output-format=json", "--output-format", "text"],
-            false,
-        ),
-        (vec![], false),
-    ] {
-        assert_eq!(
-            claude_json_output(&flags.into_iter().map(str::to_owned).collect::<Vec<_>>()),
-            expected
-        );
-    }
-}
-
-#[test]
 #[ignore = "subprocess fixture for Claude result lifecycle"]
 fn terminal_claude_fixture() {
     use std::io::Write;
@@ -66,7 +48,25 @@ fn terminal_fixture_command(mode: &str) -> Command {
     cmd
 }
 
-fn terminal_capture(mode: &str, enabled: bool, cap: Duration, cancel: Option<&str>) -> Captured {
+/// Claude Code's stream: parsed, and its terminal result ends the run.
+const ENDS_AT_RESULT: Option<agent_registry::Structured> = Some(agent_registry::Structured {
+    args: &[],
+    format: agent_registry::ReplyFormat::ResultObject,
+    ends_at_result: true,
+});
+/// The same stream for an agent whose terminal event is not verified.
+const PARSE_ONLY: Option<agent_registry::Structured> = Some(agent_registry::Structured {
+    args: &[],
+    format: agent_registry::ReplyFormat::ResultObject,
+    ends_at_result: false,
+});
+
+fn terminal_capture(
+    mode: &str,
+    stream: Option<agent_registry::Structured>,
+    cap: Duration,
+    cancel: Option<&str>,
+) -> Captured {
     run_captured_with_completion(
         terminal_fixture_command(mode),
         cap,
@@ -74,18 +74,21 @@ fn terminal_capture(mode: &str, enabled: bool, cap: Duration, cancel: Option<&st
         None,
         cancel,
         StallConfig::from_env(),
-        enabled,
+        stream,
     )
     .unwrap()
+}
+
+fn saw_terminal(c: &Captured) -> bool {
+    c.turn.as_ref().is_some_and(|t| t.terminal)
 }
 
 #[test]
 fn terminal_claude_capture_preserves_utf8_and_metadata_with_or_without_newline() {
     for mode in ["success", "unterminated"] {
-        let c = terminal_capture(mode, true, Duration::from_secs(10), None);
+        let c = terminal_capture(mode, ENDS_AT_RESULT, Duration::from_secs(10), None);
         assert!(c.success && !c.timed_out);
-        let event = c.terminal_result.unwrap();
-        let reply = reply_from_result_event(&event, &c.stdout);
+        let reply = c.turn.unwrap().into_reply(&c.stdout);
         assert_eq!(reply.text, "verified 🦀");
         assert_eq!(reply.cost_usd, Some(0.125));
         assert_eq!(reply.input_tokens, Some(30));
@@ -96,14 +99,14 @@ fn terminal_claude_capture_preserves_utf8_and_metadata_with_or_without_newline()
 
 #[test]
 fn terminal_claude_result_never_overrides_failure_or_cancellation() {
-    let c = terminal_capture("nonzero", true, Duration::from_secs(10), None);
-    assert!(!c.success && !c.timed_out && c.terminal_result.is_some());
-    let c = terminal_capture("success", true, Duration::from_millis(300), None);
+    let c = terminal_capture("nonzero", ENDS_AT_RESULT, Duration::from_secs(10), None);
+    assert!(!c.success && !c.timed_out && saw_terminal(&c));
+    let c = terminal_capture("success", ENDS_AT_RESULT, Duration::from_millis(300), None);
     assert!(!c.success && c.timed_out && !c.idle_killed);
     let _guard = agentflare_jobs::cancel::register("terminal-result-cancel", || true);
     let c = terminal_capture(
         "success",
-        true,
+        ENDS_AT_RESULT,
         Duration::from_secs(10),
         Some("terminal-result-cancel"),
     );
@@ -111,28 +114,26 @@ fn terminal_claude_result_never_overrides_failure_or_cancellation() {
 }
 
 #[test]
-fn terminal_claude_detection_is_opt_in_and_ignores_stderr_and_partial_json() {
-    assert!(claude_result(format!("{TERMINAL_EVENT} \t\r\n").as_bytes()).is_some());
-    for (mode, enabled) in [("success", false), ("stderr", true), ("partial", true)] {
-        let c = terminal_capture(mode, enabled, Duration::from_secs(10), None);
-        assert!(
-            !c.success && c.idle_killed && c.terminal_result.is_none(),
-            "{mode}"
-        );
+fn terminal_completion_is_gated_per_agent_and_ignores_stderr_and_partial_json() {
+    for (mode, stream) in [
+        ("success", None),
+        ("success", PARSE_ONLY),
+        ("stderr", ENDS_AT_RESULT),
+        ("partial", ENDS_AT_RESULT),
+    ] {
+        let c = terminal_capture(mode, stream, Duration::from_secs(10), None);
+        assert!(!c.success && c.idle_killed, "{mode}");
+        // Parse-only still sees the result; it just may not end the run.
+        assert_eq!(saw_terminal(&c), stream == PARSE_ONLY, "{mode}");
     }
-    for bytes in [b"{\"type\":\"result\"}".as_slice(),
-            b"{\"message\":{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"fake\"}}",
-            b"{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":\"false\",\"result\":\"fake\"}"] {
-            assert!(claude_result(bytes).is_none());
-        }
 }
 
 #[test]
 fn terminal_claude_errors_keep_existing_classification() {
     for (mode, succeeds) in [("error", false), ("cap", true)] {
-        let c = terminal_capture(mode, true, Duration::from_secs(10), None);
+        let c = terminal_capture(mode, ENDS_AT_RESULT, Duration::from_secs(10), None);
         assert!(c.success);
-        let reply = reply_from_result_event(&c.terminal_result.unwrap(), &c.stdout);
+        let reply = c.turn.unwrap().into_reply(&c.stdout);
         assert_eq!(
             matches!(
                 classify_result_reply("fixture", reply),
