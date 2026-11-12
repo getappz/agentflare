@@ -328,9 +328,12 @@ pub(crate) fn agent_pid_dir(worktree: &Path) -> std::path::PathBuf {
 }
 
 /// One launched agent child's pid record (see `agent_pid_dir`), removed on
-/// drop.
+/// drop. Lines: pid, start token, then (once the stream names it, and only
+/// for an agent that can delete sessions) agent name and session id.
 struct AgentPidRecord {
     path: std::path::PathBuf,
+    head: String,
+    session: Option<(Agent, String)>,
 }
 
 impl AgentPidRecord {
@@ -341,8 +344,32 @@ impl AgentPidRecord {
         std::fs::create_dir_all(&dir).ok()?;
         let path = dir.join(pid.to_string());
         let start = process_start_token(pid).unwrap_or_default();
-        std::fs::write(&path, format!("{pid}\n{start}\n")).ok()?;
-        Some(Self { path })
+        let head = format!(
+            "{pid}
+{start}
+"
+        );
+        std::fs::write(&path, &head).ok()?;
+        Some(Self {
+            path,
+            head,
+            session: None,
+        })
+    }
+
+    /// Remember the in-flight `session_id` so a kill, or the next daemon's
+    /// sweep, can delete it.
+    fn set_session(&mut self, agent: Agent, session_id: &str) {
+        let line = format!(
+            "{}{}
+{session_id}
+",
+            self.head,
+            agent.as_str()
+        );
+        if std::fs::write(&self.path, line).is_ok() {
+            self.session = Some((agent, session_id.to_string()));
+        }
     }
 }
 
@@ -355,10 +382,11 @@ impl Drop for AgentPidRecord {
 /// A launched agent child recorded under `agent_pid_dir(worktree)`: its pid
 /// (also its process-group id on Unix, see `process_group(0)` in
 /// `run_captured_for_job`) and the start-time token captured at launch, if
-/// one could be read.
+/// one could be read, plus the `(agent, session id)` it was running.
 pub(crate) struct RecordedAgentPid {
     pub pid: u32,
     pub start_token: Option<String>,
+    pub session: Option<(Agent, String)>,
     pub record_path: std::path::PathBuf,
 }
 
@@ -371,16 +399,18 @@ pub(crate) fn recorded_agent_pids(worktree: &Path) -> Vec<RecordedAgentPid> {
         .filter_map(|entry| {
             let record_path = entry.path();
             let content = std::fs::read_to_string(&record_path).ok()?;
-            let mut lines = content.lines();
-            let pid = lines.next()?.trim().parse::<u32>().ok()?;
-            let start_token = lines
+            let mut lines = content.lines().map(str::trim);
+            let pid = lines.next()?.parse::<u32>().ok()?;
+            let start_token = lines.next().filter(|t| !t.is_empty()).map(str::to_string);
+            let session = lines
                 .next()
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-                .map(str::to_string);
+                .and_then(agent_registry::agent_by_name)
+                .zip(lines.next().filter(|id| !id.is_empty()))
+                .map(|(agent, id)| (agent, id.to_string()));
             Some(RecordedAgentPid {
                 pid,
                 start_token,
+                session,
                 record_path,
             })
         })
@@ -919,7 +949,7 @@ fn run_headless_impl(
         Some(prompt),
         owner.and_then(job_id_of_owner),
         StallConfig::from_env(),
-        stream,
+        stream.map(|s| (spec.id, s)),
     );
     // Always taken (read + removed), win or lose, regardless of whether it
     // ends up used below -- otherwise `~/.agentflare/sandbox-diagnostics`
