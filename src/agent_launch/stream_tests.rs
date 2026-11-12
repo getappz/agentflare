@@ -82,7 +82,11 @@ fn an_acp_agent_is_driven_over_stdin_and_its_turn_ends_the_run() {
         None,
         None,
         StallConfig::from_env(),
-        Some(Stream::Acp(Box::new(core), unattended_approver())),
+        Some((
+            // An agent with no discard command: a killed fake never reaches a real CLI.
+            agent_registry::Agent::ClaudeCode,
+            Stream::Acp(Box::new(core), unattended_approver()),
+        )),
     )
     .unwrap();
     assert!(out.success, "stderr: {}", out.stderr);
@@ -121,7 +125,10 @@ fn live_opencode_acp_turn() {
         None,
         None,
         StallConfig::from_env(),
-        Some(Stream::Acp(Box::new(core), unattended_approver())),
+        Some((
+            agent_registry::Agent::Opencode,
+            Stream::Acp(Box::new(core), unattended_approver()),
+        )),
     )
     .unwrap();
     let turn = out.turn.expect("streamed");

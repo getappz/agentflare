@@ -1128,6 +1128,69 @@
         let _ = std::fs::remove_dir(agent_pid_dir(worktree.path()));
     }
 
+    // Item #862: a killed opencode turn has its in-flight session deleted
+    // (stub `opencode` on PATH records the argv), and the pid record carries
+    // `(agent, session)` for the orphan sweep.
+    #[cfg(unix)]
+    #[test]
+    fn killed_turn_discards_its_session_and_records_it_for_the_sweep() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let bin = tempfile::tempdir().unwrap();
+        let log = bin.path().join("calls");
+        let stub = bin.path().join("opencode");
+        std::fs::write(&stub, format!("#!/bin/sh
+echo \"$@\" >> {}
+", log.display())).unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let old_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![bin.path().to_path_buf()];
+        paths.extend(std::env::split_paths(&old_path));
+        // SAFETY: serialized by the shared PATH lock held above.
+        unsafe { std::env::set_var("PATH", std::env::join_paths(paths).unwrap()) };
+
+        let worktree = tempfile::tempdir().unwrap();
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(r#"echo '{"type":"step_start","sessionID":"ses_kill"}'; sleep 30"#)
+            .current_dir(worktree.path());
+        let stream = agent_registry::structured_output(agent_registry::Agent::Opencode).unwrap();
+        let out = run_captured_with_completion(
+            cmd,
+            Duration::from_secs(20),
+            Duration::from_millis(700),
+            None,
+            None,
+            StallConfig::from_env(),
+            Some((agent_registry::Agent::Opencode, Stream::Cli(stream))),
+        )
+        .unwrap();
+        // SAFETY: as above.
+        unsafe { std::env::set_var("PATH", old_path) };
+        assert!(out.idle_killed);
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap().trim(),
+            "session delete ses_kill"
+        );
+        let _ = std::fs::remove_dir_all(agent_pid_dir(worktree.path()));
+    }
+
+    #[test]
+    fn pid_record_round_trips_the_session_for_the_sweep() {
+        let worktree = tempfile::tempdir().unwrap();
+        let mut record = AgentPidRecord::write(worktree.path(), 4242).unwrap();
+        assert!(recorded_agent_pids(worktree.path())[0].session.is_none());
+        record.set_session(agent_registry::Agent::Opencode, "ses_1");
+        let recorded = recorded_agent_pids(worktree.path());
+        assert_eq!(recorded[0].pid, 4242);
+        assert_eq!(
+            recorded[0].session,
+            Some((agent_registry::Agent::Opencode, "ses_1".to_string()))
+        );
+        drop(record);
+        let _ = std::fs::remove_dir_all(agent_pid_dir(worktree.path()));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn process_start_token_identifies_a_live_process_and_not_a_dead_one() {

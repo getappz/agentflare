@@ -11,10 +11,12 @@ pub(crate) fn run_captured_with_stall(
     run_captured_with_completion(cmd, hard_cap, idle_timeout, stdin, cancel_job, stall, None)
 }
 
-/// With `stream`, every stdout line is parsed into a `TurnState` as it
-/// arrives (an ACP agent is also answered over its stdin, kept open for
-/// that); when the agent `ends_at_result`, its terminal event ends the run
-/// a second later even if background tools still hold the process open.
+/// With `stream` (the agent and how its stdout is read), every stdout line
+/// is parsed into a `TurnState` as it arrives (an ACP agent is also answered
+/// over its stdin, kept open for that); when the agent `ends_at_result`,
+/// its terminal event ends the run a second later even if background tools
+/// still hold the process open. A turn we kill has its agent session
+/// discarded (`agent_registry::discard_session`), best-effort.
 fn run_captured_with_completion(
     mut cmd: Command,
     hard_cap: Duration,
@@ -22,8 +24,10 @@ fn run_captured_with_completion(
     stdin: Option<&str>,
     cancel_job: Option<&str>,
     stall: StallConfig,
-    stream: Option<Stream>,
+    stream: Option<(Agent, Stream)>,
 ) -> std::io::Result<Captured> {
+    let agent = stream.as_ref().map(|(a, _)| *a);
+    let stream = stream.map(|(_, s)| s);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     let writes_stdin = stream.as_ref().is_some_and(Stream::writes_stdin);
@@ -55,7 +59,7 @@ fn run_captured_with_completion(
     // Removed again when this function returns (child reaped); left behind
     // only if this whole process dies first -- exactly the case
     // `orphan_reconcile` needs it for.
-    let _pid_record = record_dir
+    let mut pid_record = record_dir
         .as_deref()
         .and_then(|dir| AgentPidRecord::write(dir, child.id()));
 
@@ -173,6 +177,17 @@ fn run_captured_with_completion(
             last_activity_bytes = bytes_so_far;
             last_activity_at = Instant::now();
         }
+        if let (Some(agent), Some(record)) = (agent, pid_record.as_mut())
+            && record.session.is_none()
+            && agent_registry::discard_args(agent, "").is_some()
+            && let Some(id) = turn
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .and_then(|live| live.turn.reply.session_id.clone())
+        {
+            record.set_session(agent, &id);
+        }
         if start.elapsed() >= hard_cap {
             kill_tree(&mut child);
             let status = child.wait()?;
@@ -267,6 +282,19 @@ fn run_captured_with_completion(
     let stdout = reader.join().unwrap_or_default();
     let stderr = err_reader.join().unwrap_or_default();
     let killed_early = stalled || exhausted.is_some();
+    if timed_out || cancelled || killed_early {
+        // The final parsed stream is authoritative: the pid record is only a
+        // best-effort copy for the next daemon's sweep and may lag or fail.
+        let streamed = turn
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|live| live.turn.reply.session_id.clone());
+        let recorded = pid_record.as_ref().and_then(|r| r.session.clone());
+        if let Some((agent, id)) = agent.zip(streamed).or(recorded) {
+            agent_registry::discard_session(agent, &id);
+        }
+    }
     Ok(Captured {
         success: (status.success() || completed_cleanup)
             && !timed_out
