@@ -562,7 +562,7 @@ async fn t49b_ticker_runs_independently() {
     std::fs::create_dir_all(repo.join(".agentflare").join("workflows")).unwrap();
     std::fs::write(
         repo.join(".agentflare").join("workflows").join("w.json"),
-        r#"{"name":"w","steps":[{"name":"s","command":["echo","tick"]}]}"#,
+        super::tests::echo_workflow("w", "tick"),
     )
     .unwrap();
     let store = super::ScheduleStore::open(&db).unwrap();

@@ -73,11 +73,7 @@ impl Harness {
     }
 
     pub(super) fn echo_wf(&self, repo: &Path, wf: &str, msg: &str) {
-        self.write_wf(
-            repo,
-            wf,
-            &format!(r#"{{"name":"{wf}","steps":[{{"name":"s","command":["echo","{msg}"]}}]}}"#),
-        );
+        self.write_wf(repo, wf, &echo_workflow(wf, msg));
     }
 
     pub(super) fn canon(&self, repo: &Path) -> String {
@@ -184,6 +180,15 @@ impl Harness {
             .await
             .unwrap();
     }
+}
+
+pub(super) fn echo_workflow(wf: &str, msg: &str) -> String {
+    let command = if cfg!(windows) {
+        vec!["cmd", "/C", "echo", msg]
+    } else {
+        vec!["echo", msg]
+    };
+    serde_json::json!({"name": wf, "steps": [{"name": "s", "command": command}]}).to_string()
 }
 
 /// T1: due/disabled/frozen filtering.
