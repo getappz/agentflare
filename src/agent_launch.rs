@@ -913,6 +913,9 @@ fn run_headless_impl(
             spec.binary_names.join(" / ")
         ));
     };
+    if let Err(msg) = agent_registry::check_headless_flags(spec.id, spec.display_name, &binary) {
+        return HeadlessOutcome::Failed(msg);
+    }
     let mut routed_args = extra_args.to_vec();
     if let Some(model) = crate::decide::model_routing::launch_model(agent, prompt, extra_args) {
         routed_args.extend(model.args(agent));

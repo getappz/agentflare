@@ -214,41 +214,76 @@ impl VersionRunner for RealVersionRunner {
     }
 }
 
-/// Spawn `binary args...` on a helper thread and wait up to
-/// `VERSION_TIMEOUT`. A hung child on timeout is not killed here — killing
-/// cross-platform requires platform-specific process-group handling, which
-/// is overkill for an occasional `--version` probe; the helper thread is
-/// simply abandoned and the timeout error returned.
-fn run_version_command(binary: &Path, args: &[&str]) -> Result<String, String> {
-    let binary = binary.to_path_buf();
-    let binary_for_thread = binary.clone();
-    let args: Vec<String> = args.iter().map(std::string::ToString::to_string).collect();
+/// Run `binary args...` and return stdout+stderr, killing the child if it
+/// is still running after `timeout` (a hung CLI must not linger).
+/// `pub(crate)` so the `--help` flag probe shares this runner.
+pub(crate) fn run_with_timeout(
+    binary: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<String, String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = std::process::Command::new(binary)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to spawn {}: {e}", binary.display()))?;
     let (tx, rx) = mpsc::channel();
-
-    std::thread::spawn(move || {
-        let result = std::process::Command::new(&binary_for_thread)
-            .args(&args)
-            .output()
-            .map_err(|e| format!("failed to spawn {}: {e}", binary_for_thread.display()))
-            .map(|output| {
-                format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                )
-            });
-        let _ = tx.send(result);
-    });
-
-    match rx.recv_timeout(VERSION_TIMEOUT) {
-        Ok(Ok(text)) if !text.trim().is_empty() => Ok(text),
-        Ok(Ok(_)) => Err(format!("{} produced no output", binary.display())),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err(format!(
-            "{} timed out after {VERSION_TIMEOUT:?}",
-            binary.display()
-        )),
+    let mut readers = Vec::new();
+    for pipe in [
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let tx = tx.clone();
+        readers.push(std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = { pipe }.read_to_end(&mut buf);
+            let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+        }));
     }
+    drop(tx);
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                // Readers are abandoned, not joined: a grandchild may still
+                // hold the pipes open.
+                return Err(format!("{} timed out after {timeout:?}", binary.display()));
+            }
+            Err(e) => return Err(format!("failed to wait on {}: {e}", binary.display())),
+        }
+    }
+    for r in readers {
+        let _ = r.join();
+    }
+    let text: String = rx.try_iter().collect();
+    if text.trim().is_empty() {
+        return Err(format!("{} produced no output", binary.display()));
+    }
+    Ok(text)
+}
+
+fn run_version_command(binary: &Path, args: &[&str]) -> Result<String, String> {
+    run_with_timeout(binary, args, VERSION_TIMEOUT)
 }
 
 /// Resolve an agent's version, using `cache` when the binary path and mtime

@@ -160,6 +160,24 @@ pub fn structured_output(agent: Agent) -> Option<Structured> {
     headless_cli(agent).and_then(|c| c.structured)
 }
 
+/// What `--help` must mention for `agent`'s headless row to still be valid:
+/// the help args (print-mode prefix, so `codex exec --help` lists exec's own
+/// flags) and the long flags we pass (autonomous + structured). Derived from
+/// the row, so there is no second list to keep in sync.
+#[must_use]
+pub fn required_flags(agent: Agent) -> Option<(Vec<&'static str>, Vec<&'static str>)> {
+    let cli = headless_cli(agent)?;
+    let help = cli.print.iter().copied().chain(["--help"]).collect();
+    let needles = cli
+        .autonomous
+        .iter()
+        .chain(cli.structured.iter().flat_map(|s| s.args))
+        .copied()
+        .filter(|a| a.starts_with("--"))
+        .collect();
+    Some((help, needles))
+}
+
 /// Args that resume `session_id` (`--resume <id>`, `resume <id>` for
 /// Codex); empty when the agent can't resume.
 #[must_use]
@@ -260,6 +278,24 @@ mod tests {
             structured_output(Agent::Codex).map(|s| s.format),
             Some(ReplyFormat::CodexEvents)
         );
+    }
+
+    #[test]
+    fn required_flags_derive_from_the_row() {
+        let (help, needles) = required_flags(Agent::Codex).unwrap();
+        assert_eq!(help, ["exec", "--help"]);
+        assert_eq!(needles, ["--sandbox", "--json"]);
+        let (help, needles) = required_flags(Agent::ClaudeCode).unwrap();
+        assert_eq!(help, ["-p", "--help"]);
+        assert_eq!(
+            needles,
+            [
+                "--dangerously-skip-permissions",
+                "--output-format",
+                "--verbose"
+            ]
+        );
+        assert!(required_flags(Agent::Windsurf).is_none());
     }
 
     #[test]
