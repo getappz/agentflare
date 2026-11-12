@@ -4,32 +4,37 @@ use flare_workflow::budget::{BudgetAllocation, error};
 
 use crate::claude_cost::Launch;
 
-/// Records a reply's cost. For a Claude Code reply (`claude_launch` is `Some`) the reported total
-/// is the session's running total, so the turn's own cost comes from the session ledger.
-pub(crate) fn record_reply(
-    allocation: Option<&BudgetAllocation>,
+/// A finished launch's outcome with the cost of its turn. Runs on the blocking thread right after
+/// the agent returns, so a completed turn's session total is kept in the ledger even when the
+/// caller's future was dropped by a timeout. For a Claude Code reply (`claude_launch` is `Some`)
+/// the reported total is the session's running total, so the turn's own cost comes from the ledger.
+pub(crate) fn settle(
+    claude_launch: Option<Launch>,
+    outcome: crate::agent_launch::HeadlessOutcome,
+) -> (crate::agent_launch::HeadlessOutcome, Option<f64>) {
+    let cost = match &outcome {
+        crate::agent_launch::HeadlessOutcome::Ok(reply) => turn_cost(claude_launch.as_ref(), reply),
+        _ => None,
+    };
+    (outcome, cost)
+}
+
+fn turn_cost(
     claude_launch: Option<&Launch>,
     reply: &crate::agent_launch::HeadlessReply,
-) {
+) -> Option<f64> {
+    if reply.is_error && reply.cost_usd == Some(0.0) {
+        return None;
+    }
+    let Some(launch) = claude_launch else {
+        return reply.cost_usd;
+    };
+    let (session, total) = reply.session_id.as_deref().zip(reply.cost_usd)?;
+    crate::claude_cost::turn_cost(&crate::claude_cost::default_path(), session, total, launch)
+}
+
+pub(crate) fn record_reply(allocation: Option<&BudgetAllocation>, cost: Option<f64>) {
     if let Some(allocation) = allocation {
-        let cost = if reply.is_error && reply.cost_usd == Some(0.0) {
-            None
-        } else if let Some(launch) = claude_launch {
-            reply
-                .session_id
-                .as_deref()
-                .zip(reply.cost_usd)
-                .and_then(|(session, total)| {
-                    crate::claude_cost::turn_cost(
-                        &crate::claude_cost::default_path(),
-                        session,
-                        total,
-                        launch,
-                    )
-                })
-        } else {
-            reply.cost_usd
-        };
         allocation.record_cost(cost);
     }
 }
@@ -117,11 +122,8 @@ mod tests {
                         is_error,
                         ..Default::default()
                     };
-                    record_reply(
-                        inv.allocation.as_ref(),
-                        cumulative.then(Launch::default).as_ref(),
-                        &reply,
-                    );
+                    let cost = turn_cost(cumulative.then(Launch::default).as_ref(), &reply);
+                    record_reply(inv.allocation.as_ref(), cost);
                     Ok(("done".into(), 0, 0))
                 })
             });

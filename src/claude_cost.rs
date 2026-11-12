@@ -7,13 +7,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 const FILE: &str = "claude-session-costs.json";
 const VERSION: u32 = 1;
-
-/// Serialises the read-modify-write of the ledger within this process.
-static LEDGER: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Ledger {
@@ -106,6 +102,21 @@ fn load(path: &Path) -> Option<Ledger> {
     }
 }
 
+/// Exclusive lock on `<ledger>.lock`, held until the returned file is dropped.
+fn lock(path: &Path) -> Option<std::fs::File> {
+    use fs2::FileExt;
+    let mut name = path.as_os_str().to_owned();
+    name.push(".lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(name)
+        .ok()?;
+    file.lock_exclusive().ok()?;
+    Some(file)
+}
+
 /// The cost of one turn of `session`, given Claude's reported cumulative `total`. Records the new
 /// total for the next turn. Invalid totals (non-finite, negative) cost `None` and record nothing.
 pub(crate) fn turn_cost(path: &Path, session: &str, total: f64, launch: &Launch) -> Option<f64> {
@@ -119,7 +130,10 @@ fn turn_cost_at(path: &Path, session: &str, total: f64, launch: &Launch, now: u6
     if !total.is_finite() || total < 0.0 {
         return None;
     }
-    let _guard = LEDGER.lock().unwrap_or_else(|e| e.into_inner());
+    // Daemon, MCP handler and CLI runs are separate processes: serialise the read-modify-write
+    // on a sibling lock file (the data file itself is replaced by rename). Without a lock the
+    // turn is still priced, just not safely recorded, so a failure here never loses the cost.
+    let _lock = lock(path);
     let ledger = load(path);
     let kept = |id: &str| {
         ledger
@@ -247,6 +261,21 @@ mod tests {
         let second = launch_from_args("claude-code", &a(&["--resume", "s"])).unwrap();
         let cost = turn_cost(&path, "s", 0.9, &second).unwrap();
         assert!((cost - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn concurrent_writers_do_not_lose_each_others_totals() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = p(&dir);
+        std::thread::scope(|scope| {
+            for i in 0..8 {
+                let path = &path;
+                scope.spawn(move || turn_cost(path, &format!("s{i}"), 1.0, &NEW));
+            }
+        });
+        for i in 0..8 {
+            assert_eq!(kept(&path, &format!("s{i}")), Some(1.0), "s{i}");
+        }
     }
 
     #[test]

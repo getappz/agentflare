@@ -110,41 +110,46 @@ pub(crate) fn agent_send_hook() -> SendMessage {
             // polled/awaited.
             let launch_allocation = allocation.clone();
             let claude_launch = crate::claude_cost::launch_from_args(&agent, &extra_args);
-            let outcome = tokio::task::spawn_blocking(move || {
-                // Blocking-pool queue time must not permit a launch after the deadline.
-                if let Err(error) = budget_launch::prepare(
-                    &agent,
-                    &mut extra_args,
-                    &mut hard_cap,
-                    launch_allocation.as_ref(),
-                ) {
-                    return crate::agent_launch::HeadlessOutcome::Failed(error);
-                }
-                match &cwd {
-                    // Explicit cwd (a workflow compiled with
-                    // `compile_workflow_in`, e.g. a schedule's repo root) instead
-                    // of the ambient process cwd, which is the daemon's own when
-                    // the run is driven there. Never a process-wide chdir.
-                    Some(cwd) => crate::agent_launch::run_headless_in(
-                        cwd,
-                        agent_registry::REGISTRY,
-                        &agent,
-                        &prompt,
-                        hard_cap,
-                        idle_timeout,
-                        &extra_args,
-                        request_json,
-                    ),
-                    None => crate::agent_launch::run_headless(
-                        agent_registry::REGISTRY,
-                        &agent,
-                        &prompt,
-                        hard_cap,
-                        idle_timeout,
-                        &extra_args,
-                        request_json,
-                    ),
-                }
+            let (outcome, cost) = tokio::task::spawn_blocking(move || {
+                budget_launch::settle(
+                    claude_launch,
+                    (move || {
+                        // Blocking-pool queue time must not permit a launch after the deadline.
+                        if let Err(error) = budget_launch::prepare(
+                            &agent,
+                            &mut extra_args,
+                            &mut hard_cap,
+                            launch_allocation.as_ref(),
+                        ) {
+                            return crate::agent_launch::HeadlessOutcome::Failed(error);
+                        }
+                        match &cwd {
+                            // Explicit cwd (a workflow compiled with
+                            // `compile_workflow_in`, e.g. a schedule's repo root) instead
+                            // of the ambient process cwd, which is the daemon's own when
+                            // the run is driven there. Never a process-wide chdir.
+                            Some(cwd) => crate::agent_launch::run_headless_in(
+                                cwd,
+                                agent_registry::REGISTRY,
+                                &agent,
+                                &prompt,
+                                hard_cap,
+                                idle_timeout,
+                                &extra_args,
+                                request_json,
+                            ),
+                            None => crate::agent_launch::run_headless(
+                                agent_registry::REGISTRY,
+                                &agent,
+                                &prompt,
+                                hard_cap,
+                                idle_timeout,
+                                &extra_args,
+                                request_json,
+                            ),
+                        }
+                    })(),
+                )
             })
             .await
             .map_err(|e| format!("agent task panicked: {e}"))?;
@@ -153,11 +158,7 @@ pub(crate) fn agent_send_hook() -> SendMessage {
                 // reports them; 0 otherwise keeps accounting honest (unknown
                 // rather than fabricated).
                 crate::agent_launch::HeadlessOutcome::Ok(reply) => {
-                    budget_launch::record_reply(
-                        allocation.as_ref(),
-                        claude_launch.as_ref(),
-                        &reply,
-                    );
+                    budget_launch::record_reply(allocation.as_ref(), cost);
                     Ok(crate::agent_launch::reply_payload(reply))
                 }
                 crate::agent_launch::HeadlessOutcome::UnknownAgent(e)
@@ -327,25 +328,30 @@ pub(crate) fn app_send_hook(
             // from under a still-running `run_headless_in` call.
             let launch_allocation = allocation.clone();
             let claude_launch = crate::claude_cost::launch_from_args(&agent, &extra_args);
-            let outcome = tokio::task::spawn_blocking(move || {
-                let _scratch = scratch;
-                if let Err(error) = budget_launch::prepare(
-                    &agent,
-                    &mut extra_args,
-                    &mut hard_cap,
-                    launch_allocation.as_ref(),
-                ) {
-                    return crate::agent_launch::HeadlessOutcome::Failed(error);
-                }
-                crate::agent_launch::run_headless_in(
-                    &scratch_path,
-                    agent_registry::REGISTRY,
-                    &agent,
-                    &prompt,
-                    hard_cap,
-                    idle_timeout,
-                    &extra_args,
-                    request_json,
+            let (outcome, cost) = tokio::task::spawn_blocking(move || {
+                budget_launch::settle(
+                    claude_launch,
+                    (move || {
+                        let _scratch = scratch;
+                        if let Err(error) = budget_launch::prepare(
+                            &agent,
+                            &mut extra_args,
+                            &mut hard_cap,
+                            launch_allocation.as_ref(),
+                        ) {
+                            return crate::agent_launch::HeadlessOutcome::Failed(error);
+                        }
+                        crate::agent_launch::run_headless_in(
+                            &scratch_path,
+                            agent_registry::REGISTRY,
+                            &agent,
+                            &prompt,
+                            hard_cap,
+                            idle_timeout,
+                            &extra_args,
+                            request_json,
+                        )
+                    })(),
                 )
             })
             .await
@@ -353,11 +359,7 @@ pub(crate) fn app_send_hook(
 
             match outcome {
                 crate::agent_launch::HeadlessOutcome::Ok(reply) => {
-                    budget_launch::record_reply(
-                        allocation.as_ref(),
-                        claude_launch.as_ref(),
-                        &reply,
-                    );
+                    budget_launch::record_reply(allocation.as_ref(), cost);
                     Ok(crate::agent_launch::reply_payload(reply))
                 }
                 crate::agent_launch::HeadlessOutcome::UnknownAgent(e)
