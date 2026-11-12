@@ -992,73 +992,73 @@ fn real_agent_send_hook(
             // which finds the job via `owner` on its own blocking thread.
             let agent_for_reply = agent.clone();
             let launch_allocation = allocation.clone();
-            let cumulative_usage =
-                crate::workflow::budget_launch::usage_is_cumulative(&agent, &all_args);
-            let outcome = tokio::task::spawn_blocking(move || {
-                // The check reads SQLite, so it runs here on the blocking
-                // pool, not on the shared workflow runtime's worker threads.
-                if owner
-                    .as_deref()
-                    .is_some_and(crate::agent_launch::owner_job_cancelled)
-                {
-                    return crate::agent_launch::HeadlessOutcome::Failed(
-                        agentflare_jobs::cancel::CANCELLED_MESSAGE.to_string(),
-                    );
-                }
-                // Per dispatch, keyed on the role's actual agent (the judge
-                // may run on a different CLI than the implementer): make a
-                // Claude Code job self-contained on a host `init` never
-                // wired. Filesystem work, so it stays on the blocking pool.
-                let mut all_args = all_args;
-                if let Some(agent_enum) = agent_registry::agent_by_name(&agent) {
-                    all_args.extend(crate::claude_job_config::job_scoped_args(agent_enum));
-                }
-                if let Err(error) = crate::workflow::budget_launch::prepare(
-                    &agent,
-                    &mut all_args,
-                    &mut timeout,
-                    launch_allocation.as_ref(),
-                ) {
-                    return crate::agent_launch::HeadlessOutcome::Failed(error);
-                }
-                match &cwd {
-                    // Explicit cwd (the item's own worktree, threaded through
-                    // `WorkItemData::worktree_path`) instead of the ambient
-                    // process cwd — required for a run resumed by
-                    // `engine().recover()`, which never re-enters
-                    // `execute_work`'s `run_in_worktree` chdir (item #191).
-                    Some(cwd) => crate::agent_launch::run_headless_in_with_owner(
-                        owner.as_deref(),
-                        cwd,
-                        agent_registry::REGISTRY,
-                        &agent,
-                        &prompt,
-                        timeout,
-                        idle_timeout,
-                        &all_args,
-                        true,
-                    ),
-                    None => crate::agent_launch::run_headless_with_owner(
-                        owner.as_deref(),
-                        agent_registry::REGISTRY,
-                        &agent,
-                        &prompt,
-                        timeout,
-                        idle_timeout,
-                        &all_args,
-                        true,
-                    ),
-                }
+            let claude_launch = crate::claude_cost::launch_from_args(&agent, &all_args);
+            let (outcome, cost) = tokio::task::spawn_blocking(move || {
+                crate::workflow::budget_launch::settle(
+                    claude_launch,
+                    (move || {
+                        // The check reads SQLite, so it runs here on the blocking
+                        // pool, not on the shared workflow runtime's worker threads.
+                        if owner
+                            .as_deref()
+                            .is_some_and(crate::agent_launch::owner_job_cancelled)
+                        {
+                            return crate::agent_launch::HeadlessOutcome::Failed(
+                                agentflare_jobs::cancel::CANCELLED_MESSAGE.to_string(),
+                            );
+                        }
+                        // Per dispatch, keyed on the role's actual agent (the judge
+                        // may run on a different CLI than the implementer): make a
+                        // Claude Code job self-contained on a host `init` never
+                        // wired. Filesystem work, so it stays on the blocking pool.
+                        let mut all_args = all_args;
+                        if let Some(agent_enum) = agent_registry::agent_by_name(&agent) {
+                            all_args.extend(crate::claude_job_config::job_scoped_args(agent_enum));
+                        }
+                        if let Err(error) = crate::workflow::budget_launch::prepare(
+                            &agent,
+                            &mut all_args,
+                            &mut timeout,
+                            launch_allocation.as_ref(),
+                        ) {
+                            return crate::agent_launch::HeadlessOutcome::Failed(error);
+                        }
+                        match &cwd {
+                            // Explicit cwd (the item's own worktree, threaded through
+                            // `WorkItemData::worktree_path`) instead of the ambient
+                            // process cwd — required for a run resumed by
+                            // `engine().recover()`, which never re-enters
+                            // `execute_work`'s `run_in_worktree` chdir (item #191).
+                            Some(cwd) => crate::agent_launch::run_headless_in_with_owner(
+                                owner.as_deref(),
+                                cwd,
+                                agent_registry::REGISTRY,
+                                &agent,
+                                &prompt,
+                                timeout,
+                                idle_timeout,
+                                &all_args,
+                                true,
+                            ),
+                            None => crate::agent_launch::run_headless_with_owner(
+                                owner.as_deref(),
+                                agent_registry::REGISTRY,
+                                &agent,
+                                &prompt,
+                                timeout,
+                                idle_timeout,
+                                &all_args,
+                                true,
+                            ),
+                        }
+                    })(),
+                )
             })
             .await
             .map_err(|e| format!("agent task panicked: {e}"))?;
             match outcome {
                 crate::agent_launch::HeadlessOutcome::Ok(reply) => {
-                    crate::workflow::budget_launch::record_reply(
-                        allocation.as_ref(),
-                        cumulative_usage,
-                        &reply,
-                    );
+                    crate::workflow::budget_launch::record_reply(allocation.as_ref(), cost);
                     let session_id = reply.session_id.clone();
                     let (text, in_tok, out_tok) = crate::agent_launch::reply_payload(reply);
                     Ok((
