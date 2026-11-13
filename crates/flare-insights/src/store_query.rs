@@ -23,7 +23,7 @@ pub struct SearchHit {
     pub snippet: String,
 }
 
-/// Filters applied in SQL before grouping / limiting search hits.
+/// Filters applied in SQL before limiting search hits.
 #[derive(Debug, Clone, Default)]
 pub struct SearchFilters {
     pub source: Option<String>,
@@ -31,6 +31,8 @@ pub struct SearchFilters {
     pub since: Option<DateTime<Utc>>,
     pub limit: usize,
     pub offset: usize,
+    pub include_files: bool,
+    pub include_tools: bool,
 }
 
 /// Exact string form used when upserting a JSON column (`serde_json::to_string`).
@@ -76,16 +78,31 @@ fn push_session_filters(
     }
 
     if let Some(prefix) = project_prefix {
-        // Literal, case-sensitive comparison (LIKE would treat `_`/`%` as wildcards
-        // and fold ASCII case). Trailing separators are ignored; children may use
-        // `/` or `\\`.
+        // Normalize Windows spellings only; Unix paths remain case-sensitive.
+        let bytes = prefix.as_bytes();
+        let windows = (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\'))
+            || prefix.starts_with(r"\\")
+            || prefix.starts_with("//");
         let base = prefix.trim_end_matches(['/', '\\']);
+        let base = if windows {
+            base.replace('\\', "/").to_ascii_lowercase()
+        } else {
+            base.to_string()
+        };
         let n = base.chars().count() as i64 + 1;
         let mut clause = String::from(" AND (");
         for (i, col) in ["s.cwd", "s.project_path"].iter().enumerate() {
             if i > 0 {
                 clause.push_str(" OR ");
             }
+            let col = if windows {
+                format!("lower(replace({col}, '\\', '/'))")
+            } else {
+                col.to_string()
+            };
             clause.push_str(&format!("{col} = ? OR (substr({col}, 1, ?) IN (?, ?))"));
             binds.push(Value::Text(base.to_string()));
             binds.push(Value::Integer(n));
@@ -137,7 +154,7 @@ impl InsightsStore {
     ) -> Result<Vec<Session>, StoreError> {
         let (mut sql, mut binds) =
             sessions_select("SELECT s.* FROM sessions s", None, source, project_prefix);
-        sql.push_str(" ORDER BY s.updated_at DESC LIMIT ? OFFSET ?");
+        sql.push_str(" ORDER BY s.updated_at DESC, s.id LIMIT ? OFFSET ?");
         binds.push(Value::Integer(limit as i64));
         binds.push(Value::Integer(offset as i64));
 
@@ -150,7 +167,7 @@ impl InsightsStore {
         Ok(out)
     }
 
-    /// Full-text (or short-query LIKE) search with filters applied before limit.
+    /// Search turns and optional file/tool evidence, filtering before limit.
     ///
     /// One hit per session (best `rank`); queries shorter than 3 chars use LIKE.
     pub fn search_hits(
@@ -207,24 +224,13 @@ impl InsightsStore {
             )
         };
 
-        push_session_filters(
-            &mut sql,
-            &mut binds,
-            f.source.as_deref(),
-            f.project_prefix.as_deref(),
-            f.since,
-        );
-
         if use_like {
             sql.push_str(
                 r#"
-                )
-                SELECT s.*, m.turn_seq, m.hit_rank AS rank, m.snip AS snippet
+                ), turn_hits AS (
+                SELECT m.sid, m.turn_seq, m.hit_rank, m.snip
                 FROM matched m
-                JOIN sessions s ON s.id = m.sid
-                WHERE m.rn = 1
-                ORDER BY m.hit_rank, s.updated_at DESC, s.id
-                LIMIT ?, ?"#,
+                WHERE m.rn = 1"#,
             );
         } else {
             let fts_q = flare_search_kit::fts_phrase_query(q);
@@ -236,16 +242,33 @@ impl InsightsStore {
                     SELECT turn_rowid, sid, turn_seq, hit_rank
                     FROM candidates WHERE rn = 1
                 )
-                SELECT s.*, b.turn_seq, b.hit_rank AS rank,
-                       snippet(turns_fts, -1, '[', ']', '…', 24) AS snippet
+                , turn_hits AS (
+                SELECT b.sid, b.turn_seq, b.hit_rank,
+                       snippet(turns_fts, -1, '[', ']', '…', 24) AS snip
                 FROM best b
                 JOIN turns_fts ON turns_fts.rowid = b.turn_rowid
                 JOIN sessions s ON s.id = b.sid
-                WHERE turns_fts MATCH ?
-                ORDER BY b.hit_rank, s.updated_at DESC, s.id
-                LIMIT ?, ?"#,
+                WHERE turns_fts MATCH ?"#,
             );
         }
+        sql.push_str(") , all_hits AS (SELECT * FROM turn_hits");
+        if f.include_files {
+            sql.push_str(" UNION ALL SELECT session_id, 0, 0.0, substr(path, 1, 240) FROM file_events WHERE instr(lower(path), lower(?)) > 0");
+            binds.push(Value::Text(q.to_string()));
+        }
+        if f.include_tools {
+            sql.push_str(" UNION ALL SELECT session_id, turn_seq, 0.0, substr(name || ' ' || input || ' ' || COALESCE(output, ''), 1, 240) FROM tool_calls WHERE instr(lower(name || ' ' || input || ' ' || COALESCE(output, '')), lower(?)) > 0");
+            binds.push(Value::Text(q.to_string()));
+        }
+        sql.push_str(") , ranked AS (SELECT h.*, ROW_NUMBER() OVER (PARTITION BY sid ORDER BY hit_rank, turn_seq, snip) AS rn FROM all_hits h) SELECT s.*, h.turn_seq, h.hit_rank AS rank, h.snip AS snippet FROM ranked h JOIN sessions s ON s.id = h.sid WHERE h.rn = 1");
+        push_session_filters(
+            &mut sql,
+            &mut binds,
+            f.source.as_deref(),
+            f.project_prefix.as_deref(),
+            f.since,
+        );
+        sql.push_str(" ORDER BY h.hit_rank, s.updated_at DESC, s.id LIMIT ?, ?");
         binds.push(Value::Integer(f.offset as i64));
         binds.push(Value::Integer(f.limit as i64));
 

@@ -202,10 +202,15 @@ fn route_request(
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
             let source = params.get("source").cloned();
-            let mut sessions = store.list_sessions(limit, offset).unwrap_or_default();
-            if let Some(src) = source {
-                sessions.retain(|s| s.source.as_str() == src);
-            }
+            let sessions = match store.list_sessions_filtered(
+                source.as_deref(),
+                params.get("project").map(String::as_str),
+                limit,
+                offset,
+            ) {
+                Ok(sessions) => sessions,
+                Err(e) => return (500, serde_json::json!({"error": e.to_string()})),
+            };
             serde_json::to_value(&sessions)
                 .unwrap()
                 .as_array()
@@ -453,6 +458,39 @@ mod urlencoding {
 #[cfg(test)]
 mod forensics_route_tests {
     use super::*;
+
+    #[test]
+    fn sessions_route_filters_before_pagination() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        for (id, source, day, path) in [
+            ("older", "codex", 1, "/demo"),
+            ("newer", "codex", 2, "/demo"),
+            ("other-project", "codex", 3, "/else"),
+            ("other-source", "claude_code", 4, "/demo"),
+        ] {
+            let mut session = crate::migrations::tests::session(id);
+            session.source = serde_json::from_value(serde_json::json!(source)).unwrap();
+            session.cwd = Some(path.into());
+            session.updated_at =
+                chrono::DateTime::parse_from_rfc3339(&format!("2026-01-0{day}T00:00:00Z"))
+                    .unwrap()
+                    .into();
+            store.upsert_session(&session).unwrap();
+        }
+        let state = Arc::new(AppState {
+            read_store: Mutex::new(store),
+            write_store: Mutex::new(InsightsStore::open_in_memory().unwrap()),
+            db_path: PathBuf::new(),
+            stats_cache: Mutex::new(None),
+        });
+        let (status, body) = route_request(
+            &state,
+            "/api/sessions",
+            Some("source=codex&project=/demo&limit=1&offset=1"),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(body[0]["id"], "older");
+    }
 
     #[test]
     fn forensics_route_returns_report() {

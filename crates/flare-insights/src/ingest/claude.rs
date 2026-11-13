@@ -96,6 +96,7 @@ fn parse_claude_jsonl(path: &Path) -> Option<IngestBundle> {
     };
     let mut tool_call_count = 0u32;
     let mut model: Option<String> = None;
+    let mut started_at: Option<DateTime<Utc>> = None;
     let mut updated_at: Option<DateTime<Utc>> = None;
     let mut project = path
         .parent()
@@ -124,6 +125,7 @@ fn parse_claude_jsonl(path: &Path) -> Option<IngestBundle> {
             cwd = Some(value.to_string());
         }
         if let Some(ts) = v.get("timestamp").and_then(parse_timestamp) {
+            started_at = Some(started_at.map_or(ts, |prev| prev.min(ts)));
             updated_at = Some(updated_at.map_or(ts, |prev| prev.max(ts)));
         }
         if let Some(m) = v.get("model").and_then(|m| m.as_str()) {
@@ -298,10 +300,12 @@ fn parse_claude_jsonl(path: &Path) -> Option<IngestBundle> {
         model: model.clone(),
         status: SessionStatus::Completed,
         awaiting_reason: None,
-        started_at: updated_at,
+        started_at,
         updated_at: updated_at.unwrap_or_else(Utc::now),
         ended_at: updated_at,
-        duration_secs: None,
+        duration_secs: started_at
+            .zip(updated_at)
+            .map(|(start, end)| (end - start).num_seconds() as u64),
         tokens: tokens.clone(),
         cost,
         cost_basis,
@@ -351,6 +355,50 @@ fn extract_text_from_message(msg: Option<&serde_json::Value>) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn session_times_span_all_events_even_out_of_order() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let records = [
+            serde_json::json!({"type":"user","timestamp":"2026-11-13T10:00:30Z","message":{"content":"later"}}),
+            serde_json::json!({"type":"assistant","timestamp":"2026-11-13T10:00:00Z","message":{"content":"first"}}),
+            serde_json::json!({"type":"user","message":{"content":"untimed"}}),
+        ];
+        std::fs::write(
+            &path,
+            records
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let bundle = parse_claude_jsonl(&path).unwrap();
+        let session = &bundle.sessions[0];
+        assert_eq!(
+            session.started_at.unwrap().to_rfc3339(),
+            "2026-11-13T10:00:00+00:00"
+        );
+        assert_eq!(
+            session.ended_at.unwrap().to_rfc3339(),
+            "2026-11-13T10:00:30+00:00"
+        );
+        assert_eq!(session.updated_at, session.ended_at.unwrap());
+        assert_eq!(session.duration_secs, Some(30));
+    }
+
+    #[test]
+    fn missing_session_times_stay_unknown() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(&path, r#"{"type":"user","message":{"content":"untimed"}}"#).unwrap();
+        let bundle = parse_claude_jsonl(&path).unwrap();
+        let session = &bundle.sessions[0];
+        assert!(session.started_at.is_none());
+        assert!(session.ended_at.is_none());
+        assert!(session.duration_secs.is_none());
+    }
 
     #[test]
     fn claude_cost_basis_tracks_model_availability() {

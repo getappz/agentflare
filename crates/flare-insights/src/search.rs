@@ -26,7 +26,7 @@ impl Default for SearchOptions {
     }
 }
 
-/// Search turns; returns one [`SearchHit`] per matching session.
+/// Search turns and enabled retained evidence; one hit per matching session.
 pub fn search(store: &InsightsStore, opts: &SearchOptions) -> anyhow::Result<Vec<SearchHit>> {
     if opts.query.trim().is_empty() {
         let sessions = store.list_sessions_filtered(
@@ -52,6 +52,8 @@ pub fn search(store: &InsightsStore, opts: &SearchOptions) -> anyhow::Result<Vec
         since: None,
         limit: opts.limit,
         offset: opts.offset,
+        include_files: opts.include_files,
+        include_tools: opts.include_tools,
     };
     Ok(store.search_hits(&opts.query, &f)?)
 }
@@ -109,6 +111,109 @@ mod tests {
             tokens: None,
             cost_usd: None,
         }
+    }
+
+    #[test]
+    fn retained_evidence_search_respects_flags_filters_and_pagination() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        for (id, source, path) in [
+            ("a", SessionSource::Codex, r"C:\Work\demo"),
+            ("b", SessionSource::Codex, r"C:\Work\demo\child"),
+            ("c", SessionSource::ClaudeCode, r"C:\Work\demo"),
+            ("d", SessionSource::Codex, r"C:\Work\demo2"),
+        ] {
+            store
+                .upsert_session(&sample_session(id, source, Some(path)))
+                .unwrap();
+            store.conn.execute("INSERT INTO file_events(id,session_id,path,kind,at) VALUES (?1,?1,'/needlemarker.rs','read','2026-01-01')", [id]).unwrap();
+            store.conn.execute("INSERT INTO tool_calls(id,session_id,turn_seq,name,input,status) VALUES (?1,?1,3,'shell','{\"command\":\"needlemarker\"}','success')", [id]).unwrap();
+        }
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET updated_at = '2026-01-01T00:00:00+00:00'",
+                [],
+            )
+            .unwrap();
+        let mut opts = SearchOptions {
+            query: "needlemarker".into(),
+            source: Some("codex".into()),
+            project: Some("c:/work/demo/".into()),
+            limit: 1,
+            ..Default::default()
+        };
+        assert_eq!(search(&store, &opts).unwrap()[0].session.id, "a");
+        opts.offset = 1;
+        assert_eq!(search(&store, &opts).unwrap()[0].session.id, "b");
+        opts.offset = 2;
+        assert!(search(&store, &opts).unwrap().is_empty());
+        opts.offset = 0;
+        opts.include_files = false;
+        assert_eq!(search(&store, &opts).unwrap()[0].turn_seq, 3);
+        opts.include_tools = false;
+        assert!(search(&store, &opts).unwrap().is_empty());
+        opts.include_files = true;
+        assert!(search(&store, &opts).unwrap()[0]
+            .snippet
+            .contains("needlemarker.rs"));
+        opts.query = "xy".into();
+        store
+            .conn
+            .execute("UPDATE file_events SET path='/xy.rs'", [])
+            .unwrap();
+        assert_eq!(search(&store, &opts).unwrap()[0].session.id, "a");
+    }
+
+    #[test]
+    fn tool_evidence_search_includes_names_and_output() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        store
+            .upsert_session(&sample_session("tool", SessionSource::Codex, None))
+            .unwrap();
+        store.conn.execute("INSERT INTO tool_calls(id,session_id,turn_seq,name,input,output,status) VALUES ('t','tool',7,'specialtool','{}','failureoutput','failed')", []).unwrap();
+        for query in ["specialtool", "failureoutput"] {
+            let opts = SearchOptions {
+                query: query.into(),
+                include_files: false,
+                ..Default::default()
+            };
+            let hits = search(&store, &opts).unwrap();
+            assert_eq!(hits.len(), 1, "{query}");
+            assert_eq!(hits[0].turn_seq, 7);
+            assert!(hits[0].snippet.contains(query));
+        }
+    }
+
+    #[test]
+    fn windows_project_paths_normalize_without_folding_unix_paths() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        for (id, path) in [
+            ("win", r"C:\Work\demo"),
+            ("unix", "/Work/demo"),
+            ("unc", r"\\server\share\demo"),
+        ] {
+            store
+                .upsert_session(&sample_session(id, SessionSource::Codex, Some(path)))
+                .unwrap();
+        }
+        for (prefix, expected) in [
+            ("c:/work/demo", Some("win")),
+            ("//SERVER/share/demo", Some("unc")),
+            ("/work/demo", None),
+        ] {
+            let hits = store
+                .list_sessions_filtered(None, Some(prefix), 20, 0)
+                .unwrap();
+            assert_eq!(hits.first().map(|s| s.id.as_str()), expected, "{prefix}");
+        }
+        let mut session = sample_session("project-path", SessionSource::Codex, Some("/else"));
+        session.project_path = Some("C:/Work/demo/child".into());
+        store.upsert_session(&session).unwrap();
+        let hits = store
+            .list_sessions_filtered(None, Some(r"c:\work\demo"), 20, 0)
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().any(|s| s.id == "project-path"));
     }
 
     #[test]

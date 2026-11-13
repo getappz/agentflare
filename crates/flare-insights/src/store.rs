@@ -79,7 +79,7 @@ impl InsightsStore {
     // ---- sessions ----
 
     pub fn upsert_session(&self, s: &Session) -> Result<(), StoreError> {
-        exec_upsert_session(&self.conn, s)
+        exec_upsert_session(&self.conn, s, true)
     }
 
     /// Batched, single-transaction session upsert. Prefer this over calling
@@ -89,7 +89,7 @@ impl InsightsStore {
     pub fn upsert_sessions_batch(&self, sessions: &[Session]) -> Result<(), StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         for s in sessions {
-            exec_upsert_session(&tx, s)?;
+            exec_upsert_session(&tx, s, true)?;
         }
         tx.commit()?;
         Ok(())
@@ -449,7 +449,7 @@ impl InsightsStore {
                     params![s.id],
                 )?;
             }
-            exec_upsert_session(&tx, s)?;
+            exec_upsert_session(&tx, s, false)?;
             stats.sessions += 1;
         }
         for t in &bundle.turns {
@@ -626,7 +626,11 @@ fn turn_params(t: &Turn) -> [Box<dyn rusqlite::ToSql + '_>; 13] {
     ]
 }
 
-fn exec_upsert_session(conn: &Connection, s: &Session) -> Result<(), StoreError> {
+fn exec_upsert_session(
+    conn: &Connection,
+    s: &Session,
+    overwrite_annotations: bool,
+) -> Result<(), StoreError> {
     let tags = serde_json::to_string(&s.tags)?;
     conn.execute(
         r#"INSERT INTO sessions(
@@ -644,7 +648,9 @@ fn exec_upsert_session(conn: &Connection, s: &Session) -> Result<(), StoreError>
             cache_read_tokens=excluded.cache_read_tokens, cache_write_tokens=excluded.cache_write_tokens,
             reasoning_tokens=excluded.reasoning_tokens, cost_usd=excluded.cost_usd,
             turn_count=excluded.turn_count, tool_call_count=excluded.tool_call_count,
-            subagent_count=excluded.subagent_count, tags=excluded.tags, starred=excluded.starred,
+            subagent_count=excluded.subagent_count,
+            tags=CASE WHEN ?28 THEN excluded.tags ELSE sessions.tags END,
+            starred=CASE WHEN ?28 THEN excluded.starred ELSE sessions.starred END,
             pid=excluded.pid, cwd=excluded.cwd, cost_basis=excluded.cost_basis, pricing_key=excluded.pricing_key
         "#,
         params![
@@ -675,6 +681,7 @@ fn exec_upsert_session(conn: &Connection, s: &Session) -> Result<(), StoreError>
             s.cwd,
             s.cost_basis.as_str(),
             s.pricing_key,
+            overwrite_annotations,
         ],
     )?;
     Ok(())
@@ -853,6 +860,28 @@ mod commit_tests {
             file_cursors: vec![(PathBuf::from("/logs/s1.jsonl"), 10, 20)],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn reingest_preserves_local_annotations_but_refreshes_source_metadata() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        let mut annotated = session("s1");
+        annotated.tags = vec!["keep".into()];
+        annotated.starred = true;
+        store.upsert_session(&annotated).unwrap();
+        let mut refreshed = session("s1");
+        refreshed.title = Some("refreshed".into());
+        store
+            .commit_ingest("claude_code", &bundle(vec![refreshed], vec![]))
+            .unwrap();
+        let saved = store.get_session("s1").unwrap().unwrap();
+        assert_eq!(saved.tags, vec!["keep"]);
+        assert!(saved.starred);
+        assert_eq!(saved.title.as_deref(), Some("refreshed"));
+        store.upsert_session(&session("s1")).unwrap();
+        let saved = store.get_session("s1").unwrap().unwrap();
+        assert!(saved.tags.is_empty());
+        assert!(!saved.starred);
     }
 
     #[test]

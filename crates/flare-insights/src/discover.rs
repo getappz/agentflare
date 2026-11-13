@@ -23,7 +23,6 @@ pub const DEFAULT_JACCARD_THRESHOLD: f64 = 0.60;
 
 const FENCE_DROP_CHARS: usize = 500;
 const NGRAM_MIN: usize = 3;
-const NGRAM_MAX: usize = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -125,13 +124,8 @@ fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
 }
 
 fn ngrams(tokens: &[String]) -> impl Iterator<Item = String> + '_ {
-    (NGRAM_MIN..=NGRAM_MAX).flat_map(move |n| {
-        tokens
-            .windows(n)
-            .map(|w| w.join(" "))
-            .collect::<Vec<_>>()
-            .into_iter()
-    })
+    // Every eligible 4–6-gram contains an eligible 3-gram with all the same candidates.
+    tokens.windows(NGRAM_MIN).map(|w| w.join(" "))
 }
 
 struct UnionFind {
@@ -351,7 +345,6 @@ pub fn mine(
         }
     }
 
-    // Connected components never depend on pair order, so nothing here stores pairs.
     // Prompts with the same token sequence share every n-gram, so they are connected
     // whenever any is: collapse them to one representative so a prompt repeated
     // thousands of times costs one comparison. A same-set reordering has different
@@ -376,35 +369,46 @@ pub fn mine(
         }
     }
 
-    // Candidates share an n-gram present in >= min_sessions sessions. Skip pairs already
-    // connected, and pairs whose sizes alone rule out the threshold (J <= min/max).
-    for (ng, sessions_hit) in &ngram_sessions {
+    // Shared instructions produce many n-grams with identical candidate lists.
+    let mut postings = HashSet::new();
+    for (ng, sessions_hit) in ngram_sessions {
         if sessions_hit.len() < opts.min_sessions {
             continue;
         }
-        let idxs: Vec<usize> = ngram_docs
-            .get(ng)
-            .into_iter()
-            .flatten()
-            .copied()
-            .filter(|&i| is_representative[i])
-            .collect();
-        for (n, &i) in idxs.iter().enumerate() {
-            let size_i = docs[i].token_set.len();
-            for &j in &idxs[n + 1..] {
-                let size_j = docs[j].token_set.len();
-                // Compare the size ratio to the threshold (not `min < threshold * max`):
-                // `0.07 * 100` is 7.000000000000001 in f64 and would reject Jaccard == 0.07.
-                let (lo, hi) = (size_i.min(size_j), size_i.max(size_j));
-                if hi == 0
-                    || (lo as f64) / (hi as f64) < opts.jaccard_threshold
-                    || uf.find(i) == uf.find(j)
-                {
-                    continue;
-                }
-                if jaccard(&docs[i].token_set, &docs[j].token_set) >= opts.jaccard_threshold {
-                    uf.union(i, j);
-                }
+        let mut idxs = ngram_docs.remove(&ng).unwrap_or_default();
+        idxs.retain(|&i| is_representative[i]);
+        if idxs.len() > 1 {
+            postings.insert(idxs);
+        }
+    }
+    drop(ngram_docs);
+    let postings: Vec<_> = postings.into_iter().collect();
+    let mut doc_postings = vec![Vec::new(); docs.len()];
+    for (posting, idxs) in postings.iter().enumerate() {
+        for &i in idxs {
+            doc_postings[i].push(posting);
+        }
+    }
+
+    // Compare each candidate pair once, keeping only one document's candidates in memory.
+    for (i, posting_ids) in doc_postings.iter().enumerate() {
+        let mut candidates = HashSet::new();
+        for &posting in posting_ids {
+            candidates.extend(postings[posting].iter().copied().filter(|&j| j > i));
+        }
+        let size_i = docs[i].token_set.len();
+        for j in candidates {
+            let size_j = docs[j].token_set.len();
+            // Compare the ratio, not `min < threshold * max`: 0.07 * 100 rounds above 7.
+            let (lo, hi) = (size_i.min(size_j), size_i.max(size_j));
+            if hi == 0
+                || (lo as f64) / (hi as f64) < opts.jaccard_threshold
+                || uf.find(i) == uf.find(j)
+            {
+                continue;
+            }
+            if jaccard(&docs[i].token_set, &docs[j].token_set) >= opts.jaccard_threshold {
+                uf.union(i, j);
             }
         }
     }
