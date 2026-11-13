@@ -204,31 +204,6 @@ fn report_page(data: &mut Value, req: &InsightsRequest) {
     data["value_pagination"] = Value::Object(value_pages);
 }
 
-#[cfg(test)]
-mod report_tests {
-    use super::*;
-
-    #[test]
-    fn long_first_draft_does_not_empty_later_previews() {
-        let mut data = serde_json::json!({"body":[
-            {"examples":[{"excerpt":"x".repeat(2000)}],"draft":"a".repeat(2000)},
-            {"examples":[{"excerpt":"y".repeat(2000)}],"draft":"b".repeat(2000)},
-            {"examples":[{"excerpt":"z".repeat(2000)}],"draft":"c".repeat(2000)}
-        ]});
-        report_page(
-            &mut data,
-            &InsightsRequest {
-                max_chars: Some(1200),
-                ..Default::default()
-            },
-        );
-        for item in data["body"].as_array().unwrap() {
-            assert_eq!(item["draft"].as_str().unwrap().chars().count(), 400);
-        }
-        assert_eq!(data["omissions"]["/body/2/draft"], 1600);
-    }
-}
-
 impl super::AgentflareMcp {
     pub fn insights_impl(&self, req: InsightsRequest) -> Result<String, ErrorData> {
         Self::insights_execute(req, &self.insights_services)
@@ -491,5 +466,30 @@ impl super::AgentflareMcp {
             "groups": { "session": entries },
         }))
         .map_err(internal)
+    }
+}
+
+#[cfg(test)]
+mod report_tests {
+    use super::*;
+
+    #[test]
+    fn long_first_draft_does_not_empty_later_previews() {
+        let mut data = serde_json::json!({"body":[
+            {"examples":[{"excerpt":"x".repeat(2000)}],"draft":"a".repeat(2000)},
+            {"examples":[{"excerpt":"y".repeat(2000)}],"draft":"b".repeat(2000)},
+            {"examples":[{"excerpt":"z".repeat(2000)}],"draft":"c".repeat(2000)}
+        ]});
+        report_page(
+            &mut data,
+            &InsightsRequest {
+                max_chars: Some(1200),
+                ..Default::default()
+            },
+        );
+        for item in data["body"].as_array().unwrap() {
+            assert_eq!(item["draft"].as_str().unwrap().chars().count(), 400);
+        }
+        assert_eq!(data["omissions"]["/body/2/draft"], 1600);
     }
 }
