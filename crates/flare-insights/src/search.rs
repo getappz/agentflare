@@ -55,6 +55,19 @@ pub fn search(store: &InsightsStore, opts: &SearchOptions) -> anyhow::Result<Vec
         include_files: opts.include_files,
         include_tools: opts.include_tools,
     };
+    if opts.query.trim().chars().count() >= 3 && f.limit > 0 && (f.include_files || f.include_tools)
+    {
+        let turns_only = SearchFilters {
+            include_files: false,
+            include_tools: false,
+            ..f.clone()
+        };
+        let hits = store.search_hits(&opts.query, &turns_only)?;
+        // Negative FTS ranks precede all zero-ranked file/tool evidence.
+        if hits.len() == f.limit && hits.iter().all(|hit| hit.rank < 0.0) {
+            return Ok(hits);
+        }
+    }
     Ok(store.search_hits(&opts.query, &f)?)
 }
 
@@ -64,6 +77,94 @@ mod tests {
     use crate::model::*;
     use crate::store_query::SearchHit;
     use chrono::Utc;
+
+    #[test]
+    fn indexed_pages_preserve_union_ranking_filters_and_evidence_fallback() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        for id in ["a", "b", "retained", "outside"] {
+            let cwd = if id == "outside" {
+                "/work/other"
+            } else {
+                "/work/demo"
+            };
+            store
+                .upsert_session(&sample_session(id, SessionSource::ClaudeCode, Some(cwd)))
+                .unwrap();
+            if id != "retained" {
+                store
+                    .upsert_turns_batch(&[Turn {
+                        id: format!("{id}-turn"),
+                        session_id: id.into(),
+                        seq: 1,
+                        user_text: Some(format!("needleword in conversation {id}")),
+                        assistant_text: None,
+                        started_at: None,
+                        ended_at: None,
+                        tokens: None,
+                        cost_usd: None,
+                    }])
+                    .unwrap();
+            }
+        }
+        store
+            .upsert_tool_call(&ToolCall {
+                id: "evidence".into(),
+                session_id: "retained".into(),
+                turn_seq: 7,
+                name: "Run".into(),
+                input: serde_json::json!({"command":"needleword"}),
+                output: None,
+                status: "ok".into(),
+                duration_ms: None,
+                created_at: None,
+            })
+            .unwrap();
+        for query in ["needleword", "ne"] {
+            for limit in [1, 4] {
+                for offset in 0..4 {
+                    let opts = SearchOptions {
+                        query: query.into(),
+                        project: Some("/work/demo".into()),
+                        source: Some("claude_code".into()),
+                        limit,
+                        offset,
+                        ..Default::default()
+                    };
+                    let expected = store
+                        .search_hits(
+                            query,
+                            &SearchFilters {
+                                source: opts.source.clone(),
+                                project_prefix: opts.project.clone(),
+                                limit,
+                                offset,
+                                include_files: true,
+                                include_tools: true,
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        serde_json::to_value(search(&store, &opts).unwrap()).unwrap(),
+                        serde_json::to_value(expected).unwrap()
+                    );
+                }
+            }
+        }
+        let tail = search(
+            &store,
+            &SearchOptions {
+                query: "needleword".into(),
+                project: Some("/work/demo".into()),
+                limit: 1,
+                offset: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(tail[0].session.id, "retained");
+        assert_eq!(tail[0].rank, 0.0);
+    }
 
     fn sample_session(id: &str, source: SessionSource, cwd: Option<&str>) -> Session {
         Session {

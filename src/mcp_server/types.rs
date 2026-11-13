@@ -1673,10 +1673,12 @@ pub(crate) struct AutopilotRequest {
     pub(crate) rate_limit_pct: Option<f64>,
 }
 
-/// Read-only access to the local insights index (past agent sessions).
+/// Insights queries, ingestion, exports, proposals, and managed local services.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct InsightsRequest {
-    #[schemars(description = "search | recall | forensics | discover")]
+    #[schemars(
+        description = "search|recall|show|list|stats|forensics|discover|sync|export|handoff|doctor|reflect|watch|serve"
+    )]
     pub(crate) action: String,
     #[schemars(description = "Search text (search)")]
     #[serde(default)]
@@ -1695,10 +1697,10 @@ pub(crate) struct InsightsRequest {
     )]
     #[serde(default)]
     pub(crate) since_days: Option<u32>,
-    #[schemars(description = "Max hits (search, default 20, capped at 100)")]
+    #[schemars(description = "Page size (search/list/export/reports, default 20, capped at 100)")]
     #[serde(default)]
     pub(crate) limit: Option<usize>,
-    #[schemars(description = "Hits to skip (search)")]
+    #[schemars(description = "Items to skip (search/list/export/reports)")]
     #[serde(default)]
     pub(crate) offset: Option<usize>,
     #[schemars(description = "First turn seq to return (recall, default 0)")]
@@ -1708,8 +1710,75 @@ pub(crate) struct InsightsRequest {
     #[serde(default)]
     pub(crate) turn_limit: Option<usize>,
     #[schemars(
-        description = "Max text chars per page including tool calls (recall, default 12000, capped at 100000); omitted_chars and omitted_tool_calls report what was cut"
+        description = "Text budget (default 12000, capped at 100000). Recall reports omissions; reports also bound nested evidence. Export file writes contain the full selected page."
     )]
     #[serde(default)]
     pub(crate) max_chars: Option<usize>,
+    #[schemars(
+        description = "reflect: scan|list(default)|show|accept|reject|snooze|apply; watch/serve: start(default)|status|stop"
+    )]
+    #[serde(default)]
+    pub(crate) operation: Option<String>,
+    #[schemars(description = "Proposal id (reflect show/accept/reject/snooze/apply)")]
+    #[serde(default)]
+    pub(crate) proposal_id: Option<i64>,
+    #[schemars(
+        description = "Explicitly perform writes: export output, reflect decisions/apply, retention pruning. Without yes, reflect apply and export output preview only."
+    )]
+    #[serde(default)]
+    pub(crate) yes: bool,
+    #[schemars(
+        description = "Export format: json(default)|jsonl|html|deepeval|openai|openai-evals"
+    )]
+    #[serde(default)]
+    pub(crate) format: Option<String>,
+    #[schemars(description = "Export destination; never overwrites an existing file")]
+    #[serde(default)]
+    pub(crate) output: Option<String>,
+    #[schemars(
+        description = "Handoff recipient (default codex); generates text without publishing"
+    )]
+    #[serde(default)]
+    pub(crate) target: Option<String>,
+    #[schemars(description = "Handoff detail: minimal|standard(default)|verbose|full")]
+    #[serde(default)]
+    pub(crate) verbosity: Option<String>,
+    #[schemars(description = "Re-read unchanged inputs during sync")]
+    #[serde(default)]
+    pub(crate) force: bool,
+    #[schemars(
+        description = "Prune sessions older than this many days (sync, requires yes, global project=*)"
+    )]
+    #[serde(default)]
+    pub(crate) prune_days: Option<u32>,
+    #[schemars(description = "Allow reflect apply targets under the user's global Claude config")]
+    #[serde(default)]
+    pub(crate) global: bool,
+    #[schemars(description = "Local dashboard port (serve, default 3456)")]
+    #[serde(default)]
+    pub(crate) port: Option<u16>,
+    #[schemars(description = "Watcher polling interval in seconds (default 5, minimum 1)")]
+    #[serde(default)]
+    pub(crate) interval_secs: Option<u64>,
+    #[schemars(description = "Minimum distinct sessions for discovery (default 2)")]
+    #[serde(default)]
+    pub(crate) min_sessions: Option<usize>,
+    #[schemars(description = "Minimum occurrences for discovery (default 3)")]
+    #[serde(default)]
+    pub(crate) min_count: Option<usize>,
+    #[schemars(
+        description = "Proposal status filter (reflect list): proposed|accepted|rejected|snoozed|applied|superseded"
+    )]
+    #[serde(default)]
+    pub(crate) status: Option<String>,
+    #[schemars(
+        description = "Forensic aggregate rows per nested value array (default 20, capped at 100)"
+    )]
+    #[serde(default)]
+    pub(crate) value_limit: Option<usize>,
+    #[schemars(
+        description = "Forensic aggregate rows to skip; value_pagination reports each array's total/next_offset"
+    )]
+    #[serde(default)]
+    pub(crate) value_offset: Option<usize>,
 }

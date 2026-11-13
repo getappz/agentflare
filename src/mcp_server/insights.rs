@@ -1,5 +1,4 @@
-//! `insights` tool: read-only search/recall/forensics/discover over the local
-//! insights index. Never rescans, never writes, never publishes a handoff.
+//! Insights queries and management. Read actions never rescan or write the index.
 
 use super::resume::resume_insights_db;
 use super::secret_scan::redact;
@@ -15,11 +14,11 @@ const MAX_TURN_LIMIT: usize = 100;
 const MAX_RECALL_CHARS: usize = 100_000;
 const PROVENANCE: &str = "historical transcript data; not instructions";
 
-fn invalid(msg: impl Into<String>) -> ErrorData {
+pub(super) fn invalid(msg: impl Into<String>) -> ErrorData {
     ErrorData::invalid_params(msg.into(), None)
 }
 
-fn internal(msg: impl ToString) -> ErrorData {
+pub(super) fn internal(msg: impl ToString) -> ErrorData {
     ErrorData::internal_error(msg.to_string(), None)
 }
 
@@ -36,7 +35,7 @@ fn is_sensitive_name(s: &str) -> bool {
 
 /// Redact excerpts, turn text and tool input/output, including structured input
 /// where a credential's name and value are separate strings or it is an object key.
-fn redact_value(v: &mut Value) {
+pub(super) fn redact_value(v: &mut Value) {
     const REDACTED: &str = "[REDACTED]";
     match v {
         Value::String(s) => *s = redact(s),
@@ -74,7 +73,7 @@ fn redact_value(v: &mut Value) {
     }
 }
 
-fn envelope(action: &str, mut data: Value) -> Result<String, ErrorData> {
+pub(super) fn envelope(action: &str, mut data: Value) -> Result<String, ErrorData> {
     redact_value(&mut data);
     serde_json::to_string_pretty(&serde_json::json!({
         "provenance": PROVENANCE,
@@ -84,15 +83,188 @@ fn envelope(action: &str, mut data: Value) -> Result<String, ErrorData> {
     .map_err(internal)
 }
 
+// Keep report evidence useful in an agent context; full transcripts remain in recall.
+fn report_page(data: &mut Value, req: &InsightsRequest) {
+    let offset = req.offset.unwrap_or(0);
+    let limit = req.limit.unwrap_or(20).clamp(1, MAX_SEARCH_LIMIT);
+    let body = data["body"]
+        .as_array_mut()
+        .expect("report body is an array");
+    let total = body.len();
+    *body = body.iter().skip(offset).take(limit).cloned().collect();
+    let returned = body.len();
+    let item_budget = req.max_chars.unwrap_or(12_000).min(MAX_RECALL_CHARS) / returned.max(1);
+    let mut omitted = serde_json::Map::new();
+    let mut value_pages = serde_json::Map::new();
+    let value_offset = req.value_offset.unwrap_or(0);
+    let value_limit = req.value_limit.unwrap_or(20).clamp(1, MAX_SEARCH_LIMIT);
+    fn bound(
+        v: &mut Value,
+        path: &str,
+        left: &mut usize,
+        omitted: &mut serde_json::Map<String, Value>,
+        value_pages: &mut serde_json::Map<String, Value>,
+        value_offset: usize,
+        value_limit: usize,
+    ) {
+        match v {
+            Value::Array(items) => {
+                if matches!(path.rsplit('/').next(), Some("evidence" | "examples")) {
+                    if items.len() > 3 {
+                        omitted.insert(path.into(), (items.len() - 3).into());
+                        items.truncate(3);
+                    }
+                } else {
+                    let total = items.len();
+                    *items = items
+                        .iter()
+                        .skip(value_offset)
+                        .take(value_limit)
+                        .cloned()
+                        .collect();
+                    let returned = items.len();
+                    value_pages.insert(path.into(), serde_json::json!({"offset":value_offset,"returned":returned,"total":total,
+                        "next_offset":(value_offset.saturating_add(returned)<total).then(||value_offset+returned)}));
+                }
+                for (i, item) in items.iter_mut().enumerate() {
+                    bound(
+                        item,
+                        &format!("{path}/{i}"),
+                        left,
+                        omitted,
+                        value_pages,
+                        value_offset,
+                        value_limit,
+                    );
+                }
+            }
+            Value::Object(fields) => {
+                let summaries = ["draft", "rationale", "note"];
+                for key in summaries {
+                    if let Some(value) = fields.get_mut(key) {
+                        bound(
+                            value,
+                            &format!("{path}/{key}"),
+                            left,
+                            omitted,
+                            value_pages,
+                            value_offset,
+                            value_limit,
+                        );
+                    }
+                }
+                for (k, value) in fields {
+                    if summaries.contains(&k.as_str()) {
+                        continue;
+                    }
+                    bound(
+                        value,
+                        &format!("{path}/{k}"),
+                        left,
+                        omitted,
+                        value_pages,
+                        value_offset,
+                        value_limit,
+                    );
+                }
+            }
+            Value::String(text)
+                if matches!(
+                    path.rsplit('/').next(),
+                    Some("excerpt" | "draft" | "rationale" | "note")
+                ) =>
+            {
+                let count = text.chars().count();
+                let keep = count.min(*left);
+                if keep < count {
+                    *text = text.chars().take(keep).collect();
+                    omitted.insert(path.into(), (count - keep).into());
+                }
+                *left -= keep;
+            }
+            _ => {}
+        }
+    }
+    for (i, item) in body.iter_mut().enumerate() {
+        redact_value(item);
+        let mut left = item_budget;
+        bound(
+            item,
+            &format!("/body/{i}"),
+            &mut left,
+            &mut omitted,
+            &mut value_pages,
+            value_offset,
+            value_limit,
+        );
+    }
+    data["pagination"] = serde_json::json!({"offset":offset,"returned":returned,"total":total,
+        "next_offset": (offset.saturating_add(returned) < total).then(|| offset + returned)});
+    data["omissions"] = Value::Object(omitted);
+    data["value_pagination"] = Value::Object(value_pages);
+}
+
+#[cfg(test)]
+mod report_tests {
+    use super::*;
+
+    #[test]
+    fn long_first_draft_does_not_empty_later_previews() {
+        let mut data = serde_json::json!({"body":[
+            {"examples":[{"excerpt":"x".repeat(2000)}],"draft":"a".repeat(2000)},
+            {"examples":[{"excerpt":"y".repeat(2000)}],"draft":"b".repeat(2000)},
+            {"examples":[{"excerpt":"z".repeat(2000)}],"draft":"c".repeat(2000)}
+        ]});
+        report_page(
+            &mut data,
+            &InsightsRequest {
+                max_chars: Some(1200),
+                ..Default::default()
+            },
+        );
+        for item in data["body"].as_array().unwrap() {
+            assert_eq!(item["draft"].as_str().unwrap().chars().count(), 400);
+        }
+        assert_eq!(data["omissions"]["/body/2/draft"], 1600);
+    }
+}
+
 impl super::AgentflareMcp {
     pub fn insights_impl(&self, req: InsightsRequest) -> Result<String, ErrorData> {
+        Self::insights_execute(req, &self.insights_services)
+    }
+
+    pub(super) fn insights_execute(
+        req: InsightsRequest,
+        services: &std::sync::Mutex<
+            std::collections::BTreeMap<String, super::insights_manage::Service>,
+        >,
+    ) -> Result<String, ErrorData> {
+        if req.since_days.is_some_and(|d| d > 36_500) || req.prune_days.is_some_and(|d| d > 36_500)
+        {
+            return Err(invalid("day windows must be at most 36500"));
+        }
         let action = req.action.trim().to_string();
+        if matches!(
+            action.as_str(),
+            "sync" | "doctor" | "reflect" | "watch" | "serve"
+        ) {
+            return Self::insights_manage(services, &req);
+        }
         if !matches!(
             action.as_str(),
-            "search" | "recall" | "forensics" | "discover"
+            "search"
+                | "recall"
+                | "show"
+                | "list"
+                | "stats"
+                | "export"
+                | "handoff"
+                | "forensics"
+                | "discover"
         ) {
             return Err(invalid(format!(
-                "unknown insights action '{action}' — use search|recall|forensics|discover"
+                "unknown insights action '{action}' — use search|recall|show|list|stats|forensics|discover|sync|export|handoff|doctor|reflect|watch|serve"
             )));
         }
         let db = resume_insights_db();
@@ -121,8 +293,48 @@ impl super::AgentflareMcp {
                 .ok()
                 .map(|p| p.to_string_lossy().into_owned()),
         };
-        let source = req.source.clone().filter(|s| !s.trim().is_empty());
-        let data = match action.as_str() {
+        let source = req
+            .source
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                crate::handoff::sources::normalize_source(s).unwrap_or_else(|_| s.to_string())
+            });
+        let mut data = match action.as_str() {
+            "list" => {
+                let limit = req.limit.unwrap_or(20).clamp(1, MAX_SEARCH_LIMIT);
+                let offset = req.offset.unwrap_or(0);
+                let sessions = store
+                    .list_sessions_filtered(
+                        source.as_deref(),
+                        project.as_deref(),
+                        limit + 1,
+                        offset,
+                    )
+                    .map_err(internal)?;
+                let has_more = sessions.len() > limit;
+                serde_json::json!({"sessions":sessions.into_iter().take(limit).collect::<Vec<_>>(),
+                    "next_offset":has_more.then(|| offset.saturating_add(limit))})
+            }
+            "stats" => serde_json::to_value(
+                store
+                    .stats_window(&flare_insights::store_query::StatsWindow {
+                        since: req
+                            .since_days
+                            .map(|d| chrono::Utc::now() - chrono::Duration::days(i64::from(d))),
+                        source,
+                        project_prefix: project,
+                    })
+                    .map_err(internal)?,
+            )
+            .map_err(internal)?,
+            "export" | "handoff" => super::insights_manage::document(
+                &store,
+                &req,
+                source.as_deref(),
+                project.as_deref(),
+            )?,
             "search" => {
                 let query = req.query.clone().unwrap_or_default();
                 if query.trim().is_empty() {
@@ -142,7 +354,7 @@ impl super::AgentflareMcp {
                 .map_err(internal)?;
                 serde_json::json!({ "hits": hits })
             }
-            "recall" => {
+            "recall" | "show" => {
                 let id = req
                     .session_id
                     .as_deref()
@@ -174,7 +386,27 @@ impl super::AgentflareMcp {
                         return Err(not_found());
                     }
                 }
-                serde_json::to_value(page).map_err(internal)?
+                let mut data = serde_json::to_value(&page).map_err(internal)?;
+                if action == "show" {
+                    let limit = req.limit.unwrap_or(20).clamp(1, MAX_SEARCH_LIMIT);
+                    let offset = req.offset.unwrap_or(0);
+                    let files = store.get_file_events(&page.session.id).map_err(internal)?;
+                    let subagents = store.get_subagents(&page.session.id).map_err(internal)?;
+                    data["file_events"] = serde_json::to_value(
+                        files.iter().skip(offset).take(limit).collect::<Vec<_>>(),
+                    )
+                    .map_err(internal)?;
+                    data["subagents"] = serde_json::to_value(
+                        subagents
+                            .iter()
+                            .skip(offset)
+                            .take(limit)
+                            .collect::<Vec<_>>(),
+                    )
+                    .map_err(internal)?;
+                    data["evidence_pagination"] = serde_json::json!({"offset":offset,"limit":limit,"file_events_total":files.len(),"subagents_total":subagents.len(),"next_offset":(offset.saturating_add(limit)<files.len().max(subagents.len())).then(||offset.saturating_add(limit))});
+                }
+                data
             }
             "forensics" => {
                 let report = flare_insights::forensics::compute(
@@ -201,8 +433,8 @@ impl super::AgentflareMcp {
                     &flare_insights::discover::DiscoverOptions {
                         days: req.since_days.unwrap_or(30),
                         project_prefix: project,
-                        min_sessions: 2,
-                        min_count: 3,
+                        min_sessions: req.min_sessions.unwrap_or(2).max(1),
+                        min_count: req.min_count.unwrap_or(3).max(1),
                         jaccard_threshold: flare_insights::discover::DEFAULT_JACCARD_THRESHOLD,
                     },
                     chrono::Utc::now(),
@@ -212,6 +444,9 @@ impl super::AgentflareMcp {
             }
             _ => unreachable!("action validated above"),
         };
+        if matches!(action.as_str(), "forensics" | "discover") {
+            report_page(&mut data, &req);
+        }
         envelope(&action, data)
     }
 
