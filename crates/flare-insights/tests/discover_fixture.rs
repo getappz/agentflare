@@ -333,3 +333,49 @@ fn size_bound_does_not_reject_exact_threshold_jaccard() {
     );
     assert_eq!(report.body[0].occurrences, 3);
 }
+
+#[test]
+fn long_shared_instructions_do_not_repeat_connected_pair_work() {
+    let shared = (0..400)
+        .map(|i| format!("instruction{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let rows: Vec<_> = (0..300)
+        .map(|i| row(format!("{shared} request{i}"), format!("s{i}")))
+        .collect();
+    let store = load_store(&rows);
+    let started = std::time::Instant::now();
+    let report = mine(&store, &opts(DEFAULT_JACCARD_THRESHOLD), now()).unwrap();
+    let elapsed = started.elapsed();
+    eprintln!("long shared instructions: {elapsed:?}");
+    assert_eq!(report.body.len(), 1);
+    assert_eq!(report.body[0].occurrences, rows.len());
+    assert_eq!(report.body[0].examples.len(), rows.len());
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "repeated shared n-grams took {elapsed:?}"
+    );
+}
+
+#[test]
+#[ignore = "manual read-only local index benchmark; set INSIGHTS_DISCOVER_BENCH_DB"]
+fn local_index_discovery_benchmark() {
+    let path = std::env::var("INSIGHTS_DISCOVER_BENCH_DB").unwrap();
+    let store = InsightsStore::open_read_only(std::path::Path::new(&path)).unwrap();
+    let started = std::time::Instant::now();
+    let report = mine(
+        &store,
+        &DiscoverOptions {
+            days: 7,
+            ..Default::default()
+        },
+        Utc::now(),
+    )
+    .unwrap();
+    eprintln!(
+        "local index discovery: {:?}; sessions={}, proposals={}",
+        started.elapsed(),
+        report.coverage.sessions_in_window,
+        report.body.len()
+    );
+}

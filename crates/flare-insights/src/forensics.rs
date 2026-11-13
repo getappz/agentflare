@@ -38,6 +38,17 @@ impl Default for ForensicsOptions {
 
 /// Strip injected blocks, collapse whitespace, lowercase; `None` when < 15 chars.
 pub fn normalise_user_text(text: &str) -> Option<String> {
+    let trimmed = text.trim_start();
+    if ["stop hook feedback:", "<local-command-caveat>"]
+        .iter()
+        .any(|prefix| {
+            trimmed
+                .get(..prefix.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        })
+    {
+        return None;
+    }
     static RES: OnceLock<Vec<Regex>> = OnceLock::new();
     let res = RES.get_or_init(|| {
         ["SYSTEM_MESSAGE", "ADDITIONAL_METADATA", "system-reminder"]
@@ -483,6 +494,20 @@ fn cache_reuse(sessions: &[Session]) -> Vec<Finding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_feedback_is_not_a_recurring_user_request() {
+        for text in [
+            "Stop hook feedback: agentflare: before stopping, record durable learnings from this session.",
+            " <local-command-caveat>The command below was run directly, not sent as a request.</local-command-caveat>",
+        ] {
+            assert!(normalise_user_text(text).is_none());
+        }
+        assert!(
+            normalise_user_text("Please help debug the stop hook feedback from this command.")
+                .is_some()
+        );
+    }
     use crate::migrations::tests::session;
     use crate::model::Cost;
 
