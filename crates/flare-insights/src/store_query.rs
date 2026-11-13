@@ -252,12 +252,32 @@ impl InsightsStore {
             );
         }
         sql.push_str(") , all_hits AS (SELECT * FROM turn_hits");
+        let excerpt_context = 60.min(240usize.saturating_sub(q.chars().count()));
         if f.include_files {
-            sql.push_str(" UNION ALL SELECT session_id, 0, 0.0, substr(path, 1, 240) FROM file_events WHERE instr(lower(path), lower(?)) > 0");
+            sql.push_str(&format!(" UNION ALL SELECT session_id, 0, 0.0, substr(path, max(1, instr(lower(path), lower(?)) - {excerpt_context}), 240) FROM file_events WHERE instr(lower(path), lower(?)) > 0"));
+            binds.push(Value::Text(q.to_string()));
             binds.push(Value::Text(q.to_string()));
         }
         if f.include_tools {
-            sql.push_str(" UNION ALL SELECT session_id, turn_seq, 0.0, substr(name || ' ' || input || ' ' || COALESCE(output, ''), 1, 240) FROM tool_calls WHERE instr(lower(name || ' ' || input || ' ' || COALESCE(output, '')), lower(?)) > 0");
+            // Keep raw/cross-field matches as a fallback after individual decoded fields.
+            sql.push_str(&format!(
+                r#"
+                UNION ALL
+                SELECT session_id, turn_seq, 0.0,
+                       substr(evidence, max(1, match_at - {excerpt_context}), 240)
+                FROM (
+                    SELECT t.session_id, t.turn_seq, j.atom AS evidence,
+                           instr(lower(j.atom), lower(?)) AS match_at,
+                           ROW_NUMBER() OVER (PARTITION BY t.id ORDER BY j.fullkey) AS evidence_rank
+                    FROM tool_calls t, json_tree(json_array(
+                        t.name, t.input, t.output,
+                        json(CASE WHEN json_valid(t.input) THEN t.input ELSE 'null' END),
+                        t.name || ' ' || t.input || ' ' || COALESCE(t.output, '')
+                    )) j
+                    WHERE j.type = 'text' AND instr(lower(j.atom), lower(?)) > 0
+                ) WHERE evidence_rank = 1"#
+            ));
+            binds.push(Value::Text(q.to_string()));
             binds.push(Value::Text(q.to_string()));
         }
         sql.push_str(") , ranked AS (SELECT h.*, ROW_NUMBER() OVER (PARTITION BY sid ORDER BY hit_rank, turn_seq, snip) AS rn FROM all_hits h) SELECT s.*, h.turn_seq, h.hit_rank AS rank, h.snip AS snippet FROM ranked h JOIN sessions s ON s.id = h.sid WHERE h.rn = 1");

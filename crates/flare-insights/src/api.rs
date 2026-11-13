@@ -368,7 +368,7 @@ th{color:#666; font-weight:600}
 <div class="stats" id="stats"><div class="stat"><div class="label">Loading…</div></div></div>
 <h2>Recent sessions</h2>
 <table id="sessions"><thead><tr><th>Project</th><th>Source</th><th>Turns</th><th>Tools</th><th>Cost</th><th>Updated</th></tr></thead><tbody></tbody></table>
-<p id="status"></p>
+<p id="status" role="status"></p>
 <script>
 function fmtCost(c){ return (c === null || c === undefined) ? '-' : '$' + Number(c).toFixed(2); }
 function fmtTokens(n){
@@ -380,18 +380,24 @@ function fmtTokens(n){
 function esc(s){
   return String(s == null ? '' : s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 }
+async function fetchJson(url){
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(url + ' returned HTTP ' + response.status);
+  return response.json();
+}
 async function load(){
-  const [sessions, stats] = await Promise.all([
-    fetch('/api/sessions?limit=20').then(r => r.json()),
-    fetch('/api/stats').then(r => r.json())
-  ]);
-  document.getElementById('stats').innerHTML = `
+  try {
+    const [sessions, stats] = await Promise.all([
+      fetchJson('/api/sessions?limit=20'),
+      fetchJson('/api/stats')
+    ]);
+    document.getElementById('stats').innerHTML = `
     <div class="stat"><div class="label">Sessions</div><div class="value">${stats.total_sessions ?? 0}</div></div>
     <div class="stat"><div class="label">Tokens</div><div class="value">${fmtTokens(stats.total_tokens)}</div></div>
     <div class="stat"><div class="label">Cost</div><div class="value">${fmtCost(stats.total_cost_usd)}</div></div>
     <div class="stat"><div class="label">Cache read share</div><div class="value">${stats.cache_read_share == null ? '-' : (stats.cache_read_share * 100).toFixed(0) + '%'}</div></div>
-  `;
-  document.querySelector('#sessions tbody').innerHTML = sessions.map(s => `
+    `;
+    document.querySelector('#sessions tbody').innerHTML = sessions.map(s => `
     <tr>
       <td>${esc(s.project)}</td>
       <td>${esc(s.source)}</td>
@@ -400,8 +406,11 @@ async function load(){
       <td>${fmtCost(s.cost && s.cost.total_usd)}</td>
       <td>${esc((s.updated_at || '').replace('T', ' ').slice(0, 16))}</td>
     </tr>
-  `).join('');
-  document.getElementById('status').textContent = 'updated ' + new Date().toLocaleTimeString();
+    `).join('');
+    document.getElementById('status').textContent = 'updated ' + new Date().toLocaleTimeString();
+  } catch (error) {
+    document.getElementById('status').textContent = 'Refresh failed: ' + error.message;
+  }
 }
 
 load();
