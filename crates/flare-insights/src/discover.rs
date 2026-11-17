@@ -378,6 +378,7 @@ pub fn mine(
         let mut idxs = ngram_docs.remove(&ng).unwrap_or_default();
         idxs.retain(|&i| is_representative[i]);
         if idxs.len() > 1 {
+            idxs.sort_unstable();
             postings.insert(idxs);
         }
     }

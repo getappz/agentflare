@@ -43,6 +43,8 @@ fn export_html(sessions: &[Session], turns: &[crate::model::Turn]) -> String {
         text.replace('&', "&amp;")
             .replace('<', "&lt;")
             .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&#39;")
     }
     let mut h = String::from("<html><body><h1>Agent Sessions Export</h1>");
     for s in sessions {
@@ -104,8 +106,10 @@ mod tests {
         let html = export_sessions(&[session], &[turn], ExportFormat::Html);
         assert!(!html.contains(payload));
         assert_eq!(
-            html.matches("&lt;/pre&gt;&lt;script&gt;alert('x' &amp; \"y\")&lt;/script&gt;")
-                .count(),
+            html.matches(
+                "&lt;/pre&gt;&lt;script&gt;alert(&#39;x&#39; &amp; &quot;y&quot;)&lt;/script&gt;"
+            )
+            .count(),
             5
         );
     }
