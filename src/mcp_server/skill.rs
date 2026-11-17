@@ -59,20 +59,20 @@ impl AgentflareMcp {
                 // "No good local match": weak hits are dropped so the registry
                 // fallback below gets the chance to fill in.
                 let local: Vec<_> = local.into_iter().filter(|h| h.is_confident()).collect();
-                let hits = if skill_registry::github_search::needs_external(&local, limit) {
-                    let (q_registry, q_github) = (query.clone(), query.clone());
-                    let (registry, github) = tokio::join!(
+                let hits = if skill_registry::skills_sh::needs_external(&local, limit) {
+                    let (q_registry, q_skills_sh) = (query.clone(), query.clone());
+                    let (registry, skills_sh) = tokio::join!(
                         tokio::task::spawn_blocking(move || {
                             gateway_registry::registry_search::search_registry(&q_registry, limit)
                         }),
                         tokio::task::spawn_blocking(move || {
-                            skill_registry::github_search::search_github(&q_github, limit)
+                            skill_registry::skills_sh::search_skills_sh(&q_skills_sh, limit)
                         }),
                     );
-                    let local = skill_registry::github_search::merge_github_hits(
+                    let local = skill_registry::skills_sh::merge_external_hits(
                         local,
                         limit,
-                        github.unwrap_or_default(),
+                        skills_sh.unwrap_or_default(),
                     );
                     skill_registry::merge_registry_hits(local, limit, registry.unwrap_or_default())
                 } else {

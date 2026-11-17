@@ -2,11 +2,11 @@ pub mod builtin;
 pub mod db;
 pub mod embed_store;
 pub mod frontmatter;
-pub mod github_search;
 pub mod hub;
 pub mod load;
 pub mod pack;
 pub mod search;
+pub mod skills_sh;
 pub mod sources;
 
 pub use load::{LoadError, LoadedSkill, Registry, load};
