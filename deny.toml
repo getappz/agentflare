@@ -17,6 +17,10 @@ ignore = [
     # webpki-roots 1.x.
     { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26.11 is a shim over the patched 1.0.10 (via ureq 2.x)" },
     { id = "RUSTSEC-2026-0386", reason = "tokio AsyncFd unsound — tracked for dependency bump" },
+    # 2026-11-17: chrono is flagged unmaintained (informational, no patched
+    # version, no recommended replacement) but is used across the tree and
+    # has no known vulnerability. Revisit if a successor is announced.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained notice; no patched version, no known vulnerability" },
 ]
 
 [licenses]
