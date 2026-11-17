@@ -1,6 +1,6 @@
 //! Skill source adapters: flat SKILL.md directories and the Claude plugin cache.
 
-use crate::frontmatter::parse_frontmatter;
+use crate::frontmatter::{Frontmatter, parse_frontmatter};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -94,9 +94,30 @@ fn is_ignored(entry: &std::fs::DirEntry) -> bool {
         .is_some_and(|n| IGNORE_DIRS.contains(&n))
 }
 
+/// First non-empty line with any leading `#`s stripped: the description for
+/// a SKILL.md that has no frontmatter (Claude Code does the same).
+fn first_heading(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(|l| l.trim_start_matches('#').trim().to_string())
+        .unwrap_or_default()
+}
+
 fn read_entry(id: &str, path: &Path) -> Option<SkillEntry> {
     let text = std::fs::read_to_string(path).ok()?;
-    let (fm, body) = parse_frontmatter(&text)?;
+    let (fm, body) = match parse_frontmatter(&text) {
+        Some(parsed) => parsed,
+        // A `---` block that fails to parse is a broken skill: keep skipping it.
+        None if text.starts_with("---") => return None,
+        None => (
+            Frontmatter {
+                description: Some(first_heading(&text)),
+                ..Default::default()
+            },
+            text.as_str(),
+        ),
+    };
     let meta = std::fs::metadata(path).ok()?;
     let mtime = meta
         .modified()
@@ -418,7 +439,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path().join("broken");
         fs::create_dir_all(&d).unwrap();
-        fs::write(d.join("SKILL.md"), "no frontmatter at all").unwrap();
+        fs::write(d.join("SKILL.md"), "---\nname: broken\nno closing fence").unwrap();
         write_skill(tmp.path(), "ok", "works", "body");
         let out = scan_sources(&[Source {
             id: "claude-user".into(),
@@ -426,6 +447,27 @@ mod tests {
         }]);
         assert_eq!(out.entries.len(), 1);
         assert_eq!(out.skipped, 1);
+    }
+
+    #[test]
+    fn skill_without_frontmatter_is_indexed_by_dir_name_and_heading() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("sales-prospect");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(
+            d.join("SKILL.md"),
+            "\n# Full Prospect Analysis Orchestrator\n\nYou audit prospects.",
+        )
+        .unwrap();
+        let out = scan_sources(&[Source {
+            id: "claude-user".into(),
+            kind: SourceKind::FlatDir(tmp.path().to_path_buf()),
+        }]);
+        assert_eq!(out.skipped, 0);
+        let e = &out.entries[0];
+        assert_eq!(e.name, "sales-prospect");
+        assert_eq!(e.description, "Full Prospect Analysis Orchestrator");
+        assert!(e.body.contains("You audit prospects."));
     }
 
     #[test]
