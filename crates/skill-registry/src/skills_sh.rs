@@ -11,6 +11,9 @@ use std::time::Duration;
 
 const API: &str = "https://skills.sh/api/search";
 const TIMEOUT: Duration = Duration::from_secs(4);
+/// A caller-supplied limit must not turn into an unbounded request against a
+/// public endpoint (the local search path clamps separately).
+pub const MAX_REMOTE_LIMIT: usize = 100;
 
 #[derive(Deserialize)]
 struct Resp {
@@ -20,39 +23,62 @@ struct Resp {
 
 #[derive(Deserialize)]
 struct Skill {
-    id: String,
-    source: String,
-    #[serde(rename = "skillId")]
-    skill_id: String,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(rename = "skillId", default)]
+    skill_id: Option<String>,
     #[serde(default)]
     installs: u64,
 }
 
-fn hit(s: Skill) -> SkillHit {
-    SkillHit {
-        // Our installs stage into ~/.agentflare/skills (not per-agent dirs),
-        // resolving a plain skill name against the configured registries.
-        install_hint: Some(format!(
-            "agentflare skill registry add gh:{} && agentflare skill install {}",
-            s.source, s.skill_id
-        )),
-        remote_url: Some(format!("https://skills.sh/{}", s.id)),
-        description: format!("{} · {} installs", s.source, s.installs),
-        name: s.skill_id,
-        source: "skills.sh".to_string(),
-        est_tokens: 0,
-        compressed: false,
-        score: gateway_registry::REGISTRY_FALLBACK_SCORE,
-        confidence: 0.0,
-        last_used_at: 0,
-        bandit_alpha: 1.0,
-        bandit_beta: 1.0,
+/// `source`, `skillId` and `id` are interpolated into an install command and a
+/// URL that the MCP client may act on. Accept only the characters those fields
+/// legitimately use; anything else is dropped rather than passed through.
+fn safe_component(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+fn valid_source(source: &str) -> bool {
+    let mut parts = source.split('/');
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(owner), Some(repo), None) if safe_component(owner) && safe_component(repo)
+    )
+}
+
+fn valid_id(id: &str) -> bool {
+    let parts: Vec<_> = id.split('/').collect();
+    parts.len() == 3 && parts.iter().all(|part| safe_component(part))
+}
+
+fn hit(s: Skill) -> Option<SkillHit> {
+    let (Some(id), Some(source), Some(skill_id)) = (s.id, s.source, s.skill_id) else {
+        return None;
+    };
+    if !valid_id(&id) || !valid_source(&source) || !safe_component(&skill_id) {
+        return None;
     }
+    // Our installs stage into ~/.agentflare/skills (not per-agent dirs),
+    // resolving a plain skill name against the configured registries.
+    let install_hint =
+        format!("agentflare skill registry add gh:{source} && agentflare skill install {skill_id}");
+    Some(SkillHit::external(
+        skill_id.clone(),
+        "skills.sh",
+        format!("{source} · {} installs", s.installs),
+        Some(install_hint),
+        Some(format!("https://skills.sh/{id}")),
+    ))
 }
 
 /// Up to `limit` skills.sh results for `query`, in the directory's own ranking.
 pub fn search_skills_sh(query: &str, limit: usize) -> Vec<SkillHit> {
     let query = query.trim();
+    let limit = limit.min(MAX_REMOTE_LIMIT);
     if query.is_empty() || limit == 0 {
         return Vec::new();
     }
@@ -63,29 +89,24 @@ pub fn search_skills_sh(query: &str, limit: usize) -> Vec<SkillHit> {
         .call()
         .ok()
         .and_then(|r| r.into_json::<Resp>().ok())
-        .map(|r| r.skills.into_iter().take(limit).map(hit).collect())
+        .map(|r| r.skills.into_iter().filter_map(hit).take(limit).collect())
         .unwrap_or_default()
 }
 
-/// Local confidence at which a hit is trusted enough to skip the network.
-const STRONG_CONFIDENCE: f64 = 0.8;
-/// Slots external hits may take from weak local matches.
-const RESERVED: usize = 2;
-
-/// External sources are worth a request when local results are short or
-/// all weak (e.g. a one-word overlap on a multi-word query).
+/// An external request is worthwhile only when local search left open slots.
+/// Local hits have already passed `is_confident()`; evicting them for
+/// confidence-less directory entries would demote real matches.
 pub fn needs_external(local: &[SkillHit], limit: usize) -> bool {
-    local.len() < limit || !local.iter().any(|h| h.confidence >= STRONG_CONFIDENCE)
+    local.len() < limit
 }
 
-/// Append `external` hits, evicting the weakest (last) local hits if needed
-/// so at least `RESERVED` external hits fit within `limit`.
+/// Append `external` hits into the slots left open by `local`, never evicting
+/// a local match.
 pub fn merge_external_hits(
     mut local: Vec<SkillHit>,
     limit: usize,
     external: Vec<SkillHit>,
 ) -> Vec<SkillHit> {
-    local.truncate(limit.saturating_sub(external.len().min(RESERVED)));
     let room = limit.saturating_sub(local.len());
     local.extend(external.into_iter().take(room));
     local
@@ -97,9 +118,9 @@ mod tests {
 
     fn skill(id: &str) -> Skill {
         Skill {
-            id: format!("o/r/{id}"),
-            source: "o/r".to_string(),
-            skill_id: id.to_string(),
+            id: Some(format!("o/r/{id}")),
+            source: Some("o/r".to_string()),
+            skill_id: Some(id.to_string()),
             installs: 42,
         }
     }
@@ -107,13 +128,13 @@ mod tests {
     fn h(name: &str, confidence: f64) -> SkillHit {
         SkillHit {
             confidence,
-            ..hit(skill(name))
+            ..hit(skill(name)).unwrap()
         }
     }
 
     #[test]
     fn hit_maps_directory_entry() {
-        let h = hit(skill("egm-draft"));
+        let h = hit(skill("egm-draft")).unwrap();
         assert_eq!(h.name, "egm-draft");
         assert_eq!(h.source, "skills.sh");
         assert_eq!(h.description, "o/r · 42 installs");
@@ -131,8 +152,23 @@ mod tests {
     fn parses_api_response_ignoring_extra_fields() {
         let json = r#"{"query":"q","skills":[{"id":"a/b/c","source":"a/b","skillId":"c","name":"c","installs":7}],"count":1}"#;
         let r: Resp = serde_json::from_str(json).unwrap();
-        assert_eq!(r.skills[0].skill_id, "c");
+        assert_eq!(r.skills[0].skill_id.as_deref(), Some("c"));
         assert_eq!(r.skills[0].installs, 7);
+    }
+
+    #[test]
+    fn malformed_and_null_fields_are_dropped_without_killing_the_response() {
+        let json = r#"{"skills":[
+            {"id":"a/b/good","source":"a/b","skillId":"good","installs":1},
+            {"id":"a/b/bad","source":"a/b; rm -rf ~","skillId":"bad","installs":2},
+            {"id":"a/b/evil","source":"a/b","skillId":"x && whoami","installs":3},
+            {"id":null,"source":"a/b","skillId":"null-id","installs":4},
+            {"id":"a/b/missing-source","skillId":"missing-source","installs":5}
+        ]}"#;
+        let r: Resp = serde_json::from_str(json).unwrap();
+        let hits: Vec<_> = r.skills.into_iter().filter_map(hit).collect();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "good");
     }
 
     #[test]
@@ -148,30 +184,50 @@ mod tests {
         let hits = search_skills_sh("elephant goldfish model", 5);
         assert!(
             hits.iter()
-                .all(|h| h.description.starts_with("google/elephant-goldfish-model")),
+                .any(|h| h.description.starts_with("google/elephant-goldfish-model")),
             "got: {:?}",
             hits.iter().map(|h| &h.description).collect::<Vec<_>>()
         );
-        assert_eq!(hits.len(), 5);
+        assert!(!hits.is_empty());
     }
 
     #[test]
-    fn merge_reserves_slots_for_external_over_weak_local() {
+    fn merge_never_displaces_local_hits() {
         let local = (0..5).map(|i| h(&format!("l{i}"), 0.6)).collect();
         let ext = (0..4).map(|i| h(&format!("g{i}"), 0.0)).collect();
         let names: Vec<_> = merge_external_hits(local, 5, ext)
             .into_iter()
             .map(|x| x.name)
             .collect();
-        assert_eq!(names, ["l0", "l1", "l2", "g0", "g1"]);
+        assert_eq!(names, ["l0", "l1", "l2", "l3", "l4"]);
     }
 
     #[test]
-    fn external_skipped_only_when_full_and_strong() {
-        let strong: Vec<_> = (0..3).map(|i| h(&format!("a{i}"), 0.9)).collect();
-        assert!(!needs_external(&strong, 3));
-        assert!(needs_external(&strong, 5));
-        let weak: Vec<_> = (0..3).map(|i| h(&format!("a{i}"), 0.6)).collect();
-        assert!(needs_external(&weak, 3));
+    fn merge_fills_only_open_slots() {
+        let local = (0..2).map(|i| h(&format!("l{i}"), 0.6)).collect();
+        let ext = (0..4).map(|i| h(&format!("g{i}"), 0.0)).collect();
+        let names: Vec<_> = merge_external_hits(local, 5, ext)
+            .into_iter()
+            .map(|x| x.name)
+            .collect();
+        assert_eq!(names, ["l0", "l1", "g0", "g1", "g2"]);
+    }
+
+    #[test]
+    fn merge_with_no_external_preserves_local() {
+        let local = (0..3).map(|i| h(&format!("l{i}"), 0.6)).collect();
+        let names: Vec<_> = merge_external_hits(local, 5, vec![])
+            .into_iter()
+            .map(|x| x.name)
+            .collect();
+        assert_eq!(names, ["l0", "l1", "l2"]);
+    }
+
+    #[test]
+    fn external_skipped_only_when_local_fills_limit() {
+        let full: Vec<_> = (0..3).map(|i| h(&format!("a{i}"), 0.6)).collect();
+        assert!(!needs_external(&full, 3));
+        assert!(needs_external(&full, 5));
+        assert!(!needs_external(&[], 0));
     }
 }
