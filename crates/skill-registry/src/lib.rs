@@ -6,6 +6,7 @@ pub mod hub;
 pub mod load;
 pub mod pack;
 pub mod search;
+pub mod skills_sh;
 pub mod sources;
 
 pub use load::{LoadError, LoadedSkill, Registry, load};
