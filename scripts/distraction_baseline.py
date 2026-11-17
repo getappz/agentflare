@@ -15,11 +15,11 @@ from collections import defaultdict
 
 INSIGHTS = os.path.expanduser("~/.local/share/agentflare/insights/observatory.db")
 BACKEND = os.path.expanduser("~/.agentflare/backend.db")
-READ_TOOLS = re.compile(r"(^|__)(Read|ctx_read|ctx_search|ctx_compose|Grep|ctx_shell)$|^Bash$")
+READ_TOOLS = re.compile(r"(?:^|[_-])(?:read|read_file|ctx_read|ctx_search|ctx_compose|grep|ctx_shell)$|^bash$", re.I)
 # Our stale refs are `item #N` mentions in comments/docs (e.g. "Item #71/#438"),
 # plus Google-style TODO(#N)/FIXME(#N). Bare `#N` is skipped: PRs and headings.
 REF = re.compile(r"(?:\bitems?\s*#|\b(?:TODO|FIXME)\s*\(\s*#?)(\d{1,4})\b", re.I)
-ITEMISH = re.compile(r"item|git log|gh (issue|pr)|ctx_search|Grep")
+ITEMISH = re.compile(r"item|git log|gh (issue|pr)|ctx_search|grep", re.I)
 
 
 def ro(path):
