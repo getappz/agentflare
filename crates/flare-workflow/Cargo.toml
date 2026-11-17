@@ -11,7 +11,7 @@ publish = false
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 parking_lot = "0.12"
-rand = "0.8"
+rand = "0.9"
 rusqlite = { version = "0.41", features = ["bundled"] }
 rusqlite_migration = "2"
 serde = { version = "1", features = ["derive"] }

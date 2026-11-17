@@ -1861,7 +1861,7 @@ dependencies = [
  "flare-process",
  "libc",
  "parking_lot",
- "rand 0.8.6",
+ "rand 0.9.5",
  "rusqlite",
  "rusqlite_migration",
  "serde",
