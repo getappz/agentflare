@@ -2,6 +2,7 @@ pub mod builtin;
 pub mod db;
 pub mod embed_store;
 pub mod frontmatter;
+pub mod github_search;
 pub mod hub;
 pub mod load;
 pub mod pack;
