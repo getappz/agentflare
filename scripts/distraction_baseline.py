@@ -12,31 +12,34 @@ scope guard ships and compare the unprompted-detour rate.
 """
 import argparse, json, math, os, random, re, sqlite3, statistics, sys
 from collections import defaultdict
+from contextlib import closing
+from pathlib import Path
 
 INSIGHTS = os.path.expanduser("~/.local/share/agentflare/insights/observatory.db")
 BACKEND = os.path.expanduser("~/.agentflare/backend.db")
 READ_TOOLS = re.compile(r"(?:^|[_-])(?:read|read_file|ctx_read|ctx_search|ctx_compose|grep|ctx_shell)$|^bash$", re.I)
 # Our stale refs are `item #N` mentions in comments/docs (e.g. "Item #71/#438"),
 # plus Google-style TODO(#N)/FIXME(#N). Bare `#N` is skipped: PRs and headings.
-REF = re.compile(r"(?:\bitems?\s*#|\b(?:TODO|FIXME)\s*\(\s*#?)(\d{1,4})\b", re.I)
+REF = re.compile(r"(?:\bitems?\s*#|\b(?:TODO|FIXME)\s*\(\s*#?)(\d+\b(?:\s*/\s*#\d+\b)*)", re.I)
 ITEMISH = re.compile(r"item|git log|gh (issue|pr)|ctx_search|grep", re.I)
 
 
 def ro(path):
-    return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    return sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
 
 
-def item_states():
-    """sequence_id -> state group, for the project with the most items."""
-    if not os.path.exists(BACKEND):
+def item_states(path=BACKEND):
+    """Use an insights project name only when it identifies one backend project."""
+    if not os.path.exists(path):
         return {}
-    c = ro(BACKEND)
-    pid = c.execute("select project_id from items group by 1 order by count(*) desc limit 1").fetchone()
-    if not pid:
-        return {}
-    q = ("select i.sequence_id, s.group_name from items i join states s on s.id=i.state_id "
-         "where i.project_id=? and i.deleted_at is null")
-    return dict(c.execute(q, (pid[0],)).fetchall())
+    with closing(ro(path)) as c:
+        rows = c.execute("""
+            select p.name, i.sequence_id, s.group_name from projects p
+            join items i on i.project_id = p.id join states s on s.id = i.state_id
+            where i.deleted_at is null and p.deleted_at is null and p.name in
+                (select name from projects where deleted_at is null group by name having count(*) = 1)
+        """)
+        return {(project, seq): state for project, seq, state in rows}
 
 
 def sessions(c, since, until):
@@ -52,29 +55,31 @@ def sessions(c, since, until):
 def analyse(c, sess, states):
     rows = []
     for sid, project, model, calls, dur, toks in sess:
-        user = " ".join(t or "" for (t,) in c.execute("select user_text from turns where session_id=?", (sid,)))
-        tcs = c.execute("select turn_seq,name,input,output from tool_calls where session_id=? order by created_at, rowid", (sid,)).fetchall()
+        prompts = c.execute("select seq,user_text from turns where session_id=? and user_text is not null", (sid,)).fetchall()
+        tcs = c.execute("select turn_seq,name,input,output from tool_calls where session_id=? order by turn_seq, created_at, rowid", (sid,)).fetchall()
         reads = [t for t in tcs if READ_TOOLS.search(t[1])]
         exposed = {}  # id -> index of first exposure in tcs
         for idx, (_, name, _, out) in enumerate(tcs):
             if out and READ_TOOLS.search(name):
                 for m in REF.finditer(out):
-                    exposed.setdefault(m.group(1), idx)
+                    for ref in re.findall(r"\d+", m.group(1)):
+                        exposed.setdefault(ref, idx)
         acted, unprompted = set(), set()
         for ref, idx in exposed.items():
-            pat = re.compile(rf"(?<!\d)#?{ref}(?!\d)")
-            for name, inp in ((t[1], t[2]) for t in tcs[idx + 1:]):
+            # A generic number may be a line limit, timeout or git log count.
+            pat = re.compile(rf"(?:#|\b(?:TODO|FIXME)\s*\(\s*|\b(?:item|issue|pr)\s+(?:[\w-]+\s+)?){ref}\b", re.I)
+            for turn, name, inp, _ in tcs[idx + 1:]:
                 if ITEMISH.search(name + " " + (inp or "")[:200]) and pat.search(inp or ""):
                     acted.add(ref)
+                    if not any(seq <= turn and pat.search(prompt) for seq, prompt in prompts):
+                        unprompted.add(ref)
                     break
-            if ref in acted and not re.search(rf"(?<!\d)#?{ref}(?!\d)", user):
-                unprompted.add(ref)
         rows.append(dict(sid=sid, project=project, model=model or "?", calls=calls or 0, dur=dur or 0,
                          toks=toks or 0, reads=len(reads), exposed=len(exposed), acted=len(acted),
                          unprompted=len(unprompted),
-                         closed=sum(1 for r in unprompted if states.get(int(r)) in ("completed", "cancelled")),
-                         open_=sum(1 for r in unprompted if states.get(int(r)) not in (None, "completed", "cancelled")),
-                         unknown=sum(1 for r in unprompted if states.get(int(r)) is None)))
+                         closed=sum(1 for r in unprompted if states.get((project, int(r))) in ("completed", "cancelled")),
+                         open_=sum(1 for r in unprompted if states.get((project, int(r))) not in (None, "completed", "cancelled")),
+                         unknown=sum(1 for r in unprompted if (project, int(r)) not in states)))
     return rows
 
 
@@ -113,8 +118,8 @@ def main():
     ap.add_argument("--since"); ap.add_argument("--until"); ap.add_argument("--db", default=INSIGHTS)
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args()
-    c = ro(a.db)
-    rows = analyse(c, sessions(c, a.since, a.until), item_states())
+    with closing(ro(a.db)) as c:
+        rows = analyse(c, sessions(c, a.since, a.until), item_states())
     with_reads = [r for r in rows if r["reads"]]
     exp = [r for r in with_reads if r["exposed"]]
     out: dict = dict(
@@ -129,14 +134,14 @@ def main():
         detour_session_rate_per_exposed=pct(sum(1 for r in exp if r["unprompted"]), len(exp)),
     )
     for k, label in (("calls", "steps"), ("toks", "tokens"), ("dur", "wait")):
-        res = strat_ratio(exp if len(exp) > 30 else with_reads, k)
+        res = strat_ratio(exp, k)
         out[f"matched_overhead_{label}"] = None if res is None else {"effect": round(res[0], 3), "ci95": res[1] and [round(x, 3) for x in res[1]]}
     if a.json:
         print(json.dumps(out, indent=2)); return
     for k, v in out.items():
         print(f"{k:34} {v}")
     print("\nCaveats: detour/non-detour compared within (project, model) strata among exposed sessions; "
-          "task difficulty is NOT controlled -- treat overhead as an upper bound.", file=sys.stderr)
+          "task difficulty is uncontrolled, so the association does not estimate causal overhead.", file=sys.stderr)
 
 
 if __name__ == "__main__":
