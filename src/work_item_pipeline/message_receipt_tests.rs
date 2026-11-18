@@ -641,6 +641,21 @@ pub(super) fn handoff_barrier(phase: &str, run: flare_workflow::WorkflowRunId) {
     }
 }
 
+fn crash_fixture_engine(
+    workflow: &std::path::Path,
+) -> WorkflowEngine<WorkItemData, SqliteStore<WorkItemData>> {
+    let eng = WorkflowEngine::with_store(SqliteStore::open_file(workflow).unwrap());
+    eng.register_workflow(
+        WorkflowDefinition::new(WORKFLOW_ID, "crash custody").add_step(StepDefinition::new(
+            "noop",
+            "noop",
+            flare_workflow::noop_executor::<WorkItemData>(),
+        )),
+    )
+    .unwrap();
+    eng
+}
+
 #[test]
 fn crash_fixture_child() {
     let Some(dir) = std::env::var_os("AF_RECEIPT_TEST_DIR") else {
@@ -657,19 +672,7 @@ fn crash_fixture_child() {
         .build()
         .unwrap()
         .block_on(async {
-            let eng = WorkflowEngine::with_store(
-                SqliteStore::<WorkItemData>::open_file(&dir.join("workflow.db")).unwrap(),
-            );
-            eng.register_workflow(
-                WorkflowDefinition::new(WORKFLOW_ID, "crash custody").add_step(
-                    StepDefinition::new(
-                        "noop",
-                        "noop",
-                        flare_workflow::noop_executor::<WorkItemData>(),
-                    ),
-                ),
-            )
-            .unwrap();
+            let eng = crash_fixture_engine(&dir.join("workflow.db"));
             receipts::reserve_for_run(
                 &message_db(&dir.join("messages.db")),
                 &run.to_string(),
@@ -731,17 +734,7 @@ async fn killed_process_reconciles_both_real_handoff_windows() {
             std::fs::read_to_string(tmp.path().join("ready")).unwrap(),
             phase
         );
-        let contender =
-            WorkflowEngine::with_store(SqliteStore::<WorkItemData>::open_file(&workflow).unwrap());
-        contender
-            .register_workflow(WorkflowDefinition::new(WORKFLOW_ID, "contender").add_step(
-                StepDefinition::new(
-                    "noop",
-                    "noop",
-                    flare_workflow::noop_executor::<WorkItemData>(),
-                ),
-            ))
-            .unwrap();
+        let contender = crash_fixture_engine(&workflow);
         assert!(
             contender.get_status(run).await.unwrap().lease.is_some(),
             "custody preparation must already own the lease"
@@ -752,8 +745,8 @@ async fn killed_process_reconciles_both_real_handoff_windows() {
         );
         child.0.kill().unwrap();
         child.0.wait().unwrap();
-        let eng =
-            WorkflowEngine::with_store(SqliteStore::<WorkItemData>::open_file(&workflow).unwrap());
+        drop(contender);
+        let eng = crash_fixture_engine(&workflow);
         let before = eng.get_status(run).await.unwrap().context.data;
         assert_eq!(
             before.accepted_message_receipts.len(),
@@ -763,12 +756,18 @@ async fn killed_process_reconciles_both_real_handoff_windows() {
             receipts::list(&c, "agent:one", 10).unwrap()[0].state,
             "in_doubt"
         );
-        prepare_message_delivery(&eng, run, "agent:one", None, &messages, false)
-            .await
-            .unwrap();
-        prepare_message_delivery(&eng, run, "agent:one", None, &messages, false)
-            .await
-            .unwrap();
+        assert_eq!(
+            recover_with_message_custody(&eng, &messages, |_| true)
+                .await
+                .unwrap(),
+            vec![run]
+        );
+        assert!(
+            recover_with_message_custody(&eng, &messages, |_| true)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         let after = eng.get_status(run).await.unwrap().context.data;
         assert_eq!(after.pending_corrections.len(), 1);
         assert_eq!(after.accepted_message_receipts.len(), 1);
