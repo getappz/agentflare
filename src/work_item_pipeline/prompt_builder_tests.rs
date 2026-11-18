@@ -71,6 +71,13 @@ fn implementer_prompt_forbids_backgrounding_verification() {
 }
 
 #[test]
+fn implementer_prompt_scopes_out_stale_todo_references() {
+    let prompt = build_implementer_prompt(&sample_task(), None, false, false);
+    assert!(prompt.contains("Stay in scope"));
+    assert!(prompt.contains("unless the task above names them"));
+}
+
+#[test]
 fn review_analyst_prompt_forbids_backgrounding_verification() {
     // Same failure mode as the implementer (item #71/#438): the review
     // analyst is dispatched through the identical one-shot-with-`--resume`
