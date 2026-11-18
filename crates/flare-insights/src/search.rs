@@ -26,7 +26,7 @@ impl Default for SearchOptions {
     }
 }
 
-/// Search turns; returns one [`SearchHit`] per matching session.
+/// Search turns and enabled retained evidence; one hit per matching session.
 pub fn search(store: &InsightsStore, opts: &SearchOptions) -> anyhow::Result<Vec<SearchHit>> {
     if opts.query.trim().is_empty() {
         let sessions = store.list_sessions_filtered(
@@ -52,7 +52,22 @@ pub fn search(store: &InsightsStore, opts: &SearchOptions) -> anyhow::Result<Vec
         since: None,
         limit: opts.limit,
         offset: opts.offset,
+        include_files: opts.include_files,
+        include_tools: opts.include_tools,
     };
+    if opts.query.trim().chars().count() >= 3 && f.limit > 0 && (f.include_files || f.include_tools)
+    {
+        let turns_only = SearchFilters {
+            include_files: false,
+            include_tools: false,
+            ..f.clone()
+        };
+        let hits = store.search_hits(&opts.query, &turns_only)?;
+        // Negative FTS ranks precede all zero-ranked file/tool evidence.
+        if hits.len() == f.limit && hits.iter().all(|hit| hit.rank < 0.0) {
+            return Ok(hits);
+        }
+    }
     Ok(store.search_hits(&opts.query, &f)?)
 }
 
@@ -62,6 +77,94 @@ mod tests {
     use crate::model::*;
     use crate::store_query::SearchHit;
     use chrono::Utc;
+
+    #[test]
+    fn indexed_pages_preserve_union_ranking_filters_and_evidence_fallback() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        for id in ["a", "b", "retained", "outside"] {
+            let cwd = if id == "outside" {
+                "/work/other"
+            } else {
+                "/work/demo"
+            };
+            store
+                .upsert_session(&sample_session(id, SessionSource::ClaudeCode, Some(cwd)))
+                .unwrap();
+            if id != "retained" {
+                store
+                    .upsert_turns_batch(&[Turn {
+                        id: format!("{id}-turn"),
+                        session_id: id.into(),
+                        seq: 1,
+                        user_text: Some(format!("needleword in conversation {id}")),
+                        assistant_text: None,
+                        started_at: None,
+                        ended_at: None,
+                        tokens: None,
+                        cost_usd: None,
+                    }])
+                    .unwrap();
+            }
+        }
+        store
+            .upsert_tool_call(&ToolCall {
+                id: "evidence".into(),
+                session_id: "retained".into(),
+                turn_seq: 7,
+                name: "Run".into(),
+                input: serde_json::json!({"command":"needleword"}),
+                output: None,
+                status: "ok".into(),
+                duration_ms: None,
+                created_at: None,
+            })
+            .unwrap();
+        for query in ["needleword", "ne"] {
+            for limit in [1, 4] {
+                for offset in 0..4 {
+                    let opts = SearchOptions {
+                        query: query.into(),
+                        project: Some("/work/demo".into()),
+                        source: Some("claude_code".into()),
+                        limit,
+                        offset,
+                        ..Default::default()
+                    };
+                    let expected = store
+                        .search_hits(
+                            query,
+                            &SearchFilters {
+                                source: opts.source.clone(),
+                                project_prefix: opts.project.clone(),
+                                limit,
+                                offset,
+                                include_files: true,
+                                include_tools: true,
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        serde_json::to_value(search(&store, &opts).unwrap()).unwrap(),
+                        serde_json::to_value(expected).unwrap()
+                    );
+                }
+            }
+        }
+        let tail = search(
+            &store,
+            &SearchOptions {
+                query: "needleword".into(),
+                project: Some("/work/demo".into()),
+                limit: 1,
+                offset: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(tail[0].session.id, "retained");
+        assert_eq!(tail[0].rank, 0.0);
+    }
 
     fn sample_session(id: &str, source: SessionSource, cwd: Option<&str>) -> Session {
         Session {
@@ -109,6 +212,272 @@ mod tests {
             tokens: None,
             cost_usd: None,
         }
+    }
+
+    #[test]
+    fn retained_evidence_search_respects_flags_filters_and_pagination() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        for (id, source, path) in [
+            ("a", SessionSource::Codex, r"C:\Work\demo"),
+            ("b", SessionSource::Codex, r"C:\Work\demo\child"),
+            ("c", SessionSource::ClaudeCode, r"C:\Work\demo"),
+            ("d", SessionSource::Codex, r"C:\Work\demo2"),
+        ] {
+            store
+                .upsert_session(&sample_session(id, source, Some(path)))
+                .unwrap();
+            store.conn.execute("INSERT INTO file_events(id,session_id,path,kind,at) VALUES (?1,?1,'/needlemarker.rs','read','2026-01-01')", [id]).unwrap();
+            store.conn.execute("INSERT INTO tool_calls(id,session_id,turn_seq,name,input,status) VALUES (?1,?1,3,'shell','{\"command\":\"needlemarker\"}','success')", [id]).unwrap();
+        }
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET updated_at = '2026-01-01T00:00:00+00:00'",
+                [],
+            )
+            .unwrap();
+        let mut opts = SearchOptions {
+            query: "needlemarker".into(),
+            source: Some("codex".into()),
+            project: Some("c:/work/demo/".into()),
+            limit: 1,
+            ..Default::default()
+        };
+        assert_eq!(search(&store, &opts).unwrap()[0].session.id, "a");
+        opts.offset = 1;
+        assert_eq!(search(&store, &opts).unwrap()[0].session.id, "b");
+        opts.offset = 2;
+        assert!(search(&store, &opts).unwrap().is_empty());
+        opts.offset = 0;
+        opts.include_files = false;
+        assert_eq!(search(&store, &opts).unwrap()[0].turn_seq, 3);
+        opts.include_tools = false;
+        assert!(search(&store, &opts).unwrap().is_empty());
+        opts.include_files = true;
+        assert!(search(&store, &opts).unwrap()[0]
+            .snippet
+            .contains("needlemarker.rs"));
+        opts.query = "xy".into();
+        store
+            .conn
+            .execute("UPDATE file_events SET path='/xy.rs'", [])
+            .unwrap();
+        assert_eq!(search(&store, &opts).unwrap()[0].session.id, "a");
+    }
+
+    #[test]
+    fn tool_evidence_search_includes_names_and_output() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        store
+            .upsert_session(&sample_session("tool", SessionSource::Codex, None))
+            .unwrap();
+        store.conn.execute("INSERT INTO tool_calls(id,session_id,turn_seq,name,input,output,status) VALUES ('t','tool',7,'specialtool','{}','failureoutput','failed')", []).unwrap();
+        for query in ["specialtool", "failureoutput"] {
+            let opts = SearchOptions {
+                query: query.into(),
+                include_files: false,
+                ..Default::default()
+            };
+            let hits = search(&store, &opts).unwrap();
+            assert_eq!(hits.len(), 1, "{query}");
+            assert_eq!(hits[0].turn_seq, 7);
+            assert!(hits[0].snippet.contains(query));
+        }
+    }
+
+    #[test]
+    fn windows_project_paths_normalize_without_folding_unix_paths() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        for (id, path) in [
+            ("win", r"C:\Work\demo"),
+            ("unix", "/Work/demo"),
+            ("unc", r"\\server\share\demo"),
+        ] {
+            store
+                .upsert_session(&sample_session(id, SessionSource::Codex, Some(path)))
+                .unwrap();
+        }
+        for (prefix, expected) in [
+            ("c:/work/demo", Some("win")),
+            ("//SERVER/share/demo", Some("unc")),
+            ("/work/demo", None),
+        ] {
+            let hits = store
+                .list_sessions_filtered(None, Some(prefix), 20, 0)
+                .unwrap();
+            assert_eq!(hits.first().map(|s| s.id.as_str()), expected, "{prefix}");
+        }
+        let mut session = sample_session("project-path", SessionSource::Codex, Some("/else"));
+        session.project_path = Some("C:/Work/demo/child".into());
+        store.upsert_session(&session).unwrap();
+        let hits = store
+            .list_sessions_filtered(None, Some(r"c:\work\demo"), 20, 0)
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().any(|s| s.id == "project-path"));
+    }
+
+    #[test]
+    fn tool_input_search_decodes_nested_json_strings() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        store
+            .upsert_session(&sample_session("decoded", SessionSource::Codex, None))
+            .unwrap();
+        store.upsert_tool_call(&ToolCall {
+            id: "decoded-tool".into(), session_id: "decoded".into(), turn_seq: 7,
+            name: "shell".into(),
+            input: serde_json::json!({"args": [{"path": r"C:\Work\demo", "quoted": "say \"hello\"", "tab": "tab\tvalue"}]}),
+            output: None, status: "completed".into(), duration_ms: None, created_at: None,
+        }).unwrap();
+        for query in [r"C:\Work\demo", "say \"hello\"", "tab\tvalue"] {
+            let hits = search(
+                &store,
+                &SearchOptions {
+                    query: query.into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(hits.len(), 1, "{query:?}");
+            assert_eq!(hits[0].turn_seq, 7);
+            assert!(
+                hits[0].snippet.contains(query),
+                "{query:?}: {}",
+                hits[0].snippet
+            );
+        }
+    }
+
+    #[test]
+    fn retained_evidence_excerpts_include_late_matches_in_the_matching_field() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        let needle = "needlemarker";
+        for id in ["output", "input", "path"] {
+            store
+                .upsert_session(&sample_session(id, SessionSource::Codex, None))
+                .unwrap();
+        }
+        for (id, input, output) in [
+            (
+                "output",
+                serde_json::json!({"command": "input-prefix".repeat(100)}),
+                Some(format!("{needle}{}", " tail".repeat(100))),
+            ),
+            (
+                "input",
+                serde_json::json!({"command": format!("{}{needle} context", "prefix ".repeat(100))}),
+                None,
+            ),
+        ] {
+            store
+                .upsert_tool_call(&ToolCall {
+                    id: id.into(),
+                    session_id: id.into(),
+                    turn_seq: 3,
+                    name: "shell".into(),
+                    input,
+                    output,
+                    status: "completed".into(),
+                    duration_ms: None,
+                    created_at: None,
+                })
+                .unwrap();
+        }
+        store
+            .conn
+            .execute(
+                "INSERT INTO file_events(id, session_id, path, kind, at) VALUES ('p','path',?1,'read','2026-11-13T00:00:00Z')",
+                [format!("C:/{}{needle}.rs", "路/".repeat(200))],
+            )
+            .unwrap();
+        let hits = search(
+            &store,
+            &SearchOptions {
+                query: needle.into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 3);
+        for hit in hits {
+            assert!(
+                hit.snippet.contains(needle),
+                "{}: {}",
+                hit.session.id,
+                hit.snippet
+            );
+            assert!(hit.snippet.chars().count() <= 240);
+            if hit.session.id == "output" {
+                assert!(hit.snippet.starts_with(needle), "{}", hit.snippet);
+                assert!(!hit.snippet.contains("input-prefix"));
+            }
+        }
+        let query = "N".repeat(210);
+        store
+            .conn
+            .execute(
+                "UPDATE file_events SET path=?1",
+                [format!("{}{query}/tail", "前".repeat(200))],
+            )
+            .unwrap();
+        let hits = search(
+            &store,
+            &SearchOptions {
+                query: query.clone(),
+                include_tools: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].snippet.contains(&query));
+        assert!(hits[0].snippet.chars().count() <= 240);
+    }
+
+    #[test]
+    fn tool_evidence_keeps_raw_and_cross_field_matching_and_tolerates_legacy_input() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        store
+            .upsert_session(&sample_session("raw", SessionSource::Codex, None))
+            .unwrap();
+        store
+            .upsert_tool_call(&ToolCall {
+                id: "raw-tool".into(),
+                session_id: "raw".into(),
+                turn_seq: 1,
+                name: "run".into(),
+                input: serde_json::json!({"command": "cargo test"}),
+                output: Some("finished okay".into()),
+                status: "completed".into(),
+                duration_ms: None,
+                created_at: None,
+            })
+            .unwrap();
+        for query in [r#"{"command":"cargo test"}"#, "run {", "} finished"] {
+            let hits = search(
+                &store,
+                &SearchOptions {
+                    query: query.into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(hits.len(), 1, "{query}");
+            assert!(hits[0].snippet.contains(query));
+        }
+        store
+            .conn
+            .execute("UPDATE tool_calls SET input='not-json legacy-marker'", [])
+            .unwrap();
+        let hits = search(
+            &store,
+            &SearchOptions {
+                query: "legacy-marker".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1);
     }
 
     #[test]

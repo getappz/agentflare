@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- New installs no longer wrap `cat`, `head`, `tail`, `wc`, `grep`, `egrep`, `fgrep`, `rg`, `find`, `ls`, `curl`, `wget`, `python`, `python3`, `php`, `ps`, `du`, or `df`. When upgrading, remove the old agentflare shims for those names from `~/.agentflare/shims/` (with the `.exe` suffix on Windows). If you use the Bash dispatcher, rerun `agentflare init` to refresh its managed block in `~/.bashenv`.
+
 ### Added
 
 - **Claude plugin with autopilot mod (M1)**: `plugins/agentflare-claude/` (its own plugin root; the repository marketplace in `.claude-plugin/marketplace.json` points there, so the Codex `hooks/hooks.json` at the repo root never loads into Claude Code) with a TypeScript mod for Claude Code 2.1.287+. In-process guard chain, cached briefing as a system-prompt section, compaction checkpoint and re-inject, subagent shaping, turn-end memory capture, and an attended autopilot that pulls the next ready item when idle, controlled with `/flare`. Backed by a new `autopilot` MCP tool (`health`, `check`, `observe`, `briefing`, `checkpoint`, `next_work`).

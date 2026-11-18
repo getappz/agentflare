@@ -56,18 +56,37 @@ impl AgentflareMcp {
                         }
                     })?
                     .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-                // "No good local match": weak hits are dropped so the registry
-                // fallback below gets the chance to fill in.
+                // "No good local match": weak hits are dropped so the external
+                // fallbacks below get the chance to fill the open slots.
                 let local: Vec<_> = local.into_iter().filter(|h| h.is_confident()).collect();
-                let hits = if local.len() < limit {
-                    let remaining = limit - local.len();
-                    let query_owned = query.clone();
-                    let registry = tokio::task::spawn_blocking(move || {
-                        gateway_registry::registry_search::search_registry(&query_owned, remaining)
-                    })
-                    .await
-                    .unwrap_or_default();
-                    skill_registry::merge_registry_hits(local, limit, registry)
+                let hits = if skill_registry::skills_sh::needs_external(&local, limit) {
+                    let remaining = limit.saturating_sub(local.len());
+                    let (q_registry, q_skills_sh) = (query.clone(), query.clone());
+                    let (registry, skills_sh) = tokio::join!(
+                        tokio::task::spawn_blocking(move || {
+                            gateway_registry::registry_search::search_registry(
+                                &q_registry,
+                                remaining.min(skill_registry::skills_sh::MAX_REMOTE_LIMIT),
+                            )
+                        }),
+                        tokio::task::spawn_blocking(move || {
+                            skill_registry::skills_sh::search_skills_sh(&q_skills_sh, remaining)
+                        }),
+                    );
+                    let registry = registry.unwrap_or_default();
+                    let skills_sh = skills_sh.unwrap_or_default();
+                    // Both sources are fallbacks: split the open slots so
+                    // neither can starve the other. The user-configured
+                    // registry takes the first slot when the count is odd;
+                    // skills.sh fills the rest and any surplus it leaves.
+                    let registry_reserved = registry.len().min(remaining.div_ceil(2));
+                    let skills_sh = skills_sh
+                        .into_iter()
+                        .take(remaining - registry_reserved)
+                        .collect();
+                    let hits =
+                        skill_registry::skills_sh::merge_external_hits(local, limit, skills_sh);
+                    dedupe_hits(skill_registry::merge_registry_hits(hits, limit, registry))
                 } else {
                     local
                 };
@@ -344,6 +363,15 @@ Use for general-purpose skill scaffolding. Replace this content with your skill-
     }
 }
 
+/// Drop later hits that repeat a name, keeping the first (local, then registry,
+/// then skills.sh) so a skill never appears twice with conflicting hints.
+fn dedupe_hits(hits: Vec<skill_registry::SkillHit>) -> Vec<skill_registry::SkillHit> {
+    let mut seen = std::collections::HashSet::new();
+    hits.into_iter()
+        .filter(|h| seen.insert(h.name.clone()))
+        .collect()
+}
+
 /// Prefix `json` with a one-line warning when semantic search is unavailable,
 /// so keyword-only ranking is never silent.
 fn with_semantic_warning(json: String, unavailable: Option<String>) -> String {
@@ -369,5 +397,28 @@ mod semantic_warning_tests {
 []"
         ));
         assert_eq!(with_semantic_warning("[]".into(), None), "[]");
+    }
+}
+
+#[cfg(test)]
+mod dedupe_tests {
+    use super::dedupe_hits;
+
+    fn hit(name: &str, source: &str) -> skill_registry::SkillHit {
+        skill_registry::SkillHit::external(name, source, "", None, None)
+    }
+
+    #[test]
+    fn keeps_first_hit_for_each_name() {
+        let hits = dedupe_hits(vec![
+            hit("pm", "local"),
+            hit("pm", "mcp_registry"),
+            hit("other", "skills.sh"),
+        ]);
+        let seen: Vec<_> = hits
+            .iter()
+            .map(|h| (h.name.as_str(), h.source.as_str()))
+            .collect();
+        assert_eq!(seen, [("pm", "local"), ("other", "skills.sh")]);
     }
 }
