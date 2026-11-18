@@ -561,6 +561,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
 
         {
             let journal = self.state_store.journal(run_id).await?;
+            let saved_steps = self.state_store.load(run_id).await?.step_states;
             let mut t = tracker.write();
             for step in &definition.steps {
                 let memoized = match &step.mode {
@@ -598,7 +599,20 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                                 t.failed.insert(step.id.clone());
                                 true
                             }
-                            // Pending entries (result None) are re-run.
+                            // An ordinary executor persists its final output and status
+                            // before appending StepRun. Takeover can split those commits.
+                            _ if matches!(
+                                step.mode,
+                                StepMode::Sequential
+                                    | StepMode::FanOut
+                                    | StepMode::Conditional { .. }
+                            ) && saved_steps
+                                .get(&step.id)
+                                .is_some_and(|s| s.status == StepStatus::Succeeded) =>
+                            {
+                                t.completed.insert(step.id.clone());
+                                true
+                            }
                             _ => false,
                         }
                     }

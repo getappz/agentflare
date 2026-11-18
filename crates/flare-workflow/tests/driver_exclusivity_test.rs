@@ -87,6 +87,11 @@ struct SlowSaveStore {
 
 #[async_trait]
 impl StateStore<Ctx> for SlowSaveStore {
+    fn for_executor(&self, owner: Option<Arc<str>>) -> Self {
+        Self {
+            inner: self.inner.for_executor(owner),
+        }
+    }
     async fn save(&self, state: WorkflowState<Ctx>) -> WorkflowResult<()> {
         self.inner.save(state).await?;
         tokio::time::sleep(Duration::from_millis(150)).await;

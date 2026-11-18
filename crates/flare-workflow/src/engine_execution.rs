@@ -84,6 +84,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 .await;
 
             let state = self.state_store.load(run_id).await?;
+            state.check_executor(Some(self.executor_id()))?;
             let mut context = state.context.clone();
             let step_timeout = state
                 .budget
