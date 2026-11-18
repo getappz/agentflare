@@ -25,6 +25,33 @@ pub struct SkillHit {
     pub remote_url: Option<String>,
 }
 
+impl SkillHit {
+    /// A non-local fallback hit (registry or external directory): no local
+    /// confidence, zero usage stats, and the shared fallback score sentinel.
+    pub fn external(
+        name: impl Into<String>,
+        source: impl Into<String>,
+        description: impl Into<String>,
+        install_hint: Option<String>,
+        remote_url: Option<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            source: source.into(),
+            description: description.into(),
+            est_tokens: 0,
+            compressed: false,
+            score: gateway_registry::REGISTRY_FALLBACK_SCORE,
+            confidence: 0.0,
+            last_used_at: 0,
+            bandit_alpha: 1.0,
+            bandit_beta: 1.0,
+            install_hint,
+            remote_url,
+        }
+    }
+}
+
 /// Exponential decay half-life in seconds (30 days).
 const DECAY_HALF_LIFE: f64 = 30.0 * 86400.0;
 
@@ -178,25 +205,21 @@ pub fn merge_registry_hits(
     registry: Vec<gateway_registry::registry_search::RegistryHit>,
 ) -> Vec<SkillHit> {
     let remaining = limit.saturating_sub(local.len());
-    local.extend(registry.into_iter().take(remaining).map(|hit| SkillHit {
-        name: hit.server,
-        source: "mcp_registry".to_string(),
-        description: hit.description,
-        est_tokens: 0,
-        compressed: false,
-        score: gateway_registry::REGISTRY_FALLBACK_SCORE,
-        confidence: 0.0,
-        last_used_at: 0,
-        bandit_alpha: 1.0,
-        bandit_beta: 1.0,
-        install_hint: hit.install_hint.map(|h| {
+    local.extend(registry.into_iter().take(remaining).map(|hit| {
+        let install_hint = hit.install_hint.map(|h| {
             if let Some(runtime) = h.runtime_hint {
                 format!("{} {}", runtime, h.identifier)
             } else {
                 format!("{}:{}", h.registry_type, h.identifier)
             }
-        }),
-        remote_url: hit.remote_url,
+        });
+        SkillHit::external(
+            hit.server,
+            "mcp_registry",
+            hit.description,
+            install_hint,
+            hit.remote_url,
+        )
     }));
     local
 }

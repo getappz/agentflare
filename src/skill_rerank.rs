@@ -20,6 +20,10 @@ const SITE: &str = "skill_rerank";
 pub const TOP_N: usize = 8;
 const KEEP_AT: f64 = 0.65;
 const DROP_AT: f64 = 0.35;
+
+pub(crate) fn keep_candidate(probability: f64, in_baseline: bool) -> bool {
+    probability >= KEEP_AT || (probability > DROP_AT && in_baseline)
+}
 const MAX_PROMPT_CHARS: usize = 1500;
 const MAX_DESCRIPTION_CHARS: usize = 200;
 /// Well inside the UserPromptSubmit hook's wall-clock budget.
@@ -212,11 +216,7 @@ impl Pending {
             .candidates
             .iter()
             .zip(&probabilities)
-            .filter(|(s, p)| match **p {
-                p if p >= KEEP_AT => true,
-                p if p <= DROP_AT => false,
-                _ => in_baseline(s),
-            })
+            .filter(|(s, p)| keep_candidate(**p, in_baseline(s)))
             .map(|(s, _)| s.clone())
             .take(self.keep)
             .collect();
@@ -242,12 +242,16 @@ impl Pending {
                 .collect();
             Some(decide::capture::Input {
                 site: SITE,
-                features: decide::capture::rerank_features(
-                    &self.prompt,
-                    self.candidates
-                        .iter()
-                        .map(|s| (s.name.as_str(), s.description.as_str(), s.score)),
-                ),
+                features: {
+                    let mut features = decide::capture::rerank_features(
+                        &self.prompt,
+                        self.candidates
+                            .iter()
+                            .map(|s| (s.name.as_str(), s.description.as_str(), s.score)),
+                    );
+                    features["keep"] = self.keep.into();
+                    features
+                },
                 norm_input: &self.prompt,
                 label: serde_json::json!({ "summary": names(&picks), "noul": noul }),
                 confidence: Some(certainty),

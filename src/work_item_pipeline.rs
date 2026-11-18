@@ -1550,7 +1550,7 @@ pub(crate) fn run_or_resume_with_sender(
                                  (taken over {MAX_RUN_TAKEOVERS} times); giving up"
                             ));
                         }
-                        if resume_with_message_custody(eng, run_id, &heartbeat_owner, None, &crate::db::agentflare_db_path()).await? {
+                        if resume_with_message_custody(eng, run_id, &heartbeat_owner, None, &crate::db::agentflare_db_path()).await.map_err(|e| e.to_string())? {
                             eprintln!(
                                 "work_item_pipeline: item {}: took over orphaned run {run_id}",
                                 item.id
@@ -1660,22 +1660,6 @@ async fn adopt_existing_run(
     if eng.held_by_live_executor(state) {
         return Err(format!("workflow run {run_id} is leased elsewhere"));
     }
-    if eng.is_driving(run_id)
-        || matches!(
-            state.status,
-            WorkflowStatus::Completed | WorkflowStatus::Failed | WorkflowStatus::Cancelled
-        )
-    {
-        prepare_message_delivery(
-            eng,
-            run_id,
-            owner,
-            Some(target_branch),
-            &crate::db::agentflare_db_path(),
-            false,
-        )
-        .await?;
-    }
     if owner_changed || repair_redispatch || target_changed {
         if owner_changed {
             eprintln!(
@@ -1722,9 +1706,22 @@ async fn adopt_existing_run(
             Some(target_branch),
             &crate::db::agentflare_db_path(),
         )
-        .await?
+        .await
+        .map_err(|e| e.to_string())?
     {
         eprintln!("work_item_pipeline: took over orphaned run {run_id} for this dispatch");
+    } else {
+        // A concurrent local resume may win between the driving check and
+        // the lease claim. Bind this dispatch under the same custody fence.
+        prepare_message_delivery(
+            eng,
+            run_id,
+            owner,
+            Some(target_branch),
+            &crate::db::agentflare_db_path(),
+            false,
+        )
+        .await?;
     }
     Ok(())
 }

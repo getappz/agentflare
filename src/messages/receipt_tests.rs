@@ -96,6 +96,29 @@ fn reopen_recovers_the_same_reservation_even_after_owner_rebind() {
 }
 
 #[test]
+fn empty_mailbox_poll_can_reconcile_while_another_connection_is_writing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("messages.db");
+    let writer = database(&path);
+    let reader = database(&path);
+    reader.busy_timeout(std::time::Duration::ZERO).unwrap();
+    enqueue(&writer, "agent:one", 1);
+    let receipt = reserve_for_run(&writer, "run-a", "agent:one", 50, 60)
+        .unwrap()
+        .remove(0);
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert!(
+        reserve_for_run(&reader, "run-b", "agent:two", 50, 61)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        reserve_for_run(&reader, "run-a", "agent:one", 50, 61).unwrap()[0].receipt_id,
+        receipt.receipt_id
+    );
+}
+
+#[test]
 fn failed_receipt_insert_rolls_back_pickup() {
     let c = database(std::path::Path::new(":memory:"));
     enqueue(&c, "agent:one", 1);

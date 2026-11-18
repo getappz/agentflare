@@ -44,6 +44,17 @@ fn forget_outbox(run: flare_workflow::WorkflowRunId) {
     message_outboxes().lock().unwrap().remove(&run);
 }
 
+#[test]
+fn receipt_database_distinguishes_missing_from_uninspectable() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert!(
+        receipt_connection(&tmp.path().join("missing.db"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(receipt_connection(&tmp.path().join("invalid\0name")).is_err());
+}
+
 #[tokio::test]
 async fn review_regression_preserves_numeric_message_order() {
     let tmp = tempfile::tempdir().unwrap();
@@ -314,6 +325,44 @@ async fn missing_receiver_and_failed_patch_leave_visible_unknown_receipts() {
 }
 
 #[tokio::test]
+async fn regaining_a_lease_preserves_the_previous_executors_consumption() {
+    let tmp = tempfile::tempdir().unwrap();
+    let messages = tmp.path().join("messages.db");
+    let c = message_db(&messages);
+    enqueue(&c);
+    let (eng, run) = saved_run(&tmp.path().join("workflow.db")).await;
+    prepare_message_delivery(&eng, run, "agent:one", None, &messages, true)
+        .await
+        .unwrap();
+    // A different executor consumed the correction and checkpointed its turn.
+    eng.state_store()
+        .update(run, |s| {
+            s.context.data.pending_message_receipts.clear();
+            s.context.data.pending_corrections.clear();
+        })
+        .await
+        .unwrap();
+    eng.register_workflow(WorkflowDefinition::new(WORKFLOW_ID, "reacquire").add_step(
+        StepDefinition::new(
+            "noop",
+            "noop",
+            flare_workflow::noop_executor::<WorkItemData>(),
+        ),
+    ))
+    .unwrap();
+    assert!(
+        resume_with_message_custody(&eng, run, "agent:one", None, &messages)
+            .await
+            .unwrap()
+    );
+    let data = eng.get_status(run).await.unwrap().context.data;
+    assert_eq!(data.accepted_message_receipts.len(), 1);
+    assert!(data.pending_corrections.is_empty());
+    assert!(data.pending_message_receipts.is_empty());
+    forget_outbox(run);
+}
+
+#[tokio::test]
 async fn boot_reconciles_before_starting_a_run_without_a_waiter() {
     let tmp = tempfile::tempdir().unwrap();
     let messages = tmp.path().join("messages.db");
@@ -545,15 +594,28 @@ async fn boot_checkpoint_failure_never_drives_the_run() {
         BEGIN SELECT RAISE(ABORT, 'fixture checkpoint failure'); END;",
     )
     .unwrap();
-    let resumed = recover_with_message_custody(&eng, &messages, |_| true)
-        .await
-        .unwrap();
-    assert!(resumed.is_empty());
+    assert!(
+        recover_with_message_custody(&eng, &messages, |_| true)
+            .await
+            .unwrap_err()
+            .contains(&run.to_string())
+    );
     assert!(!eng.is_driving(run));
     assert!(eng.get_status(run).await.unwrap().lease.is_none());
     assert_eq!(
         receipts::list(&c, "agent:one", 10).unwrap()[0].state,
         "in_doubt"
+    );
+    wf.execute_batch("DROP TRIGGER reject_checkpoint").unwrap();
+    assert_eq!(
+        recover_with_message_custody(&eng, &messages, |_| true)
+            .await
+            .unwrap(),
+        vec![run]
+    );
+    assert_eq!(
+        receipts::list(&c, "agent:one", 10).unwrap()[0].state,
+        "received"
     );
     forget_outbox(run);
 }
@@ -579,6 +641,21 @@ pub(super) fn handoff_barrier(phase: &str, run: flare_workflow::WorkflowRunId) {
     }
 }
 
+fn crash_fixture_engine(
+    workflow: &std::path::Path,
+) -> WorkflowEngine<WorkItemData, SqliteStore<WorkItemData>> {
+    let eng = WorkflowEngine::with_store(SqliteStore::open_file(workflow).unwrap());
+    eng.register_workflow(
+        WorkflowDefinition::new(WORKFLOW_ID, "crash custody").add_step(StepDefinition::new(
+            "noop",
+            "noop",
+            flare_workflow::noop_executor::<WorkItemData>(),
+        )),
+    )
+    .unwrap();
+    eng
+}
+
 #[test]
 fn crash_fixture_child() {
     let Some(dir) = std::env::var_os("AF_RECEIPT_TEST_DIR") else {
@@ -595,19 +672,7 @@ fn crash_fixture_child() {
         .build()
         .unwrap()
         .block_on(async {
-            let eng = WorkflowEngine::with_store(
-                SqliteStore::<WorkItemData>::open_file(&dir.join("workflow.db")).unwrap(),
-            );
-            eng.register_workflow(
-                WorkflowDefinition::new(WORKFLOW_ID, "crash custody").add_step(
-                    StepDefinition::new(
-                        "noop",
-                        "noop",
-                        flare_workflow::noop_executor::<WorkItemData>(),
-                    ),
-                ),
-            )
-            .unwrap();
+            let eng = crash_fixture_engine(&dir.join("workflow.db"));
             receipts::reserve_for_run(
                 &message_db(&dir.join("messages.db")),
                 &run.to_string(),
@@ -669,17 +734,7 @@ async fn killed_process_reconciles_both_real_handoff_windows() {
             std::fs::read_to_string(tmp.path().join("ready")).unwrap(),
             phase
         );
-        let contender =
-            WorkflowEngine::with_store(SqliteStore::<WorkItemData>::open_file(&workflow).unwrap());
-        contender
-            .register_workflow(WorkflowDefinition::new(WORKFLOW_ID, "contender").add_step(
-                StepDefinition::new(
-                    "noop",
-                    "noop",
-                    flare_workflow::noop_executor::<WorkItemData>(),
-                ),
-            ))
-            .unwrap();
+        let contender = crash_fixture_engine(&workflow);
         assert!(
             contender.get_status(run).await.unwrap().lease.is_some(),
             "custody preparation must already own the lease"
@@ -690,8 +745,8 @@ async fn killed_process_reconciles_both_real_handoff_windows() {
         );
         child.0.kill().unwrap();
         child.0.wait().unwrap();
-        let eng =
-            WorkflowEngine::with_store(SqliteStore::<WorkItemData>::open_file(&workflow).unwrap());
+        drop(contender);
+        let eng = crash_fixture_engine(&workflow);
         let before = eng.get_status(run).await.unwrap().context.data;
         assert_eq!(
             before.accepted_message_receipts.len(),
@@ -701,12 +756,18 @@ async fn killed_process_reconciles_both_real_handoff_windows() {
             receipts::list(&c, "agent:one", 10).unwrap()[0].state,
             "in_doubt"
         );
-        prepare_message_delivery(&eng, run, "agent:one", None, &messages, false)
-            .await
-            .unwrap();
-        prepare_message_delivery(&eng, run, "agent:one", None, &messages, false)
-            .await
-            .unwrap();
+        assert_eq!(
+            recover_with_message_custody(&eng, &messages, |_| true)
+                .await
+                .unwrap(),
+            vec![run]
+        );
+        assert!(
+            recover_with_message_custody(&eng, &messages, |_| true)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         let after = eng.get_status(run).await.unwrap().context.data;
         assert_eq!(after.pending_corrections.len(), 1);
         assert_eq!(after.accepted_message_receipts.len(), 1);
