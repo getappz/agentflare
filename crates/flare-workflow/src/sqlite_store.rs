@@ -430,6 +430,11 @@ impl<D: WorkflowData> StateStore<D> for SqliteStore<D> {
         self.mutate_budget(run_id, operation).await
     }
     async fn save(&self, state: WorkflowState<D>) -> WorkflowResult<()> {
+        if self.executor.is_some() {
+            return Err(WorkflowError::Store(
+                "save requires an unscoped store".into(),
+            ));
+        }
         let conn = Arc::clone(&self.conn);
         blocking(move || {
             let conn = conn

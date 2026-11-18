@@ -17,6 +17,30 @@ use crate::types::*;
 /// long is treated as abandoned by a dead process and may be taken over.
 pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(60);
 
+/// Keep the local driving claim until cancellation has released the stored lease.
+struct PreparingLease<'a, D: WorkflowData, S: StateStore<D> + 'static> {
+    engine: &'a WorkflowEngine<D, S>,
+    runtime: tokio::runtime::Handle,
+    run: WorkflowRunId,
+    driving: Option<DrivingGuard<D>>,
+    claimed: bool,
+}
+
+impl<D: WorkflowData, S: StateStore<D> + 'static> Drop for PreparingLease<'_, D, S> {
+    fn drop(&mut self) {
+        if self.claimed
+            && let Some(driving) = self.driving.take()
+        {
+            let engine = self.engine.clone();
+            let run = self.run;
+            self.runtime.spawn(async move {
+                engine.release_lease(run).await;
+                drop(driving);
+            });
+        }
+    }
+}
+
 /// This process's executor identity, `host:pid:nonce`. The random nonce makes
 /// it unique even if the OS later reuses the pid (after a reboot, or on a
 /// busy host), so a stale lease can never be mistaken for a live one of ours.
@@ -417,10 +441,21 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         let Some(driving) = self.claim_driving(run_id) else {
             return Ok(false);
         };
+        let mut lease = PreparingLease {
+            engine: self,
+            runtime: self
+                .runtime
+                .clone()
+                .unwrap_or_else(tokio::runtime::Handle::current),
+            run: run_id,
+            driving: Some(driving),
+            claimed: false,
+        };
         // Re-check under the store's update (the listing above may be stale)
         // and claim the lease in the same write.
         let mut taken = true;
         let mut incompatible = false;
+        let mut previous_status = state.status;
         let result = self
             .state_store
             .update(run_id, |s| {
@@ -445,7 +480,8 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                     incompatible = true;
                     return;
                 }
-                s.status = WorkflowStatus::Running;
+                previous_status = s.status;
+                lease.claimed = true;
                 s.lease = Some(self.new_lease());
             })
             .await;
@@ -463,6 +499,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         };
         if let Err(error) = preparation {
             self.release_lease(run_id).await;
+            lease.claimed = false;
             return Err(error);
         }
         // Preparation can finish in the same tick as a takeover. Renew only
@@ -472,18 +509,24 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             .state_store
             .update(run_id, |s| {
                 ready = s.check_executor(Some(self.executor_id())).is_ok()
-                    && s.status == WorkflowStatus::Running;
+                    && s.status == previous_status;
                 if ready {
+                    s.status = WorkflowStatus::Running;
                     s.lease = Some(self.new_lease());
                 }
             })
             .await;
         if recheck.is_err() || !ready {
             self.release_lease(run_id).await;
+            lease.claimed = false;
             recheck?;
             return Ok(false);
         }
         self.active_workflows.fetch_add(1, Ordering::AcqRel);
+        let driving = lease
+            .driving
+            .take()
+            .expect("preparation owns driving claim");
         self.spawn_driven(run_id, definition, self.active_workflow_guard(), driving);
         Ok(true)
     }

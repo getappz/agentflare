@@ -41,6 +41,12 @@ struct CancelOnJournalStore {
 
 #[async_trait]
 impl StateStore<Ctx> for CancelOnJournalStore {
+    fn for_executor(&self, owner: Option<Arc<str>>) -> Self {
+        Self {
+            inner: self.inner.for_executor(owner),
+            ..self.clone()
+        }
+    }
     async fn save(&self, state: WorkflowState<Ctx>) -> WorkflowResult<()> {
         self.inner.save(state).await
     }

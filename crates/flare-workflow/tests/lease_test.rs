@@ -90,6 +90,7 @@ async fn takeover_during_preparation_fences_patch_driver_and_journal() {
         .unwrap();
     assert!(!launched);
     let stale = store.for_executor(Some(Arc::from("previous")));
+    assert!(stale.save(stale.load(run).await.unwrap()).await.is_err());
     assert!(
         stale
             .update(run, |s| s.context.data.owner.clear())
@@ -135,7 +136,9 @@ async fn an_in_flight_step_cannot_overwrite_its_successor() {
         )
         .unwrap();
     assert!(engine.resume_run(run).await.unwrap());
-    started.notified().await;
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .expect("executor did not start");
     store
         .update(run, |s| {
             s.lease = Some(lease("successor", Duration::ZERO));
@@ -161,6 +164,10 @@ async fn an_in_flight_step_cannot_overwrite_its_successor() {
 async fn failed_resume_preparation_releases_lease_without_starting_executor() {
     let store = InMemoryStore::<Ctx>::new();
     let run = seed_run(&store, None).await;
+    store
+        .update(run, |s| s.status = WorkflowStatus::Paused)
+        .await
+        .unwrap();
     let engine = WorkflowEngine::with_store(store);
     engine.register_workflow(one_step_wf()).unwrap();
     let result = engine
@@ -172,12 +179,65 @@ async fn failed_resume_preparation_releases_lease_without_starting_executor() {
     assert!(!engine.is_driving(run));
     let state = engine.get_status(run).await.unwrap();
     assert!(state.lease.is_none());
+    assert_eq!(state.status, WorkflowStatus::Paused);
+    assert!(engine.recover().await.unwrap().is_empty());
     assert!(state.context.data.log.is_empty());
     assert!(engine.resume_run(run).await.unwrap());
     assert_eq!(
         wait_terminal(&engine, run).await.status,
         WorkflowStatus::Completed
     );
+}
+
+#[tokio::test]
+async fn dropping_preparation_releases_the_lease_and_local_claim() {
+    let store = InMemoryStore::<Ctx>::new();
+    let run = seed_run(&store, None).await;
+    let engine = WorkflowEngine::with_store(store);
+    engine.register_workflow(one_step_wf()).unwrap();
+    let (entered, ready) = tokio::sync::oneshot::channel();
+    let holder = engine.clone();
+    let preparing = tokio::spawn(async move {
+        holder
+            .resume_run_with(run, || async {
+                entered.send(()).unwrap();
+                std::future::pending().await
+            })
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), ready)
+        .await
+        .unwrap()
+        .unwrap();
+    preparing.abort();
+    assert!(preparing.await.unwrap_err().is_cancelled());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while engine.is_driving(run) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(engine.get_status(run).await.unwrap().lease.is_none());
+}
+
+#[tokio::test]
+async fn recovery_skips_a_checkpointed_step_whose_success_journal_is_missing() {
+    let store = InMemoryStore::<Ctx>::new();
+    let run = seed_run(&store, None).await;
+    store
+        .update(run, |s| {
+            s.step_states.get_mut(&StepId::new("a")).unwrap().status = StepStatus::Succeeded;
+            s.context.data.log.push("checkpointed".into());
+        })
+        .await
+        .unwrap();
+    let engine = WorkflowEngine::with_store(store);
+    engine.register_workflow(one_step_wf()).unwrap();
+    assert!(engine.resume_run(run).await.unwrap());
+    let state = wait_terminal(&engine, run).await;
+    assert_eq!(state.status, WorkflowStatus::Completed);
+    assert_eq!(state.context.data.log, vec!["checkpointed"]);
 }
 
 #[tokio::test]
@@ -510,6 +570,12 @@ struct FailingUpdateStore {
 
 #[async_trait]
 impl StateStore<Ctx> for FailingUpdateStore {
+    fn for_executor(&self, owner: Option<Arc<str>>) -> Self {
+        Self {
+            inner: self.inner.for_executor(owner),
+            ..self.clone()
+        }
+    }
     async fn save(&self, state: WorkflowState<Ctx>) -> WorkflowResult<()> {
         self.inner.save(state).await
     }

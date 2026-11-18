@@ -1660,22 +1660,6 @@ async fn adopt_existing_run(
     if eng.held_by_live_executor(state) {
         return Err(format!("workflow run {run_id} is leased elsewhere"));
     }
-    if eng.is_driving(run_id)
-        || matches!(
-            state.status,
-            WorkflowStatus::Completed | WorkflowStatus::Failed | WorkflowStatus::Cancelled
-        )
-    {
-        prepare_message_delivery(
-            eng,
-            run_id,
-            owner,
-            Some(target_branch),
-            &crate::db::agentflare_db_path(),
-            false,
-        )
-        .await?;
-    }
     if owner_changed || repair_redispatch || target_changed {
         if owner_changed {
             eprintln!(
@@ -1726,6 +1710,18 @@ async fn adopt_existing_run(
         .map_err(|e| e.to_string())?
     {
         eprintln!("work_item_pipeline: took over orphaned run {run_id} for this dispatch");
+    } else {
+        // A concurrent local resume may win between the driving check and
+        // the lease claim. Bind this dispatch under the same custody fence.
+        prepare_message_delivery(
+            eng,
+            run_id,
+            owner,
+            Some(target_branch),
+            &crate::db::agentflare_db_path(),
+            false,
+        )
+        .await?;
     }
     Ok(())
 }

@@ -22,9 +22,7 @@ use crate::types::{
 pub trait StateStore<D: WorkflowData>: Send + Sync + Clone {
     /// A driver handle. Stores shared between executors must fence state and
     /// journal writes by this owner inside the same lock or transaction.
-    fn for_executor(&self, _owner: Option<Arc<str>>) -> Self {
-        self.clone()
-    }
+    fn for_executor(&self, owner: Option<Arc<str>>) -> Self;
     /// SQLite overrides this with a separate transactional ledger, isolated from step snapshots.
     async fn budget_operation(
         &self,
@@ -182,6 +180,11 @@ impl<D: WorkflowData> StateStore<D> for InMemoryStore<D> {
         }
     }
     async fn save(&self, mut state: WorkflowState<D>) -> WorkflowResult<()> {
+        if self.executor.is_some() {
+            return Err(WorkflowError::Store(
+                "save requires an unscoped store".into(),
+            ));
+        }
         state.context.budget = None;
         self.states.write().insert(state.run_id, state);
         Ok(())
@@ -423,6 +426,11 @@ mod tests {
 
     #[async_trait]
     impl<D: WorkflowData> StateStore<D> for BrokenDeleteStore<D> {
+        fn for_executor(&self, owner: Option<Arc<str>>) -> Self {
+            Self {
+                inner: self.inner.for_executor(owner),
+            }
+        }
         async fn save(&self, state: WorkflowState<D>) -> WorkflowResult<()> {
             self.inner.save(state).await
         }
