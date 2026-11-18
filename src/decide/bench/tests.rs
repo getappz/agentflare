@@ -48,7 +48,7 @@ impl Backend for Ramp {
             label: case.baseline.clone(),
             confidence: Some(1.0),
             latency_us: (nth as u64 + 1) * 1000,
-            cost: 0.0,
+            cost: (nth == 0).then_some(0.0),
         })
     }
     fn force(&mut self, _: Option<FailureMode>) {}
@@ -156,7 +156,81 @@ fn captured_rows_parse_as_cases() {
     let line = r#"{"decision_id":null,"schema":1,"ts":1,"site":"router","features":{"prompt":"x"},"norm_key":"k","label":{"summary":"easy"},"confidence":0.9,"baseline":"haiku"}"#;
     let (cases, bad) = parse_cases(&format!("{line}\nnot json\n"));
     assert_eq!((cases.len(), bad), (1, 1));
-    assert_eq!(cases[0].recorded_label().as_deref(), Some("easy"));
+    assert_eq!(cases[0].recorded_label().as_deref(), Some("haiku"));
+}
+
+#[test]
+fn cost_ceiling_includes_equality_but_rejects_missing_cost() {
+    let th =
+        Thresholds::parse("[default]\nmax_usd_per_1k = 0.0\nrequire_fail_open = false").unwrap();
+    let one = run_site("router", &cases_of(1), &mut Ramp, &th);
+    assert_eq!(one[0].usd_per_1k, Some(0.0));
+    assert!(one[0].verdict.go);
+    let two = run_site("router", &cases_of(2), &mut Ramp, &th);
+    assert_eq!(two[0].usd_per_1k, None);
+    assert_eq!(two[0].verdict.violations, ["usd per 1k unmeasured"]);
+    let empty = run("router", &[], &Thresholds::default());
+    assert!(!empty[0].verdict.go);
+    assert_eq!(empty[0].verdict.violations.len(), FailureMode::ALL.len());
+}
+
+#[test]
+fn live_and_recorded_decisions_match_for_keyed_and_site_specific_captures() {
+    use serde_json::json;
+    let choice = |s| json!({"type":"choice","choice":s,"confidence":0.9});
+    let keyed = r#"{"a":"easy","b":"hard"}"#;
+    for (site, baseline, summary, features, answers, expected) in [
+        (
+            "router",
+            keyed,
+            keyed,
+            json!({}),
+            json!({"a":choice("easy"),"b":choice("hard")}),
+            keyed,
+        ),
+        (
+            "router",
+            "none",
+            "hard",
+            json!({"hard_target":"opus"}),
+            json!({"difficulty":choice("hard")}),
+            "opus",
+        ),
+        (
+            "sdd_judge",
+            "continue_task",
+            "fix_round",
+            json!({}),
+            json!({"action":choice("fix_round")}),
+            "fix_round",
+        ),
+        (
+            "skill_rerank",
+            "a",
+            "b",
+            json!({"keep":1,"candidates":[{"name":"a"},{"name":"b"}]}),
+            json!({"skill.s0":{"type":"noul","noul":0.0},"skill.s1":{"type":"noul","noul":1.0}}),
+            "b",
+        ),
+    ] {
+        let case: Case = serde_json::from_value(
+            json!({"site":site, "baseline":baseline, "features":features,
+            "label":{"summary":summary}, "confidence":0.9}),
+        )
+        .unwrap();
+        let response = serde_json::from_value(json!({"answers": answers})).unwrap();
+        let reply = live::live_reply(&case, response, 10).unwrap();
+        assert_eq!(reply.cost, None);
+        assert_eq!(reply.label, expected);
+        assert_eq!(
+            FakeBackend::new(Profile::default())
+                .ask(&case, 0)
+                .unwrap()
+                .label,
+            reply.label
+        );
+        assert!(reply.confidence.unwrap() >= 0.9);
+    }
 }
 
 #[test]

@@ -8,7 +8,7 @@ pub struct Reply {
     pub label: String,
     pub confidence: Option<f64>,
     pub latency_us: u64,
-    pub cost: f64,
+    pub cost: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -123,9 +123,12 @@ impl Backend for FakeBackend {
                 .site
                 .bytes()
                 .fold(0u64, |a, b| a.wrapping_mul(31) ^ u64::from(b));
-            splitmix(p.seed ^ site ^ (nth as u64).wrapping_mul(0x1000_0001)) % (p.jitter_ms + 1)
+            let sample = splitmix(p.seed ^ site ^ (nth as u64).wrapping_mul(0x1000_0001));
+            p.jitter_ms
+                .checked_add(1)
+                .map_or(sample, |range| sample % range)
         };
-        let latency_us = (base + jitter) * 1000;
+        let latency_us = base.saturating_add(jitter).saturating_mul(1000);
         match self.forced {
             Some(FailureMode::Down) => return Err(Failure { latency_us: 1000 }),
             Some(FailureMode::Timeout) => {
@@ -148,7 +151,7 @@ impl Backend for FakeBackend {
             label,
             confidence,
             latency_us,
-            cost: p.cost_per_decision,
+            cost: Some(p.cost_per_decision),
         })
     }
 

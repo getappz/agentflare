@@ -70,7 +70,7 @@ pub fn dataset_path() -> PathBuf {
         .join("dataset.jsonl")
 }
 
-fn rotated(path: &Path) -> PathBuf {
+pub(crate) fn rotated(path: &Path) -> PathBuf {
     path.with_extension("jsonl.1")
 }
 

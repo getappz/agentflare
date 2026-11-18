@@ -1,6 +1,7 @@
 {
   "schema": 1,
   "backend": "fake(seed=7)",
+  "synthetic": true,
   "sites": [
     {
       "site": "router",

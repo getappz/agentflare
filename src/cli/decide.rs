@@ -27,31 +27,46 @@ enum DecideCmd {
         /// through Jev and its non-Jev baseline; omit for the offline engines.
         site: Option<String>,
         /// Labeled/adversarial JSONL fixtures (default: the built-in set).
-        #[arg(long)]
+        #[arg(long, requires = "site")]
         fixtures: Vec<std::path::PathBuf>,
         /// Replay the captured dataset (AGENTFLARE_DECIDE_CAPTURE=1) instead.
-        #[arg(long)]
+        #[arg(long, requires = "site")]
         captured: bool,
         /// Go/no-go thresholds TOML (see docs/decide-bench-thresholds.toml).
-        #[arg(long)]
+        #[arg(long, requires = "site")]
         thresholds: Option<std::path::PathBuf>,
         /// Exit 1 when any row is NO-GO.
-        #[arg(long)]
+        #[arg(long, requires = "site")]
         enforce: bool,
-        #[arg(long)]
+        #[arg(long, requires = "site")]
         json: bool,
         /// Call real Jev (needs AGENTFLARE_JEV=1 + credentials; costs money)
         /// instead of the fake backend. Only live runs measure the sites.
-        #[arg(long)]
+        #[arg(long, requires = "site")]
         live: bool,
         /// Fake backend: virtual cold / warm latency, jitter (ms) and seed.
-        #[arg(long, default_value_t = 1200)]
+        #[arg(
+            long,
+            requires = "site",
+            conflicts_with = "live",
+            default_value_t = 1200
+        )]
         fake_cold_ms: u64,
-        #[arg(long, default_value_t = 350)]
+        #[arg(
+            long,
+            requires = "site",
+            conflicts_with = "live",
+            default_value_t = 350
+        )]
         fake_warm_ms: u64,
-        #[arg(long, default_value_t = 100)]
+        #[arg(
+            long,
+            requires = "site",
+            conflicts_with = "live",
+            default_value_t = 100
+        )]
         fake_jitter_ms: u64,
-        #[arg(long, default_value_t = 7)]
+        #[arg(long, requires = "site", conflicts_with = "live", default_value_t = 7)]
         seed: u64,
     },
     /// Show how often Jev agrees with the current decision, per site
@@ -289,20 +304,41 @@ fn bench_site(
         None => bench::Thresholds::default(),
     };
     let mut cases = vec![];
+    let mut sources = fixtures.to_vec();
     if captured {
-        cases.extend(
-            decide::capture::load(&decide::capture::dataset_path())
-                .into_iter()
-                .filter_map(|r| serde_json::from_value(serde_json::to_value(r).ok()?).ok()),
-        );
+        let path = decide::capture::dataset_path();
+        for p in [decide::capture::rotated(&path), path] {
+            if p.try_exists()
+                .map_err(|e| format!("{}: {e}", p.display()))?
+            {
+                sources.push(p);
+            }
+        }
     }
-    for p in fixtures {
-        let text = std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
-        cases.extend(bench::parse_cases(&text).0);
+    for p in sources {
+        let text = std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        let (rows, rejected) = bench::parse_cases(&text);
+        if rejected != 0 {
+            return Err(format!(
+                "{}: {rejected} malformed fixture row(s)",
+                p.display()
+            ));
+        }
+        cases.extend(rows);
     }
     if !captured && fixtures.is_empty() {
         for s in &sites {
             cases.extend(bench::builtin_cases(s));
+        }
+    }
+    for site in &sites {
+        let mut selected = cases.iter().filter(|c| c.site == *site).peekable();
+        if live && selected.peek().is_none() {
+            return Err(format!("--live requires replayable cases for {site}"));
+        }
+        for case in selected {
+            case.validate_replay(live)
+                .map_err(|reason| format!("{site}: {reason}"))?;
         }
     }
     let mut backend: Box<dyn bench::Backend> = if live {
@@ -327,4 +363,61 @@ fn bench_site(
         print!("{}", bench::render_table(&report));
     }
     Ok(report.sites.iter().all(|s| s.verdict.go))
+}
+
+#[cfg(test)]
+mod bench_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        args: DecideArgs,
+    }
+
+    #[test]
+    fn legacy_bench_accepts_no_site_options() {
+        assert!(Cli::try_parse_from(["test", "bench"]).is_ok());
+        assert!(Cli::try_parse_from(["test", "bench", "router", "--live"]).is_ok());
+        for flags in [
+            &["--json"][..],
+            &["--captured"],
+            &["--live"],
+            &["--enforce"],
+            &["--fixtures", "x"],
+            &["--thresholds", "x"],
+            &["--seed", "7"],
+        ] {
+            assert!(Cli::try_parse_from(["test", "bench"].iter().chain(flags)).is_err());
+        }
+    }
+
+    #[test]
+    fn reject_bad_input_before_running_live_cases() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(f.path(), "{\"site\":\"router\",\"baseline\":\"x\"}\nbad\n").unwrap();
+        let err = bench_site(
+            "router",
+            &[f.path().into()],
+            false,
+            None,
+            bench::Profile::default(),
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains(&f.path().display().to_string()) && err.contains("1 malformed"));
+        let err = bench_site(
+            "router",
+            &[],
+            false,
+            None,
+            bench::Profile::default(),
+            true,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("typed questions"));
+    }
 }

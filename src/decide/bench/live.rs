@@ -7,8 +7,7 @@
 //! 402 / low-confidence skips the network and returns the synthetic failure,
 //! so the fail-open path is still exercised without spending anything.
 use super::{Backend, Case, Failure, FailureMode, Reply};
-use crate::decide::{self, Answer, Question};
-use std::collections::BTreeMap;
+use crate::decide::{self, Answer, Response};
 use std::time::{Duration, Instant};
 
 pub struct LiveBackend {
@@ -25,11 +24,75 @@ impl LiveBackend {
     }
 }
 
-fn label_of(a: &Answer) -> String {
-    match a {
-        Answer::Choice { choice, .. } => choice.clone(),
-        other => other.summary(),
-    }
+pub(super) fn live_reply(case: &Case, response: Response, latency_us: u64) -> Option<Reply> {
+    let answers = &response.answers;
+    let (label, confidence) =
+        if serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&case.baseline)
+            .is_ok()
+        {
+            (
+                decide::tracking::summary(answers),
+                answers
+                    .values()
+                    .filter_map(Answer::confidence)
+                    .reduce(f64::min),
+            )
+        } else if case.site == "skill_rerank"
+            && answers.values().all(|a| matches!(a, Answer::Noul { .. }))
+        {
+            let candidates = case.features["candidates"].as_array()?;
+            let keep = usize::try_from(case.features["keep"].as_u64()?).ok()?;
+            if candidates.len() != answers.len() {
+                return None;
+            }
+            let mut picks = Vec::new();
+            let mut certainty = 1.0_f64;
+            for (i, candidate) in candidates.iter().enumerate() {
+                let suffix = format!("s{i}");
+                let name = candidate["name"].as_str()?;
+                let (_, Answer::Noul { noul }) =
+                    answers.iter().find(|(key, _)| key.ends_with(&suffix))?
+                else {
+                    return None;
+                };
+                certainty = certainty.min(2.0 * (noul - 0.5).abs());
+                if picks.len() < keep
+                    && crate::skill_rerank::keep_candidate(
+                        *noul,
+                        case.baseline.split(',').any(|b| b == name),
+                    )
+                {
+                    picks.push(name);
+                }
+            }
+            (
+                if picks.is_empty() {
+                    "(none)".into()
+                } else {
+                    picks.join(",")
+                },
+                Some(certainty),
+            )
+        } else {
+            let answer = if case.site == "sdd_judge" {
+                answers.get("action")
+            } else if answers.len() == 1 {
+                answers.values().next()
+            } else {
+                None
+            }?;
+            let label = decide::capture::label_of(answer);
+            (
+                case.decision_label(label["summary"].as_str()?)?,
+                answer.confidence(),
+            )
+        };
+    Some(Reply {
+        label,
+        confidence,
+        latency_us,
+        cost: response.usage.cost,
+    })
 }
 
 impl Backend for LiveBackend {
@@ -52,38 +115,23 @@ impl Backend for LiveBackend {
                         label,
                         confidence: Some(0.05),
                         latency_us: 1000,
-                        cost: 0.0,
+                        cost: Some(0.0),
                     }),
                     None => fail(1000),
                 };
             }
             None => {}
         }
-        // A case without its typed question cannot be replayed: counts as a
-        // failure (baseline wins), so captured rows from before the question
-        // was stored lower the Jev-applied share rather than error out.
-        let Some(questions) = case
-            .question
-            .clone()
-            .and_then(|q| serde_json::from_value::<BTreeMap<String, Question>>(q).ok())
-        else {
+        let Some(questions) = case.question.as_ref().filter(|q| !q.is_empty()) else {
             return fail(0);
         };
         let t = Instant::now();
-        let res = decide::ask_within(&case.features, &questions, self.timeout);
+        let res = decide::ask_within(&case.features, questions, self.timeout);
         let latency_us = t.elapsed().as_micros() as u64;
         let Ok(out) = res else {
             return fail(latency_us);
         };
-        let Some(answer) = out.response.answers.values().next() else {
-            return fail(latency_us);
-        };
-        Ok(Reply {
-            label: label_of(answer),
-            confidence: answer.confidence(),
-            latency_us,
-            cost: out.response.usage.cost.unwrap_or(0.0),
-        })
+        live_reply(case, out.response, latency_us).ok_or(Failure { latency_us })
     }
 
     fn force(&mut self, mode: Option<FailureMode>) {

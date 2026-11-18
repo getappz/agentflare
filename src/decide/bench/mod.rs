@@ -94,7 +94,7 @@ pub struct Case {
     /// Typed questions as captured (`BTreeMap<String, Question>`); the live
     /// backend needs it.
     #[serde(default)]
-    pub question: Option<Value>,
+    pub question: Option<std::collections::BTreeMap<String, crate::decide::Question>>,
     #[serde(default)]
     pub confidence: Option<f64>,
     /// Ground truth, when labeled.
@@ -105,11 +105,57 @@ pub struct Case {
 }
 
 impl Case {
-    pub fn recorded_label(&self) -> Option<String> {
-        match self.label.as_ref()? {
-            Value::String(s) => Some(s.clone()),
-            v => v.get("summary").and_then(Value::as_str).map(str::to_owned),
+    pub fn validate_replay(&self, live: bool) -> Result<(), &'static str> {
+        if self.site == "router"
+            && matches!(self.baseline.as_str(), "haiku" | "none")
+            && (live || self.raw_label() == Some("hard"))
+            && !matches!(self.features["hard_target"].as_str(), Some("opus" | "none"))
+        {
+            return Err("router capture needs features.hard_target to replay a hard decision");
         }
+        if !live {
+            return Ok(());
+        }
+        let questions = self
+            .question
+            .as_ref()
+            .filter(|q| !q.is_empty())
+            .ok_or("--live needs typed questions in --fixtures or --captured")?;
+        if self.site == "skill_rerank"
+            && questions
+                .values()
+                .all(|q| matches!(q, crate::decide::Question::Noul { .. }))
+            && !self.baseline.trim_start().starts_with('{')
+            && self.features["keep"].as_u64().is_none()
+        {
+            return Err(
+                "skill rerank capture needs a candidate limit (features.keep) for live replay",
+            );
+        }
+        Ok(())
+    }
+
+    fn raw_label(&self) -> Option<&str> {
+        match self.label.as_ref()? {
+            Value::String(s) => Some(s),
+            v => v.get("summary").and_then(Value::as_str),
+        }
+    }
+
+    pub fn recorded_label(&self) -> Option<String> {
+        self.decision_label(self.raw_label()?)
+    }
+
+    fn decision_label(&self, label: &str) -> Option<String> {
+        if self.site == "router" && matches!(self.baseline.as_str(), "haiku" | "none") {
+            return match label {
+                "easy" => Some("haiku".into()),
+                "medium" => Some("none".into()),
+                "hard" => self.features["hard_target"].as_str().map(str::to_owned),
+                _ => Some(label.to_owned()),
+            };
+        }
+        Some(label.to_owned())
     }
 }
 
@@ -204,7 +250,8 @@ fn replay_set(
     backend.force(None);
     let (mut cold, mut warm) = (vec![], vec![]);
     let (mut agree, mut replayed) = (0usize, 0usize);
-    let (mut added, mut avoided, mut cost, mut latency_sum) = (0u64, 0u64, 0f64, 0u64);
+    let (mut added, mut avoided, mut cost, mut latency_sum) = (0u64, 0u64, Some(0.0), 0u128);
+    let mut answered = 0;
     let (mut jev_pairs, mut base_pairs) = (vec![], vec![]);
     for (nth, case) in cases.iter().enumerate() {
         let t = Instant::now();
@@ -214,7 +261,7 @@ fn replay_set(
             Ok(r) => r.latency_us,
             Err(f) => f.latency_us,
         };
-        latency_sum += latency;
+        latency_sum += u128::from(latency);
         (if nth < cold_calls {
             &mut cold
         } else {
@@ -223,8 +270,11 @@ fn replay_set(
         .push(latency);
         replayed += 1;
         if let Ok(r) = &reply {
-            cost += r.cost;
+            answered += 1;
+            cost = cost.zip(r.cost).map(|(sum, next)| sum + next);
             added += count_tokens(&case.features.to_string()) + count_tokens(&r.label);
+        } else {
+            cost = None;
         }
         let (fin, applied) = finalize(&reply, case, min_conf);
         if applied {
@@ -236,12 +286,12 @@ fn replay_set(
             base_pairs.push((case.baseline.clone(), e.clone()));
         }
     }
+    let overhead_us = started.elapsed().saturating_sub(backend_wall).as_micros() as f64;
     let failure_modes = FailureMode::ALL
         .iter()
         .map(|&mode| failure_pass(mode, cases, backend, min_conf))
         .collect();
     backend.force(None);
-    let overhead_us = started.elapsed().saturating_sub(backend_wall).as_micros() as f64;
     let mut report = SiteReport {
         site: site.to_string(),
         set,
@@ -255,12 +305,18 @@ fn replay_set(
         latency_warm: Pct::of(&warm),
         tokens_added: added,
         tokens_avoided: avoided,
-        usd_per_1k: (replayed > 0).then(|| cost / replayed as f64 * 1000.0),
+        usd_per_1k: cost
+            .filter(|_| replayed > 0)
+            .map(|c| c / replayed as f64 * 1000.0),
         failure_modes,
         overhead_pct: (latency_sum > 0).then(|| overhead_us / latency_sum as f64 * 100.0),
         verdict: Verdict::default(),
     };
     report.verdict = th.judge(&report);
+    if replayed > 0 && answered == 0 {
+        report.verdict.go = false;
+        report.verdict.violations.push("no backend answers".into());
+    }
     report
 }
 

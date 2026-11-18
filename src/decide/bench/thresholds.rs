@@ -77,7 +77,7 @@ impl SiteThresholds {
         let mut check = |name: &str, want: Option<f64>, got: Option<f64>, at_least: bool| {
             let Some(w) = want else { return };
             match got {
-                Some(g) if (g >= w) == at_least => {}
+                Some(g) if (at_least && g >= w) || (!at_least && g <= w) => {}
                 Some(g) => v.push(format!(
                     "{name} {g:.3} {} {w:.3}",
                     if at_least { "<" } else { ">" }
@@ -104,8 +104,10 @@ impl SiteThresholds {
         check("overhead %", self.max_overhead_pct, r.overhead_pct, false);
         if self.require_fail_open.unwrap_or(true) {
             for f in &r.failure_modes {
-                if f.fail_open_rate.is_some_and(|x| x < 1.0) {
-                    v.push(format!("failure mode {} did not fail open", f.mode));
+                match f.fail_open_rate {
+                    Some(1.0) => {}
+                    Some(_) => v.push(format!("failure mode {} did not fail open", f.mode)),
+                    None => v.push(format!("failure mode {} unmeasured", f.mode)),
                 }
             }
         }
