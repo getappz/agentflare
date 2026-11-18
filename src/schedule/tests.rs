@@ -184,7 +184,7 @@ impl Harness {
 
 pub(super) fn echo_workflow(wf: &str, msg: &str) -> String {
     let command = if cfg!(windows) {
-        vec!["cmd", "/C", "echo", msg]
+        vec!["cmd", "/D", "/C", "echo", msg]
     } else {
         vec!["echo", msg]
     };
