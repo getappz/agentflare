@@ -66,6 +66,26 @@ pub fn command(program: impl AsRef<OsStr>) -> Command {
     cmd
 }
 
+/// Terminate a Windows process tree, reporting only unexpected failures.
+#[cfg(windows)]
+pub fn taskkill_tree(pid: u32, force: bool) {
+    let mut cmd = command("taskkill");
+    cmd.arg("/T");
+    if force {
+        cmd.arg("/F");
+    }
+    match cmd.arg("/PID").arg(pid.to_string()).output() {
+        // taskkill returns 128 when the process has already exited.
+        Ok(out) if matches!(out.status.code(), Some(0 | 128)) => {}
+        Ok(out) => eprintln!(
+            "taskkill PID {pid} failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(e) => eprintln!("could not run taskkill for PID {pid}: {e}"),
+    }
+}
+
 /// The same suppression applied to an existing builder -- for call sites that
 /// construct the `Command` incrementally (env/cwd wiring spread across
 /// branches) or wrap `std::process::Command`.

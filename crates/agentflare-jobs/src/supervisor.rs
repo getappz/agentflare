@@ -284,18 +284,10 @@ fn kill_graceful(child: &mut std::process::Child, kill_after: Duration) {
     }
     #[cfg(windows)]
     {
-        let pid = child.id().to_string();
-        let _ = flare_process::command("taskkill")
-            .args(["/T", "/PID", &pid])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        let pid = child.id();
+        flare_process::taskkill_tree(pid, false);
         std::thread::sleep(kill_after);
-        let _ = flare_process::command("taskkill")
-            .args(["/T", "/F", "/PID", &pid])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        flare_process::taskkill_tree(pid, true);
         // `taskkill /T` builds its kill list from a single point-in-time
         // process-tree snapshot. A grandchild spawned in the narrow window
         // between that snapshot and termination (e.g. `child` hadn't yet
@@ -307,11 +299,7 @@ fn kill_graceful(child: &mut std::process::Child, kill_after: Duration) {
         // moment later still finds and kills any such straggler; it's a
         // harmless no-op once the tree is already gone.
         std::thread::sleep(Duration::from_millis(250));
-        let _ = flare_process::command("taskkill")
-            .args(["/T", "/F", "/PID", &pid])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        flare_process::taskkill_tree(pid, true);
     }
     #[cfg(not(any(unix, windows)))]
     {

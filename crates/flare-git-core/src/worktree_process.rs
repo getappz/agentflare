@@ -27,11 +27,7 @@ pub(crate) fn kill_tree(child: &mut std::process::Child) {
     }
     #[cfg(windows)]
     {
-        let _ = Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &child.id().to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        flare_process::taskkill_tree(child.id(), true);
         // `taskkill /T` builds its kill list from a single point-in-time
         // process-tree snapshot. A grandchild spawned in the narrow window
         // between that snapshot and termination (e.g. this child hadn't yet
@@ -42,11 +38,7 @@ pub(crate) fn kill_tree(child: &mut std::process::Child) {
         // such straggler; it's a harmless no-op once the tree is already
         // gone.
         std::thread::sleep(Duration::from_millis(250));
-        let _ = Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &child.id().to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        flare_process::taskkill_tree(child.id(), true);
     }
     #[cfg(not(any(unix, windows)))]
     {
