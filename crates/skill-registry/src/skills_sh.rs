@@ -37,7 +37,7 @@ struct Skill {
 /// URL that the MCP client may act on. Accept only the characters those fields
 /// legitimately use; anything else is dropped rather than passed through.
 fn safe_component(s: &str) -> bool {
-    !s.is_empty()
+    !matches!(s, "" | "." | "..")
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
@@ -62,10 +62,8 @@ fn hit(s: Skill) -> Option<SkillHit> {
     if !valid_id(&id) || !valid_source(&source) || !safe_component(&skill_id) {
         return None;
     }
-    // Our installs stage into ~/.agentflare/skills (not per-agent dirs),
-    // resolving a plain skill name against the configured registries.
     let install_hint =
-        format!("agentflare skill registry add gh:{source} && agentflare skill install {skill_id}");
+        format!("agentflare skill install --from https://github.com/{source} -- {skill_id}");
     Some(SkillHit::external(
         skill_id.clone(),
         "skills.sh",
@@ -100,15 +98,32 @@ pub fn needs_external(local: &[SkillHit], limit: usize) -> bool {
     local.len() < limit
 }
 
-/// Append `external` hits into the slots left open by `local`, never evicting
-/// a local match.
+/// Reserve half the open slots (rounded up) for distinct registry matches.
+/// Either source can fill unused slots from the other.
 pub fn merge_external_hits(
     mut local: Vec<SkillHit>,
     limit: usize,
+    registry: Vec<SkillHit>,
     external: Vec<SkillHit>,
 ) -> Vec<SkillHit> {
+    let mut seen: std::collections::HashSet<_> = local.iter().map(|h| h.name.clone()).collect();
+    let mut distinct = |h: &SkillHit| seen.insert(h.name.clone());
+    let mut registry = registry.into_iter();
     let room = limit.saturating_sub(local.len());
-    local.extend(external.into_iter().take(room));
+    local.extend(
+        registry
+            .by_ref()
+            .filter(&mut distinct)
+            .take(room.div_ceil(2)),
+    );
+    let room = limit.saturating_sub(local.len());
+    local.extend(
+        external
+            .into_iter()
+            .chain(registry)
+            .filter(distinct)
+            .take(room),
+    );
     local
 }
 
@@ -140,7 +155,7 @@ mod tests {
         assert_eq!(h.description, "o/r · 42 installs");
         assert_eq!(
             h.install_hint.as_deref(),
-            Some("agentflare skill registry add gh:o/r && agentflare skill install egm-draft")
+            Some("agentflare skill install --from https://github.com/o/r -- egm-draft")
         );
         assert_eq!(
             h.remote_url.as_deref(),
@@ -161,6 +176,7 @@ mod tests {
         let json = r#"{"skills":[
             {"id":"a/b/good","source":"a/b","skillId":"good","installs":1},
             {"id":"a/b/bad","source":"a/b; rm -rf ~","skillId":"bad","installs":2},
+            {"id":"a/b/bad","source":"../b","skillId":"bad","installs":2},
             {"id":"a/b/evil","source":"a/b","skillId":"x && whoami","installs":3},
             {"id":null,"source":"a/b","skillId":"null-id","installs":4},
             {"id":"a/b/missing-source","skillId":"missing-source","installs":5}
@@ -195,7 +211,7 @@ mod tests {
     fn merge_never_displaces_local_hits() {
         let local = (0..5).map(|i| h(&format!("l{i}"), 0.6)).collect();
         let ext = (0..4).map(|i| h(&format!("g{i}"), 0.0)).collect();
-        let names: Vec<_> = merge_external_hits(local, 5, ext)
+        let names: Vec<_> = merge_external_hits(local, 5, vec![], ext)
             .into_iter()
             .map(|x| x.name)
             .collect();
@@ -206,7 +222,7 @@ mod tests {
     fn merge_fills_only_open_slots() {
         let local = (0..2).map(|i| h(&format!("l{i}"), 0.6)).collect();
         let ext = (0..4).map(|i| h(&format!("g{i}"), 0.0)).collect();
-        let names: Vec<_> = merge_external_hits(local, 5, ext)
+        let names: Vec<_> = merge_external_hits(local, 5, vec![], ext)
             .into_iter()
             .map(|x| x.name)
             .collect();
@@ -216,11 +232,21 @@ mod tests {
     #[test]
     fn merge_with_no_external_preserves_local() {
         let local = (0..3).map(|i| h(&format!("l{i}"), 0.6)).collect();
-        let names: Vec<_> = merge_external_hits(local, 5, vec![])
+        let names: Vec<_> = merge_external_hits(local, 5, vec![], vec![])
             .into_iter()
             .map(|x| x.name)
             .collect();
         assert_eq!(names, ["l0", "l1", "l2"]);
+    }
+
+    #[test]
+    fn duplicate_candidates_leave_room_for_distinct_hits() {
+        let local = vec![h("installed", 0.8)];
+        let registry = vec![h("installed", 0.0), h("a", 0.0)];
+        let directory = vec![h("a", 0.0), h("b", 0.0)];
+        let hits = merge_external_hits(local, 3, registry, directory);
+        let names: Vec<_> = hits.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(names, ["installed", "a", "b"]);
     }
 
     #[test]

@@ -58,35 +58,33 @@ impl AgentflareMcp {
                     .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                 // "No good local match": weak hits are dropped so the external
                 // fallbacks below get the chance to fill the open slots.
-                let local: Vec<_> = local.into_iter().filter(|h| h.is_confident()).collect();
+                let local = dedupe_hits(local.into_iter().filter(|h| h.is_confident()).collect());
                 let hits = if skill_registry::skills_sh::needs_external(&local, limit) {
-                    let remaining = limit.saturating_sub(local.len());
+                    // Remote candidates can repeat names already present locally.
+                    let remote_limit = limit.min(skill_registry::skills_sh::MAX_REMOTE_LIMIT);
                     let (q_registry, q_skills_sh) = (query.clone(), query.clone());
                     let (registry, skills_sh) = tokio::join!(
                         tokio::task::spawn_blocking(move || {
                             gateway_registry::registry_search::search_registry(
                                 &q_registry,
-                                remaining.min(skill_registry::skills_sh::MAX_REMOTE_LIMIT),
+                                remote_limit,
                             )
                         }),
                         tokio::task::spawn_blocking(move || {
-                            skill_registry::skills_sh::search_skills_sh(&q_skills_sh, remaining)
+                            skill_registry::skills_sh::search_skills_sh(&q_skills_sh, remote_limit)
                         }),
                     );
-                    let registry = registry.unwrap_or_default();
-                    let skills_sh = skills_sh.unwrap_or_default();
-                    // Both sources are fallbacks: split the open slots so
-                    // neither can starve the other. The user-configured
-                    // registry takes the first slot when the count is odd;
-                    // skills.sh fills the rest and any surplus it leaves.
-                    let registry_reserved = registry.len().min(remaining.div_ceil(2));
-                    let skills_sh = skills_sh
-                        .into_iter()
-                        .take(remaining - registry_reserved)
-                        .collect();
-                    let hits =
-                        skill_registry::skills_sh::merge_external_hits(local, limit, skills_sh);
-                    dedupe_hits(skill_registry::merge_registry_hits(hits, limit, registry))
+                    let registry = skill_registry::merge_registry_hits(
+                        Vec::new(),
+                        remote_limit,
+                        registry.unwrap_or_default(),
+                    );
+                    skill_registry::skills_sh::merge_external_hits(
+                        local,
+                        limit,
+                        registry,
+                        skills_sh.unwrap_or_default(),
+                    )
                 } else {
                     local
                 };
@@ -363,8 +361,7 @@ Use for general-purpose skill scaffolding. Replace this content with your skill-
     }
 }
 
-/// Drop later hits that repeat a name, keeping the first (local, then registry,
-/// then skills.sh) so a skill never appears twice with conflicting hints.
+/// Keep the highest-ranked local hit for each name.
 fn dedupe_hits(hits: Vec<skill_registry::SkillHit>) -> Vec<skill_registry::SkillHit> {
     let mut seen = std::collections::HashSet::new();
     hits.into_iter()

@@ -15,7 +15,12 @@ pub enum SkillAction {
     /// Search the indexed skill catalog by name or description.
     Search { query: String },
     /// Install a skill by name into this agent's config.
-    Install { name: String },
+    Install {
+        name: String,
+        /// Install only from this repository or local directory.
+        #[arg(long)]
+        from: Option<String>,
+    },
     /// List installed skills.
     List,
     /// Remove an installed skill.
@@ -160,7 +165,8 @@ async fn try_install_from_source(
     url: &str,
     name: &str,
 ) -> Result<bool, skill::error::SkillError> {
-    let parsed = parse_source(url);
+    // Older install hints and saved registries use the gh: shorthand.
+    let parsed = parse_source(url.strip_prefix("gh:").unwrap_or(url));
     if parsed.source_type == skill::types::SourceType::Local {
         let lp = parsed
             .local_path
@@ -290,19 +296,42 @@ pub(crate) fn is_plain_skill_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
-async fn run_install(name: &str) -> Result<(), skill::error::SkillError> {
-    if home_skills().join(name).join("SKILL.md").exists() {
+async fn run_install(name: &str, from: Option<&str>) -> Result<(), skill::error::SkillError> {
+    use skill::error::SkillError;
+    if !is_plain_skill_name(name) {
+        return Err(SkillError::InvalidSource(format!(
+            "invalid skill name '{name}'"
+        )));
+    }
+    let installed = home_skills().join(name).join("SKILL.md");
+    if installed.exists() {
+        if from.is_some() {
+            return Err(SkillError::io(
+                installed,
+                std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "'{name}' already installed; remove it before installing from another source"
+                    ),
+                ),
+            ));
+        }
         crate::ui::skip(&format!("'{name}' already installed"));
         return Ok(());
     }
 
-    if install_from_registries(name).await?.is_some() {
+    let found = match from {
+        Some(url) => try_install_from_source(&build_manager(), url, name)
+            .await
+            .map_err(redact_skill_error)?,
+        None => install_from_registries(name).await?.is_some(),
+    };
+    if found {
         crate::ui::success(&format!("installed '{name}'"));
         return Ok(());
     }
 
-    crate::ui::error(&format!("skill '{name}' not found in any registry"));
-    std::process::exit(1);
+    Err(SkillError::SkillNotFound(name.to_string()))
 }
 
 async fn run_list() -> Result<(), skill::error::SkillError> {
@@ -1052,8 +1081,8 @@ impl SkillArgs {
         let rt = tokio::runtime::Runtime::new().unwrap();
         match self.action {
             SkillAction::Search { query } => run_search(&query),
-            SkillAction::Install { name } => {
-                if let Err(e) = rt.block_on(run_install(&name)) {
+            SkillAction::Install { name, from } => {
+                if let Err(e) = rt.block_on(run_install(&name, from.as_deref())) {
                     crate::ui::error(&e.to_string());
                     std::process::exit(1);
                 }
@@ -1286,13 +1315,47 @@ mod tests {
             );
             save_registries(&[src.path().to_string_lossy().into_owned()]);
 
-            block_on(run_install("my-test-skill")).unwrap();
+            block_on(run_install("my-test-skill", None)).unwrap();
 
             let installed = home_skills().join("my-test-skill").join("SKILL.md");
             assert!(
                 installed.exists(),
                 "expected {installed:?} to exist after install"
             );
+        });
+    }
+
+    #[test]
+    fn explicit_install_selects_only_the_requested_source() {
+        crate::paths::test_support::with_temp_home(|| {
+            let first = tempfile::tempdir().unwrap();
+            let selected = tempfile::tempdir().unwrap();
+            write_fixture_skill(first.path(), "demo", "first registry");
+            write_fixture_skill(first.path(), "other", "only in first registry");
+            write_fixture_skill(selected.path(), "demo", "selected repository");
+            let registries = vec![first.path().to_string_lossy().into_owned()];
+            save_registries(&registries);
+            use clap::Parser;
+            let path = selected.path().to_str().unwrap();
+            let cli = crate::cli::Cli::try_parse_from([
+                "agentflare",
+                "skill",
+                "install",
+                "--from",
+                path,
+                "--",
+                "demo",
+            ])
+            .unwrap();
+            let Some(crate::cli::Commands::Skill(args)) = cli.command else {
+                panic!("expected skill command")
+            };
+            args.run();
+            let contents = std::fs::read_to_string(home_skills().join("demo/SKILL.md")).unwrap();
+            assert!(contents.contains("selected repository"));
+            assert!(block_on(run_install("other", Some(path))).is_err());
+            assert!(block_on(run_install("demo", first.path().to_str())).is_err());
+            assert_eq!(load_registries(), registries);
         });
     }
 
