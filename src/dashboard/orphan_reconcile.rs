@@ -254,6 +254,8 @@ fn kill_recorded_agent_group(pid: u32, leader_alive: bool) {
     if leader_alive {
         let _ = flare_process::command("taskkill")
             .args(["/T", "/F", "/PID", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status();
     }
 }

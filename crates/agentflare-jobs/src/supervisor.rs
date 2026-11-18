@@ -287,10 +287,14 @@ fn kill_graceful(child: &mut std::process::Child, kill_after: Duration) {
         let pid = child.id().to_string();
         let _ = flare_process::command("taskkill")
             .args(["/T", "/PID", &pid])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status();
         std::thread::sleep(kill_after);
         let _ = flare_process::command("taskkill")
             .args(["/T", "/F", "/PID", &pid])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status();
         // `taskkill /T` builds its kill list from a single point-in-time
         // process-tree snapshot. A grandchild spawned in the narrow window
@@ -305,6 +309,8 @@ fn kill_graceful(child: &mut std::process::Child, kill_after: Duration) {
         std::thread::sleep(Duration::from_millis(250));
         let _ = flare_process::command("taskkill")
             .args(["/T", "/F", "/PID", &pid])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status();
     }
     #[cfg(not(any(unix, windows)))]
