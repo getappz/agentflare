@@ -158,7 +158,7 @@ pub mod test_support {
     // `agentflare-config`; re-exported here so the many existing
     // `crate::paths::test_support::with_temp_home` call sites don't need to
     // change.
-    pub use agentflare_config::test_support::with_temp_home;
+    pub use agentflare_config::test_support::{temp_home, with_temp_home};
 
     // Same GLOBAL_STATE_LOCK reasoning as agentflare_config::test_support's
     // with_temp_home -- cwd is also process-global.

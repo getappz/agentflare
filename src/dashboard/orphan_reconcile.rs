@@ -252,9 +252,7 @@ fn kill_recorded_agent_group(pgid: u32, _leader_alive: bool) {
 #[cfg(windows)]
 fn kill_recorded_agent_group(pid: u32, leader_alive: bool) {
     if leader_alive {
-        let _ = flare_process::command("taskkill")
-            .args(["/T", "/F", "/PID", &pid.to_string()])
-            .status();
+        flare_process::taskkill_tree(pid, true);
     }
 }
 

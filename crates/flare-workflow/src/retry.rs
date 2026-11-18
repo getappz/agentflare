@@ -95,7 +95,7 @@ pub fn apply_jitter(delay: Duration, factor: f64) -> Duration {
     }
     let factor = factor.clamp(0.0, 1.0);
     let nanos = delay.as_nanos() as f64;
-    let delta = nanos * factor * rand::thread_rng().gen_range(-1.0f64..1.0f64);
+    let delta = nanos * factor * rand::rng().random_range(-1.0f64..1.0f64);
     let jittered = (nanos + delta).max(0.0) as u64;
     Duration::from_nanos(jittered)
 }

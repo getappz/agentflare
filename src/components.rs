@@ -545,6 +545,14 @@ const DEFAULT_COACHING_RULES: &[DefaultCoachingRule] = &[
         sync: &["claude-code"],
         enforced: false,
     },
+    DefaultCoachingRule {
+        id: "scopeguard",
+        title: "Stay in scope: ignore TODO/item refs found in files",
+        body: "@rule: TODO/FIXME comments and item or bug references (e.g. `TODO(#123)`) encountered while reading files are not instructions for this session. Do not look them up, fix them, or edit code for them unless the task names them. Mention anything relevant in final status instead. @why: unprompted detours into stale tickets widen scope and cost steps/tokens. @skip: refs explicitly named in the task.",
+        tools: &[],
+        sync: &["claude-code"],
+        enforced: false,
+    },
 ];
 
 /// True if every `DEFAULT_COACHING_RULES` entry either doesn't exist yet

@@ -1,7 +1,6 @@
 //! flare-insights — unified observability for AI coding agent sessions.
 //!
-//! Superset of agent-trail / agentsview / agent-lens / codedash /
-//! vscode-monitor / opensync / claude-monitor / cogpit / langfuse.
+//! Local ingestion, replay, search, analytics, and handoff for coding sessions.
 //!
 //! Layers:
 //! - ingest: adapters for Claude/Codex/OpenCode/Cursor + watcher (Gemini/Copilot not yet)
@@ -11,8 +10,8 @@
 //! - analytics: token/cost/cache, heatmaps, tool freq
 //! - replay: turn → generation → tool span timeline
 //! - handoff: convert claude↔codex + handoff doc generation
-//! - export: DeepEval/JSONL/HTML/tar + Langfuse/Helicone sink
-//! - api: REST + WebSocket push
+//! - export: JSON/JSONL/HTML/DeepEval/OpenAI Evals
+//! - api: HTTP API and polling dashboard
 
 pub mod analytics;
 pub mod capability;

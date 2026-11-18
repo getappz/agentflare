@@ -250,7 +250,13 @@ fn route_answer(
         .unwrap_or_default();
     let captured = answer.map(|answer| decide::capture::Input {
         site: SITE,
-        features: decide::capture::router_features(&prompt),
+        features: {
+            let mut features = decide::capture::router_features(&prompt);
+            features["hard_target"] = target(Tier::Hard, ctx.current_model.as_deref())
+                .unwrap_or("none")
+                .into();
+            features
+        },
         norm_input: &prompt,
         label: decide::capture::label_of(answer),
         confidence,

@@ -84,6 +84,69 @@ mod evidence_tests {
     use super::*;
 
     #[test]
+    fn export_rejects_unknown_formats() {
+        assert!(InsightsArgs::try_parse_from(["insights", "export", "--format", "typo"]).is_err());
+        for format in [
+            "json",
+            "jsonl",
+            "html",
+            "deepeval",
+            "openai",
+            "openai-evals",
+        ] {
+            assert!(
+                InsightsArgs::try_parse_from(["insights", "export", "--format", format]).is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn export_filters_sessions_and_turns_by_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("insights.db");
+        let store = flare_insights::store::InsightsStore::open(&db).unwrap();
+        for source in ["codex", "claude_code"] {
+            let session = serde_json::from_value(serde_json::json!({
+                "id": source, "source": source, "project": "test",
+                "status": "completed", "updated_at": "2026-01-01T00:00:00Z",
+                "tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0},
+                "turn_count": 1, "tool_call_count": 0, "subagent_count": 0,
+                "tags": [], "starred": false
+            })).unwrap();
+            store.upsert_session(&session).unwrap();
+            let turn = flare_insights::model::Turn {
+                id: format!("{source}-turn"),
+                session_id: source.into(),
+                seq: 1,
+                user_text: None,
+                assistant_text: Some(source.into()),
+                started_at: None,
+                ended_at: None,
+                tokens: None,
+                cost_usd: None,
+            };
+            store.upsert_turn(&turn).unwrap();
+        }
+        let output = dir.path().join("export.json");
+        run_export(
+            db,
+            ExportArgs {
+                format: "json".into(),
+                source: Some("codex".into()),
+                output: Some(output.clone()),
+            },
+        );
+        let (sessions, turns): (
+            Vec<flare_insights::model::Session>,
+            Vec<flare_insights::model::Turn>,
+        ) = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "codex");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].session_id, "codex");
+    }
+
+    #[test]
     fn agent_sync_uses_git_root() {
         let repo = tempfile::tempdir().unwrap();
         assert!(
@@ -150,7 +213,7 @@ pub struct StatsArgs {
 
 #[derive(Parser, Debug)]
 pub struct ExportArgs {
-    #[arg(long, default_value = "json")]
+    #[arg(long, default_value = "json", value_parser = ["json", "jsonl", "html", "deepeval", "openai", "openai-evals"])]
     pub format: String,
     #[arg(long)]
     pub output: Option<PathBuf>,
@@ -277,7 +340,10 @@ fn run_sync(db: PathBuf, args: SyncArgs) {
                     failed_sources += 1;
                 }
             },
-            Err(e) => eprintln!("{source}: error {e}"),
+            Err(e) => {
+                eprintln!("{source}: error {e}");
+                failed_sources += 1;
+            }
         }
     }
     println!(
@@ -505,7 +571,9 @@ fn run_stats(db: PathBuf, args: StatsArgs) {
 
 fn run_export(db: PathBuf, args: ExportArgs) {
     let store = open_store(db);
-    let sessions = store.list_sessions(10000, 0).unwrap_or_default();
+    let sessions = store
+        .list_sessions_filtered(args.source.as_deref(), None, 10000, 0)
+        .unwrap_or_default();
     let turns: Vec<flare_insights::model::Turn> = sessions
         .iter()
         .flat_map(|s| store.get_turns(&s.id).unwrap_or_default())
@@ -515,7 +583,11 @@ fn run_export(db: PathBuf, args: ExportArgs) {
         "html" => flare_insights::export::ExportFormat::Html,
         "deepeval" => flare_insights::export::ExportFormat::Deepeval,
         "openai" | "openai-evals" => flare_insights::export::ExportFormat::OpenAiEvals,
-        _ => flare_insights::export::ExportFormat::Json,
+        "json" => flare_insights::export::ExportFormat::Json,
+        _ => {
+            eprintln!("unsupported export format: {}", args.format);
+            std::process::exit(1);
+        }
     };
     let out = flare_insights::export::export_sessions(&sessions, &turns, fmt);
     if let Some(path) = args.output {

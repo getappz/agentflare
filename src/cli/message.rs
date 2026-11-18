@@ -72,6 +72,16 @@ pub enum MessageCommand {
     },
     /// Print the session key you send and receive as.
     Whoami,
+    /// Show pipeline delivery custody receipts (received does not mean processed).
+    Receipts {
+        /// Mailbox to inspect (default: your own), as with history.
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
     /// Stream incoming messages, one line each, until interrupted.
     Watch {
         /// Mailbox to watch (default: your own).
@@ -223,6 +233,24 @@ impl MessageArgs {
                 println!("Marked {} read.", v["marked_read"].as_i64().unwrap_or(0));
             }
             MessageCommand::Whoami => println!("{me}"),
+            MessageCommand::Receipts { to, limit, json } => {
+                let to = to.unwrap_or(me);
+                let rows = messages::receipts::list(&conn, &to, limit)
+                    .unwrap_or_else(|e| fail(e.to_string()));
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&rows).unwrap_or_default()
+                    );
+                } else {
+                    for r in rows {
+                        println!(
+                            "{} message={} run={} state={}",
+                            r.receipt_id, r.message.id, r.run_id, r.state
+                        );
+                    }
+                }
+            }
             MessageCommand::Watch {
                 to,
                 peek,
@@ -421,6 +449,19 @@ mod tests {
             }
             _ => panic!("expected history"),
         }
+        let cli = Cli::try_parse_from([
+            "x",
+            "receipts",
+            "--to",
+            "agent:one",
+            "--limit",
+            "5",
+            "--json",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.args.command, MessageCommand::Receipts { to: Some(to), limit: 5, json: true } if to == "agent:one")
+        );
     }
 
     #[test]

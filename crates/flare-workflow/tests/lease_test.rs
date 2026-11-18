@@ -38,6 +38,270 @@ fn one_step_wf() -> WorkflowDefinition<Ctx> {
     WorkflowDefinition::new("wf", "wf").add_step(logging_step("a"))
 }
 
+#[tokio::test]
+async fn resume_preparation_runs_under_lease_before_the_executor() {
+    let store = InMemoryStore::<Ctx>::new();
+    let run = seed_run(&store, None).await;
+    let engine = WorkflowEngine::with_store(store);
+    engine.register_workflow(one_step_wf()).unwrap();
+    assert!(
+        engine
+            .resume_run_with(run, || async {
+                let state = engine.get_status(run).await?;
+                assert_eq!(state.lease.unwrap().owner, engine.executor_id());
+                assert!(state.context.data.log.is_empty());
+                engine
+                    .patch_run_data(run, |data| data.owner = "prepared".into())
+                    .await
+            })
+            .await
+            .unwrap()
+    );
+    let state = wait_terminal(&engine, run).await;
+    assert_eq!(state.context.data.log, vec!["a:prepared"]);
+}
+
+#[tokio::test]
+async fn takeover_during_preparation_fences_patch_driver_and_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("workflow.db");
+    let store = flare_workflow::SqliteStore::<Ctx>::open_file(&path).unwrap();
+    let successor = flare_workflow::SqliteStore::<Ctx>::open_file(&path).unwrap();
+    let run = seed_run(&store, None).await;
+    let engine = WorkflowEngine::with_store(store.clone()).with_executor_id("previous");
+    engine.register_workflow(one_step_wf()).unwrap();
+    let launched = engine
+        .resume_run_with(run, || async {
+            successor
+                .update(run, |s| {
+                    s.lease = Some(lease("successor", Duration::ZERO));
+                    s.context.data.owner = "successor".into();
+                })
+                .await?;
+            assert!(
+                engine
+                    .patch_run_data(run, |d| d.owner.clear())
+                    .await
+                    .is_err()
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(!launched);
+    let stale = store.for_executor(Some(Arc::from("previous")));
+    assert!(stale.save(stale.load(run).await.unwrap()).await.is_err());
+    assert!(
+        stale
+            .update(run, |s| s.context.data.owner.clear())
+            .await
+            .is_err()
+    );
+    assert!(
+        stale
+            .append_journal(run, JournalEntry::Input { value: vec![] })
+            .await
+            .is_err()
+    );
+    assert_eq!(successor.journal(run).await.unwrap().len(), 1);
+    let state = successor.load(run).await.unwrap();
+    assert_eq!(state.lease.unwrap().owner, "successor");
+    assert_eq!(state.context.data.owner, "successor");
+    assert!(state.context.data.log.is_empty());
+}
+
+#[tokio::test]
+async fn an_in_flight_step_cannot_overwrite_its_successor() {
+    let store = InMemoryStore::<Ctx>::new();
+    let run = seed_run(&store, None).await;
+    let engine = WorkflowEngine::with_store(store.clone());
+    let started = Arc::new(tokio::sync::Notify::new());
+    let finish = Arc::new(tokio::sync::Notify::new());
+    let gates = (started.clone(), finish.clone());
+    engine
+        .register_workflow(
+            WorkflowDefinition::new("wf", "wf").add_step(StepDefinition::new(
+                "a",
+                "a",
+                Arc::new(FunctionStep::new(move |ctx: &mut WorkflowContext<Ctx>| {
+                    let (started, finish) = gates.clone();
+                    Box::pin(async move {
+                        started.notify_one();
+                        finish.notified().await;
+                        ctx.data.owner = "stale".into();
+                        Ok(StepResult::Success)
+                    })
+                })),
+            )),
+        )
+        .unwrap();
+    assert!(engine.resume_run(run).await.unwrap());
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .expect("executor did not start");
+    store
+        .update(run, |s| {
+            s.lease = Some(lease("successor", Duration::ZERO));
+            s.context.data.owner = "successor".into();
+        })
+        .await
+        .unwrap();
+    finish.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while engine.is_driving(run) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let state = store.load(run).await.unwrap();
+    assert_eq!(state.context.data.owner, "successor");
+    assert_eq!(state.status, WorkflowStatus::Running);
+    assert_eq!(store.journal(run).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn failed_resume_preparation_releases_lease_without_starting_executor() {
+    let store = InMemoryStore::<Ctx>::new();
+    let run = seed_run(&store, None).await;
+    store
+        .update(run, |s| s.status = WorkflowStatus::Paused)
+        .await
+        .unwrap();
+    let engine = WorkflowEngine::with_store(store);
+    engine.register_workflow(one_step_wf()).unwrap();
+    let result = engine
+        .resume_run_with(run, || async {
+            Err(WorkflowError::Store("fixture preparation failed".into()))
+        })
+        .await;
+    assert!(result.is_err());
+    assert!(!engine.is_driving(run));
+    let state = engine.get_status(run).await.unwrap();
+    assert!(state.lease.is_none());
+    assert_eq!(state.status, WorkflowStatus::Paused);
+    assert!(engine.recover().await.unwrap().is_empty());
+    assert!(state.context.data.log.is_empty());
+    assert!(engine.resume_run(run).await.unwrap());
+    assert_eq!(
+        wait_terminal(&engine, run).await.status,
+        WorkflowStatus::Completed
+    );
+}
+
+#[tokio::test]
+async fn dropping_preparation_releases_the_lease_and_local_claim() {
+    let store = InMemoryStore::<Ctx>::new();
+    let run = seed_run(&store, None).await;
+    let engine = WorkflowEngine::with_store(store);
+    engine.register_workflow(one_step_wf()).unwrap();
+    let (entered, ready) = tokio::sync::oneshot::channel();
+    let holder = engine.clone();
+    let preparing = tokio::spawn(async move {
+        holder
+            .resume_run_with(run, || async {
+                entered.send(()).unwrap();
+                std::future::pending().await
+            })
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), ready)
+        .await
+        .unwrap()
+        .unwrap();
+    preparing.abort();
+    assert!(preparing.await.unwrap_err().is_cancelled());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while engine.is_driving(run) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(engine.get_status(run).await.unwrap().lease.is_none());
+}
+
+#[tokio::test]
+async fn recovery_skips_a_checkpointed_step_whose_success_journal_is_missing() {
+    let store = InMemoryStore::<Ctx>::new();
+    let run = seed_run(&store, None).await;
+    store
+        .update(run, |s| {
+            s.step_states.get_mut(&StepId::new("a")).unwrap().status = StepStatus::Succeeded;
+            s.context.data.log.push("checkpointed".into());
+        })
+        .await
+        .unwrap();
+    let engine = WorkflowEngine::with_store(store);
+    engine.register_workflow(one_step_wf()).unwrap();
+    assert!(engine.resume_run(run).await.unwrap());
+    let state = wait_terminal(&engine, run).await;
+    assert_eq!(state.status, WorkflowStatus::Completed);
+    assert_eq!(state.context.data.log, vec!["checkpointed"]);
+}
+
+#[tokio::test]
+async fn foreign_live_lease_skips_resume_preparation() {
+    let store = InMemoryStore::<Ctx>::new();
+    let run = seed_run(&store, Some(lease("otherhost:42:abc", Duration::ZERO))).await;
+    let engine = WorkflowEngine::with_store(store);
+    engine.register_workflow(one_step_wf()).unwrap();
+    let called = std::sync::atomic::AtomicBool::new(false);
+    assert!(
+        !engine
+            .resume_run_with(run, || async {
+                called.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .unwrap()
+    );
+    assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn long_resume_preparation_keeps_the_lease_fresh() {
+    let store = InMemoryStore::<Ctx>::new();
+    let run = seed_run(&store, None).await;
+    let engine = WorkflowEngine::with_store(store.clone())
+        .with_executor_id("fixture:42:first")
+        .with_lease_ttl(Duration::from_millis(300));
+    let contender = WorkflowEngine::with_store(store)
+        .with_executor_id("fixture:42:second")
+        .with_lease_ttl(Duration::from_millis(300));
+    engine.register_workflow(one_step_wf()).unwrap();
+    contender.register_workflow(one_step_wf()).unwrap();
+    let (ready, started) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            engine.resume_run_with(run, || async move {
+                ready.send(()).unwrap();
+                released.await.unwrap();
+                Ok(())
+            }),
+            async {
+                started.await.unwrap();
+                tokio::time::sleep(Duration::from_millis(650)).await;
+                let result = contender.resume_run(run).await;
+                let _ = release.send(());
+                result
+            }
+        )
+    })
+    .await
+    .unwrap();
+    assert!(first.unwrap());
+    assert!(
+        !second.unwrap(),
+        "preparation must renew its lease before starting the executor"
+    );
+    assert_eq!(
+        wait_terminal(&engine, run).await.status,
+        WorkflowStatus::Completed
+    );
+}
+
 /// Persist a crashed-looking `Running` run of `one_step_wf` carrying `lease`.
 async fn seed_run<S: StateStore<Ctx>>(store: &S, lease: Option<ExecutorLease>) -> WorkflowRunId {
     let run_id = WorkflowRunId::new();
@@ -306,6 +570,12 @@ struct FailingUpdateStore {
 
 #[async_trait]
 impl StateStore<Ctx> for FailingUpdateStore {
+    fn for_executor(&self, owner: Option<Arc<str>>) -> Self {
+        Self {
+            inner: self.inner.for_executor(owner),
+            ..self.clone()
+        }
+    }
     async fn save(&self, state: WorkflowState<Ctx>) -> WorkflowResult<()> {
         self.inner.save(state).await
     }

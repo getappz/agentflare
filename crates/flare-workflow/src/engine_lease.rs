@@ -17,6 +17,30 @@ use crate::types::*;
 /// long is treated as abandoned by a dead process and may be taken over.
 pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(60);
 
+/// Keep the local driving claim until cancellation has released the stored lease.
+struct PreparingLease<'a, D: WorkflowData, S: StateStore<D> + 'static> {
+    engine: &'a WorkflowEngine<D, S>,
+    runtime: tokio::runtime::Handle,
+    run: WorkflowRunId,
+    driving: Option<DrivingGuard<D>>,
+    claimed: bool,
+}
+
+impl<D: WorkflowData, S: StateStore<D> + 'static> Drop for PreparingLease<'_, D, S> {
+    fn drop(&mut self) {
+        if self.claimed
+            && let Some(driving) = self.driving.take()
+        {
+            let engine = self.engine.clone();
+            let run = self.run;
+            self.runtime.spawn(async move {
+                engine.release_lease(run).await;
+                drop(driving);
+            });
+        }
+    }
+}
+
 /// This process's executor identity, `host:pid:nonce`. The random nonce makes
 /// it unique even if the OS later reuses the pid (after a reboot, or on a
 /// busy host), so a stale lease can never be mistaken for a live one of ours.
@@ -120,7 +144,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
 
     /// [`is_leased_elsewhere`](Self::is_leased_elsewhere), minus leases whose
     /// holder is provably dead (see `lease_holder_is_dead`).
-    pub(super) fn held_by_live_executor(&self, state: &WorkflowState<D>) -> bool {
+    pub fn held_by_live_executor(&self, state: &WorkflowState<D>) -> bool {
         self.is_leased_elsewhere(state)
             && !state
                 .lease
@@ -148,10 +172,19 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         patch: impl Fn(&mut D) + Send + Sync + 'static,
     ) -> WorkflowResult<()> {
         let patch: DataPatch<D> = Arc::new(patch);
-        self.data_patches.lock().insert(run_id, Arc::clone(&patch));
+        let mut ownership = Ok(());
         self.state_store
-            .update(run_id, |s| patch(&mut s.context.data))
-            .await
+            .update(run_id, |s| {
+                if s.lease.is_some() || self.is_driving(run_id) {
+                    ownership = s.check_executor(Some(self.executor_id()));
+                }
+                if ownership.is_ok() {
+                    self.data_patches.lock().insert(run_id, Arc::clone(&patch));
+                    patch(&mut s.context.data);
+                }
+            })
+            .await?;
+        ownership
     }
 
     /// Apply the registered data patch for `run_id` (if any) to `data`.
@@ -195,7 +228,11 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
     /// Whether the driver of `run_id` must stop at its next step boundary
     /// without settling the run: paused, or superseded by another executor.
     pub(crate) async fn should_stop(&self, run_id: WorkflowRunId) -> WorkflowResult<bool> {
-        Ok(self.is_superseded(run_id) || self.state_store.is_paused(run_id).await?)
+        let state = self.state_store.load(run_id).await?;
+        Ok(self.is_superseded(run_id)
+            || state.status.is_terminal()
+            || state.status == WorkflowStatus::Paused
+            || state.check_executor(Some(self.executor_id())).is_err())
     }
 
     /// Drive `run_id` to completion on a spawned task, renewing its executor
@@ -210,17 +247,20 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         guard: ActiveWorkflowGuard,
         driving: DrivingGuard<D>,
     ) {
-        let engine = self.clone_for_execution();
+        let mut engine = self.clone_for_execution();
+        let lease_engine = engine.clone();
+        engine.state_store = self
+            .state_store
+            .for_executor(Some(self.executor_id.clone()));
         self.spawn(async move {
             let _guard = guard;
             let _driving = driving;
-            let renewer =
-                AbortOnDrop(engine.spawn(engine.clone_for_execution().renew_lease_loop(run_id)));
+            let renewer = AbortOnDrop(engine.spawn(lease_engine.clone().renew_lease_loop(run_id)));
             let result = engine
                 .execute_with_budget_deadline(run_id, definition)
                 .await;
             drop(renewer);
-            engine.release_lease(run_id).await;
+            lease_engine.release_lease(run_id).await;
             if let Err(e) = result {
                 tracing::error!(run_id = %run_id, error = ?e, "Workflow execution failed");
             }
@@ -236,12 +276,12 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         let interval = self.lease_ttl / 4;
         loop {
             tokio::time::sleep(interval).await;
-            let mut lost_to: Option<String> = None;
+            let mut lost = false;
             let result = self
                 .state_store
                 .update(run_id, |s| {
-                    if self.is_leased_elsewhere(s) {
-                        lost_to = s.lease.as_ref().map(|l| l.owner.clone());
+                    if s.check_executor(Some(self.executor_id())).is_err() {
+                        lost = true;
                     } else {
                         s.lease = Some(self.new_lease());
                     }
@@ -249,8 +289,8 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 .await;
             match result {
                 Ok(()) => {
-                    if let Some(other) = lost_to {
-                        tracing::warn!(run_id = %run_id, holder = %other, "Executor lease taken over by another process; stopping this driver");
+                    if lost {
+                        tracing::warn!(run_id = %run_id, "Executor lease lost; stopping this driver");
                         self.superseded.lock().insert(run_id);
                         return;
                     }
@@ -333,6 +373,21 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
     /// run it would otherwise just wait on — if the process that was
     /// executing it died, waiting would never end.
     pub async fn resume_run(&self, run_id: WorkflowRunId) -> WorkflowResult<bool> {
+        self.resume_run_with(run_id, || std::future::ready(Ok(())))
+            .await
+    }
+
+    /// Prepare durable receiver state after claiming the lease, before starting
+    /// the executor. Preparation failure releases ownership without driving work.
+    pub async fn resume_run_with<F, Fut>(
+        &self,
+        run_id: WorkflowRunId,
+        prepare: F,
+    ) -> WorkflowResult<bool>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = WorkflowResult<()>>,
+    {
         let state = self.state_store.load(run_id).await?;
         if matches!(
             state.status,
@@ -346,7 +401,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             .get(&state.workflow_id)
             .cloned()
             .ok_or_else(|| WorkflowError::DefinitionNotFound(state.workflow_id.clone()))?;
-        self.try_resume(&state, definition).await
+        self.try_resume_with(&state, definition, prepare).await
     }
 
     pub(super) async fn try_resume(
@@ -354,6 +409,20 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         state: &WorkflowState<D>,
         definition: Arc<WorkflowDefinition<D>>,
     ) -> WorkflowResult<bool> {
+        self.try_resume_with(state, definition, || std::future::ready(Ok(())))
+            .await
+    }
+
+    async fn try_resume_with<F, Fut>(
+        &self,
+        state: &WorkflowState<D>,
+        definition: Arc<WorkflowDefinition<D>>,
+        prepare: F,
+    ) -> WorkflowResult<bool>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = WorkflowResult<()>>,
+    {
         let run_id = state.run_id;
         if self.held_by_live_executor(state) {
             tracing::info!(run_id = %run_id, holder = ?state.lease.as_ref().map(|l| &l.owner), "Run is held by another live executor; not resuming it here");
@@ -372,10 +441,21 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         let Some(driving) = self.claim_driving(run_id) else {
             return Ok(false);
         };
+        let mut lease = PreparingLease {
+            engine: self,
+            runtime: self
+                .runtime
+                .clone()
+                .unwrap_or_else(tokio::runtime::Handle::current),
+            run: run_id,
+            driving: Some(driving),
+            claimed: false,
+        };
         // Re-check under the store's update (the listing above may be stale)
         // and claim the lease in the same write.
         let mut taken = true;
         let mut incompatible = false;
+        let mut previous_status = state.status;
         let result = self
             .state_store
             .update(run_id, |s| {
@@ -400,7 +480,8 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                     incompatible = true;
                     return;
                 }
-                s.status = WorkflowStatus::Running;
+                previous_status = s.status;
+                lease.claimed = true;
                 s.lease = Some(self.new_lease());
             })
             .await;
@@ -412,7 +493,40 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         if !taken {
             return Ok(false);
         }
+        let preparation = tokio::select! {
+            result = prepare() => result,
+            _ = self.clone().renew_lease_loop(run_id) => Err(WorkflowError::Store("lease lost during resume preparation".into())),
+        };
+        if let Err(error) = preparation {
+            self.release_lease(run_id).await;
+            lease.claimed = false;
+            return Err(error);
+        }
+        // Preparation can finish in the same tick as a takeover. Renew only
+        // our own lease under the store lock before handing off to the driver.
+        let mut ready = false;
+        let recheck = self
+            .state_store
+            .update(run_id, |s| {
+                ready = s.check_executor(Some(self.executor_id())).is_ok()
+                    && s.status == previous_status;
+                if ready {
+                    s.status = WorkflowStatus::Running;
+                    s.lease = Some(self.new_lease());
+                }
+            })
+            .await;
+        if recheck.is_err() || !ready {
+            self.release_lease(run_id).await;
+            lease.claimed = false;
+            recheck?;
+            return Ok(false);
+        }
         self.active_workflows.fetch_add(1, Ordering::AcqRel);
+        let driving = lease
+            .driving
+            .take()
+            .expect("preparation owns driving claim");
         self.spawn_driven(run_id, definition, self.active_workflow_guard(), driving);
         Ok(true)
     }
