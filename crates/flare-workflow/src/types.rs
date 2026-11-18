@@ -489,6 +489,13 @@ impl ExecutorLease {
 }
 
 impl<D: WorkflowData> WorkflowState<D> {
+    pub(crate) fn check_executor(&self, owner: Option<&str>) -> WorkflowResult<()> {
+        if owner.is_some() && self.lease.as_ref().map(|l| l.owner.as_str()) != owner {
+            return Err(WorkflowError::Paused(self.run_id));
+        }
+        Ok(())
+    }
+
     pub fn new(run_id: WorkflowRunId, workflow_id: WorkflowId, data: D) -> Self {
         let now = Utc::now();
         Self {

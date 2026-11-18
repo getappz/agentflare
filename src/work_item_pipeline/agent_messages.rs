@@ -261,6 +261,7 @@ async fn recover_with_message_custody(
         .await
         .map_err(|e| e.to_string())?;
     let mut resumed = Vec::new();
+    let mut retry = Vec::new();
     for state in active {
         if !filter(&state) || eng.is_driving(state.run_id) {
             continue;
@@ -279,13 +280,18 @@ async fn recover_with_message_custody(
         {
             Ok(true) => resumed.push(state.run_id),
             Ok(false) => {}
+            Err(WorkflowError::Store(error)) => retry.push(format!("{}: {error}", state.run_id)),
             Err(error) => eprintln!(
                 "work_item_pipeline: could not recover run {}: {error}; leaving it undispatched",
                 state.run_id
             ),
         }
     }
-    Ok(resumed)
+    if retry.is_empty() {
+        Ok(resumed)
+    } else {
+        Err(format!("retry pipeline recovery for {}", retry.join(", ")))
+    }
 }
 
 async fn resume_with_message_custody(
@@ -294,7 +300,7 @@ async fn resume_with_message_custody(
     owner: &str,
     target_branch: Option<&str>,
     message_path: &std::path::Path,
-) -> Result<bool, String> {
+) -> flare_workflow::WorkflowResult<bool> {
     eng.resume_run_with(run_id, || async {
         // Another executor may have consumed or accepted messages since we last held the lease.
         let outbox = message_outbox(run_id);
@@ -311,7 +317,6 @@ async fn resume_with_message_custody(
             .map_err(WorkflowError::Store)
     })
     .await
-    .map_err(|e| e.to_string())
 }
 pub(crate) async fn recover_at_boot() -> Result<Vec<flare_workflow::WorkflowRunId>, String> {
     recover_with_message_custody(

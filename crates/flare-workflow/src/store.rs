@@ -20,6 +20,11 @@ use crate::types::{
 /// engine only ever talks to this trait.
 #[async_trait]
 pub trait StateStore<D: WorkflowData>: Send + Sync + Clone {
+    /// A driver handle. Stores shared between executors must fence state and
+    /// journal writes by this owner inside the same lock or transaction.
+    fn for_executor(&self, _owner: Option<Arc<str>>) -> Self {
+        self.clone()
+    }
     /// SQLite overrides this with a separate transactional ledger, isolated from step snapshots.
     async fn budget_operation(
         &self,
@@ -27,16 +32,23 @@ pub trait StateStore<D: WorkflowData>: Send + Sync + Clone {
         operation: crate::budget::BudgetOperation,
     ) -> WorkflowResult<crate::budget::BudgetUpdate> {
         let mut result = Err(crate::budget::error("run has no budget"));
-        self.update(run_id, |state| {
-            if matches!(&operation, crate::budget::BudgetOperation::Reserve { .. })
-                && (state.status.is_terminal() || state.status == WorkflowStatus::Paused)
-            {
-                result = Err(crate::budget::error("run is no longer dispatchable"));
-            } else if let Some(budget) = state.budget.as_mut() {
-                result = budget.apply(operation);
-            }
-        })
-        .await?;
+        // Reconcile charges already incurred even if the run changed hands.
+        let store = if matches!(&operation, crate::budget::BudgetOperation::Reserve { .. }) {
+            self.clone()
+        } else {
+            self.for_executor(None)
+        };
+        store
+            .update(run_id, |state| {
+                if matches!(&operation, crate::budget::BudgetOperation::Reserve { .. })
+                    && (state.status.is_terminal() || state.status == WorkflowStatus::Paused)
+                {
+                    result = Err(crate::budget::error("run is no longer dispatchable"));
+                } else if let Some(budget) = state.budget.as_mut() {
+                    result = budget.apply(operation);
+                }
+            })
+            .await?;
         result
     }
 
@@ -126,6 +138,7 @@ where
 /// In-memory state storage for workflow instances.
 #[derive(Clone)]
 pub struct InMemoryStore<D: WorkflowData> {
+    executor: Option<Arc<str>>,
     states: Arc<RwLock<HashMap<WorkflowRunId, WorkflowState<D>>>>,
     journals: Arc<RwLock<HashMap<WorkflowRunId, Vec<JournalEntry>>>>,
 }
@@ -133,6 +146,7 @@ pub struct InMemoryStore<D: WorkflowData> {
 impl<D: WorkflowData> InMemoryStore<D> {
     pub fn new() -> Self {
         Self {
+            executor: None,
             states: Arc::new(RwLock::new(HashMap::new())),
             journals: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -161,6 +175,12 @@ impl<D: WorkflowData> Default for InMemoryStore<D> {
 
 #[async_trait]
 impl<D: WorkflowData> StateStore<D> for InMemoryStore<D> {
+    fn for_executor(&self, owner: Option<Arc<str>>) -> Self {
+        Self {
+            executor: owner,
+            ..self.clone()
+        }
+    }
     async fn save(&self, mut state: WorkflowState<D>) -> WorkflowResult<()> {
         state.context.budget = None;
         self.states.write().insert(state.run_id, state);
@@ -183,6 +203,7 @@ impl<D: WorkflowData> StateStore<D> for InMemoryStore<D> {
         let state = states
             .get_mut(&run_id)
             .ok_or(WorkflowError::NotFound(run_id))?;
+        state.check_executor(self.executor.as_deref())?;
         f(state);
         state.context.budget = None;
         state.updated_at = chrono::Utc::now();
@@ -283,6 +304,13 @@ impl<D: WorkflowData> StateStore<D> for InMemoryStore<D> {
         run_id: WorkflowRunId,
         entry: JournalEntry,
     ) -> WorkflowResult<u64> {
+        let states = self.states.read();
+        if self.executor.is_some() {
+            states
+                .get(&run_id)
+                .ok_or(WorkflowError::NotFound(run_id))?
+                .check_executor(self.executor.as_deref())?;
+        }
         let mut journals = self.journals.write();
         let entries = journals.entry(run_id).or_default();
         entries.push(entry);

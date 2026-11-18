@@ -594,15 +594,28 @@ async fn boot_checkpoint_failure_never_drives_the_run() {
         BEGIN SELECT RAISE(ABORT, 'fixture checkpoint failure'); END;",
     )
     .unwrap();
-    let resumed = recover_with_message_custody(&eng, &messages, |_| true)
-        .await
-        .unwrap();
-    assert!(resumed.is_empty());
+    assert!(
+        recover_with_message_custody(&eng, &messages, |_| true)
+            .await
+            .unwrap_err()
+            .contains(&run.to_string())
+    );
     assert!(!eng.is_driving(run));
     assert!(eng.get_status(run).await.unwrap().lease.is_none());
     assert_eq!(
         receipts::list(&c, "agent:one", 10).unwrap()[0].state,
         "in_doubt"
+    );
+    wf.execute_batch("DROP TRIGGER reject_checkpoint").unwrap();
+    assert_eq!(
+        recover_with_message_custody(&eng, &messages, |_| true)
+            .await
+            .unwrap(),
+        vec![run]
+    );
+    assert_eq!(
+        receipts::list(&c, "agent:one", 10).unwrap()[0].state,
+        "received"
     );
     forget_outbox(run);
 }

@@ -38,13 +38,8 @@ pub enum SqliteStoreError {
 #[derive(Clone)]
 pub struct SqliteStore<D: WorkflowData> {
     conn: Arc<Mutex<Connection>>,
-    // Serializes `update()`'s load-mutate-write cycle, which is not atomic
-    // under the connection mutex alone (it's released between the load and
-    // the write so `f` can run outside `blocking`). Without this, two
-    // concurrent updates for the same run — e.g. two fan-out branches
-    // completing around the same time — can race: both load the same
-    // pre-mutation state, and the second write silently overwrites the
-    // first's step-state change.
+    executor: Option<Arc<str>>,
+    // Queue local updates before they occupy blocking-pool threads.
     update_lock: Arc<tokio::sync::Mutex<()>>,
     _marker: PhantomData<D>,
 }
@@ -54,6 +49,7 @@ impl<D: WorkflowData> SqliteStore<D> {
         let conn = db_kit::open_file(path, &Self::migrations())?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            executor: None,
             update_lock: Arc::new(tokio::sync::Mutex::new(())),
             _marker: PhantomData,
         })
@@ -63,6 +59,7 @@ impl<D: WorkflowData> SqliteStore<D> {
         let conn = db_kit::open_memory(&Self::migrations())?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            executor: None,
             update_lock: Arc::new(tokio::sync::Mutex::new(())),
             _marker: PhantomData,
         })
@@ -419,6 +416,12 @@ where
 
 #[async_trait]
 impl<D: WorkflowData> StateStore<D> for SqliteStore<D> {
+    fn for_executor(&self, owner: Option<Arc<str>>) -> Self {
+        Self {
+            executor: owner,
+            ..self.clone()
+        }
+    }
     async fn budget_operation(
         &self,
         run_id: WorkflowRunId,
@@ -460,44 +463,49 @@ impl<D: WorkflowData> StateStore<D> for SqliteStore<D> {
     where
         F: FnOnce(&mut WorkflowState<D>) + Send,
     {
-        // Hold this for the whole load-mutate-write cycle below — see the
-        // `update_lock` field doc for why the connection mutex alone isn't
-        // enough to make this atomic.
         let _guard = self.update_lock.lock().await;
-
-        // `f` is not `'static` (trait-bound, and callers pass closures that
-        // borrow local `&StepDefinition` references), so it can't be moved
-        // into `spawn_blocking`. Split the blocking SQLite I/O either side of
-        // it instead: blocking load -> apply `f` inline (cheap, no I/O) ->
-        // blocking write, of only the owned `state`.
+        // Keep the SQLite writer lock across the borrowed mutation without
+        // running disk I/O on Tokio's worker or requiring a 'static closure.
+        let (loaded, snapshot) = tokio::sync::oneshot::channel();
+        let (mutated, result) = tokio::sync::oneshot::channel();
         let conn = Arc::clone(&self.conn);
-        let json = blocking(move || {
-            let conn = conn
+        let owner = self.executor.clone();
+        let io = blocking(move || {
+            let mut conn = conn
                 .lock()
                 .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
-            conn.query_row(
-                "SELECT state_json FROM workflow_runs WHERE id = ?1",
-                params![run_id.to_string()],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|e| WorkflowError::Store(format!("load for update: {e}")))?
-            .ok_or(WorkflowError::NotFound(run_id))
-        })
-        .await?;
-
-        let mut state = Self::deserialize(&json)?;
-        f(&mut state);
-        state.updated_at = Utc::now();
-
-        let conn = Arc::clone(&self.conn);
-        blocking(move || {
-            let conn = conn
-                .lock()
-                .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
-            Self::write_state(&conn, &state)
-        })
-        .await
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| WorkflowError::Store(format!("begin update: {e}")))?;
+            let json = tx
+                .query_row(
+                    "SELECT state_json FROM workflow_runs WHERE id = ?1",
+                    params![run_id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|e| WorkflowError::Store(format!("load for update: {e}")))?
+                .ok_or(WorkflowError::NotFound(run_id))?;
+            let state = Self::deserialize(&json)?;
+            state.check_executor(owner.as_deref())?;
+            loaded
+                .send(state)
+                .map_err(|_| WorkflowError::Cancelled(run_id))?;
+            let state = result
+                .blocking_recv()
+                .map_err(|_| WorkflowError::Cancelled(run_id))?;
+            Self::write_state_rows(&tx, &state)?;
+            tx.commit()
+                .map_err(|e| WorkflowError::Store(format!("commit update: {e}")))
+        });
+        let apply = async move {
+            if let Ok(mut state) = snapshot.await {
+                f(&mut state);
+                state.updated_at = Utc::now();
+                let _ = mutated.send(state);
+            }
+        };
+        tokio::join!(io, apply).0
     }
 
     async fn delete(&self, run_id: WorkflowRunId) -> WorkflowResult<()> {
@@ -667,11 +675,32 @@ impl<D: WorkflowData> StateStore<D> for SqliteStore<D> {
         entry: JournalEntry,
     ) -> WorkflowResult<u64> {
         let conn = Arc::clone(&self.conn);
+        let owner = self.executor.clone();
         blocking(move || {
-            let conn = conn
+            let mut conn = conn
                 .lock()
                 .map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
-            journal::append(&conn, &run_id.to_string(), &entry)
+            let Some(owner) = owner else {
+                return journal::append(&conn, &run_id.to_string(), &entry);
+            };
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| WorkflowError::Store(format!("begin journal: {e}")))?;
+            let owns: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM workflow_runs
+                 WHERE id=?1 AND json_extract(state_json,'$.lease.owner')=?2)",
+                    params![run_id.to_string(), owner.as_ref()],
+                    |r| r.get(0),
+                )
+                .map_err(|e| WorkflowError::Store(format!("journal lease: {e}")))?;
+            if !owns {
+                return Err(WorkflowError::Paused(run_id));
+            }
+            let seq = journal::append(&tx, &run_id.to_string(), &entry)?;
+            tx.commit()
+                .map_err(|e| WorkflowError::Store(format!("commit journal: {e}")))?;
+            Ok(seq)
         })
         .await
     }
@@ -868,17 +897,19 @@ mod tests {
 
     /// Concurrent `update()` calls on the same run must not lose mutations —
     /// each increments `value` by 1, so N concurrent updates must land N
-    /// increments. Without `update_lock`, two updates can both load the
-    /// pre-increment value and the second write clobbers the first.
+    /// increments, even through independently opened database connections.
     #[tokio::test]
     async fn concurrent_updates_on_same_run_do_not_lose_writes() {
-        let store = SqliteStore::<TestData>::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workflow.db");
+        let store = SqliteStore::<TestData>::open_file(&path).unwrap();
+        let other = SqliteStore::<TestData>::open_file(&path).unwrap();
         let original = state(&store).await;
 
         const N: usize = 20;
         let mut tasks = Vec::with_capacity(N);
-        for _ in 0..N {
-            let store = store.clone();
+        for i in 0..N {
+            let store = if i % 2 == 0 { &store } else { &other }.clone();
             tasks.push(tokio::spawn(async move {
                 store
                     .update(original.run_id, |s| s.context.data.value += 1)
@@ -1037,6 +1068,7 @@ mod tests {
 
         let store = SqliteStore::<TestData> {
             conn: Arc::new(Mutex::new(conn)),
+            executor: None,
             update_lock: Arc::new(tokio::sync::Mutex::new(())),
             _marker: PhantomData,
         };

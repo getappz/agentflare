@@ -1550,7 +1550,7 @@ pub(crate) fn run_or_resume_with_sender(
                                  (taken over {MAX_RUN_TAKEOVERS} times); giving up"
                             ));
                         }
-                        if resume_with_message_custody(eng, run_id, &heartbeat_owner, None, &crate::db::agentflare_db_path()).await? {
+                        if resume_with_message_custody(eng, run_id, &heartbeat_owner, None, &crate::db::agentflare_db_path()).await.map_err(|e| e.to_string())? {
                             eprintln!(
                                 "work_item_pipeline: item {}: took over orphaned run {run_id}",
                                 item.id
@@ -1722,7 +1722,8 @@ async fn adopt_existing_run(
             Some(target_branch),
             &crate::db::agentflare_db_path(),
         )
-        .await?
+        .await
+        .map_err(|e| e.to_string())?
     {
         eprintln!("work_item_pipeline: took over orphaned run {run_id} for this dispatch");
     }

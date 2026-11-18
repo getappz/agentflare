@@ -35,6 +35,7 @@ impl<D: WorkflowData> SqliteStore<D> {
         operation: BudgetOperation,
     ) -> WorkflowResult<BudgetUpdate> {
         let conn = Arc::clone(&self.conn);
+        let owner = self.executor.clone();
         blocking(move || {
             let mut conn = conn.lock().map_err(|e| WorkflowError::Store(format!("lock: {e}")))?;
             // Acquire the write lock before reading balances, across processes as well as clones.
@@ -43,6 +44,9 @@ impl<D: WorkflowData> SqliteStore<D> {
             let json: String = tx.query_row("SELECT state_json FROM workflow_runs WHERE id=?1", [run_id.to_string()], |row| row.get(0))
                 .optional().map_err(|e| WorkflowError::Store(format!("load budget run: {e}")))?.ok_or(WorkflowError::NotFound(run_id))?;
             let state = Self::deserialize(&json)?;
+            if matches!(&operation, BudgetOperation::Reserve { .. }) {
+                state.check_executor(owner.as_deref())?;
+            }
             let snapshot = matches!(&operation, BudgetOperation::Snapshot);
             if matches!(&operation, BudgetOperation::Reserve { .. }) && (state.status.is_terminal() || state.status == WorkflowStatus::Paused) {
                 return Err(crate::budget::error("run is no longer dispatchable"));
