@@ -465,18 +465,19 @@ mod tests {
              exec bash -c \"$*\"\n",
         )
         .unwrap();
+        let fake_cargo = bin.join("cargo");
+        fs::write(&fake_cargo, "#!/bin/sh\nprintf 'cargo ran\\n'\n").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            fs::set_permissions(&fake_lean_ctx, fs::Permissions::from_mode(0o755)).unwrap();
+            for script in [&fake_lean_ctx, &fake_cargo] {
+                fs::set_permissions(script, fs::Permissions::from_mode(0o755)).unwrap();
+            }
         }
 
-        // The fake lean-ctx must win over any real one; bash's own directory
-        // comes next so the fake's `sh`/`wc`/`bash` and the wrapped `cat`
-        // resolve to that same GNU toolset (on Windows, Git's `usr/bin` is not
-        // otherwise on a non-login shell's PATH and `bash` would fall through
-        // to WSL's launcher); and the machine's own installed PATH shims
-        // (which dispatch through lean-ctx themselves) must not take part.
+        // Put the fixtures first and keep nested shells on the same GNU toolset.
+        // On Windows a bare bash could otherwise resolve to the WSL launcher.
+        // Exclude installed agentflare shims so only the Bash dispatcher runs.
         let path = std::env::var_os("PATH").unwrap_or_default();
         let filtered = std::env::join_paths(
             std::iter::once(bin.clone())
@@ -487,7 +488,7 @@ mod tests {
         let posix = |p: &std::path::Path| p.to_string_lossy().replace('\\', "/");
 
         let output = std::process::Command::new(&bash)
-            .args(["-c", "cat /dev/null"])
+            .args(["-c", r#"[ "$(type -t cat)" = file ] && cargo"#])
             .current_dir(&project)
             .env("PATH", filtered)
             .env("BASH_ENV", posix(&bashenv))
@@ -514,6 +515,7 @@ mod tests {
             "wrapped command must still run and succeed after the single lap\nstderr: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        assert_eq!(output.stdout, b"cargo ran\n");
     }
 
     #[test]

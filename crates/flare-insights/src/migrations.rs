@@ -155,6 +155,8 @@ pub fn migrations() -> Migrations<'static> {
                 fingerprint TEXT NOT NULL
             );",
         ),
+        // Refresh cached Claude metadata with the corrected first/last event times.
+        M::up("DELETE FROM ingest_file_cursors WHERE source = 'claude_code' OR source GLOB 'claude_code:project:*';"),
     ])
 }
 
@@ -272,7 +274,7 @@ pub(crate) mod tests {
         let version: i64 = raw
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
     }
 
     #[test]
@@ -301,6 +303,42 @@ pub(crate) mod tests {
             store.load_file_cursors("claude_code").unwrap().len(),
             1,
             "later opens keep new cursors"
+        );
+    }
+
+    #[test]
+    fn timestamp_upgrade_refreshes_global_and_scoped_claude_cursors_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("insights.db");
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            migrations().to_version(&mut conn, 4).unwrap();
+            conn.execute_batch(
+                "INSERT INTO ingest_file_cursors(source, path, mtime_ms, size) VALUES
+                 ('claude_code', '/a.jsonl', 1, 1),
+                 ('claude_code:project:C:/repo', '/a.jsonl', 1, 1),
+                 ('codex', '/b.jsonl', 1, 1);",
+            )
+            .unwrap();
+        }
+        let store = InsightsStore::open(&path).unwrap();
+        assert!(store.load_file_cursors("claude_code").unwrap().is_empty());
+        assert!(store
+            .load_file_cursors("claude_code:project:C:/repo")
+            .unwrap()
+            .is_empty());
+        assert_eq!(store.load_file_cursors("codex").unwrap().len(), 1);
+        store
+            .upsert_file_cursors_batch("claude_code:project:C:/repo", &[("/a.jsonl".into(), 2, 2)])
+            .unwrap();
+        drop(store);
+        let store = InsightsStore::open(&path).unwrap();
+        assert_eq!(
+            store
+                .load_file_cursors("claude_code:project:C:/repo")
+                .unwrap()
+                .len(),
+            1
         );
     }
 

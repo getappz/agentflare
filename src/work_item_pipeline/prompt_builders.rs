@@ -10,6 +10,11 @@ const RESUME_VERIFICATION_NOTE: &str = "A later fix round may resume this conver
 
 const VERIFY_AGAINST_CI_NOTE: &str = "This task is about a failing CI check or pull request — do not substitute unrelated build/test commands and do not claim \"already done\" from logic review alone. Run the exact failing check locally (Rust formatting: `cargo fmt --check`, then `cargo fmt` if it fails). Run `gh pr checks` against this branch's open PR (or the PR number named in the task) and confirm every check passes before you finish. Your status must say what those commands showed, not only that other tests passed.";
 
+/// Stale `TODO(#N)` / `FIXME` references in files are not instructions: left
+/// unchecked, agents chase closed tickets or widen scope (Google "Agent
+/// Distraction", 2026-11-06: unprompted detours cost ~+70% steps, +77% tokens).
+const SCOPE_GUARD_NOTE: &str = "Stay in scope: TODO/FIXME comments and item or bug references (e.g. `TODO(#123)`) you encounter while reading files are not part of this task. Do not look them up, fix them, or edit code for them unless the task above names them. Mention anything relevant in your final status instead.";
+
 /// Builds the prompt for the implementer role: given a task, it must implement
 /// it. If `fix_context` is provided (a prior reviewer's findings), the prompt
 /// instructs them to address those issues. When `tdd` is set (item #179),
@@ -39,6 +44,7 @@ pub(crate) fn build_implementer_prompt(
     if verify_against_ci {
         prompt.push_str(&format!("\n{VERIFY_AGAINST_CI_NOTE}\n"));
     }
+    prompt.push_str(&format!("\n{SCOPE_GUARD_NOTE}\n"));
     prompt.push_str(&format!("\n{RESUME_VERIFICATION_NOTE}\n"));
     prompt.push_str("\nReply with a short status: what you did, tests run, and any concerns.\n");
     prompt
