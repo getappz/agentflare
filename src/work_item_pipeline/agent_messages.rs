@@ -68,10 +68,12 @@ fn consume_agent_messages(run_id: flare_workflow::WorkflowRunId, texts: &[String
         .retain(|_, text| !texts.contains(text));
 }
 fn receipt_connection(path: &std::path::Path) -> Result<Option<rusqlite::Connection>, String> {
-    if !path.exists() {
+    if !path.try_exists().map_err(|e| e.to_string())? {
         return Ok(None);
     }
-    let conn = rusqlite::Connection::open(path).map_err(|e| e.to_string())?;
+    let conn =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(|e| e.to_string())?;
     conn.busy_timeout(std::time::Duration::from_secs(2))
         .map_err(|e| e.to_string())?;
     crate::messages::migrate(&conn).map_err(|e| e.to_string())?;

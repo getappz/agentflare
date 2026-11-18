@@ -44,6 +44,17 @@ fn forget_outbox(run: flare_workflow::WorkflowRunId) {
     message_outboxes().lock().unwrap().remove(&run);
 }
 
+#[test]
+fn receipt_database_distinguishes_missing_from_uninspectable() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert!(
+        receipt_connection(&tmp.path().join("missing.db"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(receipt_connection(&tmp.path().join("invalid\0name")).is_err());
+}
+
 #[tokio::test]
 async fn review_regression_preserves_numeric_message_order() {
     let tmp = tempfile::tempdir().unwrap();

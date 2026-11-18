@@ -68,6 +68,9 @@ pub(crate) fn reserve_for_run(
             "run and recipient must be nonempty".into(),
         ));
     }
+    if !super::has_undelivered(conn, to_key)? {
+        return unresolved_for_run(conn, run_id);
+    }
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let existing = unresolved_for_run(&tx, run_id)?;
     if !existing.is_empty() {
