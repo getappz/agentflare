@@ -97,7 +97,66 @@ struct AppState {
 /// `MODEL_OPUS`, ...) — `cargo test` runs tests in parallel by default, and
 /// unsynchronized `env::set_var` calls across tests race.
 #[cfg(test)]
-pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) struct TestEnvGuard {
+    previous_home: Option<std::ffi::OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for TestEnvGuard {
+    fn drop(&mut self) {
+        if let Some(value) = &self.previous_home {
+            std::env::set_var("AGENTFLARE_HOME_OVERRIDE", value);
+        } else {
+            std::env::remove_var("AGENTFLARE_HOME_OVERRIDE");
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> TestEnvGuard {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    TestEnvGuard {
+        previous_home: std::env::var_os("AGENTFLARE_HOME_OVERRIDE"),
+        _lock: lock,
+    }
+}
+
+#[test]
+fn home_override_survives_test_env_scope() {
+    const CHILD: &str = "FLARE_PROXY_HOME_RESTORE_CHILD";
+    const HOME: &str = "AGENTFLARE_HOME_OVERRIDE";
+    if std::env::var_os(CHILD).is_none() {
+        for inherited in [true, false] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", "home_override_survives_test_env_scope"])
+                .env(CHILD, "1");
+            if inherited {
+                child.env(HOME, std::env::temp_dir().join("proxy-outer-test-home"));
+            } else {
+                child.env_remove(HOME);
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "inherited={inherited}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        return;
+    }
+    let before = std::env::var_os(HOME);
+    for unwind in [false, true] {
+        let result = std::panic::catch_unwind(|| {
+            let _guard = test_env_lock();
+            std::env::set_var(HOME, std::env::temp_dir().join("proxy-scoped-test-home"));
+            assert!(!unwind, "exercise panic cleanup");
+            std::env::remove_var(HOME);
+        });
+        assert_eq!(result.is_err(), unwind);
+        assert_eq!(std::env::var_os(HOME), before);
+    }
 }
