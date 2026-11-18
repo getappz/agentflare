@@ -325,6 +325,44 @@ async fn missing_receiver_and_failed_patch_leave_visible_unknown_receipts() {
 }
 
 #[tokio::test]
+async fn regaining_a_lease_preserves_the_previous_executors_consumption() {
+    let tmp = tempfile::tempdir().unwrap();
+    let messages = tmp.path().join("messages.db");
+    let c = message_db(&messages);
+    enqueue(&c);
+    let (eng, run) = saved_run(&tmp.path().join("workflow.db")).await;
+    prepare_message_delivery(&eng, run, "agent:one", None, &messages, true)
+        .await
+        .unwrap();
+    // A different executor consumed the correction and checkpointed its turn.
+    eng.state_store()
+        .update(run, |s| {
+            s.context.data.pending_message_receipts.clear();
+            s.context.data.pending_corrections.clear();
+        })
+        .await
+        .unwrap();
+    eng.register_workflow(WorkflowDefinition::new(WORKFLOW_ID, "reacquire").add_step(
+        StepDefinition::new(
+            "noop",
+            "noop",
+            flare_workflow::noop_executor::<WorkItemData>(),
+        ),
+    ))
+    .unwrap();
+    assert!(
+        resume_with_message_custody(&eng, run, "agent:one", None, &messages)
+            .await
+            .unwrap()
+    );
+    let data = eng.get_status(run).await.unwrap().context.data;
+    assert_eq!(data.accepted_message_receipts.len(), 1);
+    assert!(data.pending_corrections.is_empty());
+    assert!(data.pending_message_receipts.is_empty());
+    forget_outbox(run);
+}
+
+#[tokio::test]
 async fn boot_reconciles_before_starting_a_run_without_a_waiter() {
     let tmp = tempfile::tempdir().unwrap();
     let messages = tmp.path().join("messages.db");

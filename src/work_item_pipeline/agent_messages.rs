@@ -145,6 +145,7 @@ async fn prepare_message_delivery(
             pending
                 .entries
                 .clone_from(&state.context.data.pending_message_receipts);
+            pending.accepted.clear();
             pending.initialized = true;
         }
         pending
@@ -295,6 +296,16 @@ async fn resume_with_message_custody(
     message_path: &std::path::Path,
 ) -> Result<bool, String> {
     eng.resume_run_with(run_id, || async {
+        // Another executor may have consumed or accepted messages since we last held the lease.
+        let outbox = message_outbox(run_id);
+        {
+            let _operation = outbox.operation.lock().await;
+            outbox
+                .data
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .initialized = false;
+        }
         prepare_message_delivery(eng, run_id, owner, target_branch, message_path, false)
             .await
             .map_err(WorkflowError::Store)
