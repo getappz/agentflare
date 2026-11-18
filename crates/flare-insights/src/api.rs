@@ -202,10 +202,15 @@ fn route_request(
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
             let source = params.get("source").cloned();
-            let mut sessions = store.list_sessions(limit, offset).unwrap_or_default();
-            if let Some(src) = source {
-                sessions.retain(|s| s.source.as_str() == src);
-            }
+            let sessions = match store.list_sessions_filtered(
+                source.as_deref(),
+                params.get("project").map(String::as_str),
+                limit,
+                offset,
+            ) {
+                Ok(sessions) => sessions,
+                Err(e) => return (500, serde_json::json!({"error": e.to_string()})),
+            };
             serde_json::to_value(&sessions)
                 .unwrap()
                 .as_array()
@@ -363,7 +368,7 @@ th{color:#666; font-weight:600}
 <div class="stats" id="stats"><div class="stat"><div class="label">Loading…</div></div></div>
 <h2>Recent sessions</h2>
 <table id="sessions"><thead><tr><th>Project</th><th>Source</th><th>Turns</th><th>Tools</th><th>Cost</th><th>Updated</th></tr></thead><tbody></tbody></table>
-<p id="status"></p>
+<p id="status" role="status"></p>
 <script>
 function fmtCost(c){ return (c === null || c === undefined) ? '-' : '$' + Number(c).toFixed(2); }
 function fmtTokens(n){
@@ -375,18 +380,24 @@ function fmtTokens(n){
 function esc(s){
   return String(s == null ? '' : s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 }
+async function fetchJson(url){
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(url + ' returned HTTP ' + response.status);
+  return response.json();
+}
 async function load(){
-  const [sessions, stats] = await Promise.all([
-    fetch('/api/sessions?limit=20').then(r => r.json()),
-    fetch('/api/stats').then(r => r.json())
-  ]);
-  document.getElementById('stats').innerHTML = `
+  try {
+    const [sessions, stats] = await Promise.all([
+      fetchJson('/api/sessions?limit=20'),
+      fetchJson('/api/stats')
+    ]);
+    document.getElementById('stats').innerHTML = `
     <div class="stat"><div class="label">Sessions</div><div class="value">${stats.total_sessions ?? 0}</div></div>
     <div class="stat"><div class="label">Tokens</div><div class="value">${fmtTokens(stats.total_tokens)}</div></div>
     <div class="stat"><div class="label">Cost</div><div class="value">${fmtCost(stats.total_cost_usd)}</div></div>
     <div class="stat"><div class="label">Cache read share</div><div class="value">${stats.cache_read_share == null ? '-' : (stats.cache_read_share * 100).toFixed(0) + '%'}</div></div>
-  `;
-  document.querySelector('#sessions tbody').innerHTML = sessions.map(s => `
+    `;
+    document.querySelector('#sessions tbody').innerHTML = sessions.map(s => `
     <tr>
       <td>${esc(s.project)}</td>
       <td>${esc(s.source)}</td>
@@ -395,8 +406,11 @@ async function load(){
       <td>${fmtCost(s.cost && s.cost.total_usd)}</td>
       <td>${esc((s.updated_at || '').replace('T', ' ').slice(0, 16))}</td>
     </tr>
-  `).join('');
-  document.getElementById('status').textContent = 'updated ' + new Date().toLocaleTimeString();
+    `).join('');
+    document.getElementById('status').textContent = 'updated ' + new Date().toLocaleTimeString();
+  } catch (error) {
+    document.getElementById('status').textContent = 'Refresh failed: ' + error.message;
+  }
 }
 
 load();
@@ -453,6 +467,39 @@ mod urlencoding {
 #[cfg(test)]
 mod forensics_route_tests {
     use super::*;
+
+    #[test]
+    fn sessions_route_filters_before_pagination() {
+        let store = InsightsStore::open_in_memory().unwrap();
+        for (id, source, day, path) in [
+            ("older", "codex", 1, "/demo"),
+            ("newer", "codex", 2, "/demo"),
+            ("other-project", "codex", 3, "/else"),
+            ("other-source", "claude_code", 4, "/demo"),
+        ] {
+            let mut session = crate::migrations::tests::session(id);
+            session.source = serde_json::from_value(serde_json::json!(source)).unwrap();
+            session.cwd = Some(path.into());
+            session.updated_at =
+                chrono::DateTime::parse_from_rfc3339(&format!("2026-01-0{day}T00:00:00Z"))
+                    .unwrap()
+                    .into();
+            store.upsert_session(&session).unwrap();
+        }
+        let state = Arc::new(AppState {
+            read_store: Mutex::new(store),
+            write_store: Mutex::new(InsightsStore::open_in_memory().unwrap()),
+            db_path: PathBuf::new(),
+            stats_cache: Mutex::new(None),
+        });
+        let (status, body) = route_request(
+            &state,
+            "/api/sessions",
+            Some("source=codex&project=/demo&limit=1&offset=1"),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(body[0]["id"], "older");
+    }
 
     #[test]
     fn forensics_route_returns_report() {
