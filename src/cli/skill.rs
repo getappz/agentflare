@@ -155,12 +155,26 @@ fn home_skills() -> PathBuf {
     crate::paths::home().join(AGENTFLARE_SKILLS)
 }
 
+/// Normalize short host prefixes (`gh:`, `gl:`) to the `github:` / `gitlab:`
+/// prefixes understood by `skill::source::parse_source`.
+fn normalize_source_shorthand(url: &str) -> std::borrow::Cow<'_, str> {
+    let trimmed = url.trim();
+    if let Some(rest) = trimmed.strip_prefix("gh:") {
+        std::borrow::Cow::Owned(format!("github:{rest}"))
+    } else if let Some(rest) = trimmed.strip_prefix("gl:") {
+        std::borrow::Cow::Owned(format!("gitlab:{rest}"))
+    } else {
+        std::borrow::Cow::Borrowed(trimmed)
+    }
+}
+
 async fn try_install_from_source(
     manager: &SkillManager,
     url: &str,
     name: &str,
 ) -> Result<bool, skill::error::SkillError> {
-    let parsed = parse_source(url);
+    let normalized = normalize_source_shorthand(url);
+    let parsed = parse_source(&normalized);
     if parsed.source_type == skill::types::SourceType::Local {
         let lp = parsed
             .local_path
@@ -1234,6 +1248,38 @@ mod tests {
             format!("---\nname: {name}\ndescription: {description}\n---\nBody.\n"),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn normalize_source_shorthand_expands_gh_and_gl_for_parse_source() {
+        let gh = parse_source(&normalize_source_shorthand("gh:getappz/skill-registry"));
+        assert_eq!(gh.source_type, skill::types::SourceType::Github);
+        assert_eq!(gh.url, "https://github.com/getappz/skill-registry.git");
+
+        let gh_ref = parse_source(&normalize_source_shorthand(
+            " gh:cloudflare/security-audit-skill#main ",
+        ));
+        assert_eq!(gh_ref.source_type, skill::types::SourceType::Github);
+        assert_eq!(
+            gh_ref.url,
+            "https://github.com/cloudflare/security-audit-skill.git"
+        );
+        assert_eq!(gh_ref.git_ref.as_deref(), Some("main"));
+
+        let gh_sub = parse_source(&normalize_source_shorthand("gh:owner/repo/skills/sub"));
+        assert_eq!(gh_sub.source_type, skill::types::SourceType::Github);
+        assert_eq!(gh_sub.url, "https://github.com/owner/repo.git");
+        assert_eq!(gh_sub.subpath.as_deref(), Some("skills/sub"));
+
+        let gl = parse_source(&normalize_source_shorthand("gl:group/skills"));
+        assert_eq!(gl.source_type, skill::types::SourceType::Gitlab);
+        assert_eq!(gl.url, "https://gitlab.com/group/skills.git");
+
+        let https = parse_source(&normalize_source_shorthand(
+            "https://github.com/example/skills",
+        ));
+        assert_eq!(https.source_type, skill::types::SourceType::Github);
+        assert_eq!(https.url, "https://github.com/example/skills.git");
     }
 
     #[test]
