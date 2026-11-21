@@ -161,6 +161,7 @@ pub enum Commands {
     /// Review a diff, PR, or branch for correctness and simplification.
     Review(review::ReviewArgs),
     /// Discover, install, and manage skills for coding agents.
+    #[command(visible_alias = "skills")]
     Skill(skill::SkillArgs),
     /// Read and write agentflare's cross-session agent memory.
     Memory(memory::MemoryArgs),

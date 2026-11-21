@@ -70,7 +70,7 @@ pub(crate) struct SkillRequest {
     #[schemars(description = "What you need to do; keyword-style works best (search)")]
     #[serde(default)]
     pub(crate) query: Option<String>,
-    #[schemars(description = "Skill name; qualify as 'source:name' if ambiguous (load)")]
+    #[schemars(description = "Skill name, source:name, or GitHub skill URL (load)")]
     #[serde(default)]
     pub(crate) name: Option<String>,
     #[schemars(description = "Max results (default 5) (search)")]
