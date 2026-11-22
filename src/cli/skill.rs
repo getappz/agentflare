@@ -1,20 +1,19 @@
 use clap::{Args, Subcommand};
-use skill::agents::AgentRegistry;
 use skill::git::clone_repo;
-use skill::manager::SkillManager;
 use skill::skills::discover_skills;
 use skill::source::parse_source;
-use skill::types::{
-    AgentConfig, AgentId, DiscoverOptions, InstallMode, InstallOptions, InstallScope,
-};
+use skill::types::DiscoverOptions;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+mod resolution;
+pub(crate) use resolution::{catalog_hits, ensure_installed, github_source};
+use skill::error::SkillError;
 
 #[derive(Subcommand)]
 pub enum SkillAction {
     /// Search the indexed skill catalog by name or description.
     Search { query: String },
-    /// Install a skill by name into this agent's config.
+    /// Install a registry skill or GitHub source into ~/.agentflare/skills.
     Install { name: String },
     /// List installed skills.
     List,
@@ -61,12 +60,9 @@ pub enum SkillAction {
         #[arg(long)]
         yes: bool,
     },
-    /// Print the version-matched guide for a skill, served from this binary.
-    /// Mirrors Orca's `skills get`: the text can never drift from the binary
-    /// that will run the workflow. Builtins (`pm`, flare-code modes) come
-    /// from `include_str!`; anything else resolves from installed skills.
+    /// Load a skill guide, installing it into Flare on demand.
     Get {
-        /// Skill name (e.g. `pm`, `review`, or an installed skill).
+        /// Skill name or GitHub URL.
         name: String,
         /// Include companion references inline after the guide.
         #[arg(long)]
@@ -107,32 +103,6 @@ pub struct SkillArgs {
 
 const AGENTFLARE_SKILLS: &str = ".agentflare/skills";
 
-fn agentflare_config(home: &Path) -> AgentConfig {
-    AgentConfig {
-        name: AgentId::new("agentflare"),
-        display_name: "Agentflare".into(),
-        skills_dir: AGENTFLARE_SKILLS.into(),
-        global_skills_dir: Some(home.join(AGENTFLARE_SKILLS)),
-        detect_paths: vec![],
-        show_in_universal_list: false,
-    }
-}
-
-fn build_manager() -> SkillManager {
-    let home = crate::paths::home();
-    let mut registry = AgentRegistry::with_defaults();
-    registry.register(agentflare_config(&home));
-    SkillManager::builder().agents(registry).build()
-}
-
-fn install_opts() -> InstallOptions {
-    InstallOptions {
-        scope: InstallScope::Global,
-        mode: InstallMode::Copy,
-        ..Default::default()
-    }
-}
-
 fn load_registries() -> Vec<String> {
     let path = crate::paths::agentflare_dir().join("registries.json");
     std::fs::read_to_string(&path)
@@ -151,7 +121,7 @@ fn save_registries(registries: &[String]) {
     }
 }
 
-fn home_skills() -> PathBuf {
+pub(crate) fn home_skills() -> PathBuf {
     crate::paths::home().join(AGENTFLARE_SKILLS)
 }
 
@@ -168,38 +138,11 @@ fn normalize_source_shorthand(url: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-async fn try_install_from_source(
-    manager: &SkillManager,
-    url: &str,
-    name: &str,
-) -> Result<bool, skill::error::SkillError> {
-    let normalized = normalize_source_shorthand(url);
-    let parsed = parse_source(&normalized);
-    if parsed.source_type == skill::types::SourceType::Local {
-        let lp = parsed
-            .local_path
-            .as_deref()
-            .unwrap_or_else(|| Path::new("."));
-        let entries = discover_skills(lp, None, &DiscoverOptions::default()).await?;
-        if let Some(skill) = entries.into_iter().find(|s| s.name == name) {
-            manager
-                .install_skill(&skill, &AgentId::new("agentflare"), &install_opts())
-                .await?;
-            return Ok(true);
-        }
-        return Ok(false);
-    }
-
-    let repo_url = parsed.url.as_str();
-    let temp = clone_repo(repo_url, parsed.git_ref.as_deref()).await?;
-    let entries = match parsed.subpath.as_ref() {
-        Some(sub) => discover_skills(temp.path(), Some(sub), &DiscoverOptions::default()).await?,
-        None => discover_skills(temp.path(), None, &DiscoverOptions::default()).await?,
-    };
+async fn try_install_from_source(url: &str, name: &str) -> Result<bool, skill::error::SkillError> {
+    let (_checkout, root, entries) =
+        resolution::entries(&parse_source(&normalize_source_shorthand(url))).await?;
     if let Some(skill) = entries.into_iter().find(|s| s.name == name) {
-        manager
-            .install_skill(&skill, &AgentId::new("agentflare"), &install_opts())
-            .await?;
+        resolution::stage(&skill, &root)?;
         return Ok(true);
     }
     Ok(false)
@@ -218,10 +161,9 @@ pub(crate) async fn install_from_registries(
     if !is_plain_skill_name(name) {
         return Ok(None);
     }
-    let manager = build_manager();
     let mut first_err = None;
     for url in &load_registries() {
-        match try_install_from_source(&manager, url, name).await {
+        match try_install_from_source(url, name).await {
             Ok(true) => return Ok(Some(redact_url_credentials(url))),
             Ok(false) => {}
             Err(e) => {
@@ -305,27 +247,22 @@ pub(crate) fn is_plain_skill_name(name: &str) -> bool {
 }
 
 async fn run_install(name: &str) -> Result<(), skill::error::SkillError> {
-    if home_skills().join(name).join("SKILL.md").exists() {
-        crate::ui::skip(&format!("'{name}' already installed"));
-        return Ok(());
+    let (installed, source) = ensure_installed(name, true).await?;
+    if let Some(source) = source {
+        crate::ui::success(&format!("installed '{installed}' from {source}"));
+    } else {
+        crate::ui::skip(&format!("'{installed}' already installed"));
     }
-
-    if install_from_registries(name).await?.is_some() {
-        crate::ui::success(&format!("installed '{name}'"));
-        return Ok(());
-    }
-
-    crate::ui::error(&format!("skill '{name}' not found in any registry"));
-    std::process::exit(1);
+    Ok(())
 }
 
 async fn run_list() -> Result<(), skill::error::SkillError> {
-    let manager = build_manager();
-    let opts = skill::types::ListOptions {
-        scope: Some(InstallScope::Global),
-        ..Default::default()
+    let root = home_skills();
+    let installed = if root.is_dir() {
+        discover_skills(&root, None, &DiscoverOptions::default()).await?
+    } else {
+        Vec::new()
     };
-    let installed = manager.list_installed(&opts).await?;
     if installed.is_empty() {
         crate::ui::info("no skills installed");
         return Ok(());
@@ -337,42 +274,13 @@ async fn run_list() -> Result<(), skill::error::SkillError> {
 }
 
 async fn run_remove(name: &str) -> Result<(), skill::error::SkillError> {
-    let manager = build_manager();
-    let opts = skill::types::RemoveOptions {
-        scope: InstallScope::Global,
-        cwd: Some(crate::paths::home()),
-        ..Default::default()
-    };
-    manager.remove_skills(&[name.to_string()], &opts).await?;
+    if !is_plain_skill_name(name) {
+        return Err(SkillError::InvalidSource("expected a skill name".into()));
+    }
+    let dir = home_skills().join(name);
+    std::fs::remove_dir_all(&dir).map_err(|e| SkillError::io(dir, e))?;
     crate::ui::success(&format!("removed '{name}'"));
     Ok(())
-}
-
-fn run_search(query: &str) {
-    let skills_dir = home_skills();
-    if skills_dir.is_dir() {
-        let matched: Vec<_> = std::fs::read_dir(&skills_dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter(|e| {
-                let name = e.file_name();
-                let n = name.to_string_lossy();
-                n.to_lowercase().contains(&query.to_lowercase())
-            })
-            .collect();
-        if !matched.is_empty() {
-            println!("── installed ──");
-            for e in &matched {
-                println!("  {}", e.file_name().to_string_lossy());
-            }
-        }
-    }
-    println!("── registries ──");
-    for r in load_registries() {
-        println!("  {r}");
-    }
-    crate::ui::info("use `agentflare skill install <name>` to install");
 }
 
 fn run_registry(action: RegistryAction) {
@@ -999,6 +907,13 @@ fn resolve_guide(name: &str) -> Option<(String, Vec<(String, String)>)> {
     if let Some(body) = flare_code::sub_skills::get(name) {
         return Some((body.to_string(), Vec::new()));
     }
+    installed_guide(name)
+}
+
+fn installed_guide(name: &str) -> Option<(String, Vec<(String, String)>)> {
+    if !is_plain_skill_name(name) {
+        return None;
+    }
     let dir = home_skills().join(name);
     let body = std::fs::read_to_string(dir.join("SKILL.md")).ok()?;
     let mut companions = Vec::new();
@@ -1017,7 +932,7 @@ fn resolve_guide(name: &str) -> Option<(String, Vec<(String, String)>)> {
                 && let Ok(content) = std::fs::read_to_string(&p)
                 && let Ok(rel) = p
                     .strip_prefix(&dir)
-                    .map(|r| r.to_string_lossy().into_owned())
+                    .map(|r| r.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"))
             {
                 companions.push((rel, content));
             }
@@ -1027,10 +942,24 @@ fn resolve_guide(name: &str) -> Option<(String, Vec<(String, String)>)> {
     Some((body, companions))
 }
 
-fn run_get(name: &str, full: bool, reference: Option<&str>, references: bool) {
-    let Some((body, companions)) = resolve_guide(name) else {
+async fn run_get(name: &str, full: bool, reference: Option<&str>, references: bool) {
+    let guide = match resolve_guide(name) {
+        Some(guide) => Some(guide),
+        None => match ensure_installed(name, false).await {
+            Ok((resolved, _)) => installed_guide(&resolved),
+            Err(SkillError::SkillNotFound(_)) => None,
+            Err(e) => {
+                crate::ui::error(&e.to_string());
+                std::process::exit(1);
+            }
+        },
+    };
+    let Some((body, companions)) = guide else {
         crate::ui::error(&format!("skill '{name}' not found"));
         crate::ui::info("use `agentflare skill list` for installed skills");
+        crate::ui::info(&format!(
+            "`agentflare skill install {name}` also searches the public skills.sh directory"
+        ));
         std::process::exit(1);
     };
     if references {
@@ -1065,7 +994,7 @@ impl SkillArgs {
     pub fn run(self) {
         let rt = tokio::runtime::Runtime::new().unwrap();
         match self.action {
-            SkillAction::Search { query } => run_search(&query),
+            SkillAction::Search { query } => rt.block_on(resolution::search(&query)),
             SkillAction::Install { name } => {
                 if let Err(e) = rt.block_on(run_install(&name)) {
                     crate::ui::error(&e.to_string());
@@ -1130,7 +1059,7 @@ impl SkillArgs {
                 full,
                 reference,
                 references,
-            } => run_get(&name, full, reference.as_deref(), references),
+            } => rt.block_on(run_get(&name, full, reference.as_deref(), references)),
         }
     }
 }
@@ -1292,9 +1221,8 @@ mod tests {
                 "A test skill for install verification",
             );
 
-            let manager = build_manager();
             let url = src.path().to_string_lossy().into_owned();
-            let found = block_on(try_install_from_source(&manager, &url, "my-test-skill")).unwrap();
+            let found = block_on(try_install_from_source(&url, "my-test-skill")).unwrap();
             assert!(
                 found,
                 "expected try_install_from_source to find and install the skill"
@@ -1314,9 +1242,8 @@ mod tests {
             let src = tempfile::tempdir().unwrap();
             write_fixture_skill(src.path(), "other-skill", "Unrelated skill");
 
-            let manager = build_manager();
             let url = src.path().to_string_lossy().into_owned();
-            let found = block_on(try_install_from_source(&manager, &url, "my-test-skill")).unwrap();
+            let found = block_on(try_install_from_source(&url, "my-test-skill")).unwrap();
             assert!(!found);
         });
     }

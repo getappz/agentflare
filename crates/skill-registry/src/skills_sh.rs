@@ -64,8 +64,7 @@ fn hit(s: Skill) -> Option<SkillHit> {
     }
     // Our installs stage into ~/.agentflare/skills (not per-agent dirs),
     // resolving a plain skill name against the configured registries.
-    let install_hint =
-        format!("agentflare skill registry add gh:{source} && agentflare skill install {skill_id}");
+    let install_hint = format!("agentflare skill install github:{source}@{skill_id}");
     Some(SkillHit::external(
         skill_id.clone(),
         "skills.sh",
@@ -77,6 +76,19 @@ fn hit(s: Skill) -> Option<SkillHit> {
 
 /// Up to `limit` skills.sh results for `query`, in the directory's own ranking.
 pub fn search_skills_sh(query: &str, limit: usize) -> Vec<SkillHit> {
+    search(query, limit).into_iter().filter_map(hit).collect()
+}
+
+/// Resolve an exact skill ID to its repository, following directory ranking.
+pub fn exact_github_source(name: &str) -> Option<String> {
+    search(name, 10).into_iter().find_map(|skill| {
+        let source = skill.source.as_deref()?;
+        (skill.skill_id.as_deref() == Some(name) && valid_source(source))
+            .then(|| format!("github:{source}"))
+    })
+}
+
+fn search(query: &str, limit: usize) -> Vec<Skill> {
     let query = query.trim();
     let limit = limit.min(MAX_REMOTE_LIMIT);
     if query.is_empty() || limit == 0 {
@@ -89,7 +101,7 @@ pub fn search_skills_sh(query: &str, limit: usize) -> Vec<SkillHit> {
         .call()
         .ok()
         .and_then(|r| r.into_json::<Resp>().ok())
-        .map(|r| r.skills.into_iter().filter_map(hit).take(limit).collect())
+        .map(|r| r.skills.into_iter().take(limit).collect())
         .unwrap_or_default()
 }
 
@@ -140,7 +152,7 @@ mod tests {
         assert_eq!(h.description, "o/r · 42 installs");
         assert_eq!(
             h.install_hint.as_deref(),
-            Some("agentflare skill registry add gh:o/r && agentflare skill install egm-draft")
+            Some("agentflare skill install github:o/r@egm-draft")
         );
         assert_eq!(
             h.remote_url.as_deref(),

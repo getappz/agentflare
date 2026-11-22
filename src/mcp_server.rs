@@ -497,7 +497,7 @@ impl AgentflareMcp {
         Ok(result.to_string())
     }
     #[tool(
-        description = "Skill operations — search installed skills or load one by name. Single consolidated tool with `action` field (search|load)."
+        description = "Search skills or load a skill by name or GitHub URL. Load installs missing skills into Flare. Actions: search|load."
     )]
     async fn skill(&self, Parameters(req): Parameters<SkillRequest>) -> Result<String, ErrorData> {
         self.skill_impl(req).await
@@ -514,7 +514,7 @@ impl AgentflareMcp {
     }
 
     #[tool(
-        description = "Create a new skill from a template. Scaffolds a skill directory with SKILL.md frontmatter and body. Templates: web-development, api-development, testing, base (default). Writes to .claude/skills/<name>/ by default."
+        description = "Create a new skill from a template. Scaffolds a skill directory with SKILL.md frontmatter and body. Templates: web-development, api-development, testing, base (default). Writes to ~/.agentflare/skills/<name>/ by default."
     )]
     async fn skill_create(
         &self,
