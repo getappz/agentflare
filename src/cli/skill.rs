@@ -139,10 +139,10 @@ fn normalize_source_shorthand(url: &str) -> std::borrow::Cow<'_, str> {
 }
 
 async fn try_install_from_source(url: &str, name: &str) -> Result<bool, skill::error::SkillError> {
-    let (_checkout, entries) =
+    let (_checkout, root, entries) =
         resolution::entries(&parse_source(&normalize_source_shorthand(url))).await?;
     if let Some(skill) = entries.into_iter().find(|s| s.name == name) {
-        resolution::stage(&skill)?;
+        resolution::stage(&skill, &root)?;
         return Ok(true);
     }
     Ok(false)
@@ -247,7 +247,7 @@ pub(crate) fn is_plain_skill_name(name: &str) -> bool {
 }
 
 async fn run_install(name: &str) -> Result<(), skill::error::SkillError> {
-    let (installed, source) = ensure_installed(name).await?;
+    let (installed, source) = ensure_installed(name, true).await?;
     if let Some(source) = source {
         crate::ui::success(&format!("installed '{installed}' from {source}"));
     } else {
@@ -945,8 +945,9 @@ fn installed_guide(name: &str) -> Option<(String, Vec<(String, String)>)> {
 async fn run_get(name: &str, full: bool, reference: Option<&str>, references: bool) {
     let guide = match resolve_guide(name) {
         Some(guide) => Some(guide),
-        None => match ensure_installed(name).await {
+        None => match ensure_installed(name, false).await {
             Ok((resolved, _)) => installed_guide(&resolved),
+            Err(SkillError::SkillNotFound(_)) => None,
             Err(e) => {
                 crate::ui::error(&e.to_string());
                 std::process::exit(1);
@@ -956,6 +957,9 @@ async fn run_get(name: &str, full: bool, reference: Option<&str>, references: bo
     let Some((body, companions)) = guide else {
         crate::ui::error(&format!("skill '{name}' not found"));
         crate::ui::info("use `agentflare skill list` for installed skills");
+        crate::ui::info(&format!(
+            "`agentflare skill install {name}` also searches the public skills.sh directory"
+        ));
         std::process::exit(1);
     };
     if references {

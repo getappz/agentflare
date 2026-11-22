@@ -59,14 +59,22 @@ impl AgentflareMcp {
                 // "No good local match": weak hits are dropped so the external
                 // fallbacks below get the chance to fill the open slots.
                 let mut local: Vec<_> = local.into_iter().filter(|h| h.is_confident()).collect();
-                if local.len() < limit {
-                    let registry = crate::cli::skill::catalog_hits(&query, limit, false).await;
+                // Configured local registries take at most half of the open
+                // slots: their word match carries no confidence score, so they
+                // must not starve the skills.sh fallback. Remote registries
+                // would need a git clone per search and are skipped here.
+                let room = limit.saturating_sub(local.len()).div_ceil(2);
+                if room > 0 {
+                    let registry =
+                        crate::cli::skill::catalog_hits(&query, limit, false, false).await;
+                    let mut added = 0;
                     for hit in registry {
+                        if added == room {
+                            break;
+                        }
                         if !local.iter().any(|h| h.name == hit.name) {
                             local.push(hit);
-                            if local.len() == limit {
-                                break;
-                            }
+                            added += 1;
                         }
                     }
                 }
@@ -118,19 +126,12 @@ impl AgentflareMcp {
                 let mut installed_from = None;
                 let mut github_install = false;
                 let name = if crate::cli::skill::github_source(&name).is_some() {
-                    let (resolved, source) = crate::cli::skill::ensure_installed(&name)
+                    let (resolved, source) = crate::cli::skill::ensure_installed(&name, false)
                         .await
                         .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
                     installed_from = source;
                     github_install = true;
                     format!("agentflare-user:{resolved}")
-                } else if crate::cli::skill::is_plain_skill_name(&name)
-                    && crate::cli::skill::home_skills()
-                        .join(&name)
-                        .join("SKILL.md")
-                        .is_file()
-                {
-                    format!("agentflare-user:{name}")
                 } else {
                     name
                 };
@@ -146,11 +147,11 @@ impl AgentflareMcp {
                 if matches!(result, Err(skill_registry::LoadError::NotFound(_)))
                     && crate::cli::skill::is_plain_skill_name(&name)
                 {
-                    match crate::cli::skill::ensure_installed(&name).await {
-                        Ok((_, source)) => {
+                    match crate::cli::skill::ensure_installed(&name, false).await {
+                        Ok((resolved, source)) => {
                             installed_from = source;
                             result = self.with_forced_fresh_registry(|reg| {
-                                reg.load(&format!("agentflare-user:{name}"), req.original)
+                                reg.load(&format!("agentflare-user:{resolved}"), req.original)
                             })?;
                         }
                         Err(::skill::error::SkillError::SkillNotFound(_)) => {}

@@ -22,6 +22,12 @@ fn search_install_get_and_remove_stay_in_flare() {
     skill(&registry, "catalog", "root skill");
     skill(&registry.join("demo"), "demo", "registry copy");
     skill(&repo.join("skills/demo"), "demo", "github copy");
+    // Directory name collides with a registry skill; frontmatter name differs.
+    skill(
+        &repo.join("skills/catalog"),
+        "lookalike",
+        "github lookalike",
+    );
     for args in [
         vec!["init", "-b", "main"],
         vec!["add", "."],
@@ -81,6 +87,20 @@ fn search_install_get_and_remove_stay_in_flare() {
     };
     assert!(run(&["search", "marigold"]).contains("demo"));
     run(&["install", &tree]);
+    // A browser-copied URL may carry a query string.
+    run(&[
+        "install",
+        &format!("{github}/tree/main/skills/catalog?plain=1"),
+    ]);
+    let skills = home.join(".agentflare/skills");
+    assert!(skills.join("lookalike/SKILL.md").is_file());
+    assert!(!skills.join("catalog").exists());
+    run(&["remove", "lookalike"]);
+    // A root-level skill must not swallow the nested skills beside it.
+    run(&["install", "catalog"]);
+    assert!(skills.join("catalog/reference/example.md").is_file());
+    assert!(!skills.join("catalog/demo").exists());
+    run(&["remove", "catalog"]);
     assert!(run(&["get", "demo"]).contains("registry copy"));
     run(&["remove", "demo"]);
     fs::write(&conf, "[]").unwrap();

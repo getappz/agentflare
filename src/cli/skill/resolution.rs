@@ -2,6 +2,12 @@ use super::*;
 use skill::types::{ParsedSource, Skill, SourceType};
 
 pub(crate) fn github_source(input: &str) -> Option<ParsedSource> {
+    // A URL copied from the browser may carry ?query or #fragment; in the
+    // gh:/github: shorthands `#` is a git ref, so only strip it from URLs.
+    let input = match input.strip_prefix("https://github.com/") {
+        Some(_) => input.split(['?', '#']).next().unwrap_or(input),
+        None => input,
+    };
     let input = input.trim_end_matches('/');
     if !(input.starts_with("https://github.com/")
         || input.starts_with("gh:")
@@ -17,9 +23,11 @@ pub(crate) fn github_source(input: &str) -> Option<ParsedSource> {
     (parsed.source_type == SourceType::Github).then_some(parsed)
 }
 
+/// Discover the skills in `source`. Returns the checkout guard (remote
+/// sources), the canonical source root, and the skills found under it.
 pub(super) async fn entries(
     source: &ParsedSource,
-) -> Result<(Option<tempfile::TempDir>, Vec<Skill>), SkillError> {
+) -> Result<(Option<tempfile::TempDir>, PathBuf, Vec<Skill>), SkillError> {
     let checkout = if source.source_type == SourceType::Local {
         None
     } else {
@@ -53,56 +61,79 @@ pub(super) async fn entries(
             });
         }
     }
-    Ok((checkout, skills))
+    Ok((checkout, root, skills))
 }
 
-// Publish a complete directory on the same filesystem, including companion files.
-pub(super) fn stage(skill: &Skill) -> Result<(), SkillError> {
+// Publish a complete directory on the same filesystem, including companion
+// files. `root` is the canonical source root that symlinks must stay inside.
+pub(super) fn stage(skill: &Skill, root: &Path) -> Result<(), SkillError> {
     if !is_plain_skill_name(&skill.name) {
         return Err(SkillError::InvalidSource(
             "invalid skill name in frontmatter".into(),
         ));
     }
-    let root = home_skills();
-    std::fs::create_dir_all(&root).map_err(|e| SkillError::io(&root, e))?;
+    let skills = home_skills();
+    let dest = skills.join(&skill.name);
+    if dest.exists() && !dest.join("SKILL.md").is_file() {
+        return Err(SkillError::InvalidSource(format!(
+            "{} exists without a SKILL.md; remove it and retry",
+            dest.display()
+        )));
+    }
+    std::fs::create_dir_all(&skills).map_err(|e| SkillError::io(&skills, e))?;
     let tmp = tempfile::Builder::new()
         .prefix(".install-")
-        .tempdir_in(&root)
-        .map_err(|e| SkillError::io(&root, e))?;
-    copy_contents(&skill.path, tmp.path()).map_err(|e| SkillError::io(&skill.path, e))?;
-    let dest = root.join(&skill.name);
+        .tempdir_in(&skills)
+        .map_err(|e| SkillError::io(&skills, e))?;
+    copy_contents(&skill.path, tmp.path(), root, true)
+        .map_err(|e| SkillError::io(&skill.path, e))?;
     match std::fs::rename(tmp.path(), &dest) {
         Ok(()) => Ok(()),
+        // A concurrent install of the same skill won the rename.
         Err(_) if dest.join("SKILL.md").is_file() => Ok(()),
         Err(e) => Err(SkillError::io(dest, e)),
     }
 }
 
-fn copy_contents(from: &Path, to: &Path) -> std::io::Result<()> {
+/// Copy one skill directory. Nested directories holding their own SKILL.md are
+/// separate skills and are left out. Symlinks are followed only when their
+/// target stays inside `root` and is not an ancestor (which would loop).
+fn copy_contents(from: &Path, to: &Path, root: &Path, top: bool) -> std::io::Result<()> {
+    let here = from.canonicalize()?;
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if name.starts_with('.')
-            || matches!(
-                name.as_ref(),
-                "__pycache__" | "__pypackages__" | "metadata.json"
-            )
+            || matches!(name.as_ref(), "__pycache__" | "__pypackages__")
+            || (top && name == "metadata.json")
         {
             continue;
         }
+        let path = entry.path();
+        let mut kind = entry.file_type()?;
+        if kind.is_symlink() {
+            let target = match path.canonicalize() {
+                Ok(t) if t.starts_with(root) && !here.starts_with(&t) => t,
+                _ => {
+                    eprintln!(
+                        "skipping symlink outside the skill source: {}",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            kind = std::fs::metadata(&target)?.file_type();
+        }
         let dest = to.join(entry.file_name());
-        let kind = entry.file_type()?;
         if kind.is_dir() {
+            if path.join("SKILL.md").is_file() {
+                continue;
+            }
             std::fs::create_dir(&dest)?;
-            copy_contents(&entry.path(), &dest)?;
+            copy_contents(&path, &dest, root, false)?;
         } else if kind.is_file() {
-            std::fs::copy(entry.path(), dest)?;
-        } else {
-            return Err(std::io::Error::other(format!(
-                "unsupported skill entry: {}",
-                entry.path().display()
-            )));
+            std::fs::copy(&path, dest)?;
         }
     }
     Ok(())
@@ -123,14 +154,23 @@ async fn by_name(name: &str) -> Result<Option<(String, Option<String>)>, SkillEr
 }
 
 /// Return the installed name and, only on a new installation, its source.
-pub(crate) async fn ensure_installed(input: &str) -> Result<(String, Option<String>), SkillError> {
+/// `skills_sh` allows resolving an unknown plain name through the public
+/// skills.sh directory; only an explicit `skill install` passes it, since a
+/// typo or squatted name would otherwise inject third-party instructions.
+pub(crate) async fn ensure_installed(
+    input: &str,
+    skills_sh: bool,
+) -> Result<(String, Option<String>), SkillError> {
     let Some(source) = github_source(input) else {
-        let miss = match by_name(input).await {
-            Ok(Some(hit)) => return Ok(hit),
-            Ok(None) => SkillError::SkillNotFound(input.into()),
-            Err(e) if !is_plain_skill_name(input) => return Err(e),
-            Err(e) => e,
-        };
+        // A failing registry propagates: it may hold the skill, so falling
+        // through to the public directory could install a different one.
+        if let Some(hit) = by_name(input).await? {
+            return Ok(hit);
+        }
+        let miss = SkillError::SkillNotFound(input.into());
+        if !skills_sh {
+            return Err(miss);
+        }
         let name = input.to_owned();
         let remote = tokio::task::spawn_blocking(move || {
             skill_registry::skills_sh::exact_github_source(&name)
@@ -144,22 +184,27 @@ pub(crate) async fn ensure_installed(input: &str) -> Result<(String, Option<Stri
         }
         return Err(miss);
     };
+    // Only an explicit `@NAME` is known before cloning. A directory or repo
+    // name can differ from the frontmatter name, so it must not pick a
+    // registry skill on its own.
+    if let Some(name) = source.skill_filter.as_deref() {
+        if !is_plain_skill_name(name) {
+            return Err(SkillError::InvalidSource(
+                "invalid GitHub skill name".into(),
+            ));
+        }
+        if let Some(hit) = registry_or_fallback(name).await {
+            return Ok(hit);
+        }
+    }
     let hint = source
         .skill_filter
         .as_deref()
         .or_else(|| source.subpath.as_deref()?.rsplit('/').next())
         .or_else(|| source.url.trim_end_matches(".git").rsplit('/').next())
         .unwrap_or("");
-    if !is_plain_skill_name(hint) {
-        return Err(SkillError::InvalidSource(
-            "invalid GitHub skill name".into(),
-        ));
-    }
-    if let Some(hit) = registry_or_fallback(hint).await {
-        return Ok(hit);
-    }
 
-    let (_checkout, skills) = entries(&source).await?;
+    let (_checkout, root, skills) = entries(&source).await?;
     let selected = match skills.iter().find(|s| s.name == hint) {
         Some(skill) => skill,
         None if source.skill_filter.is_none() && skills.len() == 1 => &skills[0],
@@ -175,12 +220,12 @@ pub(crate) async fn ensure_installed(input: &str) -> Result<(String, Option<Stri
         }
         None => return Err(SkillError::SkillNotFound(hint.into())),
     };
-    if selected.name != hint
+    if source.skill_filter.as_deref() != Some(selected.name.as_str())
         && let Some(hit) = registry_or_fallback(&selected.name).await
     {
         return Ok(hit);
     }
-    stage(selected)?;
+    stage(selected, &root)?;
     Ok((selected.name.clone(), Some(source.url)))
 }
 
@@ -194,10 +239,14 @@ async fn registry_or_fallback(name: &str) -> Option<(String, Option<String>)> {
     }
 }
 
+/// Skills from configured registries (and optionally installed ones) whose
+/// name or description holds every query word. `remote: false` skips
+/// registries that need a git clone, for latency-sensitive callers.
 pub(crate) async fn catalog_hits(
     query: &str,
     limit: usize,
     include_installed: bool,
+    remote: bool,
 ) -> Vec<skill_registry::SkillHit> {
     let words: Vec<_> = query.split_whitespace().map(str::to_lowercase).collect();
     let mut hits = Vec::new();
@@ -210,8 +259,12 @@ pub(crate) async fn catalog_hits(
         sources.insert(0, home_skills().to_string_lossy().into_owned());
     }
     for source in sources {
-        match entries(&parse_source(&normalize_source_shorthand(&source))).await {
-            Ok((_checkout, skills)) => {
+        let parsed = parse_source(&normalize_source_shorthand(&source));
+        if !remote && parsed.source_type != SourceType::Local {
+            continue;
+        }
+        match entries(&parsed).await {
+            Ok((_checkout, _root, skills)) => {
                 for skill in skills {
                     let text = format!("{} {}", skill.name, skill.description).to_lowercase();
                     if is_plain_skill_name(&skill.name)
@@ -239,7 +292,7 @@ pub(crate) async fn catalog_hits(
 }
 
 pub(super) async fn search(query: &str) {
-    let mut hits = catalog_hits(query, usize::MAX, true).await;
+    let mut hits = catalog_hits(query, usize::MAX, true, true).await;
     if hits.is_empty() {
         hits = skill_registry::skills_sh::search_skills_sh(query, 10);
     }
